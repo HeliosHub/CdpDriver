@@ -1,0 +1,71 @@
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Volume
+ClassGuid   = {71a27cdd-812a-11d0-bec7-08002be2092f}
+Provider    = %ProviderName%
+DriverVer   = 05/19/2026,1.0.0.0
+CatalogFile = SysRestoreDriver.cat
+PnpLockdown = 1
+LegacyUninstall = 1
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksFiles.amd64]
+SysRestoreDriver.sys = 1,,
+
+[DestinationDirs]
+DefaultDestDir = 12 ; %SystemRoot%\System32\drivers
+SysRestoreDriver_CopyFiles.NTamd64 = 12
+SysRestoreDriver_DelFiles.NTamd64 = 12
+
+[DefaultInstall.NTamd64]
+CopyFiles = SysRestoreDriver_CopyFiles.NTamd64
+AddReg    = SysRestoreDriver_AddReg
+
+[DefaultInstall.NTamd64.Services]
+AddService = SysRestoreDriver,, SysRestoreDriver_ServiceInstall
+
+[DefaultInstall.NTamd64.Filters]
+AddFilter = SysRestoreDriver,, SysRestoreDriver_FilterInstall
+
+[DefaultUninstall.NTamd64]
+DelFiles = SysRestoreDriver_DelFiles.NTamd64
+DelReg = SysRestoreDriver_DelReg
+
+[DefaultUninstall.NTamd64.Services]
+DelService = SysRestoreDriver,0x00000002
+
+[DefaultUninstall.NTamd64.Filters]
+DelFilter = SysRestoreDriver,, SysRestoreDriver_FilterInstall
+
+[SysRestoreDriver_FilterInstall]
+FilterLevel    = 0x00000100 ; 极高优先级（仅低于系统关键过滤驱动）
+FilterType     = Upper ; 上层过滤驱动
+FilterClass    = Volume
+
+[SysRestoreDriver_CopyFiles.NTamd64]
+SysRestoreDriver.sys,,,0x00000002 ; 覆盖已存在的文件
+
+[SysRestoreDriver_DelFiles.NTamd64]
+SysRestoreDriver.sys
+
+[SysRestoreDriver_AddReg]
+
+[SysRestoreDriver_DelReg]
+HKLM,SYSTEM\CurrentControlSet\Services\SysRestoreDriver
+
+[SysRestoreDriver_ServiceInstall]
+DisplayName    = %ServiceName%
+Description    = %ServiceDesc%
+ServiceBinary  = %12%\SysRestoreDriver.sys
+ServiceType    = 1 ; SERVICE_KERNEL_DRIVER
+StartType      = 0 ; SERVICE_BOOT_START
+ErrorControl   = 1 ; SERVICE_ERROR_NORMAL
+LoadOrderGroup = "Storage Volume Filters"
+
+[Strings]
+ProviderName = "XuHui.Jiang"
+DiskName     = "SysRestoreDriver Installation Disk"
+ServiceName  = "SysRestoreDriver"
+ServiceDesc  = "QH Engine Disk Volume Filter Driver - Provides system restore and protection functionality"
