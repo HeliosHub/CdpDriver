@@ -63,7 +63,9 @@
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
   <PropertyGroup Label="UserMacros" />
-  <PropertyGroup />
+  <PropertyGroup>
+    <SkipPackageVerification>true</SkipPackageVerification>
+  </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
   </PropertyGroup>
@@ -94,17 +96,14 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Driver.c" />
-    <ClCompile Include="QHBitmap.c" />
+    <ClCompile Include="QHJournal.c" />
     <ClCompile Include="QHIrpDispatchs.c" />
-    <ClCompile Include="QHOffsetHash.c" />
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="QHBitmap.h" />
     <ClInclude Include="QHEngineDefs.h" />
     <ClInclude Include="QHIoctl.h" />
     <ClInclude Include="QHIrpDispatchs.h" />
-    <ClInclude Include="QHNtfs.h" />
-    <ClInclude Include="QHOffsetHash.h" />
+    <ClInclude Include="QHJournal.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">

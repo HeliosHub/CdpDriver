@@ -25,27 +25,107 @@
 #define QH_CONTROL_SYSTEM_LINK_NAME L"\\\\.\\QHEngineControlDevice"
 #endif
 
-// 保护状态文件路径（相对卷根目录）
-// 文件存在 + 首字节 = 1 → 保护开启
-// 文件存在 + 首字节 = 0 → 用户已关闭保护
-// 文件不存在            → 此卷未配置保护
-// 该文件被加入 ProtectRanges, 写入时直通真实磁盘, 不被重定向
 #define QH_PROTECT_STATE_FILE_NAME L"\\_qh_protect_state.data"
-
-// 保护状态文件大小（字节）
-// 必须远大于 NTFS 驻留属性阈值（~700B）以强制非驻留存储,
-// 否则数据直接放在 MFT 记录里, ProtectRanges 标记的"文件扇区"会变成空,
-// 写入将走 MFT 而被本驱动重定向
 #define QH_PROTECT_STATE_FILE_SIZE (1024 * 1024)
 
-// 自定义 IOCTL 控制码
 #define QH_IOCTL_TYPE 0x8000
 
-// 查询是否有任意卷处于保护状态
-// 遍历过滤设备链表，任一卷 Initialized==TRUE 即返回 TRUE
-// 输入: 无
-// 输出: BOOLEAN (1 字节)
 #define IOCTL_QH_QUERY_PROTECT_STATUS CTL_CODE(QH_IOCTL_TYPE, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+// 指令 1 / 2 / 4 / 5：METHOD_BUFFERED
+#define IOCTL_QH_SEND_COMMAND CTL_CODE(QH_IOCTL_TYPE, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+// 指令 3：按驱动侧句柄读扇区（METHOD_OUT_DIRECT）
+#define IOCTL_QH_READ_SECTORS CTL_CODE(QH_IOCTL_TYPE, 0x803, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
 
+// 文件预览：创建时间点会话、读取该时间点的卷数据、关闭会话
+#define IOCTL_QH_BEGIN_PREVIEW CTL_CODE(QH_IOCTL_TYPE, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_QH_READ_PREVIEW  CTL_CODE(QH_IOCTL_TYPE, 0x805, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
+#define IOCTL_QH_END_PREVIEW   CTL_CODE(QH_IOCTL_TYPE, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+#define QH_CMD_1 1
+#define QH_CMD_2 2
+#define QH_CMD_3 3
+#define QH_CMD_4 4  // 按 GUID 打开卷，返回 VolumeHandle
+#define QH_CMD_5 5  // 关闭 VolumeHandle
+
+#define QH_CMD3_MAX_READ_BYTES (1024u * 1024u)
+#define QH_SECTOR_SIZE_DEFAULT 512u
+#define QH_COMMAND_REPLY_MSG_CHARS 64
+
+#pragma pack(push, 8)
+
+typedef struct _QH_CMD1_REQUEST
+{
+	ULONG Code;
+	GUID PartitionGuid1;    // protected source volume
+	GUID PartitionGuid2;    // dedicated journal partition
+	ULONG FormatJournal;    // nonzero: initialize journal; zero: mount existing journal
+} QH_CMD1_REQUEST, *PQH_CMD1_REQUEST;
+
+typedef struct _QH_CMD2_REQUEST
+{
+	ULONG Code;
+	GUID PartitionGuid;
+} QH_CMD2_REQUEST, *PQH_CMD2_REQUEST;
+
+// 指令4：GUID → 驱动内打开并缓存，返回句柄 ID
+typedef struct _QH_CMD4_REQUEST
+{
+	ULONG Code;          // = QH_CMD_4
+	GUID PartitionGuid;
+} QH_CMD4_REQUEST, *PQH_CMD4_REQUEST;
+
+// 指令5：关闭句柄
+typedef struct _QH_CMD5_REQUEST
+{
+	ULONG Code;            // = QH_CMD_5
+	UINT64 VolumeHandle;
+} QH_CMD5_REQUEST, *PQH_CMD5_REQUEST;
+
+// 指令3：用句柄读扇区（不再带 GUID）
+typedef struct _QH_CMD3_REQUEST
+{
+	ULONG Code;            // = QH_CMD_3
+	UINT64 VolumeHandle;   // 指令4 返回的句柄
+	UINT64 ByteOffset;
+	ULONG ByteLength;
+} QH_CMD3_REQUEST, *PQH_CMD3_REQUEST;
+
+typedef struct _QH_COMMAND_REPLY
+{
+	ULONG Command;
+	ULONG Result;
+	UINT64 VolumeHandle;   // 指令4 成功时有效，其余为 0
+	WCHAR Message[QH_COMMAND_REPLY_MSG_CHARS];
+} QH_COMMAND_REPLY, *PQH_COMMAND_REPLY;
+
+// TargetTime100ns 使用 Windows FILETIME/KeQuerySystemTime 的 100ns 时间。
+typedef struct _QH_PREVIEW_BEGIN_REQUEST
+{
+	GUID SourceVolumeGuid;
+	UINT64 TargetTime100ns;
+} QH_PREVIEW_BEGIN_REQUEST, *PQH_PREVIEW_BEGIN_REQUEST;
+
+typedef struct _QH_PREVIEW_BEGIN_REPLY
+{
+	UINT64 PreviewHandle;
+	UINT64 TargetTime100ns;
+	UINT64 OldestRecoverable100ns;
+	UINT64 NewestRecoverable100ns;
+} QH_PREVIEW_BEGIN_REPLY, *PQH_PREVIEW_BEGIN_REPLY;
+
+typedef struct _QH_PREVIEW_READ_REQUEST
+{
+	UINT64 PreviewHandle;
+	UINT64 ByteOffset;
+	ULONG ByteLength;
+	ULONG Reserved;
+} QH_PREVIEW_READ_REQUEST, *PQH_PREVIEW_READ_REQUEST;
+
+typedef struct _QH_PREVIEW_END_REQUEST
+{
+	UINT64 PreviewHandle;
+} QH_PREVIEW_END_REQUEST, *PQH_PREVIEW_END_REQUEST;
+
+#pragma pack(pop)
