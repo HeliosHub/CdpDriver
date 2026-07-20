@@ -19,8 +19,6 @@
 #include "QHIoctl.h"
 #include "QHJournal.h"
 
-#define QH_ALLOCATE_NO_TAG
-
 #if (NTDDI_VERSION >= NTDDI_WIN10_VB)
 #define qhalloc(size) ExAllocatePool2(POOL_FLAG_NON_PAGED, size, 'NTAG')
 #define qhfree(P) ExFreePoolWithTag(P, 'NTAG')
@@ -56,7 +54,6 @@ typedef struct _QH_VOLUME_HANDLE_ENTRY
 	// Volume stack below our filter. Capture writes go here to bypass the
 	// mounted filesystem's DASD write denial (STATUS_ACCESS_DENIED).
 	PDEVICE_OBJECT TargetLowerDevice;
-	GUID PartitionGuid;
 	UINT64 PartitionSize;
 	ULONG SectorSize;
 	QH_JOURNAL Journal;
@@ -73,16 +70,12 @@ typedef struct _QH_DRIVER_EXTENSION
 	LIST_ENTRY DeviceObjectListHead;
 	KSPIN_LOCK DeviceObjectListLock;
 	PDEVICE_OBJECT ControlDevice;
-	volatile LONG BootReinitDone;
 
 	// 指令4 打开的卷句柄表（内核 HANDLE，用户态只持有 HandleId）
 	LIST_ENTRY VolumeHandleList;
 	FAST_MUTEX VolumeHandleMutex;
 	volatile LONGLONG VolumeHandleNextId;
 	UINT64 CaptureTargetHandleId;
-	// Set only around the driver's own ZwWriteFile call.  This prevents that
-	// write from recursively entering the capture path.
-	volatile LONG CaptureInternalIo;
 
 	// 按时间点读取的文件预览会话
 	LIST_ENTRY PreviewSessionList;
@@ -90,30 +83,7 @@ typedef struct _QH_DRIVER_EXTENSION
 	volatile LONGLONG PreviewSessionNextId;
 } QH_DRIVER_EXTENSION, *PQH_DRIVER_EXTENSION;
 
-typedef struct _QH_DEVICE_EXTENSION
-{
-	// 当前卷是否已根据 _qh_protect_state.data 激活（仅供 UI 查询；读写均透传）
-	BOOLEAN Initialized;
-	volatile LONG CaptureEnabled;
-	GUID VolumeGuid;
-	PDEVICE_OBJECT LowerDeviceObject;
-	PDEVICE_OBJECT PhysicalDeviceObject;
-	volatile LONG PagingPathCount;
-	KSPIN_LOCK CaptureQueueLock;
-	LIST_ENTRY CaptureQueue;
-	KEVENT CaptureEvent;
-	HANDLE CaptureThreadHandle;
-	volatile LONG CaptureStopping;
-	// Serializes COW capture (before-image + original write) with preview
-	// reads (journal scan + live gap fill) so the two views stay consistent.
-	KMUTEX HistoryMutex;
-} QH_DEVICE_EXTENSION, *PQH_DEVICE_EXTENSION;
-
-typedef struct _QH_CAPTURE_ITEM
-{
-	LIST_ENTRY Entry;
-	PIRP Irp;
-} QH_CAPTURE_ITEM, *PQH_CAPTURE_ITEM;
+typedef struct _QH_CORE QH_CORE, *PQH_CORE;
 
 typedef struct _QH_PREVIEW_SESSION
 {
@@ -127,3 +97,26 @@ typedef struct _QH_PREVIEW_SESSION
 	BOOLEAN Closing;
 	KEVENT NoReferences;
 } QH_PREVIEW_SESSION, *PQH_PREVIEW_SESSION;
+
+typedef struct _QH_DEVICE_EXTENSION
+{
+	volatile LONG CaptureEnabled;
+	volatile LONG Phase;
+	GUID VolumeGuid;
+	PDEVICE_OBJECT LowerDeviceObject;
+	PDEVICE_OBJECT PhysicalDeviceObject;
+	volatile LONG PagingPathCount;
+	KSPIN_LOCK CaptureQueueLock;
+	LIST_ENTRY CaptureQueue;
+	KEVENT CaptureEvent;
+	HANDLE CaptureThreadHandle;
+	volatile LONG CaptureStopping;
+	KMUTEX HistoryMutex;
+	PQH_CORE Core;
+} QH_DEVICE_EXTENSION, *PQH_DEVICE_EXTENSION;
+
+typedef struct _QH_CAPTURE_ITEM
+{
+	LIST_ENTRY Entry;
+	PIRP Irp;
+} QH_CAPTURE_ITEM, *PQH_CAPTURE_ITEM;

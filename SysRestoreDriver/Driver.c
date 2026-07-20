@@ -1,5 +1,6 @@
 ﻿#include "QHEngineDefs.h"
 #include "QHIrpDispatchs.h"
+#include "..\SysRestoreCore\include\qh_core.h"
 
 PDRIVER_OBJECT g_DriverObject = NULL;
 
@@ -10,9 +11,7 @@ VOID QHDeleteFilterDevice(_In_ PDEVICE_OBJECT FilterDeviceObject)
 	if (!DevExt)
 		return;
 
-	InterlockedExchange8((volatile CHAR*)&DevExt->Initialized, 0);
-	InterlockedExchange(&DevExt->CaptureEnabled, 0);
-	QHStopCaptureWorker(DevExt);
+	QHDisableAndDestroyCapture(DevExt);
 
 	if (DevExt->LowerDeviceObject)
 	{
@@ -96,6 +95,7 @@ NTSTATUS QHAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Physi
 	InitializeListHead(&DeviceExtension->CaptureQueue);
 	KeInitializeEvent(&DeviceExtension->CaptureEvent, NotificationEvent, FALSE);
 	KeInitializeMutex(&DeviceExtension->HistoryMutex, 0);
+	InterlockedExchange(&DeviceExtension->Phase, QH_PHASE_NORMAL);
 
 	Status = IoAttachDeviceToDeviceStackSafe(FilterDeviceObject, PhysicalDeviceObject, &DeviceExtension->LowerDeviceObject);
 	if (!NT_SUCCESS(Status))
@@ -144,6 +144,10 @@ VOID QHDriverUnload(_In_ PDRIVER_OBJECT DriverObject)
 	if (!DriverExtension)
 		return;
 
+	// Preview sessions own source-volume handles and can call into Core.  Tear
+	// them down before any filter device/Core is removed.
+	QHCloseAllPreviewSessions(DriverExtension);
+
 	while (TRUE)
 	{
 		FilterNodeEntry = ExInterlockedRemoveHeadList(&DriverExtension->DeviceObjectListHead, &DriverExtension->DeviceObjectListLock);
@@ -155,7 +159,6 @@ VOID QHDriverUnload(_In_ PDRIVER_OBJECT DriverObject)
 		qhfree(DeviceListNode);
 	}
 
-	QHCloseAllPreviewSessions(DriverExtension);
 	QHCloseAllVolumeHandles(DriverExtension);
 
 	if (DriverExtension->ControlDevice)
@@ -192,7 +195,6 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 	ExInitializeFastMutex(&DriverExtension->VolumeHandleMutex);
 	DriverExtension->VolumeHandleNextId = 0;
 	DriverExtension->CaptureTargetHandleId = 0;
-	DriverExtension->CaptureInternalIo = 0;
 	InitializeListHead(&DriverExtension->PreviewSessionList);
 	ExInitializeFastMutex(&DriverExtension->PreviewSessionMutex);
 	DriverExtension->PreviewSessionNextId = 0;
@@ -206,10 +208,10 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 
 	DriverObject->MajorFunction[IRP_MJ_PNP] = QHIrpDispatchPnp;
 	DriverObject->MajorFunction[IRP_MJ_POWER] = QHIrpDispatchPower;
+	DriverObject->MajorFunction[IRP_MJ_READ] = QHIrpDispatchRead;
 	DriverObject->MajorFunction[IRP_MJ_WRITE] = QHIrpDispatchWrite;
 	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = QHIrpDispatchDeviceControl;
 	DriverObject->DriverExtension->AddDevice = QHAddDevice;
-	IoRegisterBootDriverReinitialization(DriverObject, QHBootReinitializationRoutine, NULL);
 
 cleanup:
 	if (!NT_SUCCESS(Status))

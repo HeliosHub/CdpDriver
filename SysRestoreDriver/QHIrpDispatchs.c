@@ -1,4 +1,6 @@
 ﻿#include "QHIrpDispatchs.h"
+#include "..\SysRestoreCore\include\qh_core.h"
+#include "..\SysRestoreCore\include\qh_dev_store.h"
 #include <ntdddisk.h>
 #include <ntddvol.h>
 #include <ntstrsafe.h>
@@ -286,7 +288,6 @@ static NTSTATUS QHOpenVolumeHandle(
 
 	RtlZeroMemory(item, sizeof(*item));
 	item->FileHandle = fileHandle;
-	item->PartitionGuid = *VolumeGuid;
 	item->HandleId = (UINT64)InterlockedIncrement64(&DriverExt->VolumeHandleNextId);
 	item->ReferenceCount = 1;
 	KeInitializeEvent(&item->NoReferences, NotificationEvent, FALSE);
@@ -352,22 +353,42 @@ static NTSTATUS QHCloseVolumeHandle(
 
 static VOID QHDisableAllCaptureSources(_In_ PQH_DRIVER_EXTENSION DriverExt)
 {
-	KIRQL oldIrql;
-	PLIST_ENTRY entry;
-
-	KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &oldIrql);
-	for (entry = DriverExt->DeviceObjectListHead.Flink;
-		entry != &DriverExt->DeviceObjectListHead;
-		entry = entry->Flink)
+	// Do not destroy Core while holding DeviceObjectListLock: a spin lock raises
+	// IRQL to DISPATCH_LEVEL and Core destruction can free locks/memory.  Take a
+	// reference to one matching filter device, release the spin lock, then
+	// quiesce it.  Re-scan until no capture Core remains.
+	for (;;)
 	{
-		PQH_DEVICE_LIST_NODE node =
-			CONTAINING_RECORD(entry, QH_DEVICE_LIST_NODE, Entry);
-		PQH_DEVICE_EXTENSION ext =
-			(PQH_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
-		if (ext)
-			InterlockedExchange(&ext->CaptureEnabled, 0);
+		KIRQL oldIrql;
+		PLIST_ENTRY entry;
+		PDEVICE_OBJECT filterDevice = NULL;
+
+		KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &oldIrql);
+		for (entry = DriverExt->DeviceObjectListHead.Flink;
+			entry != &DriverExt->DeviceObjectListHead;
+			entry = entry->Flink)
+		{
+			PQH_DEVICE_LIST_NODE node =
+				CONTAINING_RECORD(entry, QH_DEVICE_LIST_NODE, Entry);
+			PQH_DEVICE_EXTENSION ext =
+				(PQH_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
+			if (ext && (InterlockedCompareExchange(&ext->CaptureEnabled, 0, 0) != 0 ||
+				ext->Core != NULL))
+			{
+				filterDevice = node->DeviceObject;
+				ObReferenceObject(filterDevice);
+				break;
+			}
+		}
+		KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
+
+		if (!filterDevice)
+			break;
+
+		QHDisableAndDestroyCapture(
+			(PQH_DEVICE_EXTENSION)filterDevice->DeviceExtension);
+		ObDereferenceObject(filterDevice);
 	}
-	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
 }
 
 static PQH_DEVICE_EXTENSION QHFindSourceExtension(
@@ -428,21 +449,6 @@ static PQH_DEVICE_EXTENSION QHFindSourceExtensionByGuid(
 	return found;
 }
 
-static VOID QHAcquireHistoryLock(_In_ PQH_DEVICE_EXTENSION DevExt)
-{
-	KeWaitForSingleObject(
-		&DevExt->HistoryMutex,
-		Executive,
-		KernelMode,
-		FALSE,
-		NULL);
-}
-
-static VOID QHReleaseHistoryLock(_In_ PQH_DEVICE_EXTENSION DevExt)
-{
-	KeReleaseMutex(&DevExt->HistoryMutex, FALSE);
-}
-
 static NTSTATUS QHConfigureCapture(
 	_In_ PQH_DRIVER_EXTENSION DriverExt,
 	_In_ const GUID* SourceVolumeGuid,
@@ -452,6 +458,8 @@ static NTSTATUS QHConfigureCapture(
 {
 	UINT64 sourceHandleId = 0;
 	UINT64 journalHandleId = 0;
+	UINT64 sourcePartitionSize = 0;
+	ULONG sourceSectorSize = 512;
 	PDEVICE_OBJECT sourceLower = NULL;
 	PQH_DEVICE_EXTENSION sourceExt = NULL;
 	PQH_VOLUME_HANDLE_ENTRY sourceEntry;
@@ -483,7 +491,11 @@ static NTSTATUS QHConfigureCapture(
 	ExAcquireFastMutex(&DriverExt->VolumeHandleMutex);
 	sourceEntry = QHLookupVolumeHandleLocked(DriverExt, sourceHandleId);
 	if (sourceEntry)
+	{
 		sourceLower = sourceEntry->TargetLowerDevice;
+		sourcePartitionSize = sourceEntry->PartitionSize;
+		sourceSectorSize = sourceEntry->SectorSize;
+	}
 	ExReleaseFastMutex(&DriverExt->VolumeHandleMutex);
 	sourceExt = QHFindSourceExtension(DriverExt, sourceLower);
 	(void)QHCloseVolumeHandle(DriverExt, sourceHandleId);
@@ -514,7 +526,6 @@ static NTSTATUS QHConfigureCapture(
 	status = FormatJournal ?
 		QHJournalFormat(&journalEntry->Journal) :
 		QHJournalMount(&journalEntry->Journal);
-	QHReleaseVolumeHandleEntry(journalEntry);
 	if (!NT_SUCCESS(status))
 	{
 		(void)QHCloseVolumeHandle(DriverExt, journalHandleId);
@@ -526,6 +537,49 @@ static NTSTATUS QHConfigureCapture(
 	ExAcquireFastMutex(&DriverExt->VolumeHandleMutex);
 	DriverExt->CaptureTargetHandleId = journalHandleId;
 	ExReleaseFastMutex(&DriverExt->VolumeHandleMutex);
+
+	if (!sourceExt->CaptureThreadHandle)
+	{
+		status = QHStartCaptureWorker(sourceExt);
+		if (!NT_SUCCESS(status))
+		{
+			ExAcquireFastMutex(&DriverExt->VolumeHandleMutex);
+			DriverExt->CaptureTargetHandleId = 0;
+			ExReleaseFastMutex(&DriverExt->VolumeHandleMutex);
+			(void)QHCloseVolumeHandle(DriverExt, journalHandleId);
+			QHReleaseVolumeHandleEntry(journalEntry);
+			return status;
+		}
+	}
+	{
+		PQH_STORE sourceStore = NULL;
+		status = QhDevStoreCreate(
+			sourceExt->LowerDeviceObject,
+			sourcePartitionSize,
+			sourceSectorSize,
+			&sourceStore);
+		if (NT_SUCCESS(status))
+		{
+			status = QhCoreBind(
+				sourceStore,
+				&journalEntry->Journal,
+				SourceVolumeGuid,
+				&sourceExt->Core);
+		}
+		if (!NT_SUCCESS(status))
+		{
+			if (sourceStore)
+				QhDevStoreDestroy(sourceStore);
+			ExAcquireFastMutex(&DriverExt->VolumeHandleMutex);
+			DriverExt->CaptureTargetHandleId = 0;
+			ExReleaseFastMutex(&DriverExt->VolumeHandleMutex);
+			(void)QHCloseVolumeHandle(DriverExt, journalHandleId);
+			QHReleaseVolumeHandleEntry(journalEntry);
+			return status;
+		}
+	}
+	QHReleaseVolumeHandleEntry(journalEntry);
+
 	InterlockedExchange(&sourceExt->CaptureEnabled, 1);
 
 	*JournalHandleId = journalHandleId;
@@ -551,6 +605,17 @@ static PQH_PREVIEW_SESSION QHLookupPreviewSessionLocked(
 		entry = entry->Flink;
 	}
 	return NULL;
+}
+
+static BOOLEAN QHAnyPreviewSessionActive(
+	_In_ PQH_DRIVER_EXTENSION DriverExt)
+{
+	BOOLEAN active;
+
+	ExAcquireFastMutex(&DriverExt->PreviewSessionMutex);
+	active = !IsListEmpty(&DriverExt->PreviewSessionList);
+	ExReleaseFastMutex(&DriverExt->PreviewSessionMutex);
+	return active;
 }
 
 static PQH_PREVIEW_SESSION QHAcquirePreviewSession(
@@ -602,15 +667,42 @@ static NTSTATUS QHBeginPreviewSession(
 {
 	PQH_VOLUME_HANDLE_ENTRY journalEntry = NULL;
 	PQH_PREVIEW_SESSION session = NULL;
+	PQH_DEVICE_EXTENSION sourceExt = NULL;
 	UINT64 sourceHandleId = 0;
 	UINT64 oldestTime = 0;
 	UINT64 newestTime = 0;
+	BOOLEAN phaseTransitioned = FALSE;
 	NTSTATUS status;
 
 	RtlZeroMemory(Reply, sizeof(*Reply));
 	journalEntry = QHAcquireCaptureTarget(DriverExt);
 	if (!journalEntry)
 		return STATUS_DEVICE_NOT_READY;
+
+	sourceExt = QHFindSourceExtensionByGuid(
+		DriverExt,
+		&Request->SourceVolumeGuid);
+	if (!sourceExt)
+	{
+		QHReleaseVolumeHandleEntry(journalEntry);
+		return STATUS_DEVICE_DOES_NOT_EXIST;
+	}
+	if (InterlockedCompareExchange(&sourceExt->Phase, 0, 0) !=
+		(LONG)QH_PHASE_NORMAL)
+	{
+		QHReleaseVolumeHandleEntry(journalEntry);
+		return STATUS_INVALID_DEVICE_STATE;
+	}
+	if (QHAnyPreviewSessionActive(DriverExt))
+	{
+		QHReleaseVolumeHandleEntry(journalEntry);
+		return STATUS_INVALID_DEVICE_STATE;
+	}
+	if (!sourceExt->Core)
+	{
+		QHReleaseVolumeHandleEntry(journalEntry);
+		return STATUS_DEVICE_NOT_READY;
+	}
 
 	if (!journalEntry->Journal.Mounted ||
 		RtlCompareMemory(
@@ -628,7 +720,6 @@ static NTSTATUS QHBeginPreviewSession(
 		&newestTime);
 	if (status == STATUS_NOT_FOUND)
 	{
-		// Empty journal is still previewable: reads return live source data.
 		oldestTime = 0;
 		newestTime = 0;
 		status = STATUS_SUCCESS;
@@ -650,6 +741,22 @@ static NTSTATUS QHBeginPreviewSession(
 	if (!NT_SUCCESS(status))
 		goto cleanup;
 
+	if (InterlockedCompareExchange(
+			&sourceExt->Phase,
+			(LONG)QH_PHASE_PREVIEW,
+			(LONG)QH_PHASE_NORMAL) != (LONG)QH_PHASE_NORMAL)
+	{
+		status = STATUS_INVALID_DEVICE_STATE;
+		goto cleanup;
+	}
+	phaseTransitioned = TRUE;
+
+	if (QHAnyPreviewSessionActive(DriverExt))
+	{
+		status = STATUS_INVALID_DEVICE_STATE;
+		goto cleanup;
+	}
+
 	session = (PQH_PREVIEW_SESSION)qhalloc(sizeof(*session));
 	if (!session)
 	{
@@ -670,22 +777,46 @@ static NTSTATUS QHBeginPreviewSession(
 		FALSE);
 
 	ExAcquireFastMutex(&DriverExt->PreviewSessionMutex);
+	if (!IsListEmpty(&DriverExt->PreviewSessionList))
+	{
+		ExReleaseFastMutex(&DriverExt->PreviewSessionMutex);
+		status = STATUS_INVALID_DEVICE_STATE;
+		goto cleanup;
+	}
 	InsertTailList(&DriverExt->PreviewSessionList, &session->Entry);
 	ExReleaseFastMutex(&DriverExt->PreviewSessionMutex);
 
+	status = QhCorePreviewBegin(sourceExt->Core, Request->TargetTime100ns);
+	if (!NT_SUCCESS(status))
+	{
+		ExAcquireFastMutex(&DriverExt->PreviewSessionMutex);
+		RemoveEntryList(&session->Entry);
+		ExReleaseFastMutex(&DriverExt->PreviewSessionMutex);
+		goto cleanup;
+	}
 	Reply->PreviewHandle = session->HandleId;
 	Reply->TargetTime100ns = session->TargetTime100ns;
 	Reply->OldestRecoverable100ns = oldestTime;
 	Reply->NewestRecoverable100ns = newestTime;
-	QH_DBG("[PREVIEW] begin handle=%llu target=%llu sourceHandle=%llu\n",
+
+	QH_DBG("[PREVIEW] begin handle=%llu target=%llu (Core)\n",
 		session->HandleId,
-		session->TargetTime100ns,
-		sourceHandleId);
+		session->TargetTime100ns);
 	return STATUS_SUCCESS;
 
 cleanup:
 	if (session)
+	{
 		qhfree(session);
+		journalEntry = NULL;
+		sourceHandleId = 0;
+	}
+	if (phaseTransitioned && sourceExt)
+	{
+		if (sourceExt->Core)
+			(void)QhCorePreviewEnd(sourceExt->Core);
+		InterlockedExchange(&sourceExt->Phase, (LONG)QH_PHASE_NORMAL);
+	}
 	if (sourceHandleId)
 		(void)QHCloseVolumeHandle(DriverExt, sourceHandleId);
 	if (journalEntry)
@@ -698,6 +829,8 @@ static NTSTATUS QHEndPreviewSession(
 	_In_ UINT64 HandleId)
 {
 	PQH_PREVIEW_SESSION session;
+	GUID sourceGuid;
+	BOOLEAN haveGuid = FALSE;
 
 	ExAcquireFastMutex(&DriverExt->PreviewSessionMutex);
 	session = QHLookupPreviewSessionLocked(DriverExt, HandleId);
@@ -705,12 +838,27 @@ static NTSTATUS QHEndPreviewSession(
 	{
 		RemoveEntryList(&session->Entry);
 		session->Closing = TRUE;
+		sourceGuid = session->SourceVolumeGuid;
+		haveGuid = TRUE;
 	}
 	ExReleaseFastMutex(&DriverExt->PreviewSessionMutex);
 	if (!session)
 		return STATUS_NOT_FOUND;
 
 	QHDestroyPreviewSession(DriverExt, session);
+
+	if (haveGuid)
+	{
+		PQH_DEVICE_EXTENSION sourceExt =
+			QHFindSourceExtensionByGuid(DriverExt, &sourceGuid);
+		if (sourceExt)
+		{
+			if (sourceExt->Core)
+				(void)QhCorePreviewEnd(sourceExt->Core);
+			InterlockedExchange(&sourceExt->Phase, (LONG)QH_PHASE_NORMAL);
+		}
+	}
+
 	QH_DBG("[PREVIEW] end handle=%llu\n", HandleId);
 	return STATUS_SUCCESS;
 }
@@ -720,6 +868,8 @@ VOID QHCloseAllPreviewSessions(_In_ PQH_DRIVER_EXTENSION DriverExt)
 	for (;;)
 	{
 		PQH_PREVIEW_SESSION session = NULL;
+		GUID sourceGuid;
+		BOOLEAN haveGuid = FALSE;
 
 		ExAcquireFastMutex(&DriverExt->PreviewSessionMutex);
 		if (!IsListEmpty(&DriverExt->PreviewSessionList))
@@ -731,82 +881,27 @@ VOID QHCloseAllPreviewSessions(_In_ PQH_DRIVER_EXTENSION DriverExt)
 				QH_PREVIEW_SESSION,
 				Entry);
 			session->Closing = TRUE;
+			sourceGuid = session->SourceVolumeGuid;
+			haveGuid = TRUE;
 		}
 		ExReleaseFastMutex(&DriverExt->PreviewSessionMutex);
 		if (!session)
 			break;
+
+		if (haveGuid)
+		{
+			PQH_DEVICE_EXTENSION sourceExt =
+				QHFindSourceExtensionByGuid(DriverExt, &sourceGuid);
+			if (sourceExt)
+			{
+				if (sourceExt->Core)
+					(void)QhCorePreviewEnd(sourceExt->Core);
+				InterlockedExchange(&sourceExt->Phase, (LONG)QH_PHASE_NORMAL);
+			}
+		}
+
 		QHDestroyPreviewSession(DriverExt, session);
 	}
-}
-
-static NTSTATUS QHReadCurrentVolumeRange(
-	_In_ PQH_VOLUME_HANDLE_ENTRY SourceEntry,
-	_In_ UINT64 ByteOffset,
-	_In_ ULONG ByteLength,
-	_Out_writes_bytes_(ByteLength) PVOID OutputBuffer)
-{
-	UINT64 alignedOffset;
-	UINT64 endOffset;
-	UINT64 alignedEnd;
-	ULONG alignedLength;
-	ULONG sectorSize = SourceEntry->SectorSize;
-	SIZE_T alignment;
-	PVOID allocationBase = NULL;
-	PVOID alignedBuffer;
-	LARGE_INTEGER offset;
-	IO_STATUS_BLOCK iosb;
-	NTSTATUS status;
-
-	if (!sectorSize || !ByteLength ||
-		ByteOffset > MAXUINT64 - ByteLength ||
-		ByteOffset + ByteLength > SourceEntry->PartitionSize)
-	{
-		return STATUS_INVALID_PARAMETER;
-	}
-
-	alignedOffset = ByteOffset - (ByteOffset % sectorSize);
-	endOffset = ByteOffset + ByteLength;
-	if (endOffset > MAXUINT64 - (sectorSize - 1))
-		return STATUS_INTEGER_OVERFLOW;
-	alignedEnd = ((endOffset + sectorSize - 1) / sectorSize) * sectorSize;
-	if (alignedEnd - alignedOffset > MAXULONG)
-		return STATUS_INVALID_BUFFER_SIZE;
-	alignedLength = (ULONG)(alignedEnd - alignedOffset);
-
-	alignment =
-		(SIZE_T)SourceEntry->TargetLowerDevice->AlignmentRequirement + 1;
-	if (alignment < sectorSize)
-		alignment = sectorSize;
-	allocationBase = qhalloc((SIZE_T)alignedLength + alignment - 1);
-	if (!allocationBase)
-		return STATUS_INSUFFICIENT_RESOURCES;
-	alignedBuffer = (PVOID)(
-		((ULONG_PTR)allocationBase + alignment - 1) &
-		~((ULONG_PTR)alignment - 1));
-
-	offset.QuadPart = (LONGLONG)alignedOffset;
-	RtlZeroMemory(&iosb, sizeof(iosb));
-	status = ZwReadFile(
-		SourceEntry->FileHandle,
-		NULL,
-		NULL,
-		NULL,
-		&iosb,
-		alignedBuffer,
-		alignedLength,
-		&offset,
-		NULL);
-	if (NT_SUCCESS(status) && iosb.Information != alignedLength)
-		status = STATUS_UNEXPECTED_IO_ERROR;
-	if (NT_SUCCESS(status))
-	{
-		RtlCopyMemory(
-			OutputBuffer,
-			(PUCHAR)alignedBuffer + (ByteOffset - alignedOffset),
-			ByteLength);
-	}
-	qhfree(allocationBase);
-	return status;
 }
 
 static NTSTATUS QHReadPreviewSession(
@@ -815,12 +910,8 @@ static NTSTATUS QHReadPreviewSession(
 	_Out_writes_bytes_(Request->ByteLength) PVOID OutputBuffer)
 {
 	PQH_PREVIEW_SESSION session;
-	PQH_VOLUME_HANDLE_ENTRY sourceEntry = NULL;
 	PQH_DEVICE_EXTENSION sourceExt = NULL;
 	BOOLEAN historyLocked = FALSE;
-	PUCHAR coveredMask = NULL;
-	PVOID liveBuffer = NULL;
-	ULONG coveredCount = 0;
 	NTSTATUS status;
 
 	if (!Request->ByteLength ||
@@ -835,110 +926,39 @@ static NTSTATUS QHReadPreviewSession(
 	if (!session)
 		return STATUS_INVALID_HANDLE;
 
-	ExAcquireFastMutex(&DriverExt->VolumeHandleMutex);
-	sourceEntry = QHLookupVolumeHandleLocked(
-		DriverExt,
-		session->SourceVolumeHandleId);
-	if (sourceEntry && !sourceEntry->Closing)
-		InterlockedIncrement(&sourceEntry->ReferenceCount);
-	else
-		sourceEntry = NULL;
-	ExReleaseFastMutex(&DriverExt->VolumeHandleMutex);
-	if (!sourceEntry)
-	{
-		status = STATUS_INVALID_HANDLE;
-		goto cleanup;
-	}
-
-	coveredMask = (PUCHAR)qhalloc(Request->ByteLength);
-	if (!coveredMask)
-	{
-		status = STATUS_INSUFFICIENT_RESOURCES;
-		goto cleanup;
-	}
-
-	// Hold HistoryMutex across journal scan + live gap fill so a concurrent
-	// COW capture cannot interleave (append before-image / apply write).
 	sourceExt = QHFindSourceExtensionByGuid(
 		DriverExt,
 		&session->SourceVolumeGuid);
-	if (sourceExt)
+	if (!sourceExt || !sourceExt->Core)
 	{
-		QHAcquireHistoryLock(sourceExt);
-		historyLocked = TRUE;
+		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup;
 	}
 
-	// Journal first. Skip live volume I/O when history fully covers the range.
-	status = QHJournalBuildPreview(
-		&session->JournalEntry->Journal,
-		session->TargetTime100ns,
+	KeWaitForSingleObject(
+		&sourceExt->HistoryMutex,
+		Executive,
+		KernelMode,
+		FALSE,
+		NULL);
+	historyLocked = TRUE;
+
+	status = QhCoreRead(
+		sourceExt->Core,
 		Request->ByteOffset,
 		Request->ByteLength,
-		OutputBuffer,
-		coveredMask,
-		&coveredCount);
-	if (!NT_SUCCESS(status))
-		goto cleanup;
-
-	if (coveredCount == Request->ByteLength)
+		OutputBuffer);
+	if (NT_SUCCESS(status))
 	{
-		QH_DBG("[PREVIEW] fully covered by journal handle=%llu offset=%llu len=%lu\n",
+		QH_DBG("[PREVIEW] core read handle=%llu offset=%llu len=%lu\n",
 			Request->PreviewHandle,
 			Request->ByteOffset,
 			Request->ByteLength);
 	}
-	else if (coveredCount == 0)
-	{
-		status = QHReadCurrentVolumeRange(
-			sourceEntry,
-			Request->ByteOffset,
-			Request->ByteLength,
-			OutputBuffer);
-		QH_DBG("[PREVIEW] live-only handle=%llu offset=%llu len=%lu status=0x%08X\n",
-			Request->PreviewHandle,
-			Request->ByteOffset,
-			Request->ByteLength,
-			status);
-	}
-	else
-	{
-		ULONG i;
-
-		liveBuffer = qhalloc(Request->ByteLength);
-		if (!liveBuffer)
-		{
-			status = STATUS_INSUFFICIENT_RESOURCES;
-			goto cleanup;
-		}
-		status = QHReadCurrentVolumeRange(
-			sourceEntry,
-			Request->ByteOffset,
-			Request->ByteLength,
-			liveBuffer);
-		if (NT_SUCCESS(status))
-		{
-			for (i = 0; i < Request->ByteLength; ++i)
-			{
-				if (!coveredMask[i])
-					((PUCHAR)OutputBuffer)[i] = ((PUCHAR)liveBuffer)[i];
-			}
-		}
-		QH_DBG("[PREVIEW] mixed journal=%lu live=%lu handle=%llu offset=%llu\n",
-			coveredCount,
-			Request->ByteLength - coveredCount,
-			Request->PreviewHandle,
-			Request->ByteOffset);
-	}
 
 cleanup:
 	if (historyLocked && sourceExt)
-		QHReleaseHistoryLock(sourceExt);
-	if (liveBuffer)
-		qhfree(liveBuffer);
-	if (coveredMask)
-		qhfree(coveredMask);
-	if (sourceEntry)
-		QHReleaseVolumeHandleEntry(sourceEntry);
+		KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
 	QHReleasePreviewSession(session);
 	return status;
 }
@@ -1008,103 +1028,6 @@ static NTSTATUS QHSendToNextDevice(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIR
 	return IoCallDriver(DeviceObject, Irp);
 }
 
-static NTSTATUS QHGetVolumeDosName(
-	_In_ PDEVICE_OBJECT PhysicalDeviceObject,
-	_Out_ PUNICODE_STRING DosName)
-{
-	UNICODE_STRING volumeMountPoint = { 0 };
-	NTSTATUS Status;
-	DECLARE_CONST_UNICODE_STRING(NtPrefix, L"\\??\\");
-
-	Status = IoVolumeDeviceToDosName(PhysicalDeviceObject, &volumeMountPoint);
-	if (!NT_SUCCESS(Status))
-		return Status;
-
-	DosName->Length = 0;
-	DosName->MaximumLength = NtPrefix.Length + volumeMountPoint.Length + 8 * sizeof(WCHAR);
-	DosName->Buffer = (PWCH)qhalloc(DosName->MaximumLength);
-	if (!DosName->Buffer)
-	{
-		ExFreePool(volumeMountPoint.Buffer);
-		return STATUS_INSUFFICIENT_RESOURCES;
-	}
-
-	RtlAppendUnicodeStringToString(DosName, (PUNICODE_STRING)&NtPrefix);
-	RtlAppendUnicodeStringToString(DosName, &volumeMountPoint);
-	ExFreePool(volumeMountPoint.Buffer);
-	return STATUS_SUCCESS;
-}
-
-// 读卷根目录 _qh_protect_state.data 首字节
-// 返回: 1 开启 / 0 关闭 / -1 不存在或读失败
-static INT32 QHReadProtectStateFromFile(_In_ PDEVICE_OBJECT PhysicalDeviceObject)
-{
-	NTSTATUS Status;
-	UNICODE_STRING dosName = { 0 };
-	UNICODE_STRING fullpath = { 0 };
-	UNICODE_STRING fileNameStr;
-	OBJECT_ATTRIBUTES oa;
-	IO_STATUS_BLOCK iosb;
-	HANDLE fileHandle = NULL;
-	UCHAR firstByte = 0;
-	INT32 result = -1;
-
-	RtlInitUnicodeString(&fileNameStr, QH_PROTECT_STATE_FILE_NAME);
-
-	Status = QHGetVolumeDosName(PhysicalDeviceObject, &dosName);
-	if (!NT_SUCCESS(Status))
-		return -1;
-
-	fullpath.Length = 0;
-	fullpath.MaximumLength = dosName.Length + fileNameStr.Length + sizeof(WCHAR);
-	fullpath.Buffer = (PWCH)qhalloc(fullpath.MaximumLength);
-	if (!fullpath.Buffer)
-	{
-		qhfree(dosName.Buffer);
-		return -1;
-	}
-	RtlAppendUnicodeStringToString(&fullpath, &dosName);
-	RtlAppendUnicodeStringToString(&fullpath, &fileNameStr);
-	qhfree(dosName.Buffer);
-
-	InitializeObjectAttributes(&oa, &fullpath,
-		OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE,
-		NULL, NULL);
-
-	Status = ZwCreateFile(&fileHandle,
-		GENERIC_READ | SYNCHRONIZE,
-		&oa, &iosb, NULL,
-		FILE_ATTRIBUTE_NORMAL,
-		FILE_SHARE_READ | FILE_SHARE_WRITE,
-		FILE_OPEN,
-		FILE_SYNCHRONOUS_IO_NONALERT,
-		NULL, 0);
-
-	qhfree(fullpath.Buffer);
-
-	if (!NT_SUCCESS(Status))
-		return -1;
-
-	{
-		LARGE_INTEGER ByteOffset = { 0 };
-		Status = ZwReadFile(fileHandle, NULL, NULL, NULL, &iosb,
-			&firstByte, sizeof(firstByte), &ByteOffset, NULL);
-	}
-	ZwClose(fileHandle);
-
-	if (!NT_SUCCESS(Status) || iosb.Information < 1)
-		return -1;
-
-	result = (firstByte != 0) ? 1 : 0;
-	return result;
-}
-
-static VOID QHInitializeVolumeProtection(_In_ PQH_DEVICE_EXTENSION DevExt)
-{
-	INT32 state = QHReadProtectStateFromFile(DevExt->PhysicalDeviceObject);
-	InterlockedExchange8((volatile CHAR*)&DevExt->Initialized, (state == 1) ? 1 : 0);
-}
-
 NTSTATUS QHIrpDispatchDefault(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 {
 	PQH_DEVICE_EXTENSION DeviceExtension = (PQH_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
@@ -1115,44 +1038,259 @@ NTSTATUS QHIrpDispatchDefault(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp
 	return QHCompleteIrp(Irp, STATUS_SUCCESS, 0);
 }
 
-static NTSTATUS QHReadBeforeImage(
-	_In_ PQH_DEVICE_EXTENSION SourceExt,
+static NTSTATUS QHBeginRecovery(
+	_In_ PQH_DRIVER_EXTENSION DriverExt,
+	_In_ const QH_RECOVERY_BEGIN_REQUEST* Request,
+	_Out_ PQH_RECOVERY_BEGIN_REPLY Reply)
+{
+	PQH_DEVICE_EXTENSION sourceExt;
+	UINT64 oldestTime = 0;
+	UINT64 newestTime = 0;
+	LONG previousPhase;
+	NTSTATUS status;
+
+	RtlZeroMemory(Reply, sizeof(*Reply));
+	sourceExt = QHFindSourceExtensionByGuid(
+		DriverExt,
+		&Request->SourceVolumeGuid);
+	if (!sourceExt)
+		return STATUS_DEVICE_DOES_NOT_EXIST;
+	if (InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) == 0)
+		return STATUS_DEVICE_NOT_READY;
+	if (!sourceExt->Core)
+		return STATUS_DEVICE_NOT_READY;
+	if (QHAnyPreviewSessionActive(DriverExt))
+		return STATUS_INVALID_DEVICE_STATE;
+
+	previousPhase = InterlockedCompareExchange(
+		&sourceExt->Phase,
+		(LONG)QH_PHASE_RECOVERY,
+		(LONG)QH_PHASE_NORMAL);
+	if (previousPhase != (LONG)QH_PHASE_NORMAL)
+		return STATUS_INVALID_DEVICE_STATE;
+
+	status = QhCoreQueryTimeRange(
+		sourceExt->Core,
+		&oldestTime,
+		&newestTime);
+	if (status == STATUS_NOT_FOUND)
+	{
+		oldestTime = 0;
+		newestTime = 0;
+		status = STATUS_SUCCESS;
+	}
+	else if (!NT_SUCCESS(status))
+	{
+		InterlockedExchange(&sourceExt->Phase, previousPhase);
+		return status;
+	}
+	else if (Request->TargetTime100ns < oldestTime)
+	{
+		InterlockedExchange(&sourceExt->Phase, previousPhase);
+		return STATUS_NOT_FOUND;
+	}
+
+	KeWaitForSingleObject(
+		&sourceExt->HistoryMutex,
+		Executive,
+		KernelMode,
+		FALSE,
+		NULL);
+	status = QhCoreRecoveryBegin(sourceExt->Core, Request->TargetTime100ns);
+	KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
+	if (!NT_SUCCESS(status))
+	{
+		InterlockedExchange(&sourceExt->Phase, previousPhase);
+		return status;
+	}
+
+	Reply->Phase = QH_PHASE_RECOVERY;
+	Reply->TargetTime100ns = Request->TargetTime100ns;
+	Reply->OldestRecoverable100ns = oldestTime;
+	Reply->NewestRecoverable100ns = newestTime;
+	QH_DBG("[PHASE] recovery begin+writeback target=%llu (Core)\n",
+		Request->TargetTime100ns);
+	return STATUS_SUCCESS;
+}
+
+static NTSTATUS QHEndRecovery(
+	_In_ PQH_DRIVER_EXTENSION DriverExt,
+	_In_ const QH_RECOVERY_END_REQUEST* Request)
+{
+	PQH_DEVICE_EXTENSION sourceExt;
+	NTSTATUS status;
+
+	sourceExt = QHFindSourceExtensionByGuid(
+		DriverExt,
+		&Request->SourceVolumeGuid);
+	if (!sourceExt)
+		return STATUS_DEVICE_DOES_NOT_EXIST;
+
+	if (InterlockedCompareExchange(
+			&sourceExt->Phase,
+			(LONG)QH_PHASE_NORMAL,
+			(LONG)QH_PHASE_RECOVERY) != (LONG)QH_PHASE_RECOVERY)
+	{
+		return STATUS_INVALID_DEVICE_STATE;
+	}
+
+	if (sourceExt->Core)
+	{
+		status = QhCoreRecoveryEnd(sourceExt->Core);
+		if (!NT_SUCCESS(status))
+		{
+			InterlockedExchange(&sourceExt->Phase, (LONG)QH_PHASE_RECOVERY);
+			return status;
+		}
+	}
+
+	QH_DBG("[PHASE] recovery end -> normal\n");
+	return STATUS_SUCCESS;
+}
+
+static NTSTATUS QHQueryTimeRange(
+	_In_ PQH_DRIVER_EXTENSION DriverExt,
+	_In_ const QH_TIME_RANGE_QUERY_REQUEST* Request,
+	_Out_ PQH_TIME_RANGE_QUERY_REPLY Reply)
+{
+	PQH_DEVICE_EXTENSION sourceExt;
+	NTSTATUS status;
+
+	RtlZeroMemory(Reply, sizeof(*Reply));
+	sourceExt = QHFindSourceExtensionByGuid(
+		DriverExt,
+		&Request->SourceVolumeGuid);
+	if (!sourceExt)
+		return STATUS_DEVICE_DOES_NOT_EXIST;
+	if (InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) == 0)
+		return STATUS_DEVICE_NOT_READY;
+	if (!sourceExt->Core)
+		return STATUS_DEVICE_NOT_READY;
+
+	status = QhCoreQueryTimeRange(
+		sourceExt->Core,
+		&Reply->OldestRecord100ns,
+		&Reply->NewestRecord100ns);
+	if (status == STATUS_NOT_FOUND)
+	{
+		Reply->HasRecords = 0;
+		Reply->OldestRecord100ns = 0;
+		Reply->NewestRecord100ns = 0;
+		return STATUS_SUCCESS;
+	}
+	if (!NT_SUCCESS(status))
+		return status;
+
+	Reply->HasRecords = 1;
+	return STATUS_SUCCESS;
+}
+
+static NTSTATUS QHQueryPhase(
+	_In_ PQH_DRIVER_EXTENSION DriverExt,
+	_In_ const QH_PHASE_QUERY_REQUEST* Request,
+	_Out_ PQH_PHASE_QUERY_REPLY Reply)
+{
+	PQH_DEVICE_EXTENSION sourceExt;
+
+	RtlZeroMemory(Reply, sizeof(*Reply));
+	sourceExt = QHFindSourceExtensionByGuid(
+		DriverExt,
+		&Request->SourceVolumeGuid);
+	if (!sourceExt)
+		return STATUS_DEVICE_DOES_NOT_EXIST;
+
+	Reply->Phase = (ULONG)InterlockedCompareExchange(&sourceExt->Phase, 0, 0);
+	if (sourceExt->Core)
+		Reply->RecoveryTargetTime100ns =
+			QhCoreGetTargetTime100ns(sourceExt->Core);
+	return STATUS_SUCCESS;
+}
+
+static NTSTATUS QHRecoveryFillReadBuffer(
+	_In_ PQH_DEVICE_EXTENSION DevExt,
+	_In_ PQH_DRIVER_EXTENSION DriverExt,
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
 	_Out_writes_bytes_(Length) PVOID Buffer)
 {
-	KEVENT event;
-	IO_STATUS_BLOCK iosb;
-	LARGE_INTEGER byteOffset;
-	PIRP readIrp;
 	NTSTATUS status;
 
-	byteOffset.QuadPart = (LONGLONG)Offset;
-	KeInitializeEvent(&event, NotificationEvent, FALSE);
-	RtlZeroMemory(&iosb, sizeof(iosb));
-	readIrp = IoBuildSynchronousFsdRequest(
-		IRP_MJ_READ,
-		SourceExt->LowerDeviceObject,
-		Buffer,
-		Length,
-		&byteOffset,
-		&event,
-		&iosb);
-	if (!readIrp)
-		return STATUS_INSUFFICIENT_RESOURCES;
-	status = IoCallDriver(SourceExt->LowerDeviceObject, readIrp);
-	if (status == STATUS_PENDING)
-	{
-		KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
-		status = iosb.Status;
-	}
-	else if (NT_SUCCESS(status))
-	{
-		status = iosb.Status;
-	}
-	if (NT_SUCCESS(status) && iosb.Information != Length)
-		return STATUS_UNEXPECTED_IO_ERROR;
+	UNREFERENCED_PARAMETER(DriverExt);
+
+	if (!DevExt->Core)
+		return STATUS_DEVICE_NOT_READY;
+
+	KeWaitForSingleObject(
+		&DevExt->HistoryMutex,
+		Executive,
+		KernelMode,
+		FALSE,
+		NULL);
+	status = QhCoreRead(DevExt->Core, Offset, Length, Buffer);
+	KeReleaseMutex(&DevExt->HistoryMutex, FALSE);
 	return status;
+}
+
+NTSTATUS QHIrpDispatchRead(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
+{
+	PQH_DEVICE_EXTENSION deviceExt =
+		(PQH_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
+	PQH_DRIVER_EXTENSION driverExt =
+		IoGetDriverObjectExtension(g_DriverObject, &g_DriverObject);
+	PIO_STACK_LOCATION irpSp;
+	UINT64 offset;
+	ULONG length;
+	PVOID buffer;
+	NTSTATUS status;
+
+	if (!deviceExt || !deviceExt->LowerDeviceObject)
+		return QHCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);
+
+	if (InterlockedCompareExchange(&deviceExt->Phase, 0, 0) !=
+		(LONG)QH_PHASE_RECOVERY)
+	{
+		return QHSendToNextDevice(deviceExt->LowerDeviceObject, Irp);
+	}
+
+	irpSp = IoGetCurrentIrpStackLocation(Irp);
+	if ((Irp->Flags & IRP_PAGING_IO) != 0 ||
+		InterlockedCompareExchange(&deviceExt->PagingPathCount, 0, 0) != 0)
+	{
+		return QHSendToNextDevice(deviceExt->LowerDeviceObject, Irp);
+	}
+
+	if (irpSp->Parameters.Read.ByteOffset.QuadPart < 0 ||
+		irpSp->Parameters.Read.Length == 0)
+	{
+		return QHSendToNextDevice(deviceExt->LowerDeviceObject, Irp);
+	}
+
+	offset = (UINT64)irpSp->Parameters.Read.ByteOffset.QuadPart;
+	length = irpSp->Parameters.Read.Length;
+	if (!driverExt ||
+		(offset % QH_SECTOR_SIZE_DEFAULT) != 0 ||
+		(length % QH_SECTOR_SIZE_DEFAULT) != 0 ||
+		length > QH_CMD3_MAX_READ_BYTES)
+	{
+		return QHSendToNextDevice(deviceExt->LowerDeviceObject, Irp);
+	}
+
+	buffer = MmGetSystemAddressForMdlSafe(
+		Irp->MdlAddress,
+		NormalPagePriority);
+	if (!buffer)
+		return QHCompleteIrp(Irp, STATUS_INSUFFICIENT_RESOURCES, 0);
+
+	status = QHRecoveryFillReadBuffer(
+		deviceExt,
+		driverExt,
+		offset,
+		length,
+		buffer);
+	if (!NT_SUCCESS(status))
+		return QHCompleteIrp(Irp, status, 0);
+
+	return QHCompleteIrp(Irp, STATUS_SUCCESS, length);
 }
 
 static NTSTATUS QHCaptureBeforeImage(
@@ -1163,70 +1301,45 @@ static NTSTATUS QHCaptureBeforeImage(
 	PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
 	UINT64 offset = (UINT64)irpSp->Parameters.Write.ByteOffset.QuadPart;
 	ULONG remaining = irpSp->Parameters.Write.Length;
-	PQH_VOLUME_HANDLE_ENTRY target;
-	PVOID allocationBase = NULL;
-	PVOID buffer;
-	SIZE_T alignment;
 	NTSTATUS status = STATUS_SUCCESS;
+	QH_JOURNAL_RECORD_HEADER writtenHdr;
+	BOOLEAN seqLogged = FALSE;
+
+	UNREFERENCED_PARAMETER(DriverExt);
 
 	if (irpSp->Parameters.Write.ByteOffset.QuadPart < 0 || remaining == 0)
 		return STATUS_INVALID_PARAMETER;
-	QH_DBG("[COW] capture begin offset=%llu len=%lu\n", offset, remaining);
-	target = QHAcquireCaptureTarget(DriverExt);
-	if (!target)
-	{
-		QH_DBG("[COW] capture skipped: no journal target\n");
+	if (!SourceExt->Core)
 		return STATUS_DEVICE_NOT_READY;
-	}
-	if (!target->Journal.Mounted)
-	{
-		QH_DBG("[COW] capture failed: journal not mounted handle=%llu\n",
-			target->HandleId);
-		status = STATUS_DEVICE_NOT_READY;
-		goto cleanup;
-	}
 
-	alignment = (SIZE_T)SourceExt->LowerDeviceObject->AlignmentRequirement + 1;
-	if (alignment < sizeof(PVOID))
-		alignment = sizeof(PVOID);
-	allocationBase = qhalloc(QH_JOURNAL_MAX_RECORD_DATA + alignment - 1);
-	if (!allocationBase)
-	{
-		status = STATUS_INSUFFICIENT_RESOURCES;
-		goto cleanup;
-	}
-	buffer = (PVOID)(((ULONG_PTR)allocationBase + alignment - 1) & ~(alignment - 1));
+	QH_DBG("[COW] capture begin offset=%llu len=%lu\n", offset, remaining);
 
 	while (remaining)
 	{
 		ULONG chunk = remaining > QH_JOURNAL_MAX_RECORD_DATA ?
 			QH_JOURNAL_MAX_RECORD_DATA : remaining;
-		status = QHReadBeforeImage(SourceExt, offset, chunk, buffer);
+
+		status = QhCoreCaptureAppend(SourceExt->Core, offset, chunk, &writtenHdr);
 		if (!NT_SUCCESS(status))
 		{
-			QH_DBG("before-image read failed 0x%08X offset=%llu len=%lu\n",
+			QH_DBG("[COW] core capture failed status=0x%08X offset=%llu len=%lu\n",
 				status, offset, chunk);
 			break;
 		}
-		status = QHJournalAppend(&target->Journal, offset, chunk, buffer);
-		if (!NT_SUCCESS(status))
+		if (!seqLogged)
 		{
-			QH_DBG("[COW] journal append failed status=0x%08X offset=%llu len=%lu\n",
-				status, offset, chunk);
-			break;
+			// Print journal record Sequence once per before-image capture.
+			QH_DBG("[COW] journal seq=%lu offset=%llu len=%lu\n",
+				writtenHdr.Sequence, offset, chunk);
+			seqLogged = TRUE;
 		}
-		QH_DBG("[COW] journal append ok offset=%llu len=%lu nextSeq=%llu\n",
-			offset, chunk, target->Journal.NextSequence);
+		QH_DBG("[COW] core capture ok offset=%llu len=%lu\n", offset, chunk);
 		offset += chunk;
 		remaining -= chunk;
 	}
 
-cleanup:
 	QH_DBG("[COW] capture end status=0x%08X remaining=%lu\n",
 		status, remaining);
-	if (allocationBase)
-		qhfree(allocationBase);
-	QHReleaseVolumeHandleEntry(target);
 	return status;
 }
 
@@ -1302,7 +1415,12 @@ static VOID QHCaptureWorker(_In_ PVOID Context)
 
 				// Capture before-image then apply the original write under one
 				// HistoryMutex so preview cannot observe a torn timeline.
-				QHAcquireHistoryLock(devExt);
+				KeWaitForSingleObject(
+					&devExt->HistoryMutex,
+					Executive,
+					KernelMode,
+					FALSE,
+					NULL);
 				if (!devExt->CaptureStopping &&
 					InterlockedCompareExchange(&devExt->CaptureEnabled, 0, 0) != 0 &&
 					driverExt)
@@ -1318,7 +1436,7 @@ static VOID QHCaptureWorker(_In_ PVOID Context)
 						item->Irp);
 				}
 				QHForwardQueuedWriteSynchronously(devExt, item->Irp);
-				QHReleaseHistoryLock(devExt);
+				KeReleaseMutex(&devExt->HistoryMutex, FALSE);
 				qhfree(item);
 			}
 		}
@@ -1360,6 +1478,30 @@ VOID QHStopCaptureWorker(_Inout_ PQH_DEVICE_EXTENSION DevExt)
 
 	ZwClose(threadHandle);
 	DevExt->CaptureThreadHandle = NULL;
+}
+
+VOID QHDisableAndDestroyCapture(_Inout_ PQH_DEVICE_EXTENSION DevExt)
+{
+	PQH_CORE core;
+
+	if (!DevExt)
+		return;
+
+	InterlockedExchange(&DevExt->CaptureEnabled, 0);
+	QHStopCaptureWorker(DevExt);
+
+	// The capture worker holds HistoryMutex whenever it can access Core.  Take
+	// ownership under that mutex only after the worker has stopped, then free
+	// Core outside every spin lock and outside the mutex.
+	KeWaitForSingleObject(&DevExt->HistoryMutex,
+		Executive, KernelMode, FALSE, NULL);
+	core = DevExt->Core;
+	DevExt->Core = NULL;
+	InterlockedExchange(&DevExt->Phase, (LONG)QH_PHASE_NORMAL);
+	KeReleaseMutex(&DevExt->HistoryMutex, FALSE);
+
+	if (core)
+		QhCoreDestroy(core);
 }
 
 NTSTATUS QHIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
@@ -1405,43 +1547,6 @@ NTSTATUS QHIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 		return QHSendToNextDevice(deviceExt->LowerDeviceObject, Irp);
 
 	return QHCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);
-}
-
-VOID QHBootReinitializationRoutine(
-	_In_ PDRIVER_OBJECT DriverObject,
-	_In_ PVOID Context,
-	_In_ ULONG Count)
-{
-	UNREFERENCED_PARAMETER(Context);
-	UNREFERENCED_PARAMETER(Count);
-
-	PQH_DRIVER_EXTENSION DriverExt = IoGetDriverObjectExtension(DriverObject, &g_DriverObject);
-	if (!DriverExt)
-		return;
-
-	KIRQL OldIrql;
-	KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &OldIrql);
-	PLIST_ENTRY Entry = DriverExt->DeviceObjectListHead.Flink;
-	while (Entry != &DriverExt->DeviceObjectListHead)
-	{
-		PQH_DEVICE_LIST_NODE Node = CONTAINING_RECORD(Entry, QH_DEVICE_LIST_NODE, Entry);
-		PQH_DEVICE_EXTENSION DevExt = (PQH_DEVICE_EXTENSION)Node->DeviceObject->DeviceExtension;
-
-		if (!DevExt->Initialized)
-		{
-			KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, OldIrql);
-			QHInitializeVolumeProtection(DevExt);
-
-			KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &OldIrql);
-			Entry = Entry->Flink;
-			continue;
-		}
-
-		Entry = Entry->Flink;
-	}
-	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, OldIrql);
-
-	InterlockedExchange(&DriverExt->BootReinitDone, 1);
 }
 
 static NTSTATUS PnpCompletionRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOID Context)
@@ -1492,9 +1597,7 @@ NTSTATUS QHIrpDispatchPnp(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 		if (NodeToFree)
 			qhfree(NodeToFree);
 
-		InterlockedExchange8((volatile CHAR*)&DevExt->Initialized, 0);
-		InterlockedExchange(&DevExt->CaptureEnabled, 0);
-		QHStopCaptureWorker(DevExt);
+		QHDisableAndDestroyCapture(DevExt);
 		LowerDevice = DevExt->LowerDeviceObject;
 
 		IoSkipCurrentIrpStackLocation(Irp);
@@ -1575,17 +1678,6 @@ NTSTATUS QHIrpDispatchPower(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 #else
 	return QHSendToNextDevice(DevExt->LowerDeviceObject, Irp);
 #endif
-}
-
-static NTSTATUS QHVolumeOnlineCompletionRoutine(
-	_In_ PDEVICE_OBJECT DeviceObject,
-	_In_ PIRP Irp,
-	_In_ PVOID Context)
-{
-	UNREFERENCED_PARAMETER(DeviceObject);
-	UNREFERENCED_PARAMETER(Irp);
-	KeSetEvent((PKEVENT)Context, IO_NO_INCREMENT, FALSE);
-	return STATUS_MORE_PROCESSING_REQUIRED;
 }
 
 NTSTATUS QHIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
@@ -1693,7 +1785,6 @@ NTSTATUS QHIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PI
 				reply = (PQH_COMMAND_REPLY)Irp->AssociatedIrp.SystemBuffer;
 
 				QH_DBG("CMD2 received\n");
-				QHDbgGuid("  Guid", &local.PartitionGuid);
 				ExAcquireFastMutex(&DriverExt->VolumeHandleMutex);
 				handleId = DriverExt->CaptureTargetHandleId;
 				ExReleaseFastMutex(&DriverExt->VolumeHandleMutex);
@@ -1874,6 +1965,116 @@ NTSTATUS QHIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PI
 			return QHCompleteIrp(Irp, status, 0);
 		}
 
+		case IOCTL_QH_QUERY_PHASE:
+		{
+			QH_PHASE_QUERY_REQUEST request;
+			PQH_PHASE_QUERY_REPLY reply;
+			ULONG inLen =
+				IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+			ULONG outLen =
+				IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
+			NTSTATUS status;
+
+			if (!DriverExt || !Irp->AssociatedIrp.SystemBuffer ||
+				inLen < sizeof(QH_PHASE_QUERY_REQUEST) ||
+				outLen < sizeof(QH_PHASE_QUERY_REPLY))
+			{
+				return QHCompleteIrp(
+					Irp,
+					STATUS_BUFFER_TOO_SMALL,
+					0);
+			}
+			request =
+				*(PQH_PHASE_QUERY_REQUEST)Irp->AssociatedIrp.SystemBuffer;
+			reply = (PQH_PHASE_QUERY_REPLY)Irp->AssociatedIrp.SystemBuffer;
+			status = QHQueryPhase(DriverExt, &request, reply);
+			return QHCompleteIrp(
+				Irp,
+				status,
+				NT_SUCCESS(status) ? sizeof(*reply) : 0);
+		}
+
+		case IOCTL_QH_BEGIN_RECOVERY:
+		{
+			QH_RECOVERY_BEGIN_REQUEST request;
+			PQH_RECOVERY_BEGIN_REPLY reply;
+			ULONG inLen =
+				IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+			ULONG outLen =
+				IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
+			NTSTATUS status;
+
+			if (!DriverExt || !Irp->AssociatedIrp.SystemBuffer ||
+				inLen < sizeof(QH_RECOVERY_BEGIN_REQUEST) ||
+				outLen < sizeof(QH_RECOVERY_BEGIN_REPLY))
+			{
+				return QHCompleteIrp(
+					Irp,
+					STATUS_BUFFER_TOO_SMALL,
+					0);
+			}
+			request =
+				*(PQH_RECOVERY_BEGIN_REQUEST)Irp->AssociatedIrp.SystemBuffer;
+			reply =
+				(PQH_RECOVERY_BEGIN_REPLY)Irp->AssociatedIrp.SystemBuffer;
+			status = QHBeginRecovery(DriverExt, &request, reply);
+			return QHCompleteIrp(
+				Irp,
+				status,
+				NT_SUCCESS(status) ? sizeof(*reply) : 0);
+		}
+
+		case IOCTL_QH_END_RECOVERY:
+		{
+			PQH_RECOVERY_END_REQUEST request;
+			ULONG inLen =
+				IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+			NTSTATUS status;
+
+			if (!DriverExt || !Irp->AssociatedIrp.SystemBuffer ||
+				inLen < sizeof(QH_RECOVERY_END_REQUEST))
+			{
+				return QHCompleteIrp(
+					Irp,
+					STATUS_BUFFER_TOO_SMALL,
+					0);
+			}
+			request =
+				(PQH_RECOVERY_END_REQUEST)Irp->AssociatedIrp.SystemBuffer;
+			status = QHEndRecovery(DriverExt, request);
+			return QHCompleteIrp(Irp, status, 0);
+		}
+
+		case IOCTL_QH_QUERY_TIME_RANGE:
+		{
+			QH_TIME_RANGE_QUERY_REQUEST request;
+			PQH_TIME_RANGE_QUERY_REPLY reply;
+			ULONG inLen =
+				IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+			ULONG outLen =
+				IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
+			NTSTATUS status;
+
+			if (!DriverExt || !Irp->AssociatedIrp.SystemBuffer ||
+				inLen < sizeof(QH_TIME_RANGE_QUERY_REQUEST) ||
+				outLen < sizeof(QH_TIME_RANGE_QUERY_REPLY))
+			{
+				return QHCompleteIrp(
+					Irp,
+					STATUS_BUFFER_TOO_SMALL,
+					0);
+			}
+			request =
+				*(PQH_TIME_RANGE_QUERY_REQUEST)Irp->AssociatedIrp.SystemBuffer;
+			reply =
+				(PQH_TIME_RANGE_QUERY_REPLY)Irp->AssociatedIrp.SystemBuffer;
+			status = QHQueryTimeRange(DriverExt, &request, reply);
+			return QHCompleteIrp(
+				Irp,
+				status,
+				NT_SUCCESS(status) ? sizeof(*reply) : 0);
+		}
+
 		case IOCTL_QH_READ_SECTORS:
 		{
 			PQH_CMD3_REQUEST req;
@@ -1931,40 +2132,6 @@ NTSTATUS QHIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PI
 
 	if (!DevExt)
 		return QHCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);
-
-	switch (IrpSp->Parameters.DeviceIoControl.IoControlCode)
-	{
-	case IOCTL_VOLUME_ONLINE:
-	{
-		if (DevExt->Initialized)
-			break;
-
-		if (DriverExt && !DriverExt->BootReinitDone)
-			return QHSendToNextDevice(DevExt->LowerDeviceObject, Irp);
-
-		KEVENT Event;
-		KeInitializeEvent(&Event, NotificationEvent, FALSE);
-
-		IoCopyCurrentIrpStackLocationToNext(Irp);
-		IoSetCompletionRoutine(Irp, QHVolumeOnlineCompletionRoutine, &Event, TRUE, TRUE, TRUE);
-
-		NTSTATUS Status = IoCallDriver(DevExt->LowerDeviceObject, Irp);
-		if (Status == STATUS_PENDING)
-		{
-			KeWaitForSingleObject(&Event, Executive, KernelMode, FALSE, NULL);
-			Status = Irp->IoStatus.Status;
-		}
-
-		if (!NT_SUCCESS(Status))
-			return QHCompleteIrp(Irp, Status, Irp->IoStatus.Information);
-
-		QHInitializeVolumeProtection(DevExt);
-		return QHCompleteIrp(Irp, STATUS_SUCCESS, Irp->IoStatus.Information);
-	}
-
-	default:
-		break;
-	}
 
 	return QHSendToNextDevice(DevExt->LowerDeviceObject, Irp);
 }

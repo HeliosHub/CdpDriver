@@ -88,6 +88,11 @@
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
   </ItemDefinitionGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>$(MSBuildProjectDirectory);$(MSBuildProjectDirectory)\..\SysRestoreCore\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+  </ItemDefinitionGroup>
   <ItemGroup>
     <Inf Include="SysRestoreDriver.inf" />
   </ItemGroup>
@@ -98,23 +103,30 @@
     <ClCompile Include="Driver.c" />
     <ClCompile Include="QHJournal.c" />
     <ClCompile Include="QHIrpDispatchs.c" />
+    <ClCompile Include="qh_dev_store.c" />
+    <ClCompile Include="..\SysRestoreCore\src\qh_core.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="QHEngineDefs.h" />
     <ClInclude Include="QHIoctl.h" />
     <ClInclude Include="QHIrpDispatchs.h" />
     <ClInclude Include="QHJournal.h" />
+    <ClInclude Include="..\SysRestoreCore\include\qh_alloc.h" />
+    <ClInclude Include="..\SysRestoreCore\include\qh_core.h" />
+    <ClInclude Include="..\SysRestoreCore\include\qh_dev_store.h" />
+    <ClInclude Include="..\SysRestoreCore\include\qh_portable.h" />
+    <ClInclude Include="..\SysRestoreCore\include\qh_store.h" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
-  <Target Name="CopyDriverToUIResources" AfterTargets="Build">
+  <Target Name="CopyDriverToConsoleDeploy" AfterTargets="Build">
     <PropertyGroup>
-      <UIResourcesDir>$(MSBuildProjectDirectory)\..\QHEngineUI\resources\</UIResourcesDir>
+      <ConsoleDeployDir>$(MSBuildProjectDirectory)\..\QHConsole\$(Platform)\$(Configuration)\driver\</ConsoleDeployDir>
     </PropertyGroup>
-    <MakeDir Directories="$(UIResourcesDir)" />
-    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(UIResourcesDir)" SkipUnchangedFiles="true" />
-    <Copy SourceFiles="$(MSBuildProjectDirectory)\SysRestoreDriver.inf" DestinationFolder="$(UIResourcesDir)" SkipUnchangedFiles="true" />
-    <Message Importance="High" Text="SysRestoreDriver: Copied $(TargetFileName) and SysRestoreDriver.inf to $(UIResourcesDir)" />
+    <MakeDir Directories="$(ConsoleDeployDir)" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ConsoleDeployDir)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="$(MSBuildProjectDirectory)\SysRestoreDriver.inf" DestinationFolder="$(ConsoleDeployDir)" SkipUnchangedFiles="true" />
+    <Message Importance="High" Text="SysRestoreDriver: Copied $(TargetFileName) and SysRestoreDriver.inf to $(ConsoleDeployDir)" />
   </Target>
 </Project>

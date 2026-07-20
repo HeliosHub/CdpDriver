@@ -1,10 +1,25 @@
+#ifdef QH_USERMODE
+#include "qh_portable.h"
+#include "qh_store.h"
+#include "QHJournal.h"
+#else
 #include "QHEngineDefs.h"
 #include "QHJournal.h"
+#endif
 
 #define QH_CRC32C_POLY 0x82F63B78UL
 
 static ULONG g_QhCrc32cTable[256];
 static volatile LONG g_QhCrc32cReady;
+
+static VOID QHStallBrief(VOID)
+{
+#ifdef QH_USERMODE
+	SwitchToThread();
+#else
+	KeStallExecutionProcessor(1);
+#endif
+}
 
 static UINT64 QHAlignDown64(_In_ UINT64 Value, _In_ ULONG Alignment)
 {
@@ -25,7 +40,7 @@ static VOID QHInitializeCrc32c(VOID)
 	if (InterlockedCompareExchange(&g_QhCrc32cReady, 1, 0) != 0)
 	{
 		while (InterlockedCompareExchange(&g_QhCrc32cReady, 0, 0) != 2)
-			KeStallExecutionProcessor(1);
+			QHStallBrief();
 		return;
 	}
 
@@ -58,20 +73,39 @@ static ULONG QHCrc32c(
 }
 
 static PVOID QHAllocateAligned(
-	_In_ PDEVICE_OBJECT Device,
+	_In_ PQH_JOURNAL Journal,
 	_In_ SIZE_T Length,
 	_Out_ PVOID* AllocationBase)
 {
-	SIZE_T alignment = (SIZE_T)Device->AlignmentRequirement + 1;
+	SIZE_T alignment = sizeof(PVOID);
 	ULONG_PTR address;
 
-	if (alignment < sizeof(PVOID))
-		alignment = sizeof(PVOID);
+	if (Journal->SectorSize > alignment)
+		alignment = Journal->SectorSize;
+#ifndef QH_USERMODE
+	if (Journal->TargetDevice)
+	{
+		SIZE_T deviceAlign =
+			(SIZE_T)Journal->TargetDevice->AlignmentRequirement + 1;
+		if (deviceAlign > alignment)
+			alignment = deviceAlign;
+	}
+#endif
 	*AllocationBase = qhalloc(Length + alignment - 1);
 	if (!*AllocationBase)
 		return NULL;
 	address = ((ULONG_PTR)*AllocationBase + alignment - 1) & ~(alignment - 1);
 	return (PVOID)address;
+}
+
+static UINT64 QHJournalUsableStart(_In_ PQH_JOURNAL Journal)
+{
+	return Journal->SectorSize;
+}
+
+static UINT64 QHJournalUsableEnd(_In_ PQH_JOURNAL Journal)
+{
+	return Journal->PartitionSize - Journal->SectorSize;
 }
 
 static NTSTATUS QHJournalRawIo(
@@ -81,14 +115,8 @@ static NTSTATUS QHJournalRawIo(
 	_In_ ULONG Length,
 	_Inout_updates_bytes_(Length) PVOID Buffer)
 {
-	KEVENT event;
-	IO_STATUS_BLOCK iosb;
-	LARGE_INTEGER byteOffset;
-	PIRP irp;
 	NTSTATUS status;
 
-	if (!Journal->TargetDevice)
-		return STATUS_DEVICE_NOT_READY;
 	if (!Buffer || Length == 0 ||
 		(Offset % Journal->SectorSize) != 0 ||
 		(Length % Journal->SectorSize) != 0 ||
@@ -97,6 +125,29 @@ static NTSTATUS QHJournalRawIo(
 	{
 		return STATUS_INVALID_PARAMETER;
 	}
+
+	if (Journal->Store)
+	{
+		if (MajorFunction == IRP_MJ_READ)
+			return Journal->Store->Read(Journal->Store, Offset, Length, Buffer);
+		if (MajorFunction == IRP_MJ_WRITE)
+			return Journal->Store->Write(
+				Journal->Store,
+				Offset,
+				Length,
+				Buffer);
+		return STATUS_NOT_IMPLEMENTED;
+	}
+
+#ifndef QH_USERMODE
+	{
+		KEVENT event;
+		IO_STATUS_BLOCK iosb;
+		LARGE_INTEGER byteOffset;
+		PIRP irp;
+
+		if (!Journal->TargetDevice)
+			return STATUS_DEVICE_NOT_READY;
 
 	byteOffset.QuadPart = (LONGLONG)Offset;
 	KeInitializeEvent(&event, NotificationEvent, FALSE);
@@ -125,10 +176,14 @@ static NTSTATUS QHJournalRawIo(
 
 	if (NT_SUCCESS(status) && iosb.Information != Length)
 		return STATUS_UNEXPECTED_IO_ERROR;
-	return status;
+		return status;
+	}
+#else
+	UNREFERENCED_PARAMETER(status);
+	return STATUS_DEVICE_NOT_READY;
+#endif
 }
 
-// RMW for unaligned / sub-sector writes (anchors are 32 bytes).
 static NTSTATUS QHJournalRawWriteSub(
 	_In_ PQH_JOURNAL Journal,
 	_In_ UINT64 Offset,
@@ -144,9 +199,14 @@ static NTSTATUS QHJournalRawWriteSub(
 	NTSTATUS status;
 
 	if ((Offset % sec) == 0 && (Length % sec) == 0)
-		return QHJournalRawIo(Journal, IRP_MJ_WRITE, Offset, Length, (PVOID)Data);
+		return QHJournalRawIo(
+			Journal,
+			IRP_MJ_WRITE,
+			Offset,
+			Length,
+			(PVOID)Data);
 
-	buf = (PUCHAR)QHAllocateAligned(Journal->TargetDevice, span, &allocationBase);
+	buf = (PUCHAR)QHAllocateAligned(Journal, span, &allocationBase);
 	if (!buf)
 		return STATUS_INSUFFICIENT_RESOURCES;
 
@@ -160,7 +220,40 @@ static NTSTATUS QHJournalRawWriteSub(
 	return status;
 }
 
+static NTSTATUS QHJournalRawReadSub(
+	_In_ PQH_JOURNAL Journal,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_Out_writes_bytes_(Length) PVOID Data)
+{
+	ULONG sec = Journal->SectorSize;
+	UINT64 start = (Offset / sec) * sec;
+	UINT64 endB = QHAlignUp64(Offset + Length, sec);
+	ULONG span = (ULONG)(endB - start);
+	PVOID allocationBase = NULL;
+	PUCHAR buf;
+	NTSTATUS status;
+
+	if ((Offset % sec) == 0 && (Length % sec) == 0)
+		return QHJournalRawIo(Journal, IRP_MJ_READ, Offset, Length, Data);
+
+	buf = (PUCHAR)QHAllocateAligned(Journal, span, &allocationBase);
+	if (!buf)
+		return STATUS_INSUFFICIENT_RESOURCES;
+
+	status = QHJournalRawIo(Journal, IRP_MJ_READ, start, span, buf);
+	if (NT_SUCCESS(status))
+		RtlCopyMemory(Data, buf + (Offset - start), Length);
+	qhfree(allocationBase);
+	return status;
+}
+
 static NTSTATUS QHJournalFlush(_In_ PQH_JOURNAL Journal)
+{
+	if (Journal->Store)
+		return STATUS_SUCCESS;
+
+#ifndef QH_USERMODE
 {
 	KEVENT event;
 	IO_STATUS_BLOCK iosb;
@@ -190,18 +283,16 @@ static NTSTATUS QHJournalFlush(_In_ PQH_JOURNAL Journal)
 		status = iosb.Status;
 	}
 	return status;
+	}
+#else
+	UNREFERENCED_PARAMETER(Journal);
+	return STATUS_SUCCESS;
+#endif
 }
 
-static VOID QHJournalComputeLayout(_Inout_ PQH_JOURNAL Journal)
+static BOOLEAN QHJournalIsEmptyLocked(_In_ PQH_JOURNAL Journal)
 {
-	ULONG sec = Journal->SectorSize;
-
-	Journal->IndexRegionOff = sec;
-	Journal->IndexRegionSize = (UINT64)QH_JOURNAL_INDEX_SECTORS * sec;
-	Journal->LogOffset = Journal->IndexRegionOff + Journal->IndexRegionSize;
-	Journal->LogSize = QHAlignDown64(
-		Journal->PartitionSize - sec - Journal->LogOffset,
-		sec);
+	return Journal->TotalRecords == 0;
 }
 
 static NTSTATUS QHJournalWriteSuperblockLocked(_Inout_ PQH_JOURNAL Journal)
@@ -211,8 +302,7 @@ static NTSTATUS QHJournalWriteSuperblockLocked(_Inout_ PQH_JOURNAL Journal)
 	PQH_JOURNAL_SUPERBLOCK superblock;
 	NTSTATUS status;
 
-	sector = (PUCHAR)QHAllocateAligned(
-		Journal->TargetDevice,
+	sector = (PUCHAR)QHAllocateAligned(Journal,
 		Journal->SectorSize,
 		&allocationBase);
 	if (!sector)
@@ -224,20 +314,8 @@ static NTSTATUS QHJournalWriteSuperblockLocked(_Inout_ PQH_JOURNAL Journal)
 	superblock->Version = QH_JOURNAL_VERSION;
 	superblock->SectorSize = Journal->SectorSize;
 	superblock->PartitionSize = Journal->PartitionSize;
-	superblock->IndexRegionOff = Journal->IndexRegionOff;
-	superblock->IndexRegionSize = Journal->IndexRegionSize;
-	superblock->LogOffset = Journal->LogOffset;
-	superblock->LogSize = Journal->LogSize;
-	superblock->LogHead = Journal->LogHead;
-	superblock->LogTail = Journal->LogTail;
-	superblock->IndexHead = Journal->IndexHead;
-	superblock->IndexTail = Journal->IndexTail;
-	superblock->IndexStride = Journal->IndexStride;
-	superblock->NextSequence = Journal->NextSequence;
-	superblock->DroppedRecords = Journal->DroppedRecords;
-	superblock->OldestRecoverable100ns = Journal->Oldest100ns;
-	superblock->NewestRecoverable100ns = Journal->Newest100ns;
-	superblock->SourceVolumeGuid = Journal->SourceVolumeGuid;
+	superblock->LastHeaderRegionOff = Journal->LastHeaderRegionOff;
+	superblock->PayloadRegionOff = Journal->PayloadRegionOff;
 	superblock->Crc32c = QHCrc32c(
 		0,
 		superblock,
@@ -267,6 +345,8 @@ static BOOLEAN QHJournalSuperblockValid(
 	_In_ const QH_JOURNAL_SUPERBLOCK* Superblock)
 {
 	ULONG crc;
+	UINT64 usableStart;
+	UINT64 usableEnd;
 
 	if (Superblock->Magic != QH_JOURNAL_MAGIC ||
 		Superblock->Version != QH_JOURNAL_VERSION ||
@@ -279,393 +359,522 @@ static BOOLEAN QHJournalSuperblockValid(
 		0,
 		Superblock,
 		FIELD_OFFSET(QH_JOURNAL_SUPERBLOCK, Crc32c));
-	if (crc != Superblock->Crc32c ||
-		RtlCompareMemory(
-			&Superblock->SourceVolumeGuid,
-			&Journal->SourceVolumeGuid,
-			sizeof(GUID)) != sizeof(GUID))
-	{
+	if (crc != Superblock->Crc32c)
 		return FALSE;
-	}
-	if (Superblock->IndexRegionOff < Journal->SectorSize ||
-		(Superblock->IndexRegionOff % Journal->SectorSize) != 0 ||
-		(Superblock->IndexRegionSize % Journal->SectorSize) != 0 ||
-		Superblock->IndexRegionSize < Journal->SectorSize ||
-		Superblock->LogOffset < Superblock->IndexRegionOff + Superblock->IndexRegionSize ||
-		(Superblock->LogOffset % Journal->SectorSize) != 0 ||
-		(Superblock->LogSize % Journal->SectorSize) != 0 ||
-		Superblock->LogSize < Journal->SectorSize * 2ULL ||
-		Superblock->LogOffset > Journal->PartitionSize ||
-		Superblock->LogSize >
-			Journal->PartitionSize - Journal->SectorSize - Superblock->LogOffset ||
-		Superblock->LogHead >= Superblock->LogSize ||
-		Superblock->LogTail >= Superblock->LogSize)
+
+	usableStart = Journal->SectorSize;
+	usableEnd = Journal->PartitionSize - Journal->SectorSize;
+	if (Superblock->LastHeaderRegionOff < usableStart ||
+		Superblock->LastHeaderRegionOff + QH_JOURNAL_HEADER_REGION_SIZE > usableEnd ||
+		(Superblock->LastHeaderRegionOff % Journal->SectorSize) != 0 ||
+		Superblock->PayloadRegionOff <
+			Superblock->LastHeaderRegionOff + QH_JOURNAL_HEADER_REGION_SIZE ||
+		Superblock->PayloadRegionOff > usableEnd ||
+		(Superblock->PayloadRegionOff % Journal->SectorSize) != 0)
 	{
 		return FALSE;
 	}
 	return TRUE;
 }
 
-static UINT64 QHJournalUsedLocked(_In_ PQH_JOURNAL Journal)
+static NTSTATUS QHJournalReadRegionLink(
+	_In_ PQH_JOURNAL Journal,
+	_In_ UINT64 RegionOff,
+	_Out_ PQH_HEADER_REGION_LINK Link)
 {
-	if (Journal->LogHead >= Journal->LogTail)
-		return Journal->LogHead - Journal->LogTail;
-	return Journal->LogSize - (Journal->LogTail - Journal->LogHead);
+	return QHJournalRawReadSub(
+		Journal,
+		RegionOff + QH_JOURNAL_HEADER_REGION_SIZE - QH_JOURNAL_HEADER_LINK_SIZE,
+		sizeof(*Link),
+		Link);
 }
 
-static UINT64 QHJournalFreeLocked(_In_ PQH_JOURNAL Journal)
+static NTSTATUS QHJournalWriteRegionLink(
+	_In_ PQH_JOURNAL Journal,
+	_In_ UINT64 RegionOff,
+	_In_ const QH_HEADER_REGION_LINK* Link)
 {
-	return Journal->LogSize - QHJournalUsedLocked(Journal) - Journal->SectorSize;
+	return QHJournalRawWriteSub(
+		Journal,
+		RegionOff + QH_JOURNAL_HEADER_REGION_SIZE - QH_JOURNAL_HEADER_LINK_SIZE,
+		sizeof(*Link),
+		Link);
 }
 
-static NTSTATUS QHIndexPushBack(
-	_Inout_ PQH_JOURNAL Journal,
-	_In_ UINT64 Sequence,
-	_In_ UINT64 Time,
-	_In_ UINT64 LogOffset,
-	_In_ UINT64 VolumeOffset,
-	_In_ ULONG DataLength)
+static NTSTATUS QHJournalInitHeaderRegion(
+	_In_ PQH_JOURNAL Journal,
+	_In_ UINT64 RegionOff,
+	_In_ UINT64 PrevOff,
+	_In_ UINT64 NextOff)
 {
-	if (Journal->IndexStart + Journal->IndexCount >= Journal->IndexCapacity)
-	{
-		if (Journal->IndexStart > 0)
-		{
-			RtlMoveMemory(
-				Journal->IndexArray,
-				Journal->IndexArray + Journal->IndexStart,
-				Journal->IndexCount * sizeof(QH_INDEX_MEM_ENTRY));
-			Journal->IndexStart = 0;
-		}
-		else
-		{
-			ULONG newCap = (Journal->IndexCapacity == 0) ?
-				4096UL : Journal->IndexCapacity * 2;
-			PQH_INDEX_MEM_ENTRY na = (PQH_INDEX_MEM_ENTRY)qhalloc(
-				(SIZE_T)newCap * sizeof(QH_INDEX_MEM_ENTRY));
-			if (!na)
-				return STATUS_INSUFFICIENT_RESOURCES;
-			if (Journal->IndexArray)
-			{
-				RtlCopyMemory(
-					na,
-					Journal->IndexArray + Journal->IndexStart,
-					Journal->IndexCount * sizeof(QH_INDEX_MEM_ENTRY));
-				qhfree(Journal->IndexArray);
-			}
-			Journal->IndexArray = na;
-			Journal->IndexStart = 0;
-			Journal->IndexCapacity = newCap;
-		}
-	}
+	PVOID allocationBase = NULL;
+	PUCHAR region;
+	PQH_HEADER_REGION_LINK link;
+	NTSTATUS status;
+	ULONG offset;
 
+	region = (PUCHAR)QHAllocateAligned(Journal,
+		QH_JOURNAL_HEADER_REGION_SIZE,
+		&allocationBase);
+	if (!region)
+		return STATUS_INSUFFICIENT_RESOURCES;
+
+	RtlZeroMemory(region, QH_JOURNAL_HEADER_REGION_SIZE);
+	link = (PQH_HEADER_REGION_LINK)(
+		region + QH_JOURNAL_HEADER_REGION_SIZE - QH_JOURNAL_HEADER_LINK_SIZE);
+	link->Marker = QH_JOURNAL_HEADER_LINK_MARK;
+	link->PrevRegionOff = PrevOff;
+	link->NextRegionOff = NextOff;
+	link->Reserved = 0;
+
+	for (offset = 0;
+		offset < QH_JOURNAL_HEADER_REGION_SIZE;
+		offset += Journal->SectorSize)
 	{
-		PQH_INDEX_MEM_ENTRY e =
-			&Journal->IndexArray[Journal->IndexStart + Journal->IndexCount];
-		e->Sequence = Sequence;
-		e->WallClock100ns = Time;
-		e->LogRingOffset = LogOffset;
-		e->VolumeOffset = VolumeOffset;
-		e->DataLength = DataLength;
-		e->Pad = 0;
-		Journal->IndexCount++;
+	status = QHJournalRawIo(
+		Journal,
+			IRP_MJ_WRITE,
+			RegionOff + offset,
+		Journal->SectorSize,
+			region + offset);
+		if (!NT_SUCCESS(status))
+		{
+			qhfree(allocationBase);
+			return status;
+		}
 	}
+	qhfree(allocationBase);
 	return STATUS_SUCCESS;
 }
 
-static VOID QHIndexPopFront(_Inout_ PQH_JOURNAL Journal)
+static ULONG QHJournalRegionHeaderLimit(
+	_In_ PQH_JOURNAL Journal,
+	_In_ UINT64 RegionOff)
 {
-	if (Journal->IndexCount > 0)
-	{
-		Journal->IndexStart++;
-		Journal->IndexCount--;
-		if (Journal->IndexCount == 0)
-			Journal->IndexStart = 0;
-	}
+	if (RegionOff == Journal->LastHeaderRegionOff)
+		return Journal->CurrentHeaderCount;
+	return QH_JOURNAL_HEADERS_PER_REGION;
 }
 
-static VOID QHIndexFree(_Inout_ PQH_JOURNAL Journal)
+static NTSTATUS QHJournalReadHeaderAt(
+	_In_ PQH_JOURNAL Journal,
+	_In_ UINT64 RegionOff,
+	_In_ ULONG Index,
+	_Out_ PQH_JOURNAL_RECORD_HEADER Header)
 {
-	if (Journal->IndexArray)
-	{
-		qhfree(Journal->IndexArray);
-		Journal->IndexArray = NULL;
-	}
-	Journal->IndexCapacity = 0;
-	Journal->IndexCount = 0;
-	Journal->IndexStart = 0;
+	if (Index >= QH_JOURNAL_HEADERS_PER_REGION)
+		return STATUS_INVALID_PARAMETER;
+	return QHJournalRawReadSub(
+		Journal,
+		RegionOff + (UINT64)Index * sizeof(QH_JOURNAL_RECORD_HEADER),
+		sizeof(*Header),
+		Header);
 }
 
-static VOID QHIndexRefreshTimeBounds(_Inout_ PQH_JOURNAL Journal)
+static NTSTATUS QHJournalWriteHeaderAt(
+	_In_ PQH_JOURNAL Journal,
+	_In_ UINT64 RegionOff,
+	_In_ ULONG Index,
+	_In_ const QH_JOURNAL_RECORD_HEADER* Header)
 {
-	if (Journal->IndexCount == 0)
+	if (Index >= QH_JOURNAL_HEADERS_PER_REGION)
+		return STATUS_INVALID_PARAMETER;
+	return QHJournalRawWriteSub(
+		Journal,
+		RegionOff + (UINT64)Index * sizeof(QH_JOURNAL_RECORD_HEADER),
+		sizeof(*Header),
+		Header);
+}
+
+static NTSTATUS QHJournalRefreshOldestTimeLocked(_Inout_ PQH_JOURNAL Journal)
+{
+	QH_JOURNAL_RECORD_HEADER header;
+	NTSTATUS status;
+
+	if (QHJournalIsEmptyLocked(Journal))
 	{
 		Journal->Oldest100ns = 0;
 		Journal->Newest100ns = 0;
-		return;
+		return STATUS_SUCCESS;
 	}
-	Journal->Oldest100ns =
-		Journal->IndexArray[Journal->IndexStart].WallClock100ns;
-	Journal->Newest100ns =
-		Journal->IndexArray[Journal->IndexStart + Journal->IndexCount - 1]
-			.WallClock100ns;
+
+	status = QHJournalReadHeaderAt(
+		Journal,
+		Journal->OldestHeaderRegionOff,
+		Journal->OldestHeaderIndex,
+		&header);
+	if (!NT_SUCCESS(status))
+	return status;
+	Journal->Oldest100ns = header.WallClock100ns;
+	return STATUS_SUCCESS;
 }
 
-static NTSTATUS QHJournalScanRebuildLocked(_Inout_ PQH_JOURNAL Journal)
+// Contiguous free bytes from PayloadRegionOff without wrapping and without
+// entering the oldest live header region.
+static UINT64 QHJournalContiguousFreeLocked(_In_ PQH_JOURNAL Journal)
 {
-	NTSTATUS status = STATUS_SUCCESS;
-	PVOID allocationBase = NULL;
-	PUCHAR headerSector;
-	UINT64 position;
-	ULONG guard = 0;
+	UINT64 usableEnd = QHJournalUsableEnd(Journal);
+	UINT64 head = Journal->PayloadRegionOff;
+	UINT64 tail = Journal->OldestHeaderRegionOff;
 
-	headerSector = (PUCHAR)QHAllocateAligned(
-		Journal->TargetDevice,
-		Journal->SectorSize,
-		&allocationBase);
-	if (!headerSector)
-		return STATUS_INSUFFICIENT_RESOURCES;
+	if (QHJournalIsEmptyLocked(Journal))
+		return usableEnd - head;
 
-	Journal->IndexStart = 0;
-	Journal->IndexCount = 0;
-	Journal->RecsSinceAnchor = 0;
+	// Write cursor caught up with oldest header: no contiguous free in front.
+	if (head == tail)
+		return 0;
 
-	position = Journal->LogTail;
-	while (position != Journal->LogHead)
-	{
-		PQH_JOURNAL_RECORD_HEADER header;
+	if (head < tail)
+		return tail - head;
 
-		if (++guard > (ULONG)(Journal->LogSize / Journal->SectorSize) + 4)
-		{
-			status = STATUS_DISK_CORRUPT_ERROR;
-			break;
-		}
-
-		status = QHJournalRawIo(
-			Journal,
-			IRP_MJ_READ,
-			Journal->LogOffset + position,
-			Journal->SectorSize,
-			headerSector);
-		if (!NT_SUCCESS(status))
-			break;
-
-		header = (PQH_JOURNAL_RECORD_HEADER)headerSector;
-		if (header->Magic != QH_JOURNAL_RECORD_MAGIC ||
-			header->RecordSize == 0 ||
-			(header->RecordSize % Journal->SectorSize) != 0 ||
-			header->RecordSize > Journal->LogSize - position)
-		{
-			Journal->LogHead = position;
-			status = STATUS_SUCCESS;
-			break;
-		}
-		if (QHCrc32c(
-				0,
-				header,
-				FIELD_OFFSET(QH_JOURNAL_RECORD_HEADER, HeaderCrc32c)) !=
-			header->HeaderCrc32c)
-		{
-			Journal->LogHead = position;
-			status = STATUS_SUCCESS;
-			break;
-		}
-
-		if (header->Flags & QH_JOURNAL_FLAG_WRAP)
-		{
-			position = 0;
-			continue;
-		}
-
-		status = QHIndexPushBack(
-			Journal,
-			header->Sequence,
-			header->WallClock100ns,
-			position,
-			header->VolumeOffset,
-			header->DataLength);
-		if (!NT_SUCCESS(status))
-			break;
-		if (header->Sequence >= Journal->NextSequence)
-			Journal->NextSequence = header->Sequence + 1;
-
-		Journal->RecsSinceAnchor++;
-		if (Journal->RecsSinceAnchor >= Journal->IndexStride)
-			Journal->RecsSinceAnchor = 0;
-
-		position += header->RecordSize;
-		if (position >= Journal->LogSize)
-			position = 0;
-	}
-
-	QHIndexRefreshTimeBounds(Journal);
-	qhfree(allocationBase);
-	return status;
+	// head > tail: free until partition end; wrap is handled separately.
+	return usableEnd - head;
 }
 
 static NTSTATUS QHJournalDropOldestLocked(_Inout_ PQH_JOURNAL Journal)
 {
-	PVOID allocationBase = NULL;
-	PUCHAR sector;
-	PQH_JOURNAL_RECORD_HEADER header;
-	ULONG crc;
+	QH_HEADER_REGION_LINK link;
+	ULONG limit;
 	NTSTATUS status;
 
-	if (Journal->LogTail == Journal->LogHead)
+	if (QHJournalIsEmptyLocked(Journal))
 		return STATUS_NOT_FOUND;
-	sector = (PUCHAR)QHAllocateAligned(
-		Journal->TargetDevice,
-		Journal->SectorSize,
-		&allocationBase);
-	if (!sector)
-		return STATUS_INSUFFICIENT_RESOURCES;
 
-	status = QHJournalRawIo(
+	limit = QHJournalRegionHeaderLimit(
 		Journal,
-		IRP_MJ_READ,
-		Journal->LogOffset + Journal->LogTail,
-		Journal->SectorSize,
-		sector);
-	header = (PQH_JOURNAL_RECORD_HEADER)sector;
-	if (!NT_SUCCESS(status) ||
-		header->Magic != QH_JOURNAL_RECORD_MAGIC ||
-		header->RecordSize == 0 ||
-		(header->RecordSize % Journal->SectorSize) != 0 ||
-		header->RecordSize > Journal->LogSize - Journal->LogTail)
+		Journal->OldestHeaderRegionOff);
+	if (Journal->OldestHeaderIndex >= limit)
+		return STATUS_DISK_CORRUPT_ERROR;
+
+	Journal->OldestHeaderIndex++;
+	Journal->TotalRecords--;
+
+	if (Journal->OldestHeaderIndex < limit)
+		return QHJournalRefreshOldestTimeLocked(Journal);
+
+	status = QHJournalReadRegionLink(
+		Journal,
+		Journal->OldestHeaderRegionOff,
+		&link);
+	if (!NT_SUCCESS(status) || link.Marker != QH_JOURNAL_HEADER_LINK_MARK)
+		return STATUS_DISK_CORRUPT_ERROR;
+
+	if (Journal->OldestHeaderRegionOff == Journal->LastHeaderRegionOff &&
+		Journal->TotalRecords == 0)
 	{
-		status = STATUS_DISK_CORRUPT_ERROR;
-		goto cleanup;
-	}
-	crc = QHCrc32c(
-		0,
-		header,
-		FIELD_OFFSET(QH_JOURNAL_RECORD_HEADER, HeaderCrc32c));
-	if (crc != header->HeaderCrc32c)
-	{
-		status = STATUS_CRC_ERROR;
-		goto cleanup;
+		Journal->OldestHeaderRegionOff = Journal->LastHeaderRegionOff;
+		Journal->OldestHeaderIndex = 0;
+		Journal->CurrentHeaderCount = 0;
+		Journal->PayloadRegionOff =
+			Journal->LastHeaderRegionOff + QH_JOURNAL_HEADER_REGION_SIZE;
+		Journal->Oldest100ns = 0;
+		Journal->Newest100ns = 0;
+		return STATUS_SUCCESS;
 	}
 
-	if (header->Flags & QH_JOURNAL_FLAG_WRAP)
-		Journal->LogTail = 0;
-	else
-	{
-		Journal->LogTail += header->RecordSize;
-		if (Journal->LogTail >= Journal->LogSize)
-			Journal->LogTail = 0;
-		Journal->DroppedRecords++;
-		QHIndexPopFront(Journal);
-		QHIndexRefreshTimeBounds(Journal);
-	}
-	status = STATUS_SUCCESS;
-
-cleanup:
-	qhfree(allocationBase);
-	return status;
+	Journal->OldestHeaderRegionOff = link.NextRegionOff;
+	Journal->OldestHeaderIndex = 0;
+	return QHJournalRefreshOldestTimeLocked(Journal);
 }
 
-static NTSTATUS QHJournalWriteDiskAnchorLocked(
+static NTSTATUS QHJournalEnsureContiguousLocked(
 	_Inout_ PQH_JOURNAL Journal,
-	_In_ UINT64 Sequence,
-	_In_ UINT64 WallClock100ns,
-	_In_ UINT64 LogRingOffset)
+	_In_ UINT64 BytesNeeded)
 {
-	QH_INDEX_ANCHOR anchor;
-	UINT64 slots;
-	UINT64 anchorSlot;
+	UINT64 usableStart = QHJournalUsableStart(Journal);
+	UINT64 usableEnd = QHJournalUsableEnd(Journal);
+	ULONG guard = 0;
 
-	if (Journal->IndexRegionSize < sizeof(QH_INDEX_ANCHOR))
-		return STATUS_INVALID_PARAMETER;
+	if (BytesNeeded > usableEnd - usableStart)
+		return STATUS_INSUFFICIENT_RESOURCES;
 
-	slots = Journal->IndexRegionSize / sizeof(QH_INDEX_ANCHOR);
-	if (slots == 0)
-		return STATUS_INVALID_PARAMETER;
+	for (;;)
+	{
+		NTSTATUS status;
 
-	RtlZeroMemory(&anchor, sizeof(anchor));
-	anchor.Sequence = Sequence;
-	anchor.WallClock100ns = WallClock100ns;
-	anchor.LogRingOffset = LogRingOffset;
-	anchor.Crc32c = QHCrc32c(
-		0,
-		&anchor,
-		FIELD_OFFSET(QH_INDEX_ANCHOR, Crc32c));
+		// Payload hits the end: wrap write cursor; do NOT open a new header.
+		if (Journal->PayloadRegionOff + BytesNeeded > usableEnd)
+			Journal->PayloadRegionOff = usableStart;
 
-	anchorSlot = Journal->IndexHead % slots;
-	return QHJournalRawWriteSub(
+		if (QHJournalContiguousFreeLocked(Journal) >= BytesNeeded)
+			return STATUS_SUCCESS;
+
+		status = QHJournalDropOldestLocked(Journal);
+		if (!NT_SUCCESS(status))
+			return status;
+		if (++guard > 1000000UL)
+			return STATUS_DISK_CORRUPT_ERROR;
+	}
+}
+
+// Place a new 2MB header region at the current payload cursor, then start a
+// fresh payload area immediately after it: ...[Pprev][Hnew 2MB][Pnew...]
+static NTSTATUS QHJournalAllocateHeaderRegionLocked(
+	_Inout_ PQH_JOURNAL Journal,
+	_Out_ PUINT64 NewRegionOff)
+{
+	UINT64 usableStart = QHJournalUsableStart(Journal);
+	UINT64 usableEnd = QHJournalUsableEnd(Journal);
+	UINT64 candidate;
+	UINT64 oldRegion;
+	QH_HEADER_REGION_LINK oldLink;
+	QH_HEADER_REGION_LINK newLink;
+	NTSTATUS status;
+	ULONG guard = 0;
+
+	candidate = QHAlignUp64(Journal->PayloadRegionOff, Journal->SectorSize);
+	if (candidate + QH_JOURNAL_HEADER_REGION_SIZE > usableEnd)
+		candidate = usableStart;
+
+	// Reclaim until [candidate, candidate+2MB) does not overlap the oldest live unit.
+	while (!QHJournalIsEmptyLocked(Journal))
+	{
+		UINT64 old = Journal->OldestHeaderRegionOff;
+		UINT64 oldEnd = old + QH_JOURNAL_HEADER_REGION_SIZE;
+		BOOLEAN overlaps =
+			!(oldEnd <= candidate ||
+				old >= candidate + QH_JOURNAL_HEADER_REGION_SIZE);
+
+		if (!overlaps)
+		{
+			if (candidate == usableStart)
+			{
+				if (Journal->OldestHeaderRegionOff >=
+					candidate + QH_JOURNAL_HEADER_REGION_SIZE)
+				{
+					break;
+				}
+			}
+			else if (Journal->PayloadRegionOff <= candidate ||
+				candidate == Journal->PayloadRegionOff)
+			{
+				break;
+			}
+		}
+
+		status = QHJournalDropOldestLocked(Journal);
+		if (!NT_SUCCESS(status))
+			return status;
+		if (++guard > 1000000UL)
+			return STATUS_DISK_CORRUPT_ERROR;
+	}
+
+	if (candidate + QH_JOURNAL_HEADER_REGION_SIZE > usableEnd)
+		return STATUS_INSUFFICIENT_RESOURCES;
+
+	oldRegion = Journal->LastHeaderRegionOff;
+	status = QHJournalReadRegionLink(Journal, oldRegion, &oldLink);
+	if (!NT_SUCCESS(status))
+		return status;
+
+	status = QHJournalInitHeaderRegion(
 		Journal,
-		Journal->IndexRegionOff + anchorSlot * sizeof(QH_INDEX_ANCHOR),
-		sizeof(anchor),
-		&anchor);
+		candidate,
+		oldRegion,
+		candidate);
+	if (!NT_SUCCESS(status))
+		return status;
+
+	oldLink.NextRegionOff = candidate;
+	status = QHJournalWriteRegionLink(Journal, oldRegion, &oldLink);
+	if (!NT_SUCCESS(status))
+		return status;
+
+	newLink.Marker = QH_JOURNAL_HEADER_LINK_MARK;
+	newLink.PrevRegionOff = oldRegion;
+	newLink.NextRegionOff = candidate;
+	newLink.Reserved = 0;
+	status = QHJournalWriteRegionLink(Journal, candidate, &newLink);
+	if (!NT_SUCCESS(status))
+		return status;
+
+	Journal->LastHeaderRegionOff = candidate;
+	Journal->CurrentHeaderCount = 0;
+	// Payload for this header region starts immediately after it.
+	Journal->PayloadRegionOff = candidate + QH_JOURNAL_HEADER_REGION_SIZE;
+
+	*NewRegionOff = candidate;
+	return STATUS_SUCCESS;
+}
+
+static NTSTATUS QHJournalRebuildRuntimeLocked(_Inout_ PQH_JOURNAL Journal)
+{
+	UINT64 regionOff;
+	UINT64 oldestOff;
+	ULONG guard = 0;
+	QH_HEADER_REGION_LINK link;
+	NTSTATUS status;
+
+	Journal->TotalRecords = 0;
+	Journal->CurrentHeaderCount = 0;
+	Journal->NextSequence = 1;
+	Journal->Oldest100ns = 0;
+	Journal->Newest100ns = 0;
+	Journal->OldestHeaderIndex = 0;
+
+	regionOff = Journal->LastHeaderRegionOff;
+	for (;;)
+	{
+		status = QHJournalReadRegionLink(Journal, regionOff, &link);
+		if (!NT_SUCCESS(status) || link.Marker != QH_JOURNAL_HEADER_LINK_MARK)
+			return STATUS_DISK_CORRUPT_ERROR;
+		if (link.PrevRegionOff == regionOff)
+			break;
+		regionOff = link.PrevRegionOff;
+		if (++guard > 100000UL)
+			return STATUS_DISK_CORRUPT_ERROR;
+	}
+	oldestOff = regionOff;
+	Journal->OldestHeaderRegionOff = oldestOff;
+
+	regionOff = oldestOff;
+	guard = 0;
+	for (;;)
+	{
+		ULONG index;
+		BOOLEAN isLast = (regionOff == Journal->LastHeaderRegionOff);
+
+		status = QHJournalReadRegionLink(Journal, regionOff, &link);
+		if (!NT_SUCCESS(status) || link.Marker != QH_JOURNAL_HEADER_LINK_MARK)
+			return STATUS_DISK_CORRUPT_ERROR;
+
+		for (index = 0; index < QH_JOURNAL_HEADERS_PER_REGION; ++index)
+		{
+			QH_JOURNAL_RECORD_HEADER header;
+
+			status = QHJournalReadHeaderAt(
+				Journal,
+				regionOff,
+				index,
+				&header);
+			if (!NT_SUCCESS(status))
+				return status;
+
+			if (header.DataLength == 0 && header.Sequence == 0)
+			{
+				if (isLast)
+					Journal->CurrentHeaderCount = index;
+				break;
+			}
+
+			Journal->TotalRecords++;
+			if (header.Sequence >= Journal->NextSequence)
+				Journal->NextSequence = header.Sequence + 1;
+			if (Journal->NextSequence == 0)
+				Journal->NextSequence = 1;
+
+			if (Journal->Oldest100ns == 0 ||
+				header.WallClock100ns < Journal->Oldest100ns)
+			{
+				Journal->Oldest100ns = header.WallClock100ns;
+			}
+			if (header.WallClock100ns > Journal->Newest100ns)
+				Journal->Newest100ns = header.WallClock100ns;
+
+			if (isLast)
+				Journal->CurrentHeaderCount = index + 1;
+		}
+
+		if (isLast)
+			break;
+		if (link.NextRegionOff == regionOff)
+			break;
+		regionOff = link.NextRegionOff;
+		if (++guard > 100000UL)
+			return STATUS_DISK_CORRUPT_ERROR;
+		if (regionOff == oldestOff)
+			break;
+	}
+
+	return STATUS_SUCCESS;
 }
 
 VOID QHJournalInitialize(
 	_Out_ PQH_JOURNAL Journal,
-	_In_ PDEVICE_OBJECT TargetDevice,
+	_In_opt_ PVOID TargetDevice,
 	_In_ UINT64 PartitionSize,
 	_In_ ULONG SectorSize,
 	_In_ const GUID* SourceVolumeGuid)
 {
 	RtlZeroMemory(Journal, sizeof(*Journal));
 	Journal->TargetDevice = TargetDevice;
+	Journal->Store = NULL;
 	Journal->PartitionSize = QHAlignDown64(PartitionSize, SectorSize);
 	Journal->SectorSize = SectorSize;
 	Journal->SourceVolumeGuid = *SourceVolumeGuid;
-	Journal->IndexStride = QH_JOURNAL_DEFAULT_STRIDE;
-	KeInitializeMutex(&Journal->Lock, 0);
+	QH_LOCK_INIT(&Journal->Lock);
+}
+
+VOID QHJournalInitializeWithStore(
+	_Out_ PQH_JOURNAL Journal,
+	_In_ PQH_STORE Store,
+	_In_ const GUID* SourceVolumeGuid,
+	_In_opt_ QH_QUERY_TIME_100NS QueryTime100ns,
+	_In_opt_ PVOID QueryTimeContext)
+{
+	RtlZeroMemory(Journal, sizeof(*Journal));
+	Journal->TargetDevice = NULL;
+	Journal->Store = Store;
+	Journal->PartitionSize = QHAlignDown64(Store->Size, Store->SectorSize);
+	Journal->SectorSize = Store->SectorSize;
+	Journal->SourceVolumeGuid = *SourceVolumeGuid;
+	Journal->QueryTime100ns = QueryTime100ns;
+	Journal->QueryTimeContext = QueryTimeContext;
+	QH_LOCK_INIT(&Journal->Lock);
+}
+
+static BOOLEAN QHJournalHasBackend(_In_ PQH_JOURNAL Journal)
+{
+	return Journal->Store != NULL || Journal->TargetDevice != NULL;
 }
 
 NTSTATUS QHJournalFormat(_Inout_ PQH_JOURNAL Journal)
 {
-	PVOID allocationBase = NULL;
-	PUCHAR zeroSector;
-	NTSTATUS status;
+	UINT64 usableStart;
+	UINT64 usableEnd;
+	UINT64 headerOff;
 	UINT64 minSize;
+	NTSTATUS status;
 
-	minSize = (UINT64)Journal->SectorSize *
-		(1ULL + QH_JOURNAL_INDEX_SECTORS + 2ULL);
-	if (!Journal->TargetDevice ||
+	minSize = (UINT64)Journal->SectorSize * 2ULL +
+		QH_JOURNAL_HEADER_REGION_SIZE + (UINT64)Journal->SectorSize;
+	if (!QHJournalHasBackend(Journal) ||
 		(Journal->SectorSize != 512 && Journal->SectorSize != 4096) ||
 		Journal->PartitionSize < minSize)
 	{
 		return STATUS_INVALID_PARAMETER;
 	}
 
-	KeWaitForSingleObject(&Journal->Lock, Executive, KernelMode, FALSE, NULL);
-	QHIndexFree(Journal);
-	QHJournalComputeLayout(Journal);
-	if (Journal->LogSize < Journal->SectorSize * 2ULL)
+	QH_LOCK_ACQUIRE(&Journal->Lock);
+
+	usableStart = QHJournalUsableStart(Journal);
+	usableEnd = QHJournalUsableEnd(Journal);
+	headerOff = usableStart;
+	if (headerOff + QH_JOURNAL_HEADER_REGION_SIZE >= usableEnd)
 	{
 		status = STATUS_INVALID_PARAMETER;
 		goto cleanup;
 	}
 
-	Journal->LogHead = 0;
-	Journal->LogTail = 0;
-	Journal->IndexHead = 0;
-	Journal->IndexTail = 0;
-	Journal->IndexStride = QH_JOURNAL_DEFAULT_STRIDE;
-	Journal->RecsSinceAnchor = 0;
+	status = QHJournalInitHeaderRegion(
+		Journal,
+		headerOff,
+		headerOff,
+		headerOff);
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+
+	Journal->LastHeaderRegionOff = headerOff;
+	// Payload area 0 starts immediately after header region 0.
+	Journal->PayloadRegionOff = headerOff + QH_JOURNAL_HEADER_REGION_SIZE;
+	Journal->OldestHeaderRegionOff = headerOff;
+	Journal->OldestHeaderIndex = 0;
+	Journal->CurrentHeaderCount = 0;
 	Journal->NextSequence = 1;
-	Journal->DroppedRecords = 0;
+	Journal->TotalRecords = 0;
 	Journal->Oldest100ns = 0;
 	Journal->Newest100ns = 0;
 
-	zeroSector = (PUCHAR)QHAllocateAligned(
-		Journal->TargetDevice,
-		Journal->SectorSize,
-		&allocationBase);
-	if (!zeroSector)
-	{
-		status = STATUS_INSUFFICIENT_RESOURCES;
-		goto cleanup;
-	}
-	RtlZeroMemory(zeroSector, Journal->SectorSize);
-	status = QHJournalRawIo(
-		Journal,
-		IRP_MJ_WRITE,
-		Journal->LogOffset,
-		Journal->SectorSize,
-		zeroSector);
-	if (NT_SUCCESS(status))
 		status = QHJournalWriteSuperblockLocked(Journal);
 	if (NT_SUCCESS(status))
 		status = QHJournalFlush(Journal);
@@ -673,9 +882,7 @@ NTSTATUS QHJournalFormat(_Inout_ PQH_JOURNAL Journal)
 		Journal->Mounted = TRUE;
 
 cleanup:
-	if (allocationBase)
-		qhfree(allocationBase);
-	KeReleaseMutex(&Journal->Lock, FALSE);
+	QH_LOCK_RELEASE(&Journal->Lock);
 	return status;
 }
 
@@ -684,22 +891,20 @@ NTSTATUS QHJournalMount(_Inout_ PQH_JOURNAL Journal)
 	PVOID allocationBase = NULL;
 	PUCHAR sector;
 	PQH_JOURNAL_SUPERBLOCK superblock;
-	NTSTATUS status;
 	UINT64 minSize;
+	NTSTATUS status;
 
-	minSize = (UINT64)Journal->SectorSize *
-		(1ULL + QH_JOURNAL_INDEX_SECTORS + 2ULL);
-	if (!Journal->TargetDevice ||
+	minSize = (UINT64)Journal->SectorSize * 2ULL +
+		QH_JOURNAL_HEADER_REGION_SIZE + (UINT64)Journal->SectorSize;
+	if (!QHJournalHasBackend(Journal) ||
 		(Journal->SectorSize != 512 && Journal->SectorSize != 4096) ||
 		Journal->PartitionSize < minSize)
 	{
 		return STATUS_INVALID_PARAMETER;
 	}
 
-	KeWaitForSingleObject(&Journal->Lock, Executive, KernelMode, FALSE, NULL);
-	QHIndexFree(Journal);
-	sector = (PUCHAR)QHAllocateAligned(
-		Journal->TargetDevice,
+	QH_LOCK_ACQUIRE(&Journal->Lock);
+	sector = (PUCHAR)QHAllocateAligned(Journal,
 		Journal->SectorSize,
 		&allocationBase);
 	if (!sector)
@@ -730,38 +935,22 @@ NTSTATUS QHJournalMount(_Inout_ PQH_JOURNAL Journal)
 		}
 	}
 
-	Journal->IndexRegionOff = superblock->IndexRegionOff;
-	Journal->IndexRegionSize = superblock->IndexRegionSize;
-	Journal->LogOffset = superblock->LogOffset;
-	Journal->LogSize = superblock->LogSize;
-	Journal->LogHead = superblock->LogHead;
-	Journal->LogTail = superblock->LogTail;
-	Journal->IndexHead = superblock->IndexHead;
-	Journal->IndexTail = superblock->IndexTail;
-	Journal->IndexStride = superblock->IndexStride ?
-		superblock->IndexStride : QH_JOURNAL_DEFAULT_STRIDE;
-	Journal->NextSequence = superblock->NextSequence;
-	Journal->DroppedRecords = superblock->DroppedRecords;
-	Journal->Oldest100ns = superblock->OldestRecoverable100ns;
-	Journal->Newest100ns = superblock->NewestRecoverable100ns;
+	Journal->LastHeaderRegionOff = superblock->LastHeaderRegionOff;
+	Journal->PayloadRegionOff = superblock->PayloadRegionOff;
 
-	status = QHJournalScanRebuildLocked(Journal);
+	status = QHJournalRebuildRuntimeLocked(Journal);
 	if (!NT_SUCCESS(status))
 		goto cleanup;
 
-	status = QHJournalWriteSuperblockLocked(Journal);
-	if (NT_SUCCESS(status))
-		Journal->Mounted = TRUE;
+	Journal->Mounted = TRUE;
+	status = STATUS_SUCCESS;
 
 cleanup:
 	if (allocationBase)
 		qhfree(allocationBase);
 	if (!NT_SUCCESS(status))
-	{
-		QHIndexFree(Journal);
 		Journal->Mounted = FALSE;
-	}
-	KeReleaseMutex(&Journal->Lock, FALSE);
+	QH_LOCK_RELEASE(&Journal->Lock);
 	return status;
 }
 
@@ -769,19 +958,16 @@ NTSTATUS QHJournalAppend(
 	_Inout_ PQH_JOURNAL Journal,
 	_In_ UINT64 VolumeOffset,
 	_In_ ULONG DataLength,
-	_In_reads_bytes_(DataLength) const VOID* BeforeImage)
+	_In_reads_bytes_(DataLength) const VOID* BeforeImage,
+	_Out_opt_ PQH_JOURNAL_RECORD_HEADER WrittenHeader)
 {
+	QH_JOURNAL_RECORD_HEADER header;
+	UINT64 payloadOff;
+	UINT64 alignedSize;
 	PVOID allocationBase = NULL;
-	PUCHAR recordBuffer;
-	PQH_JOURNAL_RECORD_HEADER header;
-	UINT64 recordSize64;
-	ULONG recordSize;
-	ULONG fillerSize = 0;
-	UINT64 recordOffset;
-	UINT64 writeSeq;
+	PUCHAR payloadBuffer = NULL;
+	ULONG writeSeq;
 	UINT64 writeTime;
-	LARGE_INTEGER wallClock;
-	LARGE_INTEGER performanceCounter;
 	NTSTATUS status = STATUS_SUCCESS;
 
 	if (!Journal->Mounted || !BeforeImage ||
@@ -789,144 +975,105 @@ NTSTATUS QHJournalAppend(
 	{
 		return STATUS_INVALID_PARAMETER;
 	}
-	recordSize64 = QHAlignUp64(
-		sizeof(QH_JOURNAL_RECORD_HEADER) + (UINT64)DataLength,
-		Journal->SectorSize);
-	if (recordSize64 > MAXULONG)
-		return STATUS_INTEGER_OVERFLOW;
-	recordSize = (ULONG)recordSize64;
 
-	KeWaitForSingleObject(&Journal->Lock, Executive, KernelMode, FALSE, NULL);
+	QH_LOCK_ACQUIRE(&Journal->Lock);
 	if (!Journal->Mounted)
 	{
 		status = STATUS_DEVICE_NOT_READY;
 		goto cleanup;
 	}
-	if ((UINT64)recordSize + Journal->SectorSize >= Journal->LogSize)
+
+	alignedSize = QHAlignUp64(DataLength, Journal->SectorSize);
+
+	// New header region only when the current 2MB header slots are exhausted.
+	if (Journal->CurrentHeaderCount >= QH_JOURNAL_HEADERS_PER_REGION)
 	{
-		status = STATUS_INSUFFICIENT_RESOURCES;
+		UINT64 newRegion = 0;
+		status = QHJournalAllocateHeaderRegionLocked(Journal, &newRegion);
+		if (!NT_SUCCESS(status))
+			goto cleanup;
+	}
+
+	// Payload: wrap at partition end and/or drop oldest until there is room.
+	status = QHJournalEnsureContiguousLocked(Journal, alignedSize);
+	if (!NT_SUCCESS(status))
 		goto cleanup;
-	}
-	if (Journal->LogHead + recordSize > Journal->LogSize)
-		fillerSize = (ULONG)(Journal->LogSize - Journal->LogHead);
 
-	while (QHJournalFreeLocked(Journal) < (UINT64)fillerSize + recordSize)
-	{
-		status = QHJournalDropOldestLocked(Journal);
-		if (!NT_SUCCESS(status))
-			goto cleanup;
-	}
-
-	if (fillerSize)
-	{
-		PVOID fillerBase = NULL;
-		PUCHAR filler = (PUCHAR)QHAllocateAligned(
-			Journal->TargetDevice,
-			Journal->SectorSize,
-			&fillerBase);
-		if (!filler)
-		{
-			status = STATUS_INSUFFICIENT_RESOURCES;
-			goto cleanup;
-		}
-		RtlZeroMemory(filler, Journal->SectorSize);
-		header = (PQH_JOURNAL_RECORD_HEADER)filler;
-		header->Magic = QH_JOURNAL_RECORD_MAGIC;
-		header->RecordSize = fillerSize;
-		header->Flags = QH_JOURNAL_FLAG_WRAP;
-		header->HeaderCrc32c = QHCrc32c(
-			0,
-			header,
-			FIELD_OFFSET(QH_JOURNAL_RECORD_HEADER, HeaderCrc32c));
-		status = QHJournalRawIo(
-			Journal,
-			IRP_MJ_WRITE,
-			Journal->LogOffset + Journal->LogHead,
-			Journal->SectorSize,
-			filler);
-		qhfree(fillerBase);
-		if (!NT_SUCCESS(status))
-			goto cleanup;
-		Journal->LogHead = 0;
-	}
-
-	recordBuffer = (PUCHAR)QHAllocateAligned(
-		Journal->TargetDevice,
-		recordSize,
+	payloadOff = Journal->PayloadRegionOff;
+	payloadBuffer = (PUCHAR)QHAllocateAligned(Journal,
+		(SIZE_T)alignedSize,
 		&allocationBase);
-	if (!recordBuffer)
+	if (!payloadBuffer)
 	{
 		status = STATUS_INSUFFICIENT_RESOURCES;
 		goto cleanup;
 	}
-	recordOffset = Journal->LogHead;
-	writeSeq = Journal->NextSequence;
-	KeQuerySystemTime(&wallClock);
-	performanceCounter = KeQueryPerformanceCounter(NULL);
-	writeTime = (UINT64)wallClock.QuadPart;
-
-	RtlZeroMemory(recordBuffer, recordSize);
-	header = (PQH_JOURNAL_RECORD_HEADER)recordBuffer;
-	header->Magic = QH_JOURNAL_RECORD_MAGIC;
-	header->RecordSize = recordSize;
-	header->Sequence = writeSeq;
-	header->WallClock100ns = writeTime;
-	header->PerformanceCounter = (UINT64)performanceCounter.QuadPart;
-	header->SourceVolumeGuid = Journal->SourceVolumeGuid;
-	header->VolumeOffset = VolumeOffset;
-	header->DataLength = DataLength;
-	RtlCopyMemory(
-		recordBuffer + sizeof(QH_JOURNAL_RECORD_HEADER),
-		BeforeImage,
-		DataLength);
-	header->DataCrc32c = QHCrc32c(
-		0,
-		recordBuffer + sizeof(QH_JOURNAL_RECORD_HEADER),
-		DataLength);
-	header->HeaderCrc32c = QHCrc32c(
-		0,
-		header,
-		FIELD_OFFSET(QH_JOURNAL_RECORD_HEADER, HeaderCrc32c));
+	RtlZeroMemory(payloadBuffer, (SIZE_T)alignedSize);
+	RtlCopyMemory(payloadBuffer, BeforeImage, DataLength);
 
 	status = QHJournalRawIo(
 		Journal,
 		IRP_MJ_WRITE,
-		Journal->LogOffset + recordOffset,
-		recordSize,
-		recordBuffer);
+		payloadOff,
+		(ULONG)alignedSize,
+		payloadBuffer);
 	if (!NT_SUCCESS(status))
 		goto cleanup;
 
-	status = QHIndexPushBack(
-		Journal,
-		writeSeq,
-		writeTime,
-		recordOffset,
-		VolumeOffset,
-		DataLength);
-	if (!NT_SUCCESS(status))
-		goto cleanup;
-
-	Journal->NextSequence = writeSeq + 1;
-	Journal->Newest100ns = writeTime;
-	if (Journal->IndexCount == 1)
-		Journal->Oldest100ns = writeTime;
-
-	Journal->LogHead = recordOffset + recordSize;
-	if (Journal->LogHead >= Journal->LogSize)
-		Journal->LogHead = 0;
-
-	Journal->RecsSinceAnchor++;
-	if (Journal->RecsSinceAnchor >= Journal->IndexStride)
+	writeSeq = Journal->NextSequence;
+	if (Journal->QueryTime100ns)
 	{
-		(VOID)QHJournalWriteDiskAnchorLocked(
-			Journal,
-			writeSeq,
-			writeTime,
-			recordOffset);
-		Journal->IndexHead++;
-		Journal->RecsSinceAnchor = 0;
+		writeTime = Journal->QueryTime100ns(Journal->QueryTimeContext);
 	}
+	else
+	{
+#ifdef QH_USERMODE
+		FILETIME ft;
+		ULARGE_INTEGER u;
+		GetSystemTimeAsFileTime(&ft);
+		u.LowPart = ft.dwLowDateTime;
+		u.HighPart = ft.dwHighDateTime;
+		writeTime = u.QuadPart;
+#else
+		{
+			LARGE_INTEGER wallClock;
+			KeQuerySystemTime(&wallClock);
+			writeTime = (UINT64)wallClock.QuadPart;
+		}
+#endif
+	}
+
+	RtlZeroMemory(&header, sizeof(header));
+	header.WallClock100ns = writeTime;
+	header.VolumeOffset = VolumeOffset;
+	header.FileOffset = payloadOff;
+	header.DataLength = DataLength;
+	header.Sequence = writeSeq;
+
+	status = QHJournalWriteHeaderAt(
+		Journal,
+		Journal->LastHeaderRegionOff,
+		Journal->CurrentHeaderCount,
+		&header);
+		if (!NT_SUCCESS(status))
+			goto cleanup;
+
+	Journal->CurrentHeaderCount++;
+	Journal->PayloadRegionOff = payloadOff + alignedSize;
+	Journal->NextSequence = writeSeq + 1;
+	if (Journal->NextSequence == 0)
+		Journal->NextSequence = 1;
+	Journal->TotalRecords++;
+	Journal->Newest100ns = writeTime;
+	if (Journal->TotalRecords == 1)
+	{
+		Journal->OldestHeaderRegionOff = Journal->LastHeaderRegionOff;
+		Journal->OldestHeaderIndex = Journal->CurrentHeaderCount - 1;
+		Journal->Oldest100ns = writeTime;
+	}
+
+	if (WrittenHeader)
+		*WrittenHeader = header;
 
 	status = QHJournalWriteSuperblockLocked(Journal);
 	if (NT_SUCCESS(status))
@@ -935,7 +1082,7 @@ NTSTATUS QHJournalAppend(
 cleanup:
 	if (allocationBase)
 		qhfree(allocationBase);
-	KeReleaseMutex(&Journal->Lock, FALSE);
+	QH_LOCK_RELEASE(&Journal->Lock);
 	return status;
 }
 
@@ -951,10 +1098,10 @@ NTSTATUS QHJournalQueryTimeRange(
 	*OldestTime100ns = 0;
 	*NewestTime100ns = 0;
 
-	KeWaitForSingleObject(&Journal->Lock, Executive, KernelMode, FALSE, NULL);
+	QH_LOCK_ACQUIRE(&Journal->Lock);
 	if (!Journal->Mounted)
 		status = STATUS_DEVICE_NOT_READY;
-	else if (Journal->IndexCount == 0)
+	else if (QHJournalIsEmptyLocked(Journal))
 		status = STATUS_NOT_FOUND;
 	else
 	{
@@ -962,36 +1109,885 @@ NTSTATUS QHJournalQueryTimeRange(
 		*NewestTime100ns = Journal->Newest100ns;
 		status = STATUS_SUCCESS;
 	}
-	KeReleaseMutex(&Journal->Lock, FALSE);
+	QH_LOCK_RELEASE(&Journal->Lock);
 	return status;
 }
 
-ULONG QHJournalFindFirstAfter(
-	_In_ PQH_JOURNAL Journal,
-	_In_ UINT64 TargetTime100ns)
+VOID QHPreviewTreeInitialize(_Out_ PQH_PREVIEW_TREE Tree)
 {
-	ULONG lo = 0;
-	ULONG hi = Journal->IndexCount;
-	PQH_INDEX_MEM_ENTRY base;
-
-	if (Journal->IndexCount == 0 || !Journal->IndexArray)
-		return 0;
-
-	base = Journal->IndexArray + Journal->IndexStart;
-	while (lo < hi)
-	{
-		ULONG mid = lo + (hi - lo) / 2;
-		if (base[mid].WallClock100ns > TargetTime100ns)
-			hi = mid;
-		else
-			lo = mid + 1;
-	}
-	return lo;
+	RtlZeroMemory(Tree, sizeof(*Tree));
 }
 
-NTSTATUS QHJournalBuildPreview(
+static VOID QHPreviewTreeFreeNode(_In_opt_ PQH_PREVIEW_TREE_NODE Node)
+{
+	if (!Node)
+		return;
+	QHPreviewTreeFreeNode(Node->Left);
+	QHPreviewTreeFreeNode(Node->Right);
+	qhfree(Node);
+}
+
+VOID QHPreviewTreeFree(_Inout_ PQH_PREVIEW_TREE Tree)
+{
+	if (!Tree)
+		return;
+	QHPreviewTreeFreeNode(Tree->Root);
+	Tree->Root = NULL;
+	Tree->NodeCount = 0;
+}
+
+static LONG QHPreviewTreeNodeHeight(
+	_In_opt_ PQH_PREVIEW_TREE_NODE Node)
+{
+	return Node ? Node->Height : 0;
+}
+
+static VOID QHPreviewTreeNodeUpdate(
+	_Inout_ PQH_PREVIEW_TREE_NODE Node)
+{
+	LONG hl = QHPreviewTreeNodeHeight(Node->Left);
+	LONG hr = QHPreviewTreeNodeHeight(Node->Right);
+	UINT64 maxEnd = Node->End;
+
+	Node->Height = 1 + (hl > hr ? hl : hr);
+	if (Node->Left && Node->Left->MaxEnd > maxEnd)
+		maxEnd = Node->Left->MaxEnd;
+	if (Node->Right && Node->Right->MaxEnd > maxEnd)
+		maxEnd = Node->Right->MaxEnd;
+	Node->MaxEnd = maxEnd;
+}
+
+static PQH_PREVIEW_TREE_NODE QHPreviewTreeRotateRight(
+	_Inout_ PQH_PREVIEW_TREE_NODE Y)
+{
+	PQH_PREVIEW_TREE_NODE x = Y->Left;
+	PQH_PREVIEW_TREE_NODE t2 = x->Right;
+
+	x->Right = Y;
+	Y->Left = t2;
+	QHPreviewTreeNodeUpdate(Y);
+	QHPreviewTreeNodeUpdate(x);
+	return x;
+}
+
+static PQH_PREVIEW_TREE_NODE QHPreviewTreeRotateLeft(
+	_Inout_ PQH_PREVIEW_TREE_NODE X)
+{
+	PQH_PREVIEW_TREE_NODE y = X->Right;
+	PQH_PREVIEW_TREE_NODE t2 = y->Left;
+
+	y->Left = X;
+	X->Right = t2;
+	QHPreviewTreeNodeUpdate(X);
+	QHPreviewTreeNodeUpdate(y);
+	return y;
+}
+
+static PQH_PREVIEW_TREE_NODE QHPreviewTreeAvlInsertNode(
+	_In_opt_ PQH_PREVIEW_TREE_NODE Root,
+	_In_ PQH_PREVIEW_TREE_NODE Node)
+{
+	LONG balance;
+
+	if (!Root)
+		return Node;
+
+	if (Node->Start < Root->Start)
+		Root->Left = QHPreviewTreeAvlInsertNode(Root->Left, Node);
+	else
+		Root->Right = QHPreviewTreeAvlInsertNode(Root->Right, Node);
+
+	QHPreviewTreeNodeUpdate(Root);
+	balance = QHPreviewTreeNodeHeight(Root->Left) -
+		QHPreviewTreeNodeHeight(Root->Right);
+
+	if (balance > 1 && Node->Start < Root->Left->Start)
+		return QHPreviewTreeRotateRight(Root);
+	if (balance < -1 && Node->Start >= Root->Right->Start)
+		return QHPreviewTreeRotateLeft(Root);
+	if (balance > 1 && Node->Start >= Root->Left->Start)
+	{
+		Root->Left = QHPreviewTreeRotateLeft(Root->Left);
+		return QHPreviewTreeRotateRight(Root);
+	}
+	if (balance < -1 && Node->Start < Root->Right->Start)
+	{
+		Root->Right = QHPreviewTreeRotateRight(Root->Right);
+		return QHPreviewTreeRotateLeft(Root);
+	}
+	return Root;
+}
+
+static NTSTATUS QHPreviewTreeInsertRaw(
+	_Inout_ PQH_PREVIEW_TREE Tree,
+	_In_ const QH_JOURNAL_RECORD_HEADER* Header)
+{
+	PQH_PREVIEW_TREE_NODE node;
+
+	if (!Tree || !Header)
+		return STATUS_INVALID_PARAMETER;
+	if (Header->DataLength == 0)
+		return STATUS_SUCCESS;
+
+	node = (PQH_PREVIEW_TREE_NODE)qhalloc(sizeof(*node));
+	if (!node)
+		return STATUS_INSUFFICIENT_RESOURCES;
+
+	RtlZeroMemory(node, sizeof(*node));
+	node->Start = Header->VolumeOffset;
+	node->End = Header->VolumeOffset + Header->DataLength;
+	node->MaxEnd = node->End;
+	node->FileOffset = Header->FileOffset;
+	node->WallClock100ns = Header->WallClock100ns;
+	node->DataLength = Header->DataLength;
+	node->Sequence = Header->Sequence;
+	node->Height = 1;
+	node->Invalid = FALSE;
+
+	Tree->Root = QHPreviewTreeAvlInsertNode(Tree->Root, node);
+	Tree->NodeCount++;
+	return STATUS_SUCCESS;
+}
+
+// Forward: defined with CollectOverlaps; used by Insert for in-tree dedup.
+static VOID QHPreviewTreeClearMaskByTree(
+	_In_ PQH_PREVIEW_TREE Tree,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_Inout_updates_(DataLength) PUCHAR Mask);
+
+NTSTATUS QHPreviewTreeInsert(
+	_Inout_ PQH_PREVIEW_TREE Tree,
+	_In_ const QH_JOURNAL_RECORD_HEADER* Header)
+{
+	PUCHAR mask = NULL;
+	ULONG len;
+	ULONG idx;
+	ULONG runStart;
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Tree || !Header)
+		return STATUS_INVALID_PARAMETER;
+	if (Header->DataLength == 0)
+		return STATUS_SUCCESS;
+	if (Header->VolumeOffset > MAXUINT64 - Header->DataLength)
+		return STATUS_INVALID_PARAMETER;
+
+	// Empty tree: raw insert.
+	if (!Tree->Root)
+		return QHPreviewTreeInsertRaw(Tree, Header);
+
+	len = Header->DataLength;
+	mask = (PUCHAR)qhalloc(len);
+	if (!mask)
+		return STATUS_INSUFFICIENT_RESOURCES;
+
+	RtlFillMemory(mask, len, 1);
+	QHPreviewTreeClearMaskByTree(
+		Tree,
+		Header->VolumeOffset,
+		len,
+		mask);
+
+	idx = 0;
+	while (idx < len)
+	{
+		while (idx < len && mask[idx] == 0)
+			++idx;
+		if (idx >= len)
+			break;
+		runStart = idx;
+		while (idx < len && mask[idx] != 0)
+			++idx;
+
+		{
+			QH_JOURNAL_RECORD_HEADER frag = *Header;
+			frag.VolumeOffset = Header->VolumeOffset + runStart;
+			frag.FileOffset = Header->FileOffset + runStart;
+			frag.DataLength = idx - runStart;
+			status = QHPreviewTreeInsertRaw(Tree, &frag);
+			if (!NT_SUCCESS(status))
+				break;
+		}
+	}
+
+	qhfree(mask);
+	return status;
+}
+
+static NTSTATUS QHPreviewTreeMergeNode(
+	_Inout_ PQH_PREVIEW_TREE Dest,
+	_In_opt_ PQH_PREVIEW_TREE_NODE Node)
+{
+	QH_JOURNAL_RECORD_HEADER header;
+	NTSTATUS status;
+
+	if (!Node)
+		return STATUS_SUCCESS;
+
+	status = QHPreviewTreeMergeNode(Dest, Node->Left);
+	if (!NT_SUCCESS(status))
+		return status;
+
+	RtlZeroMemory(&header, sizeof(header));
+	header.WallClock100ns = Node->WallClock100ns;
+	header.VolumeOffset = Node->Start;
+	header.FileOffset = Node->FileOffset;
+	header.DataLength = Node->DataLength;
+	header.Sequence = Node->Sequence;
+	status = QHPreviewTreeInsert(Dest, &header);
+	if (!NT_SUCCESS(status))
+		return status;
+
+	return QHPreviewTreeMergeNode(Dest, Node->Right);
+}
+
+NTSTATUS QHPreviewTreeMergeFrom(
+	_Inout_ PQH_PREVIEW_TREE Dest,
+	_Inout_ PQH_PREVIEW_TREE Source)
+{
+	NTSTATUS status;
+
+	if (!Dest || !Source)
+		return STATUS_INVALID_PARAMETER;
+	if (!Source->Root)
+		return STATUS_SUCCESS;
+
+	status = QHPreviewTreeMergeNode(Dest, Source->Root);
+	QHPreviewTreeFree(Source);
+	return status;
+}
+
+static VOID QHPreviewTreePunchByNode(
+	_Inout_ PQH_PREVIEW_TREE HistoryTree,
+	_In_opt_ PQH_PREVIEW_TREE_NODE Node)
+{
+	if (!Node)
+		return;
+
+	QHPreviewTreePunchByNode(HistoryTree, Node->Left);
+	QHPreviewTreeInvalidateRange(
+		HistoryTree,
+		Node->Start,
+		Node->DataLength);
+	QHPreviewTreePunchByNode(HistoryTree, Node->Right);
+}
+
+VOID QHPreviewTreePunchByStaging(
+	_Inout_ PQH_PREVIEW_TREE HistoryTree,
+	_Inout_ PQH_PREVIEW_TREE StagingTree)
+{
+	if (!HistoryTree || !StagingTree)
+		return;
+
+	if (StagingTree->Root)
+		QHPreviewTreePunchByNode(HistoryTree, StagingTree->Root);
+
+	QHPreviewTreeFree(StagingTree);
+}
+
+static VOID QHPreviewTreeInvalidateOverlaps(
+	_In_opt_ PQH_PREVIEW_TREE_NODE Node,
+	_In_ UINT64 CutStart,
+	_In_ UINT64 CutEnd)
+{
+	if (!Node)
+		return;
+	if (Node->MaxEnd <= CutStart)
+		return;
+
+	if (Node->Left)
+		QHPreviewTreeInvalidateOverlaps(Node->Left, CutStart, CutEnd);
+
+	if (!Node->Invalid &&
+		Node->Start < CutEnd &&
+		Node->End > CutStart)
+	{
+		Node->Invalid = TRUE;
+	}
+
+	if (Node->Start < CutEnd && Node->Right)
+		QHPreviewTreeInvalidateOverlaps(Node->Right, CutStart, CutEnd);
+}
+
+VOID QHPreviewTreeInvalidateRange(
+	_Inout_ PQH_PREVIEW_TREE Tree,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength)
+{
+	if (!Tree || !Tree->Root || DataLength == 0 ||
+		VolumeOffset > MAXUINT64 - DataLength)
+	{
+		return;
+	}
+
+	QHPreviewTreeInvalidateOverlaps(
+		Tree->Root,
+		VolumeOffset,
+		VolumeOffset + DataLength);
+}
+
+typedef struct _QH_PREVIEW_HIT
+{
+	PQH_PREVIEW_TREE_NODE Node;
+} QH_PREVIEW_HIT, *PQH_PREVIEW_HIT;
+
+static VOID QHPreviewTreeCollectOverlaps(
+	_In_opt_ PQH_PREVIEW_TREE_NODE Node,
+	_In_ UINT64 QueryStart,
+	_In_ UINT64 QueryEnd,
+	_Inout_updates_(HitCapacity) QH_PREVIEW_HIT* Hits,
+	_Inout_ PULONG HitCount,
+	_In_ ULONG HitCapacity)
+{
+	if (!Node || *HitCount >= HitCapacity)
+		return;
+	if (Node->MaxEnd <= QueryStart)
+		return;
+
+	if (Node->Left)
+		QHPreviewTreeCollectOverlaps(
+			Node->Left,
+			QueryStart,
+			QueryEnd,
+			Hits,
+			HitCount,
+			HitCapacity);
+
+	if (!Node->Invalid &&
+		Node->Start < QueryEnd &&
+		Node->End > QueryStart)
+	{
+		if (*HitCount < HitCapacity)
+		{
+			Hits[*HitCount].Node = Node;
+			(*HitCount)++;
+		}
+	}
+
+	if (Node->Start < QueryEnd && Node->Right)
+		QHPreviewTreeCollectOverlaps(
+			Node->Right,
+			QueryStart,
+			QueryEnd,
+			Hits,
+			HitCount,
+			HitCapacity);
+}
+
+static int QHPreviewHitCompareSequence(
+	_In_ const VOID* A,
+	_In_ const VOID* B)
+{
+	const QH_PREVIEW_HIT* ha = (const QH_PREVIEW_HIT*)A;
+	const QH_PREVIEW_HIT* hb = (const QH_PREVIEW_HIT*)B;
+	if (ha->Node->Sequence < hb->Node->Sequence)
+		return -1;
+	if (ha->Node->Sequence > hb->Node->Sequence)
+		return 1;
+	return 0;
+}
+
+static VOID QHPreviewSortHitsBySequence(
+	_Inout_updates_(Count) PQH_PREVIEW_HIT Hits,
+	_In_ ULONG Count)
+{
+	ULONG i;
+	for (i = 1; i < Count; ++i)
+	{
+		QH_PREVIEW_HIT key = Hits[i];
+		ULONG j = i;
+		while (j > 0 &&
+			QHPreviewHitCompareSequence(&Hits[j - 1], &key) > 0)
+		{
+			Hits[j] = Hits[j - 1];
+			j--;
+		}
+		Hits[j] = key;
+	}
+}
+
+static VOID QHPreviewTreeCollectAllValid(
+	_In_opt_ PQH_PREVIEW_TREE_NODE Node,
+	_Out_writes_(Capacity) PQH_PREVIEW_TREE_NODE* Nodes,
+	_Inout_ PULONG Count,
+	_In_ ULONG Capacity)
+{
+	if (!Node || *Count >= Capacity)
+		return;
+
+	QHPreviewTreeCollectAllValid(Node->Left, Nodes, Count, Capacity);
+	if (!Node->Invalid && *Count < Capacity)
+	{
+		Nodes[*Count] = Node;
+		(*Count)++;
+	}
+	QHPreviewTreeCollectAllValid(Node->Right, Nodes, Count, Capacity);
+}
+
+static int QHPreviewHeaderCompareSequence(
+	_In_ const QH_JOURNAL_RECORD_HEADER* A,
+	_In_ const QH_JOURNAL_RECORD_HEADER* B)
+{
+	if (A->Sequence < B->Sequence)
+		return -1;
+	if (A->Sequence > B->Sequence)
+		return 1;
+	return 0;
+}
+
+static VOID QHPreviewSortHeadersBySequence(
+	_Inout_updates_(Count) QH_JOURNAL_RECORD_HEADER* Headers,
+	_In_ ULONG Count)
+{
+	ULONG i;
+	for (i = 1; i < Count; ++i)
+	{
+		QH_JOURNAL_RECORD_HEADER key = Headers[i];
+		ULONG j = i;
+		while (j > 0 &&
+			QHPreviewHeaderCompareSequence(&Headers[j - 1], &key) > 0)
+		{
+			Headers[j] = Headers[j - 1];
+			--j;
+		}
+		Headers[j] = key;
+	}
+}
+
+static VOID QHPreviewTreeClearMaskByTree(
+	_In_ PQH_PREVIEW_TREE Tree,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_Inout_updates_(DataLength) PUCHAR Mask)
+{
+	QH_PREVIEW_HIT* hits = NULL;
+	ULONG hitCount = 0;
+	ULONG hitCapacity;
+	ULONG i;
+
+	if (!Tree || !Tree->Root || !Mask || DataLength == 0)
+		return;
+
+	hitCapacity = Tree->NodeCount ? Tree->NodeCount : 1;
+	hits = (QH_PREVIEW_HIT*)qhalloc(sizeof(QH_PREVIEW_HIT) * hitCapacity);
+	if (!hits)
+		return;
+
+	QHPreviewTreeCollectOverlaps(
+		Tree->Root,
+		VolumeOffset,
+		VolumeOffset + DataLength,
+		hits,
+		&hitCount,
+		hitCapacity);
+
+	for (i = 0; i < hitCount; ++i)
+	{
+		PQH_PREVIEW_TREE_NODE node = hits[i].Node;
+		UINT64 o0 = node->Start > VolumeOffset ? node->Start : VolumeOffset;
+		UINT64 o1 = node->End < (VolumeOffset + DataLength) ?
+			node->End : (VolumeOffset + DataLength);
+		UINT64 b;
+		for (b = o0; b < o1; ++b)
+			Mask[(ULONG)(b - VolumeOffset)] = 0;
+	}
+
+	qhfree(hits);
+}
+
+NTSTATUS QHPreviewTreeDedupEarliest(
+	_Inout_ PQH_PREVIEW_TREE Tree)
+{
+	PQH_PREVIEW_TREE_NODE* nodes = NULL;
+	QH_JOURNAL_RECORD_HEADER* headers = NULL;
+	ULONG count = 0;
+	ULONG capacity;
+	ULONG i;
+	NTSTATUS status = STATUS_SUCCESS;
+	QH_PREVIEW_TREE rebuilt;
+
+	if (!Tree)
+		return STATUS_INVALID_PARAMETER;
+	if (!Tree->Root || Tree->NodeCount == 0)
+		return STATUS_SUCCESS;
+
+	capacity = Tree->NodeCount;
+	nodes = (PQH_PREVIEW_TREE_NODE*)qhalloc(
+		sizeof(PQH_PREVIEW_TREE_NODE) * capacity);
+	headers = (QH_JOURNAL_RECORD_HEADER*)qhalloc(
+		sizeof(QH_JOURNAL_RECORD_HEADER) * capacity);
+	if (!nodes || !headers)
+		{
+			status = STATUS_INSUFFICIENT_RESOURCES;
+			goto cleanup;
+		}
+
+	QHPreviewTreeCollectAllValid(Tree->Root, nodes, &count, capacity);
+	for (i = 0; i < count; ++i)
+	{
+		RtlZeroMemory(&headers[i], sizeof(headers[i]));
+		headers[i].WallClock100ns = nodes[i]->WallClock100ns;
+		headers[i].VolumeOffset = nodes[i]->Start;
+		headers[i].FileOffset = nodes[i]->FileOffset;
+		headers[i].DataLength = nodes[i]->DataLength;
+		headers[i].Sequence = nodes[i]->Sequence;
+	}
+
+	// Drop old tree (including Invalid nodes) before rebuilding.
+	QHPreviewTreeFree(Tree);
+	QHPreviewTreeInitialize(&rebuilt);
+
+	QHPreviewSortHeadersBySequence(headers, count);
+
+	for (i = 0; i < count; ++i)
+	{
+		PUCHAR mask = NULL;
+		ULONG len = headers[i].DataLength;
+		ULONG idx;
+		ULONG runStart;
+
+		if (len == 0)
+			continue;
+
+		mask = (PUCHAR)qhalloc(len);
+		if (!mask)
+		{
+			status = STATUS_INSUFFICIENT_RESOURCES;
+			QHPreviewTreeFree(&rebuilt);
+			goto cleanup;
+		}
+		RtlFillMemory(mask, len, 1);
+		QHPreviewTreeClearMaskByTree(
+			&rebuilt,
+			headers[i].VolumeOffset,
+			len,
+			mask);
+
+		idx = 0;
+		while (idx < len)
+		{
+			while (idx < len && mask[idx] == 0)
+				++idx;
+			if (idx >= len)
+				break;
+			runStart = idx;
+			while (idx < len && mask[idx] != 0)
+				++idx;
+
+			{
+				QH_JOURNAL_RECORD_HEADER frag = headers[i];
+				frag.VolumeOffset =
+					headers[i].VolumeOffset + runStart;
+				frag.FileOffset =
+					headers[i].FileOffset + runStart;
+				frag.DataLength = idx - runStart;
+				status = QHPreviewTreeInsertRaw(&rebuilt, &frag);
+		if (!NT_SUCCESS(status))
+				{
+					qhfree(mask);
+					QHPreviewTreeFree(&rebuilt);
+			goto cleanup;
+				}
+			}
+		}
+		qhfree(mask);
+	}
+
+	*Tree = rebuilt;
+
+	if (NT_SUCCESS(status))
+		status = QHPreviewTreeCoalesceAdjacent(Tree);
+
+cleanup:
+	if (nodes)
+		qhfree(nodes);
+	if (headers)
+		qhfree(headers);
+	return status;
+}
+
+NTSTATUS QHPreviewTreeCoalesceAdjacent(
+	_Inout_ PQH_PREVIEW_TREE Tree)
+{
+	PQH_PREVIEW_TREE_NODE* nodes = NULL;
+	QH_JOURNAL_RECORD_HEADER* headers = NULL;
+	ULONG count = 0;
+	ULONG capacity;
+	ULONG i;
+	ULONG outCount = 0;
+	NTSTATUS status = STATUS_SUCCESS;
+	QH_PREVIEW_TREE rebuilt;
+
+	if (!Tree)
+		return STATUS_INVALID_PARAMETER;
+	if (!Tree->Root || Tree->NodeCount == 0)
+		return STATUS_SUCCESS;
+
+	capacity = Tree->NodeCount;
+	nodes = (PQH_PREVIEW_TREE_NODE*)qhalloc(
+		sizeof(PQH_PREVIEW_TREE_NODE) * capacity);
+	headers = (QH_JOURNAL_RECORD_HEADER*)qhalloc(
+		sizeof(QH_JOURNAL_RECORD_HEADER) * capacity);
+	if (!nodes || !headers)
+	{
+		status = STATUS_INSUFFICIENT_RESOURCES;
+		goto cleanup;
+	}
+
+	QHPreviewTreeCollectAllValid(Tree->Root, nodes, &count, capacity);
+	if (count <= 1)
+		goto cleanup;
+
+	for (i = 0; i < count; ++i)
+	{
+		RtlZeroMemory(&headers[i], sizeof(headers[i]));
+		headers[i].WallClock100ns = nodes[i]->WallClock100ns;
+		headers[i].VolumeOffset = nodes[i]->Start;
+		headers[i].FileOffset = nodes[i]->FileOffset;
+		headers[i].DataLength = nodes[i]->DataLength;
+		headers[i].Sequence = nodes[i]->Sequence;
+	}
+
+	// Sort by volume offset.
+	for (i = 1; i < count; ++i)
+	{
+		QH_JOURNAL_RECORD_HEADER key = headers[i];
+		ULONG j = i;
+		while (j > 0 &&
+			headers[j - 1].VolumeOffset > key.VolumeOffset)
+		{
+			headers[j] = headers[j - 1];
+			--j;
+		}
+		headers[j] = key;
+	}
+
+	outCount = 0;
+	for (i = 0; i < count; ++i)
+	{
+		QH_JOURNAL_RECORD_HEADER* cur = &headers[i];
+		QH_JOURNAL_RECORD_HEADER* prev;
+
+		if (cur->DataLength == 0)
+			continue;
+		if (outCount == 0)
+		{
+			headers[outCount++] = *cur;
+			continue;
+		}
+
+		prev = &headers[outCount - 1];
+		if (prev->VolumeOffset + prev->DataLength == cur->VolumeOffset &&
+			prev->FileOffset + prev->DataLength == cur->FileOffset &&
+			prev->DataLength <= MAXULONG - cur->DataLength)
+		{
+			// Contiguous on volume and in journal payload: merge.
+			if (cur->Sequence < prev->Sequence)
+			{
+				prev->Sequence = cur->Sequence;
+				prev->WallClock100ns = cur->WallClock100ns;
+			}
+			prev->DataLength += cur->DataLength;
+		}
+		else
+		{
+			headers[outCount++] = *cur;
+		}
+	}
+
+	QHPreviewTreeFree(Tree);
+	QHPreviewTreeInitialize(&rebuilt);
+	for (i = 0; i < outCount; ++i)
+	{
+		status = QHPreviewTreeInsertRaw(&rebuilt, &headers[i]);
+		if (!NT_SUCCESS(status))
+		{
+			QHPreviewTreeFree(&rebuilt);
+			goto cleanup;
+		}
+	}
+	*Tree = rebuilt;
+
+cleanup:
+	if (nodes)
+		qhfree(nodes);
+	if (headers)
+		qhfree(headers);
+	return status;
+}
+
+NTSTATUS QHJournalBuildPreviewTree(
 	_Inout_ PQH_JOURNAL Journal,
 	_In_ UINT64 TargetTime100ns,
+	_In_ ULONG MaxSequence,
+	_Out_ PQH_PREVIEW_TREE Tree)
+{
+	NTSTATUS status = STATUS_SUCCESS;
+	UINT64 regionOff;
+	ULONG guardRegions = 0;
+	BOOLEAN stop = FALSE;
+	QH_JOURNAL_RECORD_HEADER* headers = NULL;
+	ULONG headerCount = 0;
+	ULONG headerCapacity = 0;
+	ULONG i;
+
+	if (!Tree)
+		return STATUS_INVALID_PARAMETER;
+
+	QHPreviewTreeInitialize(Tree);
+
+	QH_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup_locked;
+	}
+	if (QHJournalIsEmptyLocked(Journal) ||
+		TargetTime100ns >= Journal->Newest100ns)
+	{
+		status = STATUS_SUCCESS;
+		goto cleanup_locked;
+	}
+	if (TargetTime100ns < Journal->Oldest100ns)
+	{
+		status = STATUS_NOT_FOUND;
+		goto cleanup_locked;
+	}
+
+	regionOff = Journal->LastHeaderRegionOff;
+	for (;;)
+	{
+		QH_HEADER_REGION_LINK link;
+		ULONG limit;
+		LONG index;
+		BOOLEAN isLast;
+		BOOLEAN isOldest;
+
+		if (++guardRegions > 100000UL)
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup_locked;
+		}
+
+		status = QHJournalReadRegionLink(Journal, regionOff, &link);
+		if (!NT_SUCCESS(status) || link.Marker != QH_JOURNAL_HEADER_LINK_MARK)
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup_locked;
+		}
+
+		isLast = (regionOff == Journal->LastHeaderRegionOff);
+		isOldest = (regionOff == Journal->OldestHeaderRegionOff);
+		limit = isLast ?
+			Journal->CurrentHeaderCount : QH_JOURNAL_HEADERS_PER_REGION;
+
+		for (index = (LONG)limit - 1; index >= 0; --index)
+		{
+			QH_JOURNAL_RECORD_HEADER header;
+			ULONG startIndex = isOldest ? Journal->OldestHeaderIndex : 0;
+
+			if ((ULONG)index < startIndex)
+				break;
+
+			status = QHJournalReadHeaderAt(
+				Journal,
+				regionOff,
+				(ULONG)index,
+				&header);
+			if (!NT_SUCCESS(status))
+				goto cleanup_locked;
+
+			if (header.DataLength == 0 ||
+				header.DataLength > QH_JOURNAL_MAX_RECORD_DATA ||
+				header.VolumeOffset > MAXUINT64 - header.DataLength)
+			{
+				continue;
+			}
+
+			if (header.Sequence >= MaxSequence)
+				continue;
+
+			if (header.WallClock100ns <= TargetTime100ns)
+			{
+				stop = TRUE;
+				break;
+			}
+
+			if (headerCount >= headerCapacity)
+			{
+				ULONG newCap = headerCapacity ? headerCapacity * 2UL : 256UL;
+				QH_JOURNAL_RECORD_HEADER* grown;
+
+				if (newCap < headerCount + 1)
+					newCap = headerCount + 1;
+				grown = (QH_JOURNAL_RECORD_HEADER*)qhalloc(
+					sizeof(QH_JOURNAL_RECORD_HEADER) * newCap);
+				if (!grown)
+				{
+					status = STATUS_INSUFFICIENT_RESOURCES;
+					goto cleanup_locked;
+				}
+				if (headers)
+				{
+	RtlCopyMemory(
+						grown,
+						headers,
+						sizeof(QH_JOURNAL_RECORD_HEADER) * headerCount);
+					qhfree(headers);
+				}
+				headers = grown;
+				headerCapacity = newCap;
+			}
+
+			headers[headerCount++] = header;
+		}
+
+		if (stop)
+			break;
+		if (isOldest)
+			break;
+		if (link.PrevRegionOff == regionOff)
+			break;
+		regionOff = link.PrevRegionOff;
+	}
+
+	status = STATUS_SUCCESS;
+
+cleanup_locked:
+	QH_LOCK_RELEASE(&Journal->Lock);
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+
+	// Insert oldest Sequence first; Insert skips already-covered bytes so the
+	// tree never holds overlapping intervals (Preview + Recovery share this).
+	if (headerCount > 0)
+	{
+		QHPreviewSortHeadersBySequence(headers, headerCount);
+		for (i = 0; i < headerCount; ++i)
+		{
+			status = QHPreviewTreeInsert(Tree, &headers[i]);
+			if (!NT_SUCCESS(status))
+			{
+				QHPreviewTreeFree(Tree);
+				break;
+			}
+		}
+		if (NT_SUCCESS(status))
+			status = QHPreviewTreeCoalesceAdjacent(Tree);
+		if (!NT_SUCCESS(status))
+			QHPreviewTreeFree(Tree);
+	}
+
+cleanup:
+	if (headers)
+		qhfree(headers);
+	return status;
+}
+
+NTSTATUS QHJournalApplyPreviewTree(
+	_Inout_ PQH_JOURNAL Journal,
+	_In_ PQH_PREVIEW_TREE Tree,
 	_In_ UINT64 VolumeOffset,
 	_In_ ULONG DataLength,
 	_Out_writes_bytes_(DataLength) PVOID Buffer,
@@ -999,11 +1995,13 @@ NTSTATUS QHJournalBuildPreview(
 	_Out_ PULONG CoveredCount)
 {
 	NTSTATUS status = STATUS_SUCCESS;
+	PQH_PREVIEW_HIT hits = NULL;
+	ULONG hitCount = 0;
+	ULONG hitCapacity;
 	ULONG covered = 0;
-	ULONG slot;
-	ULONG startSlot;
+	ULONG i;
 
-	if (!Buffer || !CoveredMask || !CoveredCount || DataLength == 0 ||
+	if (!Tree || !Buffer || !CoveredMask || !CoveredCount || DataLength == 0 ||
 		VolumeOffset > MAXUINT64 - DataLength)
 	{
 		return STATUS_INVALID_PARAMETER;
@@ -1012,109 +2010,64 @@ NTSTATUS QHJournalBuildPreview(
 	*CoveredCount = 0;
 	RtlZeroMemory(CoveredMask, DataLength);
 
-	KeWaitForSingleObject(&Journal->Lock, Executive, KernelMode, FALSE, NULL);
+	if (!Tree->Root || Tree->NodeCount == 0)
+		return STATUS_SUCCESS;
+
+	hitCapacity = Tree->NodeCount;
+	hits = (PQH_PREVIEW_HIT)qhalloc(sizeof(QH_PREVIEW_HIT) * hitCapacity);
+	if (!hits)
+		return STATUS_INSUFFICIENT_RESOURCES;
+
 	if (!Journal->Mounted)
 	{
 		status = STATUS_DEVICE_NOT_READY;
 		goto cleanup;
 	}
-	if (Journal->IndexCount == 0)
-	{
-		// Empty journal: caller fills everything from the live volume.
-		status = STATUS_SUCCESS;
-		goto cleanup;
-	}
-	if (TargetTime100ns < Journal->Oldest100ns)
-	{
-		status = STATUS_NOT_FOUND;
-		goto cleanup;
-	}
-	if (TargetTime100ns >= Journal->Newest100ns)
-	{
-		// No write after T: caller fills everything from the live volume.
-		status = STATUS_SUCCESS;
-		goto cleanup;
-	}
 
-	// Binary search to the first record after T, then scan forward.
-	// VolumeOffset/DataLength in the memory index skip non-overlapping
-	// records without touching the journal disk.
-	startSlot = QHJournalFindFirstAfter(Journal, TargetTime100ns);
-	for (slot = startSlot;
-		slot < Journal->IndexCount && covered < DataLength;
-		++slot)
+	QHPreviewTreeCollectOverlaps(
+		Tree->Root,
+		VolumeOffset,
+		VolumeOffset + DataLength,
+		hits,
+		&hitCount,
+		hitCapacity);
+	QHPreviewSortHitsBySequence(hits, hitCount);
+
+	for (i = 0; i < hitCount && covered < DataLength; ++i)
 	{
-		PQH_INDEX_MEM_ENTRY entry =
-			&Journal->IndexArray[Journal->IndexStart + slot];
-		PVOID recordBase = NULL;
-		PUCHAR record;
-		PUCHAR beforeImage;
-		PQH_JOURNAL_RECORD_HEADER header;
+		PQH_PREVIEW_TREE_NODE node = hits[i].Node;
+		PVOID payloadBase = NULL;
+		PUCHAR payload;
+		UINT64 alignedSize;
 		UINT64 overlapStart;
 		UINT64 overlapEnd;
 		UINT64 byteOffset;
-		ULONG recordSize;
 
-		if (entry->DataLength == 0 ||
-			entry->DataLength > QH_JOURNAL_MAX_RECORD_DATA ||
-			entry->VolumeOffset > MAXUINT64 - entry->DataLength ||
-			entry->VolumeOffset >= VolumeOffset + DataLength ||
-			VolumeOffset >= entry->VolumeOffset + entry->DataLength)
-		{
-			continue;
-		}
-
-		recordSize = (ULONG)QHAlignUp64(
-			sizeof(QH_JOURNAL_RECORD_HEADER) + (UINT64)entry->DataLength,
-			Journal->SectorSize);
-		record = (PUCHAR)QHAllocateAligned(
-			Journal->TargetDevice,
-			recordSize,
-			&recordBase);
-		if (!record)
+		alignedSize = QHAlignUp64(node->DataLength, Journal->SectorSize);
+		payload = (PUCHAR)QHAllocateAligned(Journal,
+			(SIZE_T)alignedSize,
+			&payloadBase);
+		if (!payload)
 		{
 			status = STATUS_INSUFFICIENT_RESOURCES;
 			goto cleanup;
 		}
 
-		status = QHJournalRawIo(
-			Journal,
+	status = QHJournalRawIo(
+		Journal,
 			IRP_MJ_READ,
-			Journal->LogOffset + entry->LogRingOffset,
-			recordSize,
-			record);
-		if (!NT_SUCCESS(status))
+			node->FileOffset,
+			(ULONG)alignedSize,
+			payload);
+	if (!NT_SUCCESS(status))
 		{
-			qhfree(recordBase);
-			goto cleanup;
+			qhfree(payloadBase);
+		goto cleanup;
 		}
 
-		header = (PQH_JOURNAL_RECORD_HEADER)record;
-		beforeImage = record + sizeof(*header);
-		if (header->Magic != QH_JOURNAL_RECORD_MAGIC ||
-			header->Sequence != entry->Sequence ||
-			header->DataLength != entry->DataLength ||
-			header->VolumeOffset != entry->VolumeOffset ||
-			QHCrc32c(
-				0,
-				header,
-				FIELD_OFFSET(QH_JOURNAL_RECORD_HEADER, HeaderCrc32c)) !=
-				header->HeaderCrc32c ||
-			QHCrc32c(0, beforeImage, header->DataLength) !=
-				header->DataCrc32c)
-		{
-			qhfree(recordBase);
-			status = STATUS_DISK_CORRUPT_ERROR;
-			goto cleanup;
-		}
-
-		overlapStart = header->VolumeOffset > VolumeOffset ?
-			header->VolumeOffset : VolumeOffset;
-		overlapEnd =
-			(header->VolumeOffset + header->DataLength) <
-			(VolumeOffset + DataLength) ?
-			(header->VolumeOffset + header->DataLength) :
-			(VolumeOffset + DataLength);
+		overlapStart = node->Start > VolumeOffset ? node->Start : VolumeOffset;
+		overlapEnd = node->End < (VolumeOffset + DataLength) ?
+			node->End : (VolumeOffset + DataLength);
 
 		for (byteOffset = overlapStart; byteOffset < overlapEnd; ++byteOffset)
 		{
@@ -1122,28 +2075,67 @@ NTSTATUS QHJournalBuildPreview(
 			if (!CoveredMask[outputIndex])
 			{
 				((PUCHAR)Buffer)[outputIndex] =
-					beforeImage[byteOffset - header->VolumeOffset];
+					payload[byteOffset - node->Start];
 				CoveredMask[outputIndex] = 1;
 				covered++;
 			}
 		}
-		qhfree(recordBase);
+		qhfree(payloadBase);
 	}
 
 	*CoveredCount = covered;
 
 cleanup:
-	KeReleaseMutex(&Journal->Lock, FALSE);
+	if (hits)
+		qhfree(hits);
+	return status;
+}
+
+NTSTATUS QHJournalReadPayload(
+	_Inout_ PQH_JOURNAL Journal,
+	_In_ UINT64 FileOffset,
+	_In_ ULONG DataLength,
+	_Out_writes_bytes_(DataLength) PVOID Buffer)
+{
+	UINT64 alignedSize;
+	PVOID allocationBase = NULL;
+	PUCHAR payload;
+	NTSTATUS status;
+
+	if (!Journal || !Journal->Mounted || !Buffer ||
+		DataLength == 0 || DataLength > QH_JOURNAL_MAX_RECORD_DATA)
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+
+	alignedSize = QHAlignUp64(DataLength, Journal->SectorSize);
+	payload = (PUCHAR)QHAllocateAligned(Journal,
+		(SIZE_T)alignedSize,
+		&allocationBase);
+	if (!payload)
+		return STATUS_INSUFFICIENT_RESOURCES;
+
+	status = QHJournalRawIo(
+		Journal,
+		IRP_MJ_READ,
+		FileOffset,
+		(ULONG)alignedSize,
+		payload);
+	if (NT_SUCCESS(status))
+		RtlCopyMemory(Buffer, payload, DataLength);
+
+		qhfree(allocationBase);
 	return status;
 }
 
 VOID QHJournalClose(_Inout_ PQH_JOURNAL Journal)
 {
-	KeWaitForSingleObject(&Journal->Lock, Executive, KernelMode, FALSE, NULL);
+	QH_LOCK_ACQUIRE(&Journal->Lock);
 	if (Journal->Mounted)
 		(VOID)QHJournalWriteSuperblockLocked(Journal);
 	Journal->Mounted = FALSE;
 	Journal->TargetDevice = NULL;
-	QHIndexFree(Journal);
-	KeReleaseMutex(&Journal->Lock, FALSE);
+	Journal->Store = NULL;
+	QH_LOCK_RELEASE(&Journal->Lock);
+	QH_LOCK_DELETE(&Journal->Lock);
 }

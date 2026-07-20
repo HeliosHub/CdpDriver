@@ -1,248 +1,165 @@
-[英文版](ARCHITECTURE_EN.md)
-
----
-
 # 架构设计
 
 ## 概述
-本项目是一个基于 Windows 卷过滤框架的系统重启还原驱动。通过对目标卷的写操作进行重定向，将所有修改写入空闲扇区，重启后这些修改自然丢弃，从而实现系统还原。
 
-当前仅支持 NTFS 分区，已在 Win10/11 环境验证。配套 MFC 用户态管理程序 `QHEngineUI` 提供一键安装/开启/关闭保护。
+本项目是一个 Windows **卷过滤驱动**，对受保护卷的写入做 **Copy-on-Write（写前镜像）**：每次写操作先把被覆盖的旧数据追加到独立的 **CDP/Journal 分区**，再把原始写透传到下层设备。磁盘上始终是最新数据；历史 before-image 留在 journal 中，用于：
 
-## 核心设计思想
+- **Preview**：按时间点只读重建历史视图
+- **Recovery**：按时间点拦截读，对外呈现恢复目标时刻的数据
 
-**为什么选择卷过滤而非文件过滤**
+配套工具：
 
-文件过滤驱动（minifilter）只能拦截文件级别的操作。卷过滤驱动位于文件系统下层，可拦截所有对卷的块级写入，包括 NTFS 元数据（如 `$Bitmap`、`$MFT` 等）的修改。在还原场景下，卷过滤能提供更完整的保护——所有写入操作都被重定向，重启后原始数据完整无损。
+| 组件 | 作用 |
+|------|------|
+| `QHConsole` | 安装/注册驱动、配置捕获（CMD1/2）、卷句柄读写（CMD3–5）、Preview、查询 journal 时间范围 |
+| `SysRestoreCore` | 用户态库：内存模拟源卷+journal，单测 COW/Preview/Recovery（见 `SysRestoreCore/README.md`） |
 
-**为什么不需要自己维护空闲位图**
-
-`$Bitmap` 是 NTFS 用于记录卷中每个簇分配状态的文件。在卷过滤驱动下，对 `$Bitmap` 的任何写入也会被重定向。因此，驱动启动时从磁盘读到的 `$Bitmap` 永远是"保护开启时刻的快照"，可以直接用它来识别空闲扇区作为重定向目标。
+当前 journal 磁盘格式版本为 **v6**（2MB 头区 + 负载区交替）。旧版 journal 分区需重新 Format。
 
 ## 驱动在设备栈中的位置
-文件系统驱动
+
+```
+文件系统驱动 (NTFS 等)
 |
-本驱动（卷过滤层）
+本驱动（Volume Upper Filter）
 |
 卷设备
 |
 磁盘驱动
+```
 
-## 关键设计决策与方案演变
+写路径：`IRP_MJ_WRITE` →（若 `CaptureEnabled`）排队到捕获工作线程 → 读 before-image → `QHJournalAppend` → 同步转发原写。  
+读路径：默认透传；仅在 **Recovery** 阶段对非分页读做历史合成。
 
-### 1. 位图管理的简化
+## 核心设计思想
 
-**最初想法**：自己维护一个位图来记录空扇区状态。200GB 的 C 盘需约 35MB 位图，更大容量会导致内存压力，因此计划将位图存储在磁盘扇区中。
+### 为什么用 COW Journal，而不是写重定向
 
-**最终方案**：完全放弃自己维护位图。因为卷过滤驱动会重定向所有写入（包括 `$Bitmap` 的修改），所以 `$Bitmap` 在原始磁盘上永远保持保护开启时的状态。驱动启动时从磁盘解析 `$Bitmap` 得到簇级占用信息，再展开为扇区级位图存于内存。
+早期方案曾把写入重定向到空闲扇区，靠“重启丢弃映射”做还原。当前实现改为：
 
-**变化原因**：`$Bitmap` 本身就是天然的空扇区索引，自己维护是重复劳动。
+1. **受保护卷上的数据始终是最新的**——文件系统与应用看到真实落盘内容，无需维护 `$Bitmap` / 扇区映射表。
+2. **历史保存在独立分区**——容量、寿命与受保护卷解耦；journal 满时可丢弃最旧记录（环式推进 header region）。
+3. **可按时间点回溯**——Preview / Recovery 基于 wall-clock + sequence，而不是“仅重启还原”。
 
-### 1.1 位图实现
+## 卷工作阶段（Phase）
 
-扇区级位图基于 Windows 内核 `RTL_BITMAP` 做一层薄包装 `QH_BITMAP`，创建时按 `SizeOfBitMap` 一次性分配整块缓冲区。
+每个源卷 `QH_DEVICE_EXTENSION.Phase`：
 
-**选用 RTL_BITMAP 的理由**：
-- **代码量小**：`Create/Set/Test/FindNextClear` 全部直接转发给 `RtlSetBit` / `RtlClearBit` / `RtlCheckBit` / `RtlFindClearBits`，其中 `RtlFindClearBits` 自带 wrap-around 语义，省掉了上层"找不到再扫一次"的二次搜索逻辑
-- **足够的容量上限**:`RTL_BITMAP` 用 `ULONG` 索引，单张位图上限 ~4G 位(512B 扇区下约 2TB 卷，4KB 扇区下约 16TB)，覆盖绝大多数系统盘 + 数据盘场景。若未来需要支持更大卷，可在 `QH_BITMAP` 层内部再加稀疏分槽，上层接口保持不变
-- **依赖标准内核 API**：`RTL_BITMAP` 是 Microsoft 公开内核 API，行为有官方文档保证，无需自行验证位操作算法的正确性与稳定性
+| 值 | 宏 | 行为 |
+|----|-----|------|
+| 0 | `QH_PHASE_NORMAL` | COW 捕获（若已 CMD1）；读透传 |
+| 1 | `QH_PHASE_PREVIEW` | 同 Normal 的写捕获；允许 Preview IOCTL |
+| 2 | `QH_PHASE_RECOVERY` | 写仍 COW；`IRP_MJ_READ`（非分页）合成恢复时刻数据 |
 
-**内存代价**：一次性分配整块缓冲区意味着 1TB 卷的 `SectorBitmap` 约 256MB 内存。目标场景（系统盘 + 数据盘）很少超过 2TB，可接受。
+约束：
 
-### 2. 重定向映射表的数据结构选择
+- **全局同时只能有一个 Preview 会话**；`BEGIN_PREVIEW` 要求当前为 Normal，成功后进入 Preview。
+- **Recovery 只能从 Normal 进入**；存在 Preview 会话时拒绝 `BEGIN_RECOVERY`。
+- **`END_RECOVERY` / `END_PREVIEW` 后进入 Normal**。
 
-**最初想法**：使用 Windows 内核提供的 `RTL_DYNAMIC_HASH_TABLE`，利用其 O(1) 查找性能。
+## Journal 布局（v6）
 
-**演变过程**：
-- 尝试引入开源的 `khashl` 哈希表库到内核态
-- 发现 `khashl` 在内核环境下不稳定
-- 最终使用 `RTL_GENERIC_TABLE`（基于 Splay 树）作为过渡方案
+独立 CDP 分区采用 **2MB 记录头区 + 对应负载区** 交替排列：
 
-**最终方案**：当前版本使用 `RTL_GENERIC_TABLE` 存储扇区偏移映射，查找复杂度为 O(log N)。未来计划在稳定后自行实现更高效的哈希表。
+```
++------------------+  扇区 0
+| Superblock 主    |
++------------------+
+| HeaderRegion 0   |  2MB（密排 32B 记录头 + 尾部 RegionLink）
+| Payload 0        |  本区内记录的 before-image（紧随其后追加）
++------------------+
+| HeaderRegion 1   |  2MB
+| Payload 1        |
++------------------+
+| …                |
+| HeaderRegion n   |  2MB
+| Payload n        |
++------------------+
+| Superblock 备    |  分区末扇区
++------------------+
+```
 
-**变化原因**：稳定性优先于性能。`RTL_GENERIC_TABLE` 是微软官方支持的内核数据结构，可靠性有保障。
+- **只有当前 2MB Header 槽用尽**时，才在 `PayloadRegionOff`（或回绕到可用区起点）新开一对 `Header[2MB]+Payload`。
+- **Payload 写到分区尾不够**：写游标绕回可用区起点，**不**新开 Header；空间仍不够则丢弃最旧记录腾地方。
+- 记录头里的 `FileOffset` 指向该条 payload 的绝对偏移。
+- Header 区间用 `RegionLink`（Prev/Next）串成链，Mount / Preview 扫描 / 丢弃最旧记录时使用。
 
-### 3. 映射粒度的调整
+Version = **6**。旧版 journal 需重新 Format。
 
-**最初想法**：以簇为单位建立映射（偏移簇 → 重定向簇）。
+### Superblock
 
-**最终方案**：以扇区为单位建立映射（偏移扇区 → 重定向扇区）。
+| 字段 | 含义 |
+|------|------|
+| `LastHeaderRegionOff` | 最新 2MB Header 区起点 |
+| `PayloadRegionOff` | 当前 Payload 区下一写位置 |
 
-**变化原因**：簇级映射在簇内只有部分扇区被使用时需要"读原簇 → 改写 → 写新簇"，多一次 IO，性能直接减半。扇区级映射则能精确匹配 IRP 范围，避免无谓的拷贝。
+### 记录头（32 字节）
 
-### 4. 文件删除导致重定向空间耗尽的问题
+| 字段 | 含义 |
+|------|------|
+| `WallClock100ns` | 写入时刻 |
+| `VolumeOffset` | 源卷字节偏移 |
+| `FileOffset` | journal 内 payload 绝对偏移 |
+| `DataLength` | before-image 长度 |
+| `Sequence` | 单调递增序号 |
 
-**问题描述**：
+## Preview / Recovery 区间树
 
-保护开启时，有空闲簇 Z。原始扇区 X 被写入，驱动将其重定向到 Z（X → Z）。之后文件系统认为 Z 空闲，将 Z 分配给新文件。新文件写入 Z 时，驱动不得不再次重定向（Z → W）。当该文件被删除，`$Bitmap`（重定向视图）将 Z 标记为空闲，但驱动无法感知这一变化，Z 仍然作为 X 的重定向目标被占用。
+按 `VolumeOffset`（`Start`）排序的 **AVL 区间树**，节点维护 `MaxEnd` 做重叠剪枝；插入/查找 O(log n)。构建时按 Sequence 升序去重插入，并合并卷/payload 均连续的相邻区间。
 
-如果用户频繁删除大文件，会导致大量扇区被驱动"锁定"而无法回收，最终耗尽重定向空间。
+## Preview：时间点只读视图
 
-**当前决策：暂不处理**
+1. **BEGIN**：校验源卷 Phase=Normal、全局无其他 Preview；CAS 进入 Preview；冻结 `SnapshotMaxSequence`；扫 journal 收集匹配 header，按 Sequence 升序插入并去重；再合并卷/payload 均连续的相邻区间；构建期间并发 COW 写入 StagingTree，结束后 Merge（Insert 去重）+ Dedup/Coalesce。
+2. **READ**：区间树重叠查询；同字节取最早 `Sequence`；未覆盖空缺用当前卷 live 数据填充。全程持有源卷 `HistoryMutex`，与 COW 捕获互斥。
+3. **END**：销毁会话，Phase → Normal。
 
-理由：
-- 重定向空间耗尽的前提是用户对**已存在的、被重定向保护的数据**进行大量修改，同时配合大量文件删除。在真实使用场景中，保护状态下的写入量通常是有限的
-- 处理此问题需要编写额外的 minifilter 驱动，引入跨驱动通信，增加系统复杂度和不稳定性风险
-- 若保护的是 50GB 磁盘，使用了 30GB，则只需对这 30GB 数据的修改进行重定向。写入空闲扇区的操作直接放行，不产生重定向映射
+## Recovery：HistoryTree 回填 + 无效标记
 
-这是当前版本的已知限制，未来如有必要，将通过 minifilter 拦截文件删除事件来解决。
+1. **BEGIN**：冻结 `SnapshotMaxSequence`；扫 journal 收集匹配 header；按 Sequence 升序插入并去重；**合并连续区间**（卷偏移与 journal payload 均相邻）。构建期间并发新写只记入 StagingTree。结束后 PunchByStaging，再 DedupEarliest（含 Coalesce）丢掉 Invalid。
+2. **回填**：遍历 HistoryTree 回填源分区（COW 后写下层；`Sequence` 升序；跳过 `Invalid`）。
+3. **读拦截**：HistoryTree 合成（跳过 `Invalid`）；未覆盖读源分区。
+4. **写路径**：COW 照常；对新写重叠的 HistoryTree 节点打 **`Invalid`**（不删节点）。
+5. **END**：清上下文 → Normal。
 
-### 5. 保护状态的持久化方案
+回填期间的 COW 设 `WritebackActive`，避免把自己刚回填的写再标成 Invalid。
 
-驱动重启后必须知道"上次用户是否开启了保护"，这就需要一种**能够穿透重定向**的持久化机制。
+> Preview 的 Staging→PreviewTree 仍是 **Merge 插入**（补扫盘遗漏的 before-image）。Recovery 的 Staging 语义不同：表示“这些区间已被新写覆盖，History 应跳过”，故用 **Punch** 而非 Merge。
 
-**第一代方案（已废弃）：自定义扇区**
+## 控制接口（IOCTL）
 
-在 NTFS 空闲簇中挑选一个扇区作为"自定义扇区"，首字节写入 1/0 表示开启/关闭。注册表中记录该扇区号。
+| IOCTL | 用途 |
+|-------|------|
+| `IOCTL_QH_QUERY_PROTECT_STATUS` | 查询是否有卷已 CMD1 开启捕获（`CaptureEnabled`） |
+| `IOCTL_QH_SEND_COMMAND` | CMD1 配置捕获 / CMD2 停止 / CMD4 开卷 / CMD5 关卷 |
+| `IOCTL_QH_READ_SECTORS` | CMD3 按句柄读扇区 |
+| `IOCTL_QH_BEGIN/READ/END_PREVIEW` | Preview 会话 |
+| `IOCTL_QH_QUERY_PHASE` | 查询 Phase |
+| `IOCTL_QH_QUERY_TIME_RANGE` | 查询 journal 最早/最新 COW 记录 WallClock |
+| `IOCTL_QH_BEGIN/END_RECOVERY` | 进入/结束 Recovery |
 
-问题：NTFS 完全不知道这个扇区被驱动私自征用了。下次启动时，文件系统可能已经把这个扇区分配给某个文件并写入了新数据，驱动按记录的扇区号去读，读到的是文件内容，导致状态判断完全错误（关闭保护无法生效）。
+CMD1 参数：`PartitionGuid1`（源卷）、`PartitionGuid2`（journal 分区）、`FormatJournal`（非 0 则 Format，否则 Mount）。
 
-**第二代方案（当前）：ProtectRanges + 卷根目录状态文件**
+## 关键同步
 
-引入 `ProtectRanges`（直写放行扇区区间表）机制：记录在表中的扇区在读写时直接走原始磁盘位置，不被重定向。`ProtectRanges` 是 init 阶段一次性填充、之后只读的小数组（容量上限 8 段，实际仅占 3-4 段），IRP 路径上无锁线性扫描。
+- **`HistoryMutex`（每源卷）**：COW（读 before-image + Append + 转发原写）与 Preview/Recovery 读合成串行化，避免时间线撕裂。
+- **`Journal.Lock`**：journal 结构与磁盘元数据。
+- **Preview/Recovery `TreeLock`**：AVL 区间树与 Staging 合并。
+- **捕获工作线程**：写 IRP 入队，PASSIVE_LEVEL 下执行 COW + 同步转发。
 
-UI 在开启保护时，在被保护卷根目录创建 `_qh_protect_state.data`（1MB，隐藏 + 系统属性），首字节写 1。驱动在初始化阶段通过 `FSCTL_GET_RETRIEVAL_POINTERS` 查询该文件的所有簇位置，将这些扇区追加到 `ProtectRanges` 中。
+## 捕获启用
 
-由此达成的不变量：
-- 文件由 NTFS 真实管理，不会被覆盖
-- 文件的扇区被 `ProtectRanges` 收录，UI 写入时直通真实磁盘，关闭保护重启后驱动能读到 `0`
-- 驱动初始化时（`Initialized = FALSE`），所有 IRP 走默认透传，`ZwReadFile` 读到的就是真实磁盘内容
-- 文件大小 1MB 足以保证 NTFS 走非驻留存储，不会把数据塞进 MFT 记录（驻留属性 ~700B 阈值）
-
-完全不依赖注册表。同样基于 `ProtectRanges` 机制还放行了 `$Volume`（MFT #3 主区与镜像）以避免 NTFS dirty flag 因被重定向而无法落盘——多次重启后 Windows 累计判定未干净关机会进入 WinRE。
-
-**关于 pagefile.sys / hiberfil.sys / bootstat.dat 不收录的说明**：早期版本曾把这几个文件也加入直写放行表，但它们存在被用户态动态扩容/缩小的可能（特别是 `pagefile.sys` 在内存压力下会自动伸缩）。新分配的扇区不在已快照的放行表里，写入会被驱动重定向 → 系统读 pagefile 读到错位数据 → 蓝屏或更严重。因此当前版本只收录扇区位置静态不变的实体（状态文件 + MFT 元数据）。
-
-### 6. 驱动初始化的时机
-
-**最初想法**：在收到 `IOCTL_VOLUME_ONLINE` 控制码后执行初始化。
-
-**最终方案**：注册 `IoRegisterBootDriverReinitialization` 回调，在所有 Boot 驱动加载完成（NTFS 已挂载）后再做初始化。
-
-**变化原因**：状态文件需要通过文件系统打开，而 `IOCTL_VOLUME_ONLINE` 触发时文件系统未必就绪。`BootDriverReinitialization` 回调由系统保证在 NTFS 挂载完毕后调用，是文件操作的最早安全时机。对于动态插拔介质（U 盘等），仍在 `IOCTL_VOLUME_ONLINE` 路径执行初始化，但要等 `BootReinitDone == 1` 后才允许激活保护。
-
-## 核心数据结构
-
-### 扇区位图 + 直写放行区间表
-
-驱动在每个保护卷上维护一张基于 `RTL_BITMAP` 的位图与一张静态嵌入的小数组：
-
-| 结构 | 含义 | 来源 |
-|---|---|---|
-| `SectorBitmap`（`QH_BITMAP` 薄包装） | 扇区级占用位图 | 从 `$Bitmap` 簇级位图展开而来 |
-| `ProtectRanges[8]`（嵌入 DEVICE_EXTENSION） | 直写放行扇区区间（状态文件 + `$Volume` MFT#3 主/镜） | `QHPopulateProtectRanges` 初始化时填充，IRP 路径上无锁只读 |
-
-### 偏移记录表（重定向映射表）
-- **实现**：`RTL_GENERIC_TABLE`（Splay 树）
-- **键**：原始扇区索引
-- **值**：重定向后的扇区索引
-- **用途**：判断扇区是否已重定向 + 取出重定向目标。读路径与写路径均直接查表，未命中即按原位置处理
-
-## 关键操作的完整流程
-
-### 写 IRP 处理流程
-
-1. 应用发起写入，IRP 到达卷设备栈，本驱动 `IRP_MJ_WRITE` 拦截
-2. 若 `Initialized == FALSE`，直接透传到下层设备
-3. 若不在 `PASSIVE_LEVEL`，排入工作项队列后续处理（NTFS 文件 API 要求 `PASSIVE_LEVEL`）
-4. 引导扇区写保护：偏移 < `BytesPerSector` 直接返回 `STATUS_ACCESS_DENIED`
-5. 范围短路：整段命中 `ProtectRanges` 或整段空闲，直接透传，省去缓冲区分配
-6. 拷贝用户数据到独立缓冲区（防 PFN_LIST_CORRUPT）
-7. 逐扇区分类：
-   - `ProtectRanges` 命中 → 写原始位置，**完全放行**
-   - `SectorBitmap` 显示空闲 → 写原始位置（重启后 `$Bitmap` 复原，数据自动丢弃）
-   - 已占用扇区 → 在 `OffsetHashMutex` 内原子完成"查表 → 命中即写目标 / 未命中则分配新空闲扇区 + 写哈希表"
-8. 物理上连续的扇区合并为单次 IO 下发
-
-### 读 IRP 处理流程
-
-1. 快速扫描：若整段范围都在 `ProtectRanges` 内或都无重定向，直接透传
-2. 否则逐扇区：
-   - `ProtectRanges` 命中或哈希表未命中 → 读原始位置
-   - 哈希表命中 → 读目标位置
-3. 连续 IO 合并下发，结果拷贝回原始缓冲区
-
-### 重启还原的机制
-
-重启后，驱动内存中的所有位图与偏移表全部丢失。NTFS 重新挂载时读取的是磁盘真实数据——而 `$Bitmap` 自保护开启起从未被真实修改（写入全被重定向），整个 NTFS 视图回到"保护开启时刻"的状态。所有重定向期间写入新扇区的数据虽然物理上仍在磁盘上，但 NTFS 不知道它们曾被用过，会随后续的 `$Bitmap` 分配过程自然被覆盖。
+**COW 捕获**仅由控制设备 **CMD1** 开启（源卷 GUID + journal 分区 GUID），**CMD2** 停止。无持久化“保护开关”文件；重启后需重新 CMD1（或后续可扩展为 journal/注册表持久化配置）。
 
 ## 已知限制
 
-1. **仅支持 NTFS 分区**：当前未适配 FAT32、exFAT 等其他文件系统
-2. **未处理文件删除导致的空间萎缩**：详见设计决策第 4 条
-3. **未测试 Win7/8/8.1**：理论上兼容，但未经实测
-4. **哈希表为临时方案**：当前使用 Splay 树，查找性能非最优，未来计划自行实现更高效的哈希表
-5. **保护状态文件可被用户删除**：删除后等同关闭保护，未做防删除监控
+1. Preview / Recovery 依赖 journal 中有足够历史；journal Format 后历史清空。
+2. 全局仅允许一个 Preview 会话。
+3. Recovery 读路径对分页 IO 仍透传，避免与内存管理死锁。
+4. `QHConsole` 目前暴露 Preview；Recovery IOCTL 需自行调用或后续加控制台命令。
 
 ## 未来规划
 
-- 自行实现高性能内核态哈希表，替换当前的 `RTL_GENERIC_TABLE`
-- 用 minifilter 监控状态文件，阻止误删
-- 研究 NTFS 元数据语义，优化空闲扇区管理
-- 评估实现对 FAT32/exFAT 的支持
-
-## 附录：开发期试过但放弃的优化
-
-这里记一下开发期间调写性能时走过的弯路，免得以后又被同样的思路骗一次。
-
-测试环境：CrystalDiskMark 8.0.4，1 GiB × 5 轮，C 盘 60GB NVMe SSD，用了 38%。
-
-### 起点
-
-最初的实现写性能：保护关掉是 676 MB/s，开了保护掉到 385 MB/s，损失 43%。读基本没掉。
-当时慢路径每个扇区都要单独抢一次锁，1 MiB 写最多抢 8000 次，看着像是大问题。
-
-### 最后留下的：写入口加整段直通判断（+5%）
-
-写 IRP 进来时，先用 `RtlAreBitsClear` + `QHAreSectorsProtected` 看一眼整段是不是：
-- 全在 `ProtectRanges` 里 → 直接透传
-- 全是空闲扇区 → 标个位然后直接透传
-
-只要命中其中一种，那 1 MiB 的 qhalloc + memcpy 就省了，慢路径循环也跳过。
-改动就 30 行左右，在 `QHIrpDispatchWrite` 入口。
-
-实测只有 +5%，比想象的少很多，但代码简单、风险小，留下了。
-
-### 试过但撤回的
-
-**读路径也加整段直通判断** — 想法跟写一样。结果 SEQ Q1 Read 反而掉 5-11%，
-没搞清楚为什么，可能 `RtlAreBitsClear` 扫一遍比逐位 Test 还慢？读本来也只损失
-百分之几，不值得为了优化引入不确定性，撤了。
-
-**慢路径锁合并** — 每个扇区原本要抢 3-4 次锁，合并成一次大临界区。理论上应该
-有明显提升，结果 CDM 测下来完全没变。FAST_MUTEX 在这台机器上太快了，根本不是
-瓶颈。徒增代码复杂度，撤。
-
-**异步 IO 流水线**（这个折腾得最厉害）— 写了批次结构、完成例程、引用计数、
-槽位限流（MAX_INFLIGHT=16），想让一个写 IRP 里的多个段并发跑，理论上能把
-sum(每段) 压到 max(每段)。结果只 +5%。
-
-为啥？因为 `LastScanIndex` 让连续写拿到的重定向目标也是连续的，IO 合并之后
-通常就剩 1 段，根本没东西可以并发。CDM 这种"先分配后重写"的场景特别坑这个优化。
-
-不是说这条路死了 — "解压一堆小文件"这种天然多段的负载可能还有用，但要专门做
-稳定性测试才敢上，CDM 测不出来就先撤了。
-
-### 想明白的几件事
-
-1. **CDM SEQ 写不能代表所有写负载**。它的特点决定了控制流优化基本没用：
-   - 1 MiB 大块，IO 合并几乎没缝
-   - 文件预分配好之后 5 轮反复重写同一段，第二轮起全走慢路径
-   - 重定向后物理位置还是连续的，本质上还是顺序写
-
-2. **写损失的真正原因不在控制流**。剩下的延迟里：
-   - 防御性的 1 MiB qhalloc + memcpy 占一部分
-   - 慢路径下发 IO 时 `IoCallDriver + KeWait` 同步等待占一部分
-
-   这两个不动，光优化锁和分支没意义。
-
-3. **缓冲区方案不能动**。试过去掉防御性的 qhalloc + memcpy，直接把父 IRP 的
-   MDL 系统地址传给下层 — 蓝屏。这条路堵死了，别再试。
-
-### 以后可以考虑的方向（没试过）
-
-- 用 per-bucket 锁的开链哈希表替掉 Splay 树（"未来规划"里已经写了），并发写
-  应该更好，但 CDM 单线程测不出区别
-- ERESOURCE 替掉 FAST_MUTEX，让位图支持多读并发，Q8 多线程读可能有用
-- 改 LastScanIndex 策略让重定向更紧凑 — 但可能反而破坏 IO 合并，要小心
-- 整个改成 IRP 流水线异步模型 — 工程量大，没 WinDbg 这种调试设备就别碰
+- 在 `QHConsole` 中暴露 Recovery、捕获配置持久化
+- journal 容量告警与策略（保留窗口、优先级）
+- 性能剖析与写路径批处理优化
+- 评估非 NTFS 卷上的捕获可行性（当前捕获不依赖 `$Bitmap`，但 QHConsole 卷枚举仍以固定盘为主）
