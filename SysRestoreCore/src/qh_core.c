@@ -413,8 +413,7 @@ static NTSTATUS QhCoreSynthesizeRead(
 	ULONG i;
 
 	coveredMask = (PUCHAR)QH_ALLOC0(Length);
-	live = (PUCHAR)QH_ALLOC(Length);
-	if (!coveredMask || !live)
+	if (!coveredMask)
 	{
 		status = STATUS_INSUFFICIENT_RESOURCES;
 		goto done;
@@ -427,16 +426,15 @@ static NTSTATUS QhCoreSynthesizeRead(
 			Offset,
 			Length);
 	}
-	QH_LOCK_ACQUIRE(&Core->TreeLock);
 	status = QHJournalApplyPreviewTree(
 		Core->Journal,
 		Tree,
+		&Core->TreeLock,
 		Offset,
 		Length,
 		Buffer,
 		coveredMask,
 		&coveredCount);
-	QH_LOCK_RELEASE(&Core->TreeLock);
 	if (Core->Phase == QH_CORE_PHASE_RECOVERY)
 	{
 		QH_RECOVERY_DBG(
@@ -449,7 +447,15 @@ static NTSTATUS QhCoreSynthesizeRead(
 	}
 	if (!NT_SUCCESS(status))
 		goto done;
+	if (coveredCount == Length)
+		goto done;
 
+	live = (PUCHAR)QH_ALLOC(Length);
+	if (!live)
+	{
+		status = STATUS_INSUFFICIENT_RESOURCES;
+		goto done;
+	}
 	status = QhCoreSourceRead(Core, Offset, Length, live);
 	if (!NT_SUCCESS(status))
 		goto done;

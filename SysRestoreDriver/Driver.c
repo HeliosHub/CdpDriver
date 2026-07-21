@@ -94,7 +94,11 @@ NTSTATUS QHAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Physi
 	KeInitializeSpinLock(&DeviceExtension->CaptureQueueLock);
 	InitializeListHead(&DeviceExtension->CaptureQueue);
 	KeInitializeEvent(&DeviceExtension->CaptureEvent, NotificationEvent, FALSE);
+	KeInitializeSpinLock(&DeviceExtension->RecoveryReadQueueLock);
+	InitializeListHead(&DeviceExtension->RecoveryReadQueue);
+	KeInitializeEvent(&DeviceExtension->RecoveryReadEvent, NotificationEvent, FALSE);
 	KeInitializeMutex(&DeviceExtension->HistoryMutex, 0);
+	DeviceExtension->SectorSize = QH_SECTOR_SIZE_DEFAULT;
 	InterlockedExchange(&DeviceExtension->Phase, QH_PHASE_NORMAL);
 
 	Status = IoAttachDeviceToDeviceStackSafe(FilterDeviceObject, PhysicalDeviceObject, &DeviceExtension->LowerDeviceObject);
@@ -103,6 +107,9 @@ NTSTATUS QHAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Physi
 
 	FilterDeviceObject->Flags = DeviceExtension->LowerDeviceObject->Flags | DO_POWER_PAGABLE | DO_DIRECT_IO;
 	Status = QHStartCaptureWorker(DeviceExtension);
+	if (!NT_SUCCESS(Status))
+		goto cleanup;
+	Status = QHStartRecoveryReadWorker(DeviceExtension);
 	if (!NT_SUCCESS(Status))
 		goto cleanup;
 
@@ -122,6 +129,8 @@ NTSTATUS QHAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Physi
 cleanup:
 	if (!NT_SUCCESS(Status) && FilterDeviceObject)
 	{
+		if (DeviceExtension)
+			QHStopRecoveryReadWorker(DeviceExtension);
 		if (DeviceExtension)
 			QHStopCaptureWorker(DeviceExtension);
 		if (DeviceExtension && DeviceExtension->LowerDeviceObject)

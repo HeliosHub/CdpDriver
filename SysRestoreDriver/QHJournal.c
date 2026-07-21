@@ -1564,7 +1564,7 @@ VOID QHPreviewTreeInvalidateRange(
 
 typedef struct _QH_PREVIEW_HIT
 {
-	PQH_PREVIEW_TREE_NODE Node;
+	QH_PREVIEW_TREE_NODE Node;
 } QH_PREVIEW_HIT, *PQH_PREVIEW_HIT;
 
 static VOID QHPreviewTreeCollectOverlaps(
@@ -1595,7 +1595,7 @@ static VOID QHPreviewTreeCollectOverlaps(
 	{
 		if (*HitCount < HitCapacity)
 		{
-			Hits[*HitCount].Node = Node;
+			Hits[*HitCount].Node = *Node;
 			(*HitCount)++;
 		}
 	}
@@ -1616,9 +1616,9 @@ static int QHPreviewHitCompareSequence(
 {
 	const QH_PREVIEW_HIT* ha = (const QH_PREVIEW_HIT*)A;
 	const QH_PREVIEW_HIT* hb = (const QH_PREVIEW_HIT*)B;
-	if (ha->Node->Sequence < hb->Node->Sequence)
+	if (ha->Node.Sequence < hb->Node.Sequence)
 		return -1;
-	if (ha->Node->Sequence > hb->Node->Sequence)
+	if (ha->Node.Sequence > hb->Node.Sequence)
 		return 1;
 	return 0;
 }
@@ -1719,7 +1719,7 @@ static VOID QHPreviewTreeClearMaskByTree(
 
 	for (i = 0; i < hitCount; ++i)
 	{
-		PQH_PREVIEW_TREE_NODE node = hits[i].Node;
+		PQH_PREVIEW_TREE_NODE node = &hits[i].Node;
 		UINT64 o0 = node->Start > VolumeOffset ? node->Start : VolumeOffset;
 		UINT64 o1 = node->End < (VolumeOffset + DataLength) ?
 			node->End : (VolumeOffset + DataLength);
@@ -2128,6 +2128,7 @@ cleanup:
 NTSTATUS QHJournalApplyPreviewTree(
 	_Inout_ PQH_JOURNAL Journal,
 	_In_ PQH_PREVIEW_TREE Tree,
+	_Inout_ QH_LOCK* TreeLock,
 	_In_ UINT64 VolumeOffset,
 	_In_ ULONG DataLength,
 	_Out_writes_bytes_(DataLength) PVOID Buffer,
@@ -2140,8 +2141,10 @@ NTSTATUS QHJournalApplyPreviewTree(
 	ULONG hitCapacity;
 	ULONG covered = 0;
 	ULONG i;
+	BOOLEAN treeLocked = FALSE;
 
-	if (!Tree || !Buffer || !CoveredMask || !CoveredCount || DataLength == 0 ||
+	if (!Tree || !TreeLock || !Buffer || !CoveredMask || !CoveredCount ||
+		DataLength == 0 ||
 		VolumeOffset > MAXUINT64 - DataLength)
 	{
 		return STATUS_INVALID_PARAMETER;
@@ -2150,13 +2153,18 @@ NTSTATUS QHJournalApplyPreviewTree(
 	*CoveredCount = 0;
 	RtlZeroMemory(CoveredMask, DataLength);
 
+	QH_LOCK_ACQUIRE(TreeLock);
+	treeLocked = TRUE;
 	if (!Tree->Root || Tree->NodeCount == 0)
-		return STATUS_SUCCESS;
+		goto cleanup;
 
 	hitCapacity = Tree->NodeCount;
 	hits = (PQH_PREVIEW_HIT)qhalloc(sizeof(QH_PREVIEW_HIT) * hitCapacity);
 	if (!hits)
-		return STATUS_INSUFFICIENT_RESOURCES;
+	{
+		status = STATUS_INSUFFICIENT_RESOURCES;
+		goto cleanup;
+	}
 
 	if (!Journal->Mounted)
 	{
@@ -2176,6 +2184,10 @@ NTSTATUS QHJournalApplyPreviewTree(
 		hits,
 		&hitCount,
 		hitCapacity);
+	// Hits contain value copies.  The tree may now be modified or replaced
+	// without keeping a mutex held across journal I/O.
+	QH_LOCK_RELEASE(TreeLock);
+	treeLocked = FALSE;
 	QH_JOURNAL_DIAG(
 		"collect end volumeOff=%llu len=%lu hits=%lu\n",
 		VolumeOffset,
@@ -2190,7 +2202,7 @@ NTSTATUS QHJournalApplyPreviewTree(
 
 	for (i = 0; i < hitCount && covered < DataLength; ++i)
 	{
-		PQH_PREVIEW_TREE_NODE node = hits[i].Node;
+		PQH_PREVIEW_TREE_NODE node = &hits[i].Node;
 		PVOID payloadBase = NULL;
 		PUCHAR payload;
 		UINT64 alignedSize;
@@ -2276,6 +2288,8 @@ NTSTATUS QHJournalApplyPreviewTree(
 		status);
 
 cleanup:
+	if (treeLocked)
+		QH_LOCK_RELEASE(TreeLock);
 	if (!NT_SUCCESS(status))
 	{
 		QH_JOURNAL_DIAG(

@@ -39,6 +39,10 @@ NTSTATUS QHStartCaptureWorker(_Inout_ PQH_DEVICE_EXTENSION DevExt);
 
 VOID QHStopCaptureWorker(_Inout_ PQH_DEVICE_EXTENSION DevExt);
 
+NTSTATUS QHStartRecoveryReadWorker(_Inout_ PQH_DEVICE_EXTENSION DevExt);
+
+VOID QHStopRecoveryReadWorker(_Inout_ PQH_DEVICE_EXTENSION DevExt);
+
 // Disable capture, wait for its worker to leave Core, then release Core.
 // This routine must be used before a filter device is removed or reconfigured.
 VOID QHDisableAndDestroyCapture(_Inout_ PQH_DEVICE_EXTENSION DevExt);

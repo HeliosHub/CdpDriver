@@ -160,6 +160,7 @@ NTSTATUS QHJournalBuildPreviewTree(
 NTSTATUS QHJournalApplyPreviewTree(
 	_Inout_ PQH_JOURNAL Journal,
 	_In_ PQH_PREVIEW_TREE Tree,
+	_Inout_ QH_LOCK* TreeLock,
 	_In_ UINT64 VolumeOffset,
 	_In_ ULONG DataLength,
 	_Out_writes_bytes_(DataLength) PVOID Buffer,

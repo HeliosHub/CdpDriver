@@ -102,6 +102,8 @@ typedef struct _TEST_FAIL_STORE
 	PVOID OriginalContext;
 	QH_STORE_READ OriginalRead;
 	QH_STORE_WRITE OriginalWrite;
+	LONG FailNextReads;
+	ULONG ReadCallCount;
 	LONG FailNextWrites;
 	ULONG MaxWriteLength;
 	ULONG OversizeWriteCount;
@@ -116,6 +118,13 @@ static NTSTATUS TestFailStoreRead(
 {
 	PTEST_FAIL_STORE fail = (PTEST_FAIL_STORE)Store->Context;
 	NTSTATUS status;
+
+	++fail->ReadCallCount;
+	if (fail->FailNextReads > 0)
+	{
+		--fail->FailNextReads;
+		return STATUS_IO_DEVICE_ERROR;
+	}
 
 	Store->Context = fail->OriginalContext;
 	status = fail->OriginalRead(Store, Offset, Length, Buffer);
@@ -156,6 +165,8 @@ static VOID TestFailStoreInstall(_Inout_ PQH_STORE Store, _Out_ PTEST_FAIL_STORE
 	Fail->OriginalContext = Store->Context;
 	Fail->OriginalRead = Store->Read;
 	Fail->OriginalWrite = Store->Write;
+	Fail->FailNextReads = 0;
+	Fail->ReadCallCount = 0;
 	Fail->FailNextWrites = 0;
 	Fail->MaxWriteLength = 0;
 	Fail->OversizeWriteCount = 0;
@@ -1655,6 +1666,44 @@ static int TestPreparedRecoveryCommitCancel(void)
 	return g_caseFailed;
 }
 
+static int TestFullyCoveredRecoveryReadSkipsSource(void)
+{
+	TEST_CTX ctx;
+	TEST_FAIL_STORE sourceFail;
+	UCHAR a[512];
+	UCHAR b[512];
+	UCHAR out[512];
+	UINT64 t0;
+	NTSTATUS st;
+
+	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 30000)),
+		"setup fully covered recovery read");
+	FillPattern(a, sizeof(a), 0x91);
+	FillPattern(b, sizeof(b), 0x92);
+	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
+		"seed fully covered source A");
+	t0 = QhCoreGetTime100ns(ctx.Core);
+	Expect(NT_SUCCESS(QhCoreWrite(ctx.Core, 0, sizeof(b), b)),
+		"journal full-block before-image A");
+	Expect(NT_SUCCESS(QhCoreRecoveryBegin(ctx.Core, t0)),
+		"prepare fully covered recovery");
+
+	TestFailStoreInstall(ctx.Source, &sourceFail);
+	sourceFail.FailNextReads = 1;
+	memset(out, 0, sizeof(out));
+	st = QhCoreRead(ctx.Core, 0, sizeof(out), out);
+	Expect(NT_SUCCESS(st) && memcmp(out, a, sizeof(a)) == 0,
+		"fully covered recovery read uses journal only");
+	Expect(sourceFail.ReadCallCount == 0 && sourceFail.FailNextReads == 1,
+		"fully covered recovery read skips live source");
+	TestFailStoreRemove(ctx.Source, &sourceFail);
+
+	Expect(NT_SUCCESS(QhCoreRecoveryCancel(ctx.Core)),
+		"cancel fully covered recovery");
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
 int main(void)
 {
 	int failed = 0;
@@ -1692,6 +1741,7 @@ int main(void)
 	failed += RunCase("Journal superblock redundancy", TestSuperblockRedundancy);
 	failed += RunCase("Journal failure keeps live source unchanged", TestJournalWriteFailureDoesNotWriteSource);
 	failed += RunCase("Prepared Recovery commit/cancel", TestPreparedRecoveryCommitCancel);
+	failed += RunCase("Fully covered Recovery read", TestFullyCoveredRecoveryReadSkipsSource);
 
 	printf("\n%s (%d failures)\n", failed ? "FAILED" : "ALL PASSED", failed);
 	return failed ? 1 : 0;

@@ -20,7 +20,7 @@
 #include "QHJournal.h"
 
 #define QH_DRIVER_VERSION_STRING "1.1.0"
-#define QH_DRIVER_BUILD_STRING   "20260721.9"
+#define QH_DRIVER_BUILD_STRING   "20260721.12"
 
 #if (NTDDI_VERSION >= NTDDI_WIN10_VB)
 #define qhalloc(size) ExAllocatePool2(POOL_FLAG_NON_PAGED, size, 'NTAG')
@@ -109,11 +109,17 @@ typedef struct _QH_DEVICE_EXTENSION
 	PDEVICE_OBJECT LowerDeviceObject;
 	PDEVICE_OBJECT PhysicalDeviceObject;
 	volatile LONG PagingPathCount;
+	ULONG SectorSize;
 	KSPIN_LOCK CaptureQueueLock;
 	LIST_ENTRY CaptureQueue;
 	KEVENT CaptureEvent;
 	HANDLE CaptureThreadHandle;
 	volatile LONG CaptureStopping;
+	KSPIN_LOCK RecoveryReadQueueLock;
+	LIST_ENTRY RecoveryReadQueue;
+	KEVENT RecoveryReadEvent;
+	HANDLE RecoveryReadThreadHandle;
+	volatile LONG RecoveryReadStopping;
 	KMUTEX HistoryMutex;
 	PQH_CORE Core;
 } QH_DEVICE_EXTENSION, *PQH_DEVICE_EXTENSION;
@@ -123,3 +129,9 @@ typedef struct _QH_CAPTURE_ITEM
 	LIST_ENTRY Entry;
 	PIRP Irp;
 } QH_CAPTURE_ITEM, *PQH_CAPTURE_ITEM;
+
+typedef struct _QH_RECOVERY_READ_ITEM
+{
+	LIST_ENTRY Entry;
+	PIRP Irp;
+} QH_RECOVERY_READ_ITEM, *PQH_RECOVERY_READ_ITEM;
