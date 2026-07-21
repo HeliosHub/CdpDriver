@@ -1081,6 +1081,15 @@ static NTSTATUS QHBeginRecovery(
 		return STATUS_DEVICE_NOT_READY;
 	if (QHAnyPreviewSessionActive(DriverExt))
 		return STATUS_INVALID_DEVICE_STATE;
+	// Recovery services paging reads from a worker and can therefore not be
+	// activated on a volume that backs the system paging path.
+	if (InterlockedCompareExchange(&sourceExt->PagingPathCount, 0, 0) != 0)
+	{
+		QH_DBG(
+			"[RECOVERY] begin rejected: pagingPathCount=%ld\n",
+			InterlockedCompareExchange(&sourceExt->PagingPathCount, 0, 0));
+		return STATUS_DEVICE_BUSY;
+	}
 
 	previousPhase = InterlockedCompareExchange(
 		&sourceExt->Phase,
@@ -1343,23 +1352,6 @@ NTSTATUS QHIrpDispatchRead(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 	}
 
 	irpSp = IoGetCurrentIrpStackLocation(Irp);
-	if ((Irp->Flags & IRP_PAGING_IO) != 0)
-	{
-		QH_DBG(
-			"[RECOVERY] paging read bypass irp=%p offset=%lld len=%lu "
-			"flags=0x%08lX irql=%lu thread=%p pagingPathCount=%ld\n",
-			Irp,
-			irpSp->Parameters.Read.ByteOffset.QuadPart,
-			irpSp->Parameters.Read.Length,
-			Irp->Flags,
-			(ULONG)KeGetCurrentIrql(),
-			PsGetCurrentThreadId(),
-			InterlockedCompareExchange(
-				&deviceExt->PagingPathCount,
-				0,
-				0));
-		return QHSendToNextDevice(deviceExt->LowerDeviceObject, Irp);
-	}
 	if (irpSp->Parameters.Read.ByteOffset.QuadPart < 0 ||
 		irpSp->Parameters.Read.Length == 0)
 	{
@@ -1392,11 +1384,12 @@ NTSTATUS QHIrpDispatchRead(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 		KeReleaseSpinLock(&deviceExt->RecoveryReadQueueLock, oldIrql);
 		QH_DBG(
 			"[RECOVERY] read queued irp=%p offset=%llu len=%lu "
-			"flags=0x%08lX irql=%lu thread=%p\n",
+			"flags=0x%08lX pagingIo=%lu irql=%lu thread=%p\n",
 			Irp,
 			offset,
 			length,
 			Irp->Flags,
+			(Irp->Flags & IRP_PAGING_IO) != 0 ? 1UL : 0UL,
 			(ULONG)KeGetCurrentIrql(),
 			PsGetCurrentThreadId());
 		return STATUS_PENDING;
@@ -1477,11 +1470,13 @@ static VOID QHRecoveryReadWorker(_In_ PVOID Context)
 
 					QH_DBG(
 						"[RECOVERY] worker read end irp=%p offset=%llu "
-						"len=%lu status=0x%08X irql=%lu thread=%p\n",
+						"len=%lu status=0x%08X pagingIo=%lu "
+						"irql=%lu thread=%p\n",
 						irp,
 						offset,
 						length,
 						status,
+						(irp->Flags & IRP_PAGING_IO) != 0 ? 1UL : 0UL,
 						(ULONG)KeGetCurrentIrql(),
 						PsGetCurrentThreadId());
 					QHCompleteIrp(
@@ -1868,6 +1863,13 @@ NTSTATUS QHIrpDispatchPnp(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 	{
 		if (IrpSp->Parameters.UsageNotification.Type != DeviceUsageTypePaging)
 			return QHSendToNextDevice(DevExt->LowerDeviceObject, Irp);
+		if (IrpSp->Parameters.UsageNotification.InPath &&
+			InterlockedCompareExchange(&DevExt->Phase, 0, 0) ==
+				(LONG)QH_PHASE_RECOVERY)
+		{
+			QH_DBG("[RECOVERY] paging path activation rejected while active\n");
+			return QHCompleteIrp(Irp, STATUS_DEVICE_BUSY, 0);
+		}
 
 		BOOLEAN SetPagable = FALSE;
 		if (!IrpSp->Parameters.UsageNotification.InPath &&
