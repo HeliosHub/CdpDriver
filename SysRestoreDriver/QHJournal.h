@@ -76,6 +76,9 @@ typedef struct _QH_JOURNAL
 	UINT64 OldestHeaderRegionOff;
 	ULONG OldestHeaderIndex;
 	ULONG CurrentHeaderCount;
+	// Largest successful transfer used to initialize a 2MB header region.
+	// Starts at 2MB and is halved on write failure, down to one sector.
+	ULONG HeaderRegionWriteChunk;
 	ULONG NextSequence;
 	UINT64 TotalRecords;
 	UINT64 Oldest100ns;
@@ -86,6 +89,8 @@ typedef struct _QH_JOURNAL
 #else
 	PVOID TargetDevice;
 #endif
+	PVOID RawDiskHandle; // kernel HANDLE; physical disk backend when non-NULL
+	UINT64 TargetBaseOffset; // partition start on RawDiskHandle
 	PQH_STORE Store; // if set, RawIo uses store instead of TargetDevice
 	QH_QUERY_TIME_100NS QueryTime100ns;
 	PVOID QueryTimeContext;
@@ -116,6 +121,8 @@ typedef struct _QH_PREVIEW_TREE
 VOID QHJournalInitialize(
 	_Out_ PQH_JOURNAL Journal,
 	_In_opt_ PVOID TargetDevice,
+	_In_opt_ PVOID RawDiskHandle,
+	_In_ UINT64 TargetBaseOffset,
 	_In_ UINT64 PartitionSize,
 	_In_ ULONG SectorSize,
 	_In_ const GUID* SourceVolumeGuid);
@@ -147,6 +154,7 @@ NTSTATUS QHJournalBuildPreviewTree(
 	_Inout_ PQH_JOURNAL Journal,
 	_In_ UINT64 TargetTime100ns,
 	_In_ ULONG MaxSequence,
+	_In_ BOOLEAN IncludeTargetTime,
 	_Out_ PQH_PREVIEW_TREE Tree);
 
 NTSTATUS QHJournalApplyPreviewTree(

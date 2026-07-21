@@ -72,8 +72,14 @@ NTSTATUS QhCoreRead(
 NTSTATUS QhCorePreviewBegin(_Inout_ PQH_CORE Core, _In_ UINT64 TargetTime100ns);
 NTSTATUS QhCorePreviewEnd(_Inout_ PQH_CORE Core);
 
+/* Build the target-time history view and remain in Recovery phase. */
 NTSTATUS QhCoreRecoveryBegin(_Inout_ PQH_CORE Core, _In_ UINT64 TargetTime100ns);
-NTSTATUS QhCoreRecoveryEnd(_Inout_ PQH_CORE Core);
+
+/* Write the prepared history back to the source and return to Normal. */
+NTSTATUS QhCoreRecoveryCommit(_Inout_ PQH_CORE Core);
+
+/* Discard a prepared history view without writing back. */
+NTSTATUS QhCoreRecoveryCancel(_Inout_ PQH_CORE Core);
 
 VOID QhCoreSetWritebackActive(_Inout_ PQH_CORE Core, _In_ LONG Value);
 

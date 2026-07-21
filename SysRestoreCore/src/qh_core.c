@@ -4,7 +4,13 @@
 
 #ifndef QH_USERMODE
 #include "qh_dev_store.h"
+#define QH_RECOVERY_DBG(fmt, ...) \
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
+		"SysRestoreDriver: [RECOVERY] " fmt, ##__VA_ARGS__)
+#else
+#define QH_RECOVERY_DBG(fmt, ...) ((void)0)
 #endif
+#define QH_RECOVERY_DETAIL_LIMIT 512UL
 
 #ifdef QH_USERMODE
 #include <string.h>
@@ -63,7 +69,25 @@ static NTSTATUS QhCoreSourceRead(
 	_In_ ULONG Length,
 	_Out_writes_bytes_(Length) PVOID Buffer)
 {
-	return Core->Source->Read(Core->Source, Offset, Length, Buffer);
+	NTSTATUS status;
+
+	if (Core->Phase == QH_CORE_PHASE_RECOVERY)
+	{
+		QH_RECOVERY_DBG(
+			"source read begin offset=%llu len=%lu\n",
+			Offset,
+			Length);
+	}
+	status = Core->Source->Read(Core->Source, Offset, Length, Buffer);
+	if (Core->Phase == QH_CORE_PHASE_RECOVERY)
+	{
+		QH_RECOVERY_DBG(
+			"source read end offset=%llu len=%lu status=0x%08X\n",
+			Offset,
+			Length,
+			status);
+	}
+	return status;
 }
 
 static NTSTATUS QhCoreSourceWriteDirect(
@@ -72,7 +96,25 @@ static NTSTATUS QhCoreSourceWriteDirect(
 	_In_ ULONG Length,
 	_In_reads_bytes_(Length) const VOID* Buffer)
 {
-	return Core->Source->Write(Core->Source, Offset, Length, Buffer);
+	NTSTATUS status;
+
+	if (Core->WritebackActive)
+	{
+		QH_RECOVERY_DBG(
+			"source write begin offset=%llu len=%lu\n",
+			Offset,
+			Length);
+	}
+	status = Core->Source->Write(Core->Source, Offset, Length, Buffer);
+	if (Core->WritebackActive)
+	{
+		QH_RECOVERY_DBG(
+			"source write end offset=%llu len=%lu status=0x%08X\n",
+			Offset,
+			Length,
+			status);
+	}
+	return status;
 }
 
 static VOID QhCoreInitCommon(_Inout_ PQH_CORE Core)
@@ -295,9 +337,38 @@ NTSTATUS QhCoreCaptureAppend(
 	if (!NT_SUCCESS(status))
 		goto done;
 
+	if (Core->WritebackActive)
+	{
+		QH_RECOVERY_DBG(
+			"capture journal append begin offset=%llu len=%lu\n",
+			Offset,
+			Length);
+	}
 	status = QHJournalAppend(Core->Journal, Offset, Length, before, &hdr);
 	if (!NT_SUCCESS(status))
+	{
+		if (Core->WritebackActive)
+		{
+			QH_RECOVERY_DBG(
+				"capture journal append end offset=%llu len=%lu "
+				"status=0x%08X\n",
+				Offset,
+				Length,
+				status);
+		}
 		goto done;
+	}
+	if (Core->WritebackActive)
+	{
+		QH_RECOVERY_DBG(
+			"capture journal append end offset=%llu len=%lu "
+			"seq=%lu journalOff=%llu status=0x%08X\n",
+			Offset,
+			Length,
+			hdr.Sequence,
+			hdr.FileOffset,
+			status);
+	}
 
 	QhCoreAfterAppend(Core, &hdr, Offset, Length);
 	Core->Time100ns += 1;
@@ -349,6 +420,13 @@ static NTSTATUS QhCoreSynthesizeRead(
 		goto done;
 	}
 
+	if (Core->Phase == QH_CORE_PHASE_RECOVERY)
+	{
+		QH_RECOVERY_DBG(
+			"synthesize tree begin offset=%llu len=%lu\n",
+			Offset,
+			Length);
+	}
 	QH_LOCK_ACQUIRE(&Core->TreeLock);
 	status = QHJournalApplyPreviewTree(
 		Core->Journal,
@@ -359,6 +437,16 @@ static NTSTATUS QhCoreSynthesizeRead(
 		coveredMask,
 		&coveredCount);
 	QH_LOCK_RELEASE(&Core->TreeLock);
+	if (Core->Phase == QH_CORE_PHASE_RECOVERY)
+	{
+		QH_RECOVERY_DBG(
+			"synthesize tree end offset=%llu len=%lu covered=%lu "
+			"status=0x%08X\n",
+			Offset,
+			Length,
+			coveredCount,
+			status);
+	}
 	if (!NT_SUCCESS(status))
 		goto done;
 
@@ -442,6 +530,7 @@ NTSTATUS QhCorePreviewBegin(_Inout_ PQH_CORE Core, _In_ UINT64 TargetTime100ns)
 		Core->Journal,
 		TargetTime100ns,
 		Core->SnapshotMaxSequence,
+		TRUE,
 		&Core->PreviewTree);
 	if (!NT_SUCCESS(status) && status != STATUS_NOT_FOUND)
 	{
@@ -485,13 +574,18 @@ static NTSTATUS QhCoreWritebackHistory(_Inout_ PQH_CORE Core)
 	ULONG capacity;
 	ULONG count = 0;
 	ULONG i;
+	ULONG writeRuns = 0;
+	UINT64 writeBytes = 0;
 	NTSTATUS status = STATUS_SUCCESS;
 	PQH_PREVIEW_TREE_NODE stack[64];
 	LONG sp = 0;
 	PQH_PREVIEW_TREE_NODE cur;
 
 	if (!Core->HistoryTree.Root || Core->HistoryTree.NodeCount == 0)
+	{
+		QH_RECOVERY_DBG("writeback skipped: history tree is empty\n");
 		return STATUS_SUCCESS;
+	}
 
 	capacity = Core->HistoryTree.NodeCount;
 	all = (PQH_PREVIEW_TREE_NODE*)QH_ALLOC0(
@@ -531,6 +625,8 @@ static NTSTATUS QhCoreWritebackHistory(_Inout_ PQH_CORE Core)
 	}
 
 	Core->WritebackActive = 1;
+	QH_RECOVERY_DBG("writeback begin nodes=%lu detailLimit=%lu\n",
+		count, QH_RECOVERY_DETAIL_LIMIT);
 #ifdef QH_USERMODE
 	if (g_writebackHook)
 		g_writebackHook(Core);
@@ -569,6 +665,23 @@ static NTSTATUS QhCoreWritebackHistory(_Inout_ PQH_CORE Core)
 			break;
 		}
 
+		if (i < QH_RECOVERY_DETAIL_LIMIT)
+		{
+			QH_RECOVERY_DBG(
+				"node index=%lu seq=%lu time=%llu volumeOff=%llu len=%lu "
+				"journalOff=%llu head=%02X%02X%02X%02X\n",
+				i,
+				node->Sequence,
+				node->WallClock100ns,
+				node->Start,
+				node->DataLength,
+				node->FileOffset,
+				node->DataLength > 0 ? payload[0] : 0,
+				node->DataLength > 1 ? payload[1] : 0,
+				node->DataLength > 2 ? payload[2] : 0,
+				node->DataLength > 3 ? payload[3] : 0);
+		}
+
 		RtlFillMemory(mask, node->DataLength, 1);
 		for (a = 0; a < i; ++a)
 		{
@@ -597,12 +710,24 @@ static NTSTATUS QhCoreWritebackHistory(_Inout_ PQH_CORE Core)
 				node->Start + runStart,
 				idx - runStart,
 				payload + runStart);
+			if (i < QH_RECOVERY_DETAIL_LIMIT)
+			{
+				QH_RECOVERY_DBG(
+					"write node=%lu seq=%lu offset=%llu len=%lu status=0x%08X\n",
+					i,
+					node->Sequence,
+					node->Start + runStart,
+					idx - runStart,
+					status);
+			}
 			if (!NT_SUCCESS(status))
 			{
 				QH_FREE(payload);
 				QH_FREE(mask);
 				goto done;
 			}
+			++writeRuns;
+			writeBytes += idx - runStart;
 		}
 		QH_FREE(payload);
 		QH_FREE(mask);
@@ -610,6 +735,17 @@ static NTSTATUS QhCoreWritebackHistory(_Inout_ PQH_CORE Core)
 
 done:
 	Core->WritebackActive = 0;
+	if (count > QH_RECOVERY_DETAIL_LIMIT)
+	{
+		QH_RECOVERY_DBG("detail suppressed for %lu nodes\n",
+			count - QH_RECOVERY_DETAIL_LIMIT);
+	}
+	QH_RECOVERY_DBG(
+		"writeback end status=0x%08X nodes=%lu runs=%lu bytes=%llu\n",
+		status,
+		count,
+		writeRuns,
+		writeBytes);
 	QH_FREE(all);
 	return status;
 }
@@ -627,6 +763,13 @@ NTSTATUS QhCoreRecoveryBegin(_Inout_ PQH_CORE Core, _In_ UINT64 TargetTime100ns)
 	Core->Building = 1;
 	Core->TargetTime100ns = TargetTime100ns;
 	Core->SnapshotMaxSequence = Core->Journal->NextSequence;
+	QH_RECOVERY_DBG(
+		"begin target=%llu snapshotMaxSeq=%lu records=%llu range=[%llu,%llu]\n",
+		TargetTime100ns,
+		Core->SnapshotMaxSequence,
+		Core->Journal->TotalRecords,
+		Core->Journal->Oldest100ns,
+		Core->Journal->Newest100ns);
 	QHPreviewTreeFree(&Core->HistoryTree);
 	QHPreviewTreeFree(&Core->StagingTree);
 	QHPreviewTreeInitialize(&Core->HistoryTree);
@@ -641,6 +784,7 @@ NTSTATUS QhCoreRecoveryBegin(_Inout_ PQH_CORE Core, _In_ UINT64 TargetTime100ns)
 		Core->Journal,
 		TargetTime100ns,
 		Core->SnapshotMaxSequence,
+		TRUE,
 		&Core->HistoryTree);
 	if (!NT_SUCCESS(status) && status != STATUS_NOT_FOUND)
 	{
@@ -650,6 +794,10 @@ NTSTATUS QhCoreRecoveryBegin(_Inout_ PQH_CORE Core, _In_ UINT64 TargetTime100ns)
 	}
 	if (status == STATUS_NOT_FOUND)
 		status = STATUS_SUCCESS;
+	QH_RECOVERY_DBG("tree build status=0x%08X nodes=%lu staging=%lu\n",
+		status,
+		Core->HistoryTree.NodeCount,
+		Core->StagingTree.NodeCount);
 
 	QH_LOCK_ACQUIRE(&Core->TreeLock);
 	QHPreviewTreePunchByStaging(&Core->HistoryTree, &Core->StagingTree);
@@ -662,24 +810,61 @@ NTSTATUS QhCoreRecoveryBegin(_Inout_ PQH_CORE Core, _In_ UINT64 TargetTime100ns)
 		return status;
 	}
 
-	status = QhCoreWritebackHistory(Core);
-	if (!NT_SUCCESS(status))
-	{
-		QHPreviewTreeFree(&Core->HistoryTree);
-		Core->Phase = QH_CORE_PHASE_NORMAL;
-		return status;
-	}
+	QH_RECOVERY_DBG(
+		"prepared target=%llu nodes=%lu; waiting for commit\n",
+		Core->TargetTime100ns,
+		Core->HistoryTree.NodeCount);
 	return STATUS_SUCCESS;
 }
 
-NTSTATUS QhCoreRecoveryEnd(_Inout_ PQH_CORE Core)
+NTSTATUS QhCoreRecoveryCommit(_Inout_ PQH_CORE Core)
 {
-	if (!Core || Core->Phase != QH_CORE_PHASE_RECOVERY)
+	NTSTATUS status;
+
+	if (!Core || Core->Phase != QH_CORE_PHASE_RECOVERY || Core->Building)
 		return STATUS_INVALID_DEVICE_STATE;
+
+	QH_RECOVERY_DBG(
+		"commit begin target=%llu nodes=%lu\n",
+		Core->TargetTime100ns,
+		Core->HistoryTree.NodeCount);
+	status = QhCoreWritebackHistory(Core);
+	if (!NT_SUCCESS(status))
+	{
+		QH_RECOVERY_DBG(
+			"commit failed status=0x%08X; remaining in Recovery\n",
+			status);
+		return status;
+	}
+
 	QHPreviewTreeFree(&Core->HistoryTree);
 	QHPreviewTreeFree(&Core->StagingTree);
 	QHPreviewTreeInitialize(&Core->HistoryTree);
 	QHPreviewTreeInitialize(&Core->StagingTree);
+	Core->TargetTime100ns = 0;
+	Core->SnapshotMaxSequence = 0;
+	Core->Phase = QH_CORE_PHASE_NORMAL;
+	QH_RECOVERY_DBG("commit complete -> normal\n");
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS QhCoreRecoveryCancel(_Inout_ PQH_CORE Core)
+{
+	if (!Core || Core->Phase != QH_CORE_PHASE_RECOVERY || Core->Building)
+		return STATUS_INVALID_DEVICE_STATE;
+
+	QH_RECOVERY_DBG(
+		"cancel target=%llu nodes=%lu -> normal\n",
+		Core->TargetTime100ns,
+		Core->HistoryTree.NodeCount);
+	QHPreviewTreeFree(&Core->HistoryTree);
+	QHPreviewTreeFree(&Core->StagingTree);
+	QHPreviewTreeInitialize(&Core->HistoryTree);
+	QHPreviewTreeInitialize(&Core->StagingTree);
+	Core->TargetTime100ns = 0;
+	Core->SnapshotMaxSequence = 0;
+	Core->Building = 0;
+	Core->WritebackActive = 0;
 	Core->Phase = QH_CORE_PHASE_NORMAL;
 	return STATUS_SUCCESS;
 }

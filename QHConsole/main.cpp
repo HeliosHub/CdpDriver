@@ -456,6 +456,109 @@ static BOOL DoPreviewEnd(HANDLE hDevice)
 	return TRUE;
 }
 
+static BOOL DoRecoveryBegin(HANDLE hDevice)
+{
+	QH_RECOVERY_BEGIN_REQUEST req = { 0 };
+	QH_RECOVERY_BEGIN_REPLY reply = { 0 };
+	DWORD bytesReturned = 0;
+	wchar_t line[64];
+
+	ListVolumes();
+	if (!PromptGuid(L"Protected source volume GUID: ", &req.SourceVolumeGuid))
+		return FALSE;
+	ConOut(L"TargetTime100ns (Windows FILETIME value): ");
+	if (!ReadLine(line, _countof(line)))
+		return FALSE;
+	req.TargetTime100ns = _wcstoui64(line, NULL, 10);
+	if (!req.TargetTime100ns)
+	{
+		ConOut(L"Invalid target time.\n");
+		return FALSE;
+	}
+
+	if (!DeviceIoControl(
+			hDevice,
+			IOCTL_QH_BEGIN_RECOVERY,
+			&req,
+			sizeof(req),
+			&reply,
+			sizeof(reply),
+			&bytesReturned,
+			NULL))
+	{
+		ConOutFmt(L"Begin recovery failed (err=%lu).\n", GetLastError());
+		return FALSE;
+	}
+
+	ConOutFmt(
+		L"Recovery prepared. Phase=%lu target=%llu range=[%llu, %llu]\n",
+		reply.Phase,
+		reply.TargetTime100ns,
+		reply.OldestRecoverable100ns,
+		reply.NewestRecoverable100ns);
+	ConOut(L"No writeback has occurred. Bring the source online, then use r to commit.\n");
+	return TRUE;
+}
+
+static BOOL DoRecoveryCommit(HANDLE hDevice)
+{
+	QH_RECOVERY_CONTROL_REQUEST req = { 0 };
+	QH_RECOVERY_COMMIT_REPLY reply = { 0 };
+	DWORD bytesReturned = 0;
+
+	ListVolumes();
+	if (!PromptGuid(L"Prepared source volume GUID: ", &req.SourceVolumeGuid))
+		return FALSE;
+
+	if (!DeviceIoControl(
+			hDevice,
+			IOCTL_QH_COMMIT_RECOVERY,
+			&req,
+			sizeof(req),
+			&reply,
+			sizeof(reply),
+			&bytesReturned,
+			NULL))
+	{
+		ConOutFmt(L"Recovery commit failed (err=%lu).\n", GetLastError());
+		return FALSE;
+	}
+
+	ConOutFmt(
+		L"Recovery committed. Phase=%lu target=%llu\n",
+		reply.Phase,
+		reply.TargetTime100ns);
+	ConOut(L"Writeback completed and the source volume is back in Normal phase.\n");
+	return TRUE;
+}
+
+static BOOL DoRecoveryCancel(HANDLE hDevice)
+{
+	QH_RECOVERY_CONTROL_REQUEST req = { 0 };
+	DWORD bytesReturned = 0;
+
+	ListVolumes();
+	if (!PromptGuid(L"Prepared source volume GUID: ", &req.SourceVolumeGuid))
+		return FALSE;
+
+	if (!DeviceIoControl(
+			hDevice,
+			IOCTL_QH_CANCEL_RECOVERY,
+			&req,
+			sizeof(req),
+			NULL,
+			0,
+			&bytesReturned,
+			NULL))
+	{
+		ConOutFmt(L"Recovery cancel failed (err=%lu).\n", GetLastError());
+		return FALSE;
+	}
+
+	ConOut(L"Prepared recovery cancelled; source volume returned to Normal phase.\n");
+	return TRUE;
+}
+
 static BOOL DoQueryTimeRange(HANDLE hDevice)
 {
 	QH_TIME_RANGE_QUERY_REQUEST req = { 0 };
@@ -542,6 +645,9 @@ static void PrintHelp(void)
 		QH_CMD3_MAX_READ_BYTES);
 	ConOut(L"  8  - end preview session\n");
 	ConOut(L"  9  - query journal oldest/newest record time (source GUID)\n");
+	ConOut(L"  e  - enter prepared recovery (source GUID + time; no writeback)\n");
+	ConOut(L"  r  - commit prepared recovery synchronously (writeback to source)\n");
+	ConOut(L"  c  - cancel prepared recovery without writeback\n");
 	ConOut(L"  v  - list volumes\n");
 	ConOut(L"  h  - help\n");
 	ConOut(L"  q  - quit\n");
@@ -639,6 +745,24 @@ int wmain(void)
 			hDevice = EnsureControlDevice(hDevice);
 			if (hDevice != INVALID_HANDLE_VALUE)
 				DoQueryTimeRange(hDevice);
+			break;
+		case L'r':
+		case L'R':
+			hDevice = EnsureControlDevice(hDevice);
+			if (hDevice != INVALID_HANDLE_VALUE)
+				DoRecoveryCommit(hDevice);
+			break;
+		case L'e':
+		case L'E':
+			hDevice = EnsureControlDevice(hDevice);
+			if (hDevice != INVALID_HANDLE_VALUE)
+				DoRecoveryBegin(hDevice);
+			break;
+		case L'c':
+		case L'C':
+			hDevice = EnsureControlDevice(hDevice);
+			if (hDevice != INVALID_HANDLE_VALUE)
+				DoRecoveryCancel(hDevice);
 			break;
 		case L'v':
 		case L'V':

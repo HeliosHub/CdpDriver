@@ -19,6 +19,9 @@
 #include "QHIoctl.h"
 #include "QHJournal.h"
 
+#define QH_DRIVER_VERSION_STRING "1.1.0"
+#define QH_DRIVER_BUILD_STRING   "20260721.9"
+
 #if (NTDDI_VERSION >= NTDDI_WIN10_VB)
 #define qhalloc(size) ExAllocatePool2(POOL_FLAG_NON_PAGED, size, 'NTAG')
 #define qhfree(P) ExFreePoolWithTag(P, 'NTAG')

@@ -103,6 +103,9 @@ typedef struct _TEST_FAIL_STORE
 	QH_STORE_READ OriginalRead;
 	QH_STORE_WRITE OriginalWrite;
 	LONG FailNextWrites;
+	ULONG MaxWriteLength;
+	ULONG OversizeWriteCount;
+	ULONG LargestSuccessfulWrite;
 } TEST_FAIL_STORE, *PTEST_FAIL_STORE;
 
 static NTSTATUS TestFailStoreRead(
@@ -134,10 +137,17 @@ static NTSTATUS TestFailStoreWrite(
 		--fail->FailNextWrites;
 		return STATUS_IO_DEVICE_ERROR;
 	}
+	if (fail->MaxWriteLength != 0 && Length > fail->MaxWriteLength)
+	{
+		++fail->OversizeWriteCount;
+		return STATUS_IO_DEVICE_ERROR;
+	}
 
 	Store->Context = fail->OriginalContext;
 	status = fail->OriginalWrite(Store, Offset, Length, Buffer);
 	Store->Context = fail;
+	if (NT_SUCCESS(status) && Length > fail->LargestSuccessfulWrite)
+		fail->LargestSuccessfulWrite = Length;
 	return status;
 }
 
@@ -147,6 +157,9 @@ static VOID TestFailStoreInstall(_Inout_ PQH_STORE Store, _Out_ PTEST_FAIL_STORE
 	Fail->OriginalRead = Store->Read;
 	Fail->OriginalWrite = Store->Write;
 	Fail->FailNextWrites = 0;
+	Fail->MaxWriteLength = 0;
+	Fail->OversizeWriteCount = 0;
+	Fail->LargestSuccessfulWrite = 0;
 	Store->Context = Fail;
 	Store->Read = TestFailStoreRead;
 	Store->Write = TestFailStoreWrite;
@@ -176,6 +189,16 @@ static VOID TestCtxDestroy(_Inout_ PTEST_CTX Ctx)
 		QhMemStoreDestroy(Ctx->Source);
 		Ctx->Source = NULL;
 	}
+}
+
+static NTSTATUS TestRecoveryOneShot(
+	_Inout_ PQH_CORE Core,
+	_In_ UINT64 TargetTime100ns)
+{
+	NTSTATUS status = QhCoreRecoveryBegin(Core, TargetTime100ns);
+	if (!NT_SUCCESS(status))
+		return status;
+	return QhCoreRecoveryCommit(Core);
 }
 
 static int RunCase(const char* title, int (*fn)(void))
@@ -234,27 +257,25 @@ static int TestCowPreviewRecovery(void)
 
 	memset(out, 0, sizeof(out));
 	st = QhCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, b, sizeof(b)) == 0,
-		"Preview read at t0 sees B");
+	Expect(NT_SUCCESS(st) && memcmp(out, a, sizeof(a)) == 0,
+		"Preview at t0 includes t0 record and sees A");
 
 	st = QhCorePreviewEnd(ctx.Core);
 	Expect(NT_SUCCESS(st), "PreviewEnd");
 	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_NORMAL, "phase Normal");
 
-	st = QhCoreRecoveryBegin(ctx.Core, t0);
+	st = TestRecoveryOneShot(ctx.Core, t0);
 	Expect(NT_SUCCESS(st), "RecoveryBegin at t0");
-	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_RECOVERY, "phase Recovery");
+	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_NORMAL,
+		"one-shot Recovery returns to Normal");
 
 	memset(out, 0, sizeof(out));
 	st = QhCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, b, sizeof(b)) == 0,
-		"Recovery read sees B");
+	Expect(NT_SUCCESS(st) && memcmp(out, a, sizeof(a)) == 0,
+		"Recovery at t0 includes t0 record and reads A");
 
-	Expect(memcmp(QhMemStoreData(ctx.Source), b, sizeof(b)) == 0,
-		"source store physically writeback to B");
-
-	st = QhCoreRecoveryEnd(ctx.Core);
-	Expect(NT_SUCCESS(st), "RecoveryEnd");
+	Expect(memcmp(QhMemStoreData(ctx.Source), a, sizeof(a)) == 0,
+		"Recovery at t0 physically writes back t0 before-image A");
 
 	TestCtxDestroy(&ctx);
 	return g_caseFailed;
@@ -279,18 +300,17 @@ static int TestRecoveryInvalidate(void)
 	QhCoreWrite(ctx.Core, 0, sizeof(b), b);
 	t1 = QhCoreGetTime100ns(ctx.Core);
 
-	st = QhCoreRecoveryBegin(ctx.Core, t1 - 1);
+	st = TestRecoveryOneShot(ctx.Core, t1 - 1);
 	Expect(NT_SUCCESS(st), "RecoveryBegin before B");
 
 	st = QhCoreWrite(ctx.Core, 0, sizeof(n), n);
-	Expect(NT_SUCCESS(st), "write during recovery");
+	Expect(NT_SUCCESS(st), "write after one-shot recovery");
 
 	memset(out, 0, sizeof(out));
 	st = QhCoreRead(ctx.Core, 0, sizeof(out), out);
 	Expect(NT_SUCCESS(st) && memcmp(out, n, sizeof(n)) == 0,
-		"Recovery read after Invalid sees new write");
+		"read after Recovery sees new write");
 
-	QhCoreRecoveryEnd(ctx.Core);
 	TestCtxDestroy(&ctx);
 	return g_caseFailed;
 }
@@ -357,8 +377,8 @@ static int TestMixedReadPartialCoverage(void)
 	memset(out, 0, sizeof(out));
 	st = QhCoreRead(ctx.Core, 0, sizeof(out), out);
 	Expect(NT_SUCCESS(st), "Preview mixed read ok");
-	Expect(memcmp(out, half, sizeof(half)) == 0,
-		"covered prefix from journal (B)");
+	Expect(memcmp(out, whole, sizeof(half)) == 0,
+		"covered prefix uses target-time record before-image (A)");
 	Expect(memcmp(out + sizeof(half), whole + sizeof(half),
 			sizeof(whole) - sizeof(half)) == 0,
 		"uncovered suffix from live (A)");
@@ -400,8 +420,8 @@ static int TestMultiOffsetAndDedup(void)
 
 	memset(out, 0, sizeof(out));
 	st = QhCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, cow0, sizeof(cow0)) == 0,
-		"offset 0 live fill (oldest COW record excluded from tree)");
+	Expect(NT_SUCCESS(st) && memcmp(out, seed0, sizeof(seed0)) == 0,
+		"offset 0 includes oldest target-time COW record");
 
 	memset(out, 0, sizeof(out));
 	st = QhCoreRead(ctx.Core, 512, sizeof(out), out);
@@ -486,27 +506,22 @@ static int TestErrorsAndPhaseGuards(void)
 	Expect(QhCorePreviewBegin(ctx.Core, 7000) ==
 			STATUS_INVALID_DEVICE_STATE,
 		"PreviewBegin rejected while already Preview");
-	Expect(QhCoreRecoveryBegin(ctx.Core, 7000) ==
+	Expect(TestRecoveryOneShot(ctx.Core, 7000) ==
 			STATUS_INVALID_DEVICE_STATE,
 		"RecoveryBegin rejected while Preview");
 
 	QhCorePreviewEnd(ctx.Core);
 
-	st = QhCoreRecoveryBegin(ctx.Core, 7000);
+	st = TestRecoveryOneShot(ctx.Core, 7000);
 	Expect(NT_SUCCESS(st), "RecoveryBegin ok");
-	Expect(QhCorePreviewBegin(ctx.Core, 7000) ==
-			STATUS_INVALID_DEVICE_STATE,
-		"PreviewBegin rejected while Recovery");
-	Expect(QhCoreRecoveryBegin(ctx.Core, 7000) ==
-			STATUS_INVALID_DEVICE_STATE,
-		"RecoveryBegin rejected while already Recovery");
-
-	Expect(QhCorePreviewEnd(ctx.Core) == STATUS_INVALID_DEVICE_STATE,
-		"PreviewEnd rejected while Recovery");
-
-	QhCoreRecoveryEnd(ctx.Core);
-	Expect(QhCoreRecoveryEnd(ctx.Core) == STATUS_INVALID_DEVICE_STATE,
-		"RecoveryEnd rejected while Normal");
+	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_NORMAL,
+		"Recovery completes in Normal phase");
+	Expect(NT_SUCCESS(QhCorePreviewBegin(ctx.Core, 7000)),
+		"PreviewBegin allowed after one-shot Recovery");
+	Expect(NT_SUCCESS(QhCorePreviewEnd(ctx.Core)),
+		"PreviewEnd succeeds after one-shot Recovery");
+	Expect(NT_SUCCESS(TestRecoveryOneShot(ctx.Core, 7000)),
+		"another one-shot Recovery is allowed");
 
 	Expect(QhCorePreviewEnd(ctx.Core) == STATUS_INVALID_DEVICE_STATE,
 		"PreviewEnd rejected while Normal");
@@ -543,8 +558,8 @@ static int TestPreviewWriteDuringSession(void)
 	tAfterB = QhCoreGetTime100ns(ctx.Core);
 	QhCoreWrite(ctx.Core, 0, sizeof(c), c);
 
-	st = QhCorePreviewBegin(ctx.Core, tAfterB - 1);
-	Expect(NT_SUCCESS(st), "PreviewBegin at B record time (before C)");
+	st = QhCorePreviewBegin(ctx.Core, tAfterB);
+	Expect(NT_SUCCESS(st), "PreviewBegin at C record time");
 
 	memset(out, 0, sizeof(out));
 	st = QhCoreRead(ctx.Core, 0, sizeof(out), out);
@@ -618,8 +633,8 @@ static int TestPreviewStagingMerge(void)
 	FillPattern(early, sizeof(early), 0xF1);
 	ctx.Source->Write(ctx.Source, 0, sizeof(base), base);
 
-	t0 = QhCoreGetTime100ns(ctx.Core);
 	QhCoreWrite(ctx.Core, 0, sizeof(early), early);
+	t0 = QhCoreGetTime100ns(ctx.Core);
 	FillPattern(beforeStaging, sizeof(beforeStaging), 0xF2);
 	ctx.Source->Write(ctx.Source, 256, sizeof(beforeStaging), beforeStaging);
 
@@ -674,7 +689,7 @@ static int TestRecoveryStagingPunch(void)
 
 	/* Recover to t1: history should be B, staging during build punches B */
 	QhCoreTestSetRecoveryBuildHook(RecoveryBuildHook_StagingPunch);
-	st = QhCoreRecoveryBegin(ctx.Core, t1);
+	st = TestRecoveryOneShot(ctx.Core, t1);
 	QhCoreTestSetRecoveryBuildHook(NULL);
 	Expect(NT_SUCCESS(st), "RecoveryBegin with staging punch hook");
 
@@ -687,7 +702,6 @@ static int TestRecoveryStagingPunch(void)
 	Expect(memcmp(QhMemStoreData(ctx.Source), g_punchBuf, sizeof(g_punchBuf)) == 0,
 		"source reflects post-punch writeback path");
 
-	QhCoreRecoveryEnd(ctx.Core);
 	TestCtxDestroy(&ctx);
 	return g_caseFailed;
 }
@@ -711,11 +725,11 @@ static int TestRecoveryWritebackOverlap(void)
 	FillPattern(bTail, sizeof(bTail), 0xBE);
 	ctx.Source->Write(ctx.Source, 0, sizeof(a), a);
 
-	tAfterFull = QhCoreGetTime100ns(ctx.Core);
 	QhCoreWrite(ctx.Core, 0, sizeof(bFull), bFull);
+	tAfterFull = QhCoreGetTime100ns(ctx.Core);
 	QhCoreWrite(ctx.Core, 256, sizeof(bTail), bTail);
 
-	st = QhCoreRecoveryBegin(ctx.Core, tAfterFull);
+	st = TestRecoveryOneShot(ctx.Core, tAfterFull);
 	Expect(NT_SUCCESS(st), "RecoveryBegin to full B time");
 
 	memset(out, 0, sizeof(out));
@@ -725,7 +739,6 @@ static int TestRecoveryWritebackOverlap(void)
 	Expect(memcmp(QhMemStoreData(ctx.Source), bFull, sizeof(bFull)) == 0,
 		"writeback restores full B (earlier seq on overlap)");
 
-	QhCoreRecoveryEnd(ctx.Core);
 	TestCtxDestroy(&ctx);
 	return g_caseFailed;
 }
@@ -749,7 +762,7 @@ static int TestUnmountedJournal(void)
 		"CaptureAppend fails when journal not mounted");
 	Expect(QhCorePreviewBegin(bare, 13000) == STATUS_DEVICE_NOT_READY,
 		"PreviewBegin fails when journal not mounted");
-	Expect(QhCoreRecoveryBegin(bare, 13000) == STATUS_DEVICE_NOT_READY,
+	Expect(TestRecoveryOneShot(bare, 13000) == STATUS_DEVICE_NOT_READY,
 		"RecoveryBegin fails when journal not mounted");
 
 	QhCoreDestroy(bare);
@@ -823,7 +836,7 @@ static int TestJournalDropOldest(void)
 		"preview before oldest reads live (evicted journal unavailable)");
 	QhCorePreviewEnd(ctx.Core);
 
-	st = QhCorePreviewBegin(ctx.Core, newest - 1);
+	st = QhCorePreviewBegin(ctx.Core, newest);
 	Expect(NT_SUCCESS(st), "preview near newest still works");
 	FillPattern(expectSnapshot, sizeof(expectSnapshot), (UCHAR)(2598 & 0xFF));
 	memset(out, 0, sizeof(out));
@@ -957,7 +970,7 @@ static int TestJournalTinyPartitionLargeRecord(void)
 		"evicted large record not reconstructable from journal");
 	QhCorePreviewEnd(ctx.Core);
 
-	st = QhCorePreviewBegin(ctx.Core, newest - 1);
+	st = QhCorePreviewBegin(ctx.Core, newest);
 	Expect(NT_SUCCESS(st), "preview newest on tiny journal");
 	memset(outBuf, 0, sizeof(outBuf));
 	st = QhCoreRead(ctx.Core, 512, sizeof(smallBuf), outBuf);
@@ -1025,23 +1038,15 @@ static int TestRecoveryTimeBoundaries(void)
 	Expect(NT_SUCCESS(st), "QueryTimeRange after COWs");
 	memcpy(liveBefore, QhMemStoreData(ctx.Source), sizeof(liveBefore));
 
-	st = QhCoreRecoveryBegin(ctx.Core, oldest - 1);
+	st = TestRecoveryOneShot(ctx.Core, oldest - 1);
 	Expect(NT_SUCCESS(st), "RecoveryBegin before oldest succeeds (empty history)");
 	Expect(memcmp(QhMemStoreData(ctx.Source), liveBefore, sizeof(liveBefore)) == 0,
 		"Recovery before oldest leaves live source unchanged");
-	QhCoreRecoveryEnd(ctx.Core);
 
-	st = QhCoreRecoveryBegin(ctx.Core, newest);
-	Expect(NT_SUCCESS(st), "RecoveryBegin at newest succeeds (empty history)");
-	Expect(memcmp(QhMemStoreData(ctx.Source), liveBefore, sizeof(liveBefore)) == 0,
-		"Recovery at newest leaves live source unchanged");
-	QhCoreRecoveryEnd(ctx.Core);
-
-	st = QhCoreRecoveryBegin(ctx.Core, newest + 1000);
-	Expect(NT_SUCCESS(st), "RecoveryBegin after newest succeeds (empty history)");
-	Expect(memcmp(QhMemStoreData(ctx.Source), liveBefore, sizeof(liveBefore)) == 0,
-		"Recovery after newest leaves live source unchanged");
-	QhCoreRecoveryEnd(ctx.Core);
+	st = TestRecoveryOneShot(ctx.Core, oldest);
+	Expect(NT_SUCCESS(st), "RecoveryBegin at oldest includes oldest record");
+	Expect(memcmp(QhMemStoreData(ctx.Source), a, sizeof(a)) == 0,
+		"Recovery at oldest restores oldest record before-image");
 
 	TestCtxDestroy(&ctx);
 	return g_caseFailed;
@@ -1076,8 +1081,8 @@ static int TestPreviewTargetAtOrAfterNewest(void)
 	Expect(NT_SUCCESS(st), "PreviewBegin at newest");
 	memset(out, 0, sizeof(out));
 	st = QhCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, c, sizeof(c)) == 0,
-		"Preview at newest reads live C");
+	Expect(NT_SUCCESS(st) && memcmp(out, b, sizeof(b)) == 0,
+		"Preview at newest includes newest record and reads B");
 	QhCorePreviewEnd(ctx.Core);
 
 	st = QhCorePreviewBegin(ctx.Core, newest + 500);
@@ -1189,12 +1194,12 @@ static int TestRecoveryWritebackActive(void)
 	FillPattern(bTail, sizeof(bTail), 0xBE);
 	ctx.Source->Write(ctx.Source, 0, sizeof(a), a);
 
-	tAfterFull = QhCoreGetTime100ns(ctx.Core);
 	QhCoreWrite(ctx.Core, 0, sizeof(bFull), bFull);
+	tAfterFull = QhCoreGetTime100ns(ctx.Core);
 	QhCoreWrite(ctx.Core, 256, sizeof(bTail), bTail);
 
 	QhCoreTestSetWritebackHook(RecoveryWritebackHook);
-	st = QhCoreRecoveryBegin(ctx.Core, tAfterFull);
+	st = TestRecoveryOneShot(ctx.Core, tAfterFull);
 	QhCoreTestSetWritebackHook(NULL);
 	Expect(NT_SUCCESS(st), "RecoveryBegin with writeback hook");
 	Expect(g_writebackHookInvoked != 0, "writeback hook invoked during RecoveryBegin");
@@ -1206,7 +1211,6 @@ static int TestRecoveryWritebackActive(void)
 			sizeof(scratchLive)) == 0,
 		"concurrent COW during writeback applied to live source");
 
-	QhCoreRecoveryEnd(ctx.Core);
 	TestCtxDestroy(&ctx);
 	return g_caseFailed;
 }
@@ -1393,6 +1397,56 @@ static int TestJournalFormatTooSmall(void)
 	return g_caseFailed;
 }
 
+/* --- header-region format write-size fallback and cache --- */
+
+static int TestJournalFormatWriteChunkFallback(void)
+{
+	PQH_STORE source = NULL;
+	PQH_STORE journal = NULL;
+	PQH_CORE core = NULL;
+	TEST_FAIL_STORE limited;
+	NTSTATUS st;
+
+	st = QhMemStoreCreate(SRC_SIZE, SECTOR, &source);
+	Expect(NT_SUCCESS(st), "create source for format write fallback");
+	st = QhMemStoreCreate(JNL_SIZE, SECTOR, &journal);
+	Expect(NT_SUCCESS(st), "create journal for format write fallback");
+	st = QhCoreCreate(source, journal, &core);
+	Expect(NT_SUCCESS(st), "create core for format write fallback");
+	if (!NT_SUCCESS(st))
+		goto cleanup;
+
+	TestFailStoreInstall(journal, &limited);
+	limited.MaxWriteLength = 64UL * 1024UL;
+
+	st = QhCoreFormatJournal(core);
+	Expect(NT_SUCCESS(st), "format falls back to supported write size");
+	Expect(limited.OversizeWriteCount == 5,
+		"format probes 2MB down to 64KB");
+	Expect(limited.LargestSuccessfulWrite == 64UL * 1024UL,
+		"format selects 64KB as largest successful write");
+
+	limited.OversizeWriteCount = 0;
+	limited.LargestSuccessfulWrite = 0;
+	st = QhCoreFormatJournal(core);
+	Expect(NT_SUCCESS(st), "second format reuses cached write size");
+	Expect(limited.OversizeWriteCount == 0,
+		"second format does not retry oversized writes");
+	Expect(limited.LargestSuccessfulWrite == 64UL * 1024UL,
+		"second format continues with cached 64KB writes");
+
+	QhCoreDestroy(core);
+	core = NULL;
+	TestFailStoreRemove(journal, &limited);
+
+cleanup:
+	if (core)
+		QhCoreDestroy(core);
+	QhMemStoreDestroy(journal);
+	QhMemStoreDestroy(source);
+	return g_caseFailed;
+}
+
 /* --- 4 KiB-sector journal end to end --- */
 
 static int TestFourKiBSectorCowPreviewRecovery(void)
@@ -1403,6 +1457,7 @@ static int TestFourKiBSectorCowPreviewRecovery(void)
 	UCHAR c[4096];
 	UCHAR out[4096];
 	UINT64 t0;
+	UINT64 tAfterB;
 	NTSTATUS st;
 
 	Expect(NT_SUCCESS(TestCtxCreateWithSector(
@@ -1416,6 +1471,7 @@ static int TestFourKiBSectorCowPreviewRecovery(void)
 	t0 = QhCoreGetTime100ns(ctx.Core);
 	Expect(NT_SUCCESS(QhCoreWrite(ctx.Core, 0, sizeof(b), b)),
 		"4KiB COW write B");
+	tAfterB = QhCoreGetTime100ns(ctx.Core);
 	Expect(NT_SUCCESS(QhCoreWrite(ctx.Core, 0, sizeof(c), c)),
 		"4KiB COW write C");
 
@@ -1423,15 +1479,16 @@ static int TestFourKiBSectorCowPreviewRecovery(void)
 		"4KiB PreviewBegin");
 	memset(out, 0, sizeof(out));
 	st = QhCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, b, sizeof(b)) == 0,
-		"4KiB Preview returns B");
+	Expect(NT_SUCCESS(st) && memcmp(out, a, sizeof(a)) == 0,
+		"4KiB Preview includes target-time record and returns A");
 	Expect(NT_SUCCESS(QhCorePreviewEnd(ctx.Core)), "4KiB PreviewEnd");
 
-	Expect(NT_SUCCESS(QhCoreRecoveryBegin(ctx.Core, t0)),
+	Expect(NT_SUCCESS(TestRecoveryOneShot(ctx.Core, tAfterB)),
 		"4KiB RecoveryBegin");
 	Expect(memcmp(QhMemStoreData(ctx.Source), b, sizeof(b)) == 0,
 		"4KiB Recovery writes back B");
-	Expect(NT_SUCCESS(QhCoreRecoveryEnd(ctx.Core)), "4KiB RecoveryEnd");
+	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_NORMAL,
+		"4KiB Recovery returns to Normal");
 	TestCtxDestroy(&ctx);
 	return g_caseFailed;
 }
@@ -1519,6 +1576,85 @@ static int TestJournalWriteFailureDoesNotWriteSource(void)
 	return g_caseFailed;
 }
 
+static int TestPreparedRecoveryCommitCancel(void)
+{
+	TEST_CTX ctx;
+	UCHAR a[512];
+	UCHAR b[512];
+	UCHAR c[512];
+	UCHAR n[512];
+	UCHAR x[512];
+	UCHAR y[512];
+	UCHAR out[512];
+	UINT64 t0;
+	UINT64 tx;
+	NTSTATUS st;
+
+	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 29000)),
+		"setup prepared recovery test");
+	FillPattern(a, sizeof(a), 0x10);
+	FillPattern(b, sizeof(b), 0x20);
+	FillPattern(c, sizeof(c), 0x30);
+	FillPattern(n, sizeof(n), 0x40);
+	FillPattern(x, sizeof(x), 0x50);
+	FillPattern(y, sizeof(y), 0x60);
+
+	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
+		"seed prepared recovery source A");
+	t0 = QhCoreGetTime100ns(ctx.Core);
+	Expect(NT_SUCCESS(QhCoreWrite(ctx.Core, 0, sizeof(b), b)),
+		"COW write B before prepare");
+	Expect(NT_SUCCESS(QhCoreWrite(ctx.Core, 0, sizeof(c), c)),
+		"COW write C before prepare");
+
+	st = QhCoreRecoveryBegin(ctx.Core, t0);
+	Expect(NT_SUCCESS(st), "prepare recovery without writeback");
+	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_RECOVERY,
+		"prepare remains in Recovery phase");
+	Expect(memcmp(QhMemStoreData(ctx.Source), c, sizeof(c)) == 0,
+		"prepare leaves physical source unchanged");
+	memset(out, 0, sizeof(out));
+	st = QhCoreRead(ctx.Core, 0, sizeof(out), out);
+	Expect(NT_SUCCESS(st) && memcmp(out, a, sizeof(a)) == 0,
+		"prepared read serves target-time history");
+
+	Expect(NT_SUCCESS(QhCoreWrite(ctx.Core, 0, sizeof(n), n)),
+		"new write is allowed while recovery is prepared");
+	memset(out, 0, sizeof(out));
+	st = QhCoreRead(ctx.Core, 0, sizeof(out), out);
+	Expect(NT_SUCCESS(st) && memcmp(out, n, sizeof(n)) == 0,
+		"new prepared-phase write wins over history");
+	Expect(NT_SUCCESS(QhCoreRecoveryCommit(ctx.Core)),
+		"commit prepared recovery");
+	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_NORMAL,
+		"commit returns to Normal");
+	Expect(memcmp(QhMemStoreData(ctx.Source), n, sizeof(n)) == 0,
+		"commit preserves prepared-phase new write");
+
+	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 512, sizeof(x), x)),
+		"seed cancel range X");
+	tx = QhCoreGetTime100ns(ctx.Core);
+	Expect(NT_SUCCESS(QhCoreWrite(ctx.Core, 512, sizeof(y), y)),
+		"COW write Y before cancel test");
+	Expect(NT_SUCCESS(QhCoreRecoveryBegin(ctx.Core, tx)),
+		"prepare recovery for cancel");
+	memset(out, 0, sizeof(out));
+	Expect(NT_SUCCESS(QhCoreRead(ctx.Core, 512, sizeof(out), out)) &&
+			memcmp(out, x, sizeof(x)) == 0,
+		"prepared cancel view serves X");
+	Expect(NT_SUCCESS(QhCoreRecoveryCancel(ctx.Core)),
+		"cancel prepared recovery");
+	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_NORMAL,
+		"cancel returns to Normal");
+	Expect(memcmp((PUCHAR)QhMemStoreData(ctx.Source) + 512, y, sizeof(y)) == 0,
+		"cancel performs no physical writeback");
+	Expect(QhCoreRecoveryCommit(ctx.Core) == STATUS_INVALID_DEVICE_STATE,
+		"commit requires prepared Recovery phase");
+
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
 int main(void)
 {
 	int failed = 0;
@@ -1551,9 +1687,11 @@ int main(void)
 	failed += RunCase("Journal payload tail wrap", TestJournalPayloadTailWrap);
 	failed += RunCase("Journal tiny partition large record", TestJournalTinyPartitionLargeRecord);
 	failed += RunCase("Journal format too small", TestJournalFormatTooSmall);
+	failed += RunCase("Journal format write chunk fallback", TestJournalFormatWriteChunkFallback);
 	failed += RunCase("4KiB-sector COW / Preview / Recovery", TestFourKiBSectorCowPreviewRecovery);
 	failed += RunCase("Journal superblock redundancy", TestSuperblockRedundancy);
 	failed += RunCase("Journal failure keeps live source unchanged", TestJournalWriteFailureDoesNotWriteSource);
+	failed += RunCase("Prepared Recovery commit/cancel", TestPreparedRecoveryCommitCancel);
 
 	printf("\n%s (%d failures)\n", failed ? "FAILED" : "ALL PASSED", failed);
 	return failed ? 1 : 0;

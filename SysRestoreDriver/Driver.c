@@ -176,6 +176,14 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 
 	UNREFERENCED_PARAMETER(RegistryPath);
 
+	DbgPrintEx(
+		DPFLTR_IHVDRIVER_ID,
+		DPFLTR_ERROR_LEVEL,
+		"SysRestoreDriver: loaded version=%s journal=v%lu build=%s\n",
+		QH_DRIVER_VERSION_STRING,
+		QH_JOURNAL_VERSION,
+		QH_DRIVER_BUILD_STRING);
+
 	g_DriverObject = DriverObject;
 	DriverObject->DriverUnload = QHDriverUnload;
 

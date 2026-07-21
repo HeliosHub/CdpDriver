@@ -8,6 +8,13 @@
 #endif
 
 #define QH_CRC32C_POLY 0x82F63B78UL
+#ifndef QH_USERMODE
+#define QH_JOURNAL_DIAG(fmt, ...) \
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
+		"SysRestoreDriver: [JOURNAL-APPLY] " fmt, ##__VA_ARGS__)
+#else
+#define QH_JOURNAL_DIAG(fmt, ...) ((void)0)
+#endif
 
 static ULONG g_QhCrc32cTable[256];
 static volatile LONG g_QhCrc32cReady;
@@ -140,6 +147,63 @@ static NTSTATUS QHJournalRawIo(
 	}
 
 #ifndef QH_USERMODE
+	// Prefer the volume stack below our own filter.  This keeps offsets volume-
+	// relative and avoids blocking on a synchronous \\PhysicalDrive handle.
+	// Retain the physical-disk backend only as a compatibility fallback when no
+	// lower volume device was supplied.
+	if (Journal->RawDiskHandle && !Journal->TargetDevice)
+	{
+		IO_STATUS_BLOCK iosb;
+		LARGE_INTEGER byteOffset;
+
+		if (MajorFunction != IRP_MJ_READ &&
+			MajorFunction != IRP_MJ_WRITE)
+			return STATUS_NOT_IMPLEMENTED;
+		if (Journal->TargetBaseOffset >
+			(UINT64)MAXLONGLONG - Offset)
+			return STATUS_INTEGER_OVERFLOW;
+
+		byteOffset.QuadPart =
+			(LONGLONG)(Journal->TargetBaseOffset + Offset);
+		RtlZeroMemory(&iosb, sizeof(iosb));
+		DbgPrintEx(
+			DPFLTR_IHVDRIVER_ID,
+			DPFLTR_ERROR_LEVEL,
+			"SysRestoreDriver: [JOURNAL-PHYSICAL] io begin handle=%p "
+			"major=0x%02X partitionOffset=%llu diskOffset=%llu len=%lu\n",
+			Journal->RawDiskHandle,
+			MajorFunction,
+			Offset,
+			(UINT64)byteOffset.QuadPart,
+			Length);
+		if (MajorFunction == IRP_MJ_READ)
+		{
+			status = ZwReadFile(
+				(HANDLE)Journal->RawDiskHandle,
+				NULL, NULL, NULL, &iosb,
+				Buffer, Length, &byteOffset, NULL);
+		}
+		else
+		{
+			status = ZwWriteFile(
+				(HANDLE)Journal->RawDiskHandle,
+				NULL, NULL, NULL, &iosb,
+				Buffer, Length, &byteOffset, NULL);
+		}
+		if (NT_SUCCESS(status))
+			status = iosb.Status;
+		DbgPrintEx(
+			DPFLTR_IHVDRIVER_ID,
+			DPFLTR_ERROR_LEVEL,
+			"SysRestoreDriver: [JOURNAL-PHYSICAL] io end "
+			"status=0x%08X bytes=%Iu\n",
+			status,
+			iosb.Information);
+		if (NT_SUCCESS(status) && iosb.Information != Length)
+			return STATUS_UNEXPECTED_IO_ERROR;
+		return status;
+	}
+
 	{
 		KEVENT event;
 		IO_STATUS_BLOCK iosb;
@@ -163,11 +227,43 @@ static NTSTATUS QHJournalRawIo(
 	if (!irp)
 		return STATUS_INSUFFICIENT_RESOURCES;
 
+	DbgPrintEx(
+		DPFLTR_IHVDRIVER_ID,
+		DPFLTR_ERROR_LEVEL,
+		"SysRestoreDriver: [JOURNAL-RAW] io begin target=%p major=0x%02X "
+		"offset=%llu len=%lu irp=%p\n",
+		Journal->TargetDevice,
+		MajorFunction,
+		Offset,
+		Length,
+		irp);
 	status = IoCallDriver(Journal->TargetDevice, irp);
+	DbgPrintEx(
+		DPFLTR_IHVDRIVER_ID,
+		DPFLTR_ERROR_LEVEL,
+		"SysRestoreDriver: [JOURNAL-RAW] IoCallDriver returned irp=%p "
+		"status=0x%08X iosb=0x%08X bytes=%Iu\n",
+		irp,
+		status,
+		iosb.Status,
+		iosb.Information);
 	if (status == STATUS_PENDING)
 	{
+		DbgPrintEx(
+			DPFLTR_IHVDRIVER_ID,
+			DPFLTR_ERROR_LEVEL,
+			"SysRestoreDriver: [JOURNAL-RAW] wait begin irp=%p\n",
+			irp);
 		KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
 		status = iosb.Status;
+		DbgPrintEx(
+			DPFLTR_IHVDRIVER_ID,
+			DPFLTR_ERROR_LEVEL,
+			"SysRestoreDriver: [JOURNAL-RAW] wait end irp=%p "
+			"status=0x%08X bytes=%Iu\n",
+			irp,
+			status,
+			iosb.Information);
 	}
 	else if (NT_SUCCESS(status))
 	{
@@ -176,6 +272,14 @@ static NTSTATUS QHJournalRawIo(
 
 	if (NT_SUCCESS(status) && iosb.Information != Length)
 		return STATUS_UNEXPECTED_IO_ERROR;
+	DbgPrintEx(
+		DPFLTR_IHVDRIVER_ID,
+		DPFLTR_ERROR_LEVEL,
+		"SysRestoreDriver: [JOURNAL-RAW] io end irp=%p status=0x%08X "
+		"bytes=%Iu\n",
+		irp,
+		status,
+		iosb.Information);
 		return status;
 	}
 #else
@@ -260,6 +364,8 @@ static NTSTATUS QHJournalFlush(_In_ PQH_JOURNAL Journal)
 	PIRP irp;
 	NTSTATUS status;
 
+	if (!Journal->TargetDevice)
+		return STATUS_DEVICE_NOT_READY;
 	KeInitializeEvent(&event, NotificationEvent, FALSE);
 	RtlZeroMemory(&iosb, sizeof(iosb));
 	irp = IoBuildSynchronousFsdRequest(
@@ -412,6 +518,7 @@ static NTSTATUS QHJournalInitHeaderRegion(
 	PQH_HEADER_REGION_LINK link;
 	NTSTATUS status;
 	ULONG offset;
+	ULONG chunk;
 
 	region = (PUCHAR)QHAllocateAligned(Journal,
 		QH_JOURNAL_HEADER_REGION_SIZE,
@@ -427,21 +534,43 @@ static NTSTATUS QHJournalInitHeaderRegion(
 	link->NextRegionOff = NextOff;
 	link->Reserved = 0;
 
-	for (offset = 0;
-		offset < QH_JOURNAL_HEADER_REGION_SIZE;
-		offset += Journal->SectorSize)
+	chunk = Journal->HeaderRegionWriteChunk;
+	if (chunk == 0 || chunk > QH_JOURNAL_HEADER_REGION_SIZE)
+		chunk = QH_JOURNAL_HEADER_REGION_SIZE;
+	chunk = (chunk / Journal->SectorSize) * Journal->SectorSize;
+	if (chunk < Journal->SectorSize)
+		chunk = Journal->SectorSize;
+
+	for (offset = 0; offset < QH_JOURNAL_HEADER_REGION_SIZE;)
 	{
-	status = QHJournalRawIo(
-		Journal,
+		ULONG remaining = QH_JOURNAL_HEADER_REGION_SIZE - offset;
+		ULONG transfer = chunk < remaining ? chunk : remaining;
+
+		status = QHJournalRawIo(
+			Journal,
 			IRP_MJ_WRITE,
 			RegionOff + offset,
-		Journal->SectorSize,
+			transfer,
 			region + offset);
 		if (!NT_SUCCESS(status))
 		{
-			qhfree(allocationBase);
-			return status;
+			if (chunk <= Journal->SectorSize)
+			{
+				qhfree(allocationBase);
+				return status;
+			}
+
+			chunk /= 2;
+			chunk = (chunk / Journal->SectorSize) * Journal->SectorSize;
+			if (chunk < Journal->SectorSize)
+				chunk = Journal->SectorSize;
+			continue;
 		}
+
+		// Cache the largest transfer that succeeded.  Later header regions
+		// start directly with this size instead of probing from 2MB again.
+		Journal->HeaderRegionWriteChunk = chunk;
+		offset += transfer;
 	}
 	qhfree(allocationBase);
 	return STATUS_SUCCESS;
@@ -792,12 +921,16 @@ static NTSTATUS QHJournalRebuildRuntimeLocked(_Inout_ PQH_JOURNAL Journal)
 VOID QHJournalInitialize(
 	_Out_ PQH_JOURNAL Journal,
 	_In_opt_ PVOID TargetDevice,
+	_In_opt_ PVOID RawDiskHandle,
+	_In_ UINT64 TargetBaseOffset,
 	_In_ UINT64 PartitionSize,
 	_In_ ULONG SectorSize,
 	_In_ const GUID* SourceVolumeGuid)
 {
 	RtlZeroMemory(Journal, sizeof(*Journal));
 	Journal->TargetDevice = TargetDevice;
+	Journal->RawDiskHandle = RawDiskHandle;
+	Journal->TargetBaseOffset = TargetBaseOffset;
 	Journal->Store = NULL;
 	Journal->PartitionSize = QHAlignDown64(PartitionSize, SectorSize);
 	Journal->SectorSize = SectorSize;
@@ -825,7 +958,9 @@ VOID QHJournalInitializeWithStore(
 
 static BOOLEAN QHJournalHasBackend(_In_ PQH_JOURNAL Journal)
 {
-	return Journal->Store != NULL || Journal->TargetDevice != NULL;
+	return Journal->Store != NULL ||
+		Journal->RawDiskHandle != NULL ||
+		Journal->TargetDevice != NULL;
 }
 
 NTSTATUS QHJournalFormat(_Inout_ PQH_JOURNAL Journal)
@@ -1821,6 +1956,7 @@ NTSTATUS QHJournalBuildPreviewTree(
 	_Inout_ PQH_JOURNAL Journal,
 	_In_ UINT64 TargetTime100ns,
 	_In_ ULONG MaxSequence,
+	_In_ BOOLEAN IncludeTargetTime,
 	_Out_ PQH_PREVIEW_TREE Tree)
 {
 	NTSTATUS status = STATUS_SUCCESS;
@@ -1844,7 +1980,9 @@ NTSTATUS QHJournalBuildPreviewTree(
 		goto cleanup_locked;
 	}
 	if (QHJournalIsEmptyLocked(Journal) ||
-		TargetTime100ns >= Journal->Newest100ns)
+		(IncludeTargetTime ?
+			TargetTime100ns > Journal->Newest100ns :
+			TargetTime100ns >= Journal->Newest100ns))
 	{
 		status = STATUS_SUCCESS;
 		goto cleanup_locked;
@@ -1908,7 +2046,9 @@ NTSTATUS QHJournalBuildPreviewTree(
 			if (header.Sequence >= MaxSequence)
 				continue;
 
-			if (header.WallClock100ns <= TargetTime100ns)
+			if (IncludeTargetTime ?
+				header.WallClock100ns < TargetTime100ns :
+				header.WallClock100ns <= TargetTime100ns)
 			{
 				stop = TRUE;
 				break;
@@ -2024,6 +2164,11 @@ NTSTATUS QHJournalApplyPreviewTree(
 		goto cleanup;
 	}
 
+	QH_JOURNAL_DIAG(
+		"collect begin volumeOff=%llu len=%lu nodes=%lu\n",
+		VolumeOffset,
+		DataLength,
+		Tree->NodeCount);
 	QHPreviewTreeCollectOverlaps(
 		Tree->Root,
 		VolumeOffset,
@@ -2031,7 +2176,17 @@ NTSTATUS QHJournalApplyPreviewTree(
 		hits,
 		&hitCount,
 		hitCapacity);
+	QH_JOURNAL_DIAG(
+		"collect end volumeOff=%llu len=%lu hits=%lu\n",
+		VolumeOffset,
+		DataLength,
+		hitCount);
 	QHPreviewSortHitsBySequence(hits, hitCount);
+	QH_JOURNAL_DIAG(
+		"sort end volumeOff=%llu len=%lu hits=%lu\n",
+		VolumeOffset,
+		DataLength,
+		hitCount);
 
 	for (i = 0; i < hitCount && covered < DataLength; ++i)
 	{
@@ -2043,6 +2198,17 @@ NTSTATUS QHJournalApplyPreviewTree(
 		UINT64 overlapEnd;
 		UINT64 byteOffset;
 
+		QH_JOURNAL_DIAG(
+			"hit begin index=%lu/%lu seq=%lu node=[%llu,%llu) "
+			"dataLen=%lu fileOff=%llu invalid=%lu\n",
+			i,
+			hitCount,
+			node->Sequence,
+			node->Start,
+			node->End,
+			node->DataLength,
+			node->FileOffset,
+			node->Invalid ? 1UL : 0UL);
 		alignedSize = QHAlignUp64(node->DataLength, Journal->SectorSize);
 		payload = (PUCHAR)QHAllocateAligned(Journal,
 			(SIZE_T)alignedSize,
@@ -2053,16 +2219,27 @@ NTSTATUS QHJournalApplyPreviewTree(
 			goto cleanup;
 		}
 
-	status = QHJournalRawIo(
-		Journal,
+		QH_JOURNAL_DIAG(
+			"payload read begin index=%lu seq=%lu fileOff=%llu len=%lu\n",
+			i,
+			node->Sequence,
+			node->FileOffset,
+			(ULONG)alignedSize);
+		status = QHJournalRawIo(
+			Journal,
 			IRP_MJ_READ,
 			node->FileOffset,
 			(ULONG)alignedSize,
 			payload);
-	if (!NT_SUCCESS(status))
+		QH_JOURNAL_DIAG(
+			"payload read end index=%lu seq=%lu status=0x%08X\n",
+			i,
+			node->Sequence,
+			status);
+		if (!NT_SUCCESS(status))
 		{
 			qhfree(payloadBase);
-		goto cleanup;
+			goto cleanup;
 		}
 
 		overlapStart = node->Start > VolumeOffset ? node->Start : VolumeOffset;
@@ -2081,11 +2258,35 @@ NTSTATUS QHJournalApplyPreviewTree(
 			}
 		}
 		qhfree(payloadBase);
+		QH_JOURNAL_DIAG(
+			"hit end index=%lu seq=%lu covered=%lu\n",
+			i,
+			node->Sequence,
+			covered);
 	}
 
 	*CoveredCount = covered;
+	QH_JOURNAL_DIAG(
+		"apply end volumeOff=%llu len=%lu hits=%lu covered=%lu "
+		"status=0x%08X\n",
+		VolumeOffset,
+		DataLength,
+		hitCount,
+		covered,
+		status);
 
 cleanup:
+	if (!NT_SUCCESS(status))
+	{
+		QH_JOURNAL_DIAG(
+			"apply failed volumeOff=%llu len=%lu hits=%lu covered=%lu "
+			"status=0x%08X\n",
+			VolumeOffset,
+			DataLength,
+			hitCount,
+			covered,
+			status);
+	}
 	if (hits)
 		qhfree(hits);
 	return status;
