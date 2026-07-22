@@ -20,7 +20,7 @@
 #include "QHJournal.h"
 
 #define QH_DRIVER_VERSION_STRING "1.2.0"
-#define QH_DRIVER_BUILD_STRING   "20260722.31"
+#define QH_DRIVER_BUILD_STRING   "20260722.33"
 
 // QH_LOG: always (Release+Debug) — version / errors / rare lifecycle.
 // QH_DBG: Debug builds only — verbose I/O and path tracing.
@@ -72,7 +72,7 @@ typedef struct _QH_VOLUME_HANDLE_ENTRY
 	ULONG SectorSize;
 	QH_JOURNAL Journal;
 	// One reference is held while the entry is in VolumeHandleList.  Capture
-	// operations take an extra reference so CMD5 cannot close a handle while a
+	// operations take an extra reference so close cannot drop a handle while a
 	// write callback is using it.
 	volatile LONG ReferenceCount;
 	BOOLEAN Closing;
@@ -91,7 +91,6 @@ typedef struct _QH_DRIVER_EXTENSION
 	LIST_ENTRY VolumeHandleList;
 	FAST_MUTEX VolumeHandleMutex;
 	volatile LONGLONG VolumeHandleNextId;
-	UINT64 CaptureTargetHandleId;
 	// KMUTEX (not FastMutex): configure/auto-discover issue sync IoBuild*
 	// IRPs and must stay at PASSIVE_LEVEL for the whole critical section.
 	KMUTEX CaptureConfigMutex;
@@ -157,6 +156,8 @@ typedef struct _QH_DEVICE_EXTENSION
 	volatile LONG RecoveryReadStopping;
 	KMUTEX HistoryMutex;
 	PQH_CORE Core;
+	// Journal VolumeHandleList entry used while CaptureEnabled is set.
+	UINT64 JournalHandleId;
 } QH_DEVICE_EXTENSION, *PQH_DEVICE_EXTENSION;
 
 typedef struct _QH_CAPTURE_ITEM

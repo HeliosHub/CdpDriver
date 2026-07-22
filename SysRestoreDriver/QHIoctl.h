@@ -29,11 +29,8 @@
 
 #define IOCTL_QH_QUERY_PROTECT_STATUS CTL_CODE(QH_IOCTL_TYPE, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-// 指令 1 / 2 / 4 / 5：METHOD_BUFFERED
+// 指令 1 / 2：METHOD_BUFFERED
 #define IOCTL_QH_SEND_COMMAND CTL_CODE(QH_IOCTL_TYPE, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
-
-// 指令 3：按驱动侧句柄读扇区（METHOD_OUT_DIRECT）
-#define IOCTL_QH_READ_SECTORS CTL_CODE(QH_IOCTL_TYPE, 0x803, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
 
 // 文件预览：创建时间点会话、读取该时间点的卷数据、关闭会话
 #define IOCTL_QH_BEGIN_PREVIEW CTL_CODE(QH_IOCTL_TYPE, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -56,9 +53,6 @@
 
 #define QH_CMD_1 1
 #define QH_CMD_2 2
-#define QH_CMD_3 3
-#define QH_CMD_4 4  // 按 GUID 打开卷，返回 VolumeHandle
-#define QH_CMD_5 5  // 关闭 VolumeHandle
 
 #define QH_CMD3_MAX_READ_BYTES (2u * 1024u * 1024u)
 #define QH_SECTOR_SIZE_DEFAULT 512u
@@ -77,36 +71,14 @@ typedef struct _QH_CMD1_REQUEST
 typedef struct _QH_CMD2_REQUEST
 {
 	ULONG Code;
+	GUID SourceVolumeGuid; // stop CDP for this protected source only
 } QH_CMD2_REQUEST, *PQH_CMD2_REQUEST;
-
-// 指令4：GUID → 驱动内打开并缓存，返回句柄 ID
-typedef struct _QH_CMD4_REQUEST
-{
-	ULONG Code;          // = QH_CMD_4
-	GUID PartitionGuid;
-} QH_CMD4_REQUEST, *PQH_CMD4_REQUEST;
-
-// 指令5：关闭句柄
-typedef struct _QH_CMD5_REQUEST
-{
-	ULONG Code;            // = QH_CMD_5
-	UINT64 VolumeHandle;
-} QH_CMD5_REQUEST, *PQH_CMD5_REQUEST;
-
-// 指令3：用句柄读扇区（不再带 GUID）
-typedef struct _QH_CMD3_REQUEST
-{
-	ULONG Code;            // = QH_CMD_3
-	UINT64 VolumeHandle;   // 指令4 返回的句柄
-	UINT64 ByteOffset;
-	ULONG ByteLength;
-} QH_CMD3_REQUEST, *PQH_CMD3_REQUEST;
 
 typedef struct _QH_COMMAND_REPLY
 {
 	ULONG Command;
 	ULONG Result;
-	UINT64 VolumeHandle;   // 指令4 成功时有效，其余为 0
+	UINT64 VolumeHandle;   // CMD1 成功时有效，其余为 0
 	WCHAR Message[QH_COMMAND_REPLY_MSG_CHARS];
 } QH_COMMAND_REPLY, *PQH_COMMAND_REPLY;
 

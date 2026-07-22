@@ -8,7 +8,6 @@
 
 #pragma comment(lib, "ole32.lib")
 
-static UINT64 g_VolumeHandle = 0;
 static UINT64 g_PreviewHandle = 0;
 
 static void ConOut(const wchar_t* text)
@@ -208,14 +207,6 @@ static BOOL SendCmdBuffered(HANDLE hDevice, const void* req, DWORD reqSize)
 	ConOutFmt(L"Reply: Command=%lu Result=%lu Handle=%llu Message=%s\n",
 		reply.Command, reply.Result, reply.VolumeHandle, reply.Message);
 
-	if ((reply.Command == QH_CMD_1 || reply.Command == QH_CMD_4) &&
-		reply.Result == 0)
-		g_VolumeHandle = reply.VolumeHandle;
-
-	if ((reply.Command == QH_CMD_2 || reply.Command == QH_CMD_5) &&
-		reply.Result == 0)
-		g_VolumeHandle = 0;
-
 	return TRUE;
 }
 
@@ -239,53 +230,19 @@ static BOOL DoCommand1(HANDLE hDevice)
 static BOOL DoCommand2(HANDLE hDevice)
 {
 	QH_CMD2_REQUEST req = { 0 };
+
 	req.Code = QH_CMD_2;
-	return SendCmdBuffered(hDevice, &req, sizeof(req));
-}
-
-static BOOL DoCommand4(HANDLE hDevice)
-{
-	QH_CMD4_REQUEST req = { 0 };
-	req.Code = QH_CMD_4;
 	ListVolumes();
-	if (!PromptGuid(L"Volume GUID to open: ", &req.PartitionGuid))
+	if (!PromptGuid(L"Protected source volume GUID to stop: ", &req.SourceVolumeGuid))
 		return FALSE;
-	ConOut(L"Opening volume (CMD4)...\n");
-	return SendCmdBuffered(hDevice, &req, sizeof(req));
-}
-
-static BOOL DoCommand5(HANDLE hDevice)
-{
-	QH_CMD5_REQUEST req = { 0 };
-	wchar_t line[64];
-
-	req.Code = QH_CMD_5;
-	if (g_VolumeHandle != 0)
-	{
-		ConOutFmt(L"Current handle=%llu. Press Enter to close it, or type another id: ", g_VolumeHandle);
-		if (!ReadLine(line, _countof(line)))
-			return FALSE;
-		if (line[0] == L'\0')
-			req.VolumeHandle = g_VolumeHandle;
-		else
-			req.VolumeHandle = _wcstoui64(line, NULL, 0);
-	}
-	else
-	{
-		ConOut(L"VolumeHandle: ");
-		if (!ReadLine(line, _countof(line)))
-			return FALSE;
-		req.VolumeHandle = _wcstoui64(line, NULL, 0);
-	}
-
-	ConOut(L"Closing volume (CMD5)...\n");
+	ConOut(L"Stopping capture for source...\n");
 	return SendCmdBuffered(hDevice, &req, sizeof(req));
 }
 
 static void PrintMaxReadHint(void)
 {
 	ConOutFmt(
-		L"  (CMD3 / Preview read: max %u bytes per request, 2 MiB)\n",
+		L"  (Preview read: max %u bytes per request, 2 MiB)\n",
 		QH_CMD3_MAX_READ_BYTES);
 }
 
@@ -318,81 +275,6 @@ static void PrintTime100nsLabel(_In_ const wchar_t* label, _In_ UINT64 time100ns
 	{
 		ConOut(L"\n");
 	}
-}
-
-static BOOL DoCommand3(HANDLE hDevice)
-{
-	QH_CMD3_REQUEST req = { 0 };
-	BYTE* buf = NULL;
-	DWORD bytesReturned = 0;
-	wchar_t line[64];
-	ULONG i;
-	ULONG dump;
-
-	req.Code = QH_CMD_3;
-
-	if (g_VolumeHandle == 0)
-	{
-		ConOut(L"No open handle. Run command 4 first.\n");
-		return FALSE;
-	}
-
-	req.VolumeHandle = g_VolumeHandle;
-	ConOutFmt(L"Using handle=%llu\n", req.VolumeHandle);
-
-	ConOut(L"ByteOffset (e.g. 0): ");
-	if (!ReadLine(line, _countof(line)))
-		return FALSE;
-	req.ByteOffset = _wcstoui64(line, NULL, 0);
-
-	ConOutFmt(L"ByteLength (512-byte aligned, 1..%u): ", QH_CMD3_MAX_READ_BYTES);
-	if (!ReadLine(line, _countof(line)))
-		return FALSE;
-	req.ByteLength = (ULONG)wcstoul(line, NULL, 0);
-
-	if (req.ByteLength == 0 || req.ByteLength > QH_CMD3_MAX_READ_BYTES)
-	{
-		ConOutFmt(L"Length must be 1..%u\n", QH_CMD3_MAX_READ_BYTES);
-		return FALSE;
-	}
-	if ((req.ByteOffset % QH_SECTOR_SIZE_DEFAULT) != 0 ||
-		(req.ByteLength % QH_SECTOR_SIZE_DEFAULT) != 0)
-	{
-		ConOut(L"Offset/Length must be multiples of 512.\n");
-		return FALSE;
-	}
-
-	buf = (BYTE*)VirtualAlloc(NULL, req.ByteLength, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-	if (!buf)
-	{
-		ConOut(L"VirtualAlloc failed.\n");
-		return FALSE;
-	}
-
-	ConOutFmt(L"Reading handle=%llu offset=%llu len=%lu ...\n",
-		req.VolumeHandle, req.ByteOffset, req.ByteLength);
-
-	if (!DeviceIoControl(hDevice, IOCTL_QH_READ_SECTORS,
-		&req, sizeof(req), buf, req.ByteLength, &bytesReturned, NULL))
-	{
-		ConOutFmt(L"Read failed (err=%lu)\n", GetLastError());
-		VirtualFree(buf, 0, MEM_RELEASE);
-		return FALSE;
-	}
-
-	ConOutFmt(L"Got %lu bytes. Hex (first 64):\n", bytesReturned);
-	dump = min(bytesReturned, 64ul);
-	for (i = 0; i < dump; ++i)
-	{
-		ConOutFmt(L"%02X ", buf[i]);
-		if ((i + 1) % 16 == 0)
-			ConOut(L"\n");
-	}
-	if (dump % 16)
-		ConOut(L"\n");
-
-	VirtualFree(buf, 0, MEM_RELEASE);
-	return TRUE;
 }
 
 static BOOL DoPreviewBegin(HANDLE hDevice)
@@ -745,12 +627,7 @@ static void PrintHelp(void)
 	ConOut(L"\nCommands:\n");
 	ConOut(L"  i  - install/register SysRestoreDriver (INF + UpperFilters)\n");
 	ConOut(L"  1  - configure capture: source GUID + dedicated journal GUID\n");
-	ConOut(L"  2  - stop capture and close the journal\n");
-	ConOut(L"  4  - CMD4: open volume by GUID -> handle\n");
-	ConOutFmt(
-		L"  3  - CMD3: read sectors by handle (need 4 first; max %u bytes)\n",
-		QH_CMD3_MAX_READ_BYTES);
-	ConOut(L"  5  - CMD5: close handle\n");
+	ConOut(L"  2  - stop capture for a source GUID (invalidate its journal)\n");
 	ConOut(L"  6  - begin point-in-time preview (source GUID + time)\n");
 	ConOutFmt(
 		L"  7  - read preview data by volume offset and length (max %u bytes)\n",
@@ -766,8 +643,6 @@ static void PrintHelp(void)
 	ConOut(L"  q  - quit console (does not stop CDP)\n");
 	PrintMaxReadHint();
 	ConOut(L"\n");
-	if (g_VolumeHandle)
-		ConOutFmt(L"Current VolumeHandle=%llu\n\n", g_VolumeHandle);
 	if (g_PreviewHandle)
 		ConOutFmt(L"Current PreviewHandle=%llu\n\n", g_PreviewHandle);
 }
@@ -823,21 +698,6 @@ int wmain(void)
 			hDevice = EnsureControlDevice(hDevice);
 			if (hDevice != INVALID_HANDLE_VALUE)
 				DoCommand2(hDevice);
-			break;
-		case L'3':
-			hDevice = EnsureControlDevice(hDevice);
-			if (hDevice != INVALID_HANDLE_VALUE)
-				DoCommand3(hDevice);
-			break;
-		case L'4':
-			hDevice = EnsureControlDevice(hDevice);
-			if (hDevice != INVALID_HANDLE_VALUE)
-				DoCommand4(hDevice);
-			break;
-		case L'5':
-			hDevice = EnsureControlDevice(hDevice);
-			if (hDevice != INVALID_HANDLE_VALUE)
-				DoCommand5(hDevice);
 			break;
 		case L'6':
 			hDevice = EnsureControlDevice(hDevice);

@@ -212,7 +212,6 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 	InitializeListHead(&DriverExtension->VolumeHandleList);
 	ExInitializeFastMutex(&DriverExtension->VolumeHandleMutex);
 	DriverExtension->VolumeHandleNextId = 0;
-	DriverExtension->CaptureTargetHandleId = 0;
 	KeInitializeMutex(&DriverExtension->CaptureConfigMutex, 0);
 	InitializeListHead(&DriverExtension->PreviewSessionList);
 	ExInitializeFastMutex(&DriverExtension->PreviewSessionMutex);
