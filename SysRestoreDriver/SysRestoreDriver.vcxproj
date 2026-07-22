@@ -122,7 +122,7 @@
   </ImportGroup>
   <Target Name="CopyDriverToConsoleDeploy" AfterTargets="Build">
     <PropertyGroup>
-      <ConsoleDeployDir>$(MSBuildProjectDirectory)\..\QHConsole\$(Platform)\$(Configuration)\driver\</ConsoleDeployDir>
+      <ConsoleDeployDir>$(MSBuildProjectDirectory)\..\x64\$(Configuration)\driver\</ConsoleDeployDir>
     </PropertyGroup>
     <MakeDir Directories="$(ConsoleDeployDir)" />
     <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ConsoleDeployDir)" SkipUnchangedFiles="true" />

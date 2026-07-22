@@ -19,8 +19,19 @@
 #include "QHIoctl.h"
 #include "QHJournal.h"
 
-#define QH_DRIVER_VERSION_STRING "1.1.0"
-#define QH_DRIVER_BUILD_STRING   "20260721.13"
+#define QH_DRIVER_VERSION_STRING "1.2.0"
+#define QH_DRIVER_BUILD_STRING   "20260722.31"
+
+// QH_LOG: always (Release+Debug) — version / errors / rare lifecycle.
+// QH_DBG: Debug builds only — verbose I/O and path tracing.
+#define QH_LOG(fmt, ...) \
+	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
+		"SysRestoreDriver: " fmt, ##__VA_ARGS__)
+#if DBG
+#define QH_DBG(fmt, ...) QH_LOG(fmt, ##__VA_ARGS__)
+#else
+#define QH_DBG(fmt, ...) ((void)0)
+#endif
 
 #if (NTDDI_VERSION >= NTDDI_WIN10_VB)
 #define qhalloc(size) ExAllocatePool2(POOL_FLAG_NON_PAGED, size, 'NTAG')
@@ -65,6 +76,8 @@ typedef struct _QH_VOLUME_HANDLE_ENTRY
 	// write callback is using it.
 	volatile LONG ReferenceCount;
 	BOOLEAN Closing;
+	BOOLEAN VolumeGuidValid;
+	GUID VolumeGuid;
 	KEVENT NoReferences;
 } QH_VOLUME_HANDLE_ENTRY, *PQH_VOLUME_HANDLE_ENTRY;
 
@@ -79,11 +92,25 @@ typedef struct _QH_DRIVER_EXTENSION
 	FAST_MUTEX VolumeHandleMutex;
 	volatile LONGLONG VolumeHandleNextId;
 	UINT64 CaptureTargetHandleId;
+	// KMUTEX (not FastMutex): configure/auto-discover issue sync IoBuild*
+	// IRPs and must stay at PASSIVE_LEVEL for the whole critical section.
+	KMUTEX CaptureConfigMutex;
 
 	// 按时间点读取的文件预览会话
 	LIST_ENTRY PreviewSessionList;
 	FAST_MUTEX PreviewSessionMutex;
 	volatile LONGLONG PreviewSessionNextId;
+
+	WORK_QUEUE_ITEM AutoDiscoveryWorkItem;
+	volatile LONG AutoDiscoveryQueued;
+	volatile LONG AutoDiscoveryStopping;
+	volatile LONG AutoDiscoverySuppressed;
+	// 0 until every started volume is classified and no journal is waiting
+	// on a not-yet-started source (or CDP has been enabled).
+	volatile LONG AutoDiscoverySettled;
+	volatile LONG AutoDiscoveryRunning;
+	KEVENT AutoDiscoveryIdle;
+	KEVENT AutoDiscoverySettledEvent;
 } QH_DRIVER_EXTENSION, *PQH_DRIVER_EXTENSION;
 
 typedef struct _QH_CORE QH_CORE, *PQH_CORE;
@@ -105,6 +132,14 @@ typedef struct _QH_DEVICE_EXTENSION
 {
 	volatile LONG CaptureEnabled;
 	volatile LONG Phase;
+	// Auto discovery may run concurrently with PnP removal.  Started prevents
+	// raw I/O before IRP_MN_START_DEVICE has completed; rundown keeps the lower
+	// device attachment stable for the duration of a probe.
+	volatile LONG Started;
+	// Auto-discovery classification: 0=unknown, 1=source, 2=journal.
+	volatile LONG AutoKind;
+	BOOLEAN VolumeGuidValid;
+	EX_RUNDOWN_REF AutoDiscoveryRundown;
 	GUID VolumeGuid;
 	PDEVICE_OBJECT LowerDeviceObject;
 	PDEVICE_OBJECT PhysicalDeviceObject;

@@ -39,10 +39,7 @@ static NTSTATUS QhDevStoreRawIo(
 	if (!irp)
 		return STATUS_INSUFFICIENT_RESOURCES;
 
-	DbgPrintEx(
-		DPFLTR_IHVDRIVER_ID,
-		DPFLTR_ERROR_LEVEL,
-		"SysRestoreDriver: [DEVSTORE] io begin device=%p major=0x%02X "
+	QH_DBG("[DEVSTORE] io begin device=%p major=0x%02X "
 		"offset=%llu len=%lu irp=%p\n",
 		Device,
 		MajorFunction,
@@ -50,10 +47,7 @@ static NTSTATUS QhDevStoreRawIo(
 		Length,
 		irp);
 	status = IoCallDriver(Device, irp);
-	DbgPrintEx(
-		DPFLTR_IHVDRIVER_ID,
-		DPFLTR_ERROR_LEVEL,
-		"SysRestoreDriver: [DEVSTORE] IoCallDriver returned irp=%p "
+	QH_DBG("[DEVSTORE] IoCallDriver returned irp=%p "
 		"status=0x%08X iosb=0x%08X bytes=%Iu\n",
 		irp,
 		status,
@@ -61,17 +55,11 @@ static NTSTATUS QhDevStoreRawIo(
 		iosb.Information);
 	if (status == STATUS_PENDING)
 	{
-		DbgPrintEx(
-			DPFLTR_IHVDRIVER_ID,
-			DPFLTR_ERROR_LEVEL,
-			"SysRestoreDriver: [DEVSTORE] wait begin irp=%p\n",
+		QH_DBG("[DEVSTORE] wait begin irp=%p\n",
 			irp);
 		KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
 		status = iosb.Status;
-		DbgPrintEx(
-			DPFLTR_IHVDRIVER_ID,
-			DPFLTR_ERROR_LEVEL,
-			"SysRestoreDriver: [DEVSTORE] wait end irp=%p "
+		QH_DBG("[DEVSTORE] wait end irp=%p "
 			"status=0x%08X bytes=%Iu\n",
 			irp,
 			status,
@@ -84,10 +72,7 @@ static NTSTATUS QhDevStoreRawIo(
 
 	if (NT_SUCCESS(status) && iosb.Information != Length)
 		return STATUS_UNEXPECTED_IO_ERROR;
-	DbgPrintEx(
-		DPFLTR_IHVDRIVER_ID,
-		DPFLTR_ERROR_LEVEL,
-		"SysRestoreDriver: [DEVSTORE] io end irp=%p status=0x%08X "
+	QH_DBG("[DEVSTORE] io end irp=%p status=0x%08X "
 		"bytes=%Iu\n",
 		irp,
 		status,

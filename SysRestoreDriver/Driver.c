@@ -1,4 +1,4 @@
-﻿#include "QHEngineDefs.h"
+#include "QHEngineDefs.h"
 #include "QHIrpDispatchs.h"
 #include "..\SysRestoreCore\include\qh_core.h"
 
@@ -98,8 +98,9 @@ NTSTATUS QHAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Physi
 	InitializeListHead(&DeviceExtension->RecoveryReadQueue);
 	KeInitializeEvent(&DeviceExtension->RecoveryReadEvent, NotificationEvent, FALSE);
 	KeInitializeMutex(&DeviceExtension->HistoryMutex, 0);
+	ExInitializeRundownProtection(&DeviceExtension->AutoDiscoveryRundown);
 	DeviceExtension->SectorSize = QH_SECTOR_SIZE_DEFAULT;
-	InterlockedExchange(&DeviceExtension->Phase, QH_PHASE_NORMAL);
+	InterlockedExchange(&DeviceExtension->Phase, QH_PHASE_GENERAL);
 
 	Status = IoAttachDeviceToDeviceStackSafe(FilterDeviceObject, PhysicalDeviceObject, &DeviceExtension->LowerDeviceObject);
 	if (!NT_SUCCESS(Status))
@@ -125,6 +126,7 @@ NTSTATUS QHAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Physi
 		&DriverExtension->DeviceObjectListLock);
 
 	FilterDeviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
+	QHScheduleAutoDiscovery(DriverExtension);
 
 cleanup:
 	if (!NT_SUCCESS(Status) && FilterDeviceObject)
@@ -155,6 +157,7 @@ VOID QHDriverUnload(_In_ PDRIVER_OBJECT DriverObject)
 
 	// Preview sessions own source-volume handles and can call into Core.  Tear
 	// them down before any filter device/Core is removed.
+	QHStopAutoDiscovery(DriverExtension);
 	QHCloseAllPreviewSessions(DriverExtension);
 
 	while (TRUE)
@@ -185,10 +188,8 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 
 	UNREFERENCED_PARAMETER(RegistryPath);
 
-	DbgPrintEx(
-		DPFLTR_IHVDRIVER_ID,
-		DPFLTR_ERROR_LEVEL,
-		"SysRestoreDriver: loaded version=%s journal=v%lu build=%s\n",
+	QH_LOG(
+		"loaded version=%s journal=v%lu build=%s\n",
 		QH_DRIVER_VERSION_STRING,
 		QH_JOURNAL_VERSION,
 		QH_DRIVER_BUILD_STRING);
@@ -212,9 +213,11 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 	ExInitializeFastMutex(&DriverExtension->VolumeHandleMutex);
 	DriverExtension->VolumeHandleNextId = 0;
 	DriverExtension->CaptureTargetHandleId = 0;
+	KeInitializeMutex(&DriverExtension->CaptureConfigMutex, 0);
 	InitializeListHead(&DriverExtension->PreviewSessionList);
 	ExInitializeFastMutex(&DriverExtension->PreviewSessionMutex);
 	DriverExtension->PreviewSessionNextId = 0;
+	QHInitializeAutoDiscovery(DriverExtension);
 
 	Status = QHCreateControlDevice(DriverObject);
 	if (!NT_SUCCESS(Status))

@@ -49,9 +49,10 @@
 #define IOCTL_QH_QUERY_TIME_RANGE CTL_CODE(QH_IOCTL_TYPE, 0x80A, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_QH_CANCEL_RECOVERY CTL_CODE(QH_IOCTL_TYPE, 0x80B, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-#define QH_PHASE_NORMAL   0UL
+#define QH_PHASE_GENERAL  0UL
 #define QH_PHASE_PREVIEW  1UL
 #define QH_PHASE_RECOVERY 2UL
+#define QH_STATUS_UNPROTECTED (-1L)
 
 #define QH_CMD_1 1
 #define QH_CMD_2 2
@@ -109,7 +110,7 @@ typedef struct _QH_COMMAND_REPLY
 	WCHAR Message[QH_COMMAND_REPLY_MSG_CHARS];
 } QH_COMMAND_REPLY, *PQH_COMMAND_REPLY;
 
-// TargetTime100ns 使用 Windows FILETIME/KeQuerySystemTime 的 100ns 时间。
+// TargetTime100ns 使用本地时区 wall-clock（与 COW 记录 WallClock100ns 同口径）。
 typedef struct _QH_PREVIEW_BEGIN_REQUEST
 {
 	GUID SourceVolumeGuid;
@@ -144,7 +145,10 @@ typedef struct _QH_PHASE_QUERY_REQUEST
 
 typedef struct _QH_PHASE_QUERY_REPLY
 {
-	ULONG Phase; // QH_PHASE_*
+	// QH_PHASE_GENERAL / PREVIEW / RECOVERY, or QH_STATUS_UNPROTECTED (-1).
+	LONG Status;
+	ULONG Reserved;
+	GUID JournalPartitionGuid; // valid when Status >= 0 and protection is on
 	UINT64 RecoveryTargetTime100ns;
 } QH_PHASE_QUERY_REPLY, *PQH_PHASE_QUERY_REPLY;
 
@@ -169,7 +173,7 @@ typedef struct _QH_RECOVERY_CONTROL_REQUEST
 
 typedef struct _QH_RECOVERY_COMMIT_REPLY
 {
-	ULONG Phase; // QH_PHASE_NORMAL after synchronous writeback completes
+	ULONG Phase; // QH_PHASE_GENERAL after synchronous writeback completes
 	UINT64 TargetTime100ns;
 } QH_RECOVERY_COMMIT_REPLY, *PQH_RECOVERY_COMMIT_REPLY;
 

@@ -35,6 +35,16 @@ VOID QHCloseAllVolumeHandles(_In_ PQH_DRIVER_EXTENSION DriverExt);
 
 VOID QHCloseAllPreviewSessions(_In_ PQH_DRIVER_EXTENSION DriverExt);
 
+VOID QHInitializeAutoDiscovery(_Inout_ PQH_DRIVER_EXTENSION DriverExt);
+
+// Queue an immediate scan (safe at DISPATCH_LEVEL). Prefer calling from
+// IRP_MN_START_DEVICE so CDP arms before volume traffic.
+VOID QHQueueAutoDiscovery(_Inout_ PQH_DRIVER_EXTENSION DriverExt);
+
+VOID QHScheduleAutoDiscovery(_Inout_ PQH_DRIVER_EXTENSION DriverExt);
+
+VOID QHStopAutoDiscovery(_Inout_ PQH_DRIVER_EXTENSION DriverExt);
+
 NTSTATUS QHStartCaptureWorker(_Inout_ PQH_DEVICE_EXTENSION DevExt);
 
 VOID QHStopCaptureWorker(_Inout_ PQH_DEVICE_EXTENSION DevExt);

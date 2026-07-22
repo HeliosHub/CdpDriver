@@ -9,7 +9,7 @@ extern "C" {
 
 typedef enum _QH_CORE_PHASE
 {
-	QH_CORE_PHASE_NORMAL = 0,
+	QH_CORE_PHASE_GENERAL = 0,
 	QH_CORE_PHASE_PREVIEW = 1,
 	QH_CORE_PHASE_RECOVERY = 2
 } QH_CORE_PHASE;
@@ -75,7 +75,7 @@ NTSTATUS QhCorePreviewEnd(_Inout_ PQH_CORE Core);
 /* Build the target-time history view and remain in Recovery phase. */
 NTSTATUS QhCoreRecoveryBegin(_Inout_ PQH_CORE Core, _In_ UINT64 TargetTime100ns);
 
-/* Write the prepared history back to the source and return to Normal. */
+/* Write the prepared history back to the source and return to General. */
 NTSTATUS QhCoreRecoveryCommit(_Inout_ PQH_CORE Core);
 
 /* Discard a prepared history view without writing back. */

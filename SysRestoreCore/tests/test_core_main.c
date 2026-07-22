@@ -104,6 +104,13 @@ typedef struct _TEST_FAIL_STORE
 	QH_STORE_WRITE OriginalWrite;
 	LONG FailNextReads;
 	ULONG ReadCallCount;
+	ULONG ReadLength32Count;
+	ULONG MaxReadLength;
+	ULONG OversizeReadCount;
+	ULONG LargestSuccessfulRead;
+	UINT64 TotalReadBytes;
+	UINT64 LastReadOffset;
+	ULONG LastReadLength;
 	LONG FailNextWrites;
 	ULONG MaxWriteLength;
 	ULONG OversizeWriteCount;
@@ -120,15 +127,30 @@ static NTSTATUS TestFailStoreRead(
 	NTSTATUS status;
 
 	++fail->ReadCallCount;
+	if (Length == sizeof(QH_JOURNAL_RECORD_HEADER))
+		++fail->ReadLength32Count;
 	if (fail->FailNextReads > 0)
 	{
 		--fail->FailNextReads;
+		return STATUS_IO_DEVICE_ERROR;
+	}
+	if (fail->MaxReadLength != 0 && Length > fail->MaxReadLength)
+	{
+		++fail->OversizeReadCount;
 		return STATUS_IO_DEVICE_ERROR;
 	}
 
 	Store->Context = fail->OriginalContext;
 	status = fail->OriginalRead(Store, Offset, Length, Buffer);
 	Store->Context = fail;
+	if (NT_SUCCESS(status))
+	{
+		if (Length > fail->LargestSuccessfulRead)
+			fail->LargestSuccessfulRead = Length;
+		fail->TotalReadBytes += Length;
+		fail->LastReadOffset = Offset;
+		fail->LastReadLength = Length;
+	}
 	return status;
 }
 
@@ -167,6 +189,13 @@ static VOID TestFailStoreInstall(_Inout_ PQH_STORE Store, _Out_ PTEST_FAIL_STORE
 	Fail->OriginalWrite = Store->Write;
 	Fail->FailNextReads = 0;
 	Fail->ReadCallCount = 0;
+	Fail->ReadLength32Count = 0;
+	Fail->MaxReadLength = 0;
+	Fail->OversizeReadCount = 0;
+	Fail->LargestSuccessfulRead = 0;
+	Fail->TotalReadBytes = 0;
+	Fail->LastReadOffset = 0;
+	Fail->LastReadLength = 0;
 	Fail->FailNextWrites = 0;
 	Fail->MaxWriteLength = 0;
 	Fail->OversizeWriteCount = 0;
@@ -273,12 +302,12 @@ static int TestCowPreviewRecovery(void)
 
 	st = QhCorePreviewEnd(ctx.Core);
 	Expect(NT_SUCCESS(st), "PreviewEnd");
-	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_NORMAL, "phase Normal");
+	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_GENERAL, "phase General");
 
 	st = TestRecoveryOneShot(ctx.Core, t0);
 	Expect(NT_SUCCESS(st), "RecoveryBegin at t0");
-	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_NORMAL,
-		"one-shot Recovery returns to Normal");
+	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_GENERAL,
+		"one-shot Recovery returns to General");
 
 	memset(out, 0, sizeof(out));
 	st = QhCoreRead(ctx.Core, 0, sizeof(out), out);
@@ -525,8 +554,8 @@ static int TestErrorsAndPhaseGuards(void)
 
 	st = TestRecoveryOneShot(ctx.Core, 7000);
 	Expect(NT_SUCCESS(st), "RecoveryBegin ok");
-	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_NORMAL,
-		"Recovery completes in Normal phase");
+	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_GENERAL,
+		"Recovery completes in General phase");
 	Expect(NT_SUCCESS(QhCorePreviewBegin(ctx.Core, 7000)),
 		"PreviewBegin allowed after one-shot Recovery");
 	Expect(NT_SUCCESS(QhCorePreviewEnd(ctx.Core)),
@@ -535,7 +564,7 @@ static int TestErrorsAndPhaseGuards(void)
 		"another one-shot Recovery is allowed");
 
 	Expect(QhCorePreviewEnd(ctx.Core) == STATUS_INVALID_DEVICE_STATE,
-		"PreviewEnd rejected while Normal");
+		"PreviewEnd rejected while General");
 
 	TestCtxDestroy(&ctx);
 	return g_caseFailed;
@@ -1498,59 +1527,131 @@ static int TestFourKiBSectorCowPreviewRecovery(void)
 		"4KiB RecoveryBegin");
 	Expect(memcmp(QhMemStoreData(ctx.Source), b, sizeof(b)) == 0,
 		"4KiB Recovery writes back B");
-	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_NORMAL,
-		"4KiB Recovery returns to Normal");
+	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_GENERAL,
+		"4KiB Recovery returns to General");
 	TestCtxDestroy(&ctx);
 	return g_caseFailed;
 }
 
-/* --- redundant superblock mount behavior --- */
+/* --- single superblock, source GUID, and payload-head rebuild --- */
 
-static int TestSuperblockRedundancy(void)
+static int TestSingleSuperblockMetadata(void)
 {
-	TEST_CTX ctx;
-	PQH_CORE remounted = NULL;
+	PQH_STORE store = NULL;
+	QH_JOURNAL journal;
+	QH_JOURNAL remounted;
+	GUID sourceGuid = {
+		0x12345678, 0x1234, 0x5678,
+		{ 0x90, 0xAB, 0xCD, 0xEF, 1, 2, 3, 4 }
+	};
+	GUID zeroGuid = { 0 };
+	QH_JOURNAL_RECORD_HEADER lastHeader;
 	PUCHAR journalBytes;
-	UCHAR a[512];
-	UCHAR b[512];
-	UINT64 oldest = 0;
-	UINT64 newest = 0;
+	UCHAR payload[513];
+	UINT64 expectedPayloadHead;
 	NTSTATUS st;
 
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 27000)),
-		"setup redundant superblock test");
-	FillPattern(a, sizeof(a), 0x71);
-	FillPattern(b, sizeof(b), 0x72);
-	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
-		"seed source before superblock test");
-	Expect(NT_SUCCESS(QhCoreWrite(ctx.Core, 0, sizeof(b), b)),
-		"append record before superblock test");
+	Expect(NT_SUCCESS(QhMemStoreCreate(JNL_SIZE, SECTOR, &store)),
+		"create single-superblock store");
+	if (!store)
+		return g_caseFailed;
+	journalBytes = (PUCHAR)QhMemStoreData(store);
+	*(ULONG*)(journalBytes + store->Size - SECTOR) = QH_JOURNAL_MAGIC;
+	QHJournalInitializeWithStore(
+		&journal, store, &sourceGuid, NULL, NULL);
+	Expect(NT_SUCCESS(QHJournalFormat(&journal)),
+		"format single-superblock journal");
+	Expect(*(ULONG*)(journalBytes + store->Size - SECTOR) != QH_JOURNAL_MAGIC,
+		"format removes stale backup superblock from partition tail");
 
-	journalBytes = (PUCHAR)QhMemStoreData(ctx.Journal);
-	QhCoreDestroy(ctx.Core);
-	ctx.Core = NULL;
-	journalBytes[0] ^= 0xFF; /* corrupt primary superblock magic */
-	Expect(NT_SUCCESS(QhCoreCreate(ctx.Source, ctx.Journal, &remounted)),
-		"recreate after primary superblock corruption");
-	st = QhCoreMountJournal(remounted);
-	Expect(NT_SUCCESS(st), "mount falls back to backup superblock");
-	st = QhCoreQueryTimeRange(remounted, &oldest, &newest);
-	Expect(NT_SUCCESS(st) && oldest <= newest,
-		"backup superblock preserves journal records");
-	QhCoreDestroy(remounted);
-	remounted = NULL;
+	FillPattern(payload, sizeof(payload), 0x71);
+	Expect(NT_SUCCESS(QHJournalAppend(
+		&journal, 0, sizeof(payload), payload, &lastHeader)),
+		"append record before payload-head rebuild");
+	expectedPayloadHead = lastHeader.FileOffset + sizeof(payload);
+	expectedPayloadHead =
+		(expectedPayloadHead + SECTOR - 1) / SECTOR * SECTOR;
+	QHJournalClose(&journal);
 
-	// QHJournalClose() may rewrite superblocks on successful mount.
-	// Corrupt both primary+backup again to simulate "both invalid".
-	journalBytes[0] = 0; /* corrupt primary superblock magic */
-	journalBytes[ctx.Journal->Size - SECTOR] = 0; /* corrupt backup superblock magic */
-	Expect(NT_SUCCESS(QhCoreCreate(ctx.Source, ctx.Journal, &remounted)),
-		"recreate after both superblocks corrupted");
-	st = QhCoreMountJournal(remounted);
+	QHJournalInitializeWithStore(
+		&remounted, store, &zeroGuid, NULL, NULL);
+	st = QHJournalMount(&remounted);
+	Expect(NT_SUCCESS(st), "mount single-superblock journal");
+	Expect(RtlCompareMemory(
+		&remounted.SourceVolumeGuid,
+		&sourceGuid,
+		sizeof(GUID)) == sizeof(GUID),
+		"superblock persists source volume GUID");
+	Expect(remounted.PayloadRegionOff == expectedPayloadHead,
+		"mount derives payload head from latest record fileoffset+length");
+	QHJournalClose(&remounted);
+
+	journalBytes[0] ^= 0xFF;
+	QHJournalInitializeWithStore(
+		&remounted, store, &zeroGuid, NULL, NULL);
+	st = QHJournalMount(&remounted);
 	Expect(st == STATUS_DISK_CORRUPT_ERROR,
-		"mount rejects journal when both superblocks are invalid");
-	QhCoreDestroy(remounted);
-	TestCtxDestroy(&ctx);
+		"invalid primary superblock has no backup fallback");
+	QHJournalClose(&remounted);
+	QhMemStoreDestroy(store);
+	return g_caseFailed;
+}
+
+/* Stop-CDP must clear superblock magic so a later mount (auto-discovery) fails. */
+static int TestJournalInvalidateRejectsRemount(void)
+{
+	PQH_STORE store = NULL;
+	QH_JOURNAL journal;
+	QH_JOURNAL remounted;
+	GUID sourceGuid = {
+		0xF0E833C9, 0x0000, 0x0000,
+		{ 0x00, 0x00, 0x10, 0x80, 0x02, 0x00, 0x00, 0x00 }
+	};
+	GUID zeroGuid = { 0 };
+	QH_JOURNAL_RECORD_HEADER header;
+	PUCHAR journalBytes;
+	UCHAR payload[512];
+	NTSTATUS st;
+
+	Expect(NT_SUCCESS(QhMemStoreCreate(JNL_SIZE, SECTOR, &store)),
+		"create journal store for invalidate test");
+	if (!store)
+		return g_caseFailed;
+	journalBytes = (PUCHAR)QhMemStoreData(store);
+
+	QHJournalInitializeWithStore(
+		&journal, store, &sourceGuid, NULL, NULL);
+	Expect(NT_SUCCESS(QHJournalFormat(&journal)), "format journal");
+	FillPattern(payload, sizeof(payload), 0xA5);
+	Expect(NT_SUCCESS(QHJournalAppend(
+		&journal, 0, sizeof(payload), payload, &header)),
+		"append before stop");
+	QHJournalClose(&journal);
+
+	QHJournalInitializeWithStore(
+		&remounted, store, &zeroGuid, NULL, NULL);
+	Expect(NT_SUCCESS(QHJournalMount(&remounted)),
+		"close alone still leaves a remountable journal");
+	Expect(*(ULONG*)journalBytes == QH_JOURNAL_MAGIC,
+		"close preserves superblock magic (auto-CDP would find it)");
+
+	Expect(NT_SUCCESS(QHJournalInvalidate(&remounted)),
+		"invalidate clears on-disk magic like stop CDP");
+	Expect(*(ULONG*)journalBytes != QH_JOURNAL_MAGIC,
+		"superblock magic cleared after invalidate");
+	Expect(remounted.Mounted == FALSE, "invalidate marks journal unmounted");
+	QHJournalClose(&remounted);
+
+	QHJournalInitializeWithStore(
+		&remounted, store, &zeroGuid, NULL, NULL);
+	st = QHJournalMount(&remounted);
+	Expect(st == STATUS_DISK_CORRUPT_ERROR,
+		"mount rejects invalidated journal (no auto remount)");
+	Expect(*(ULONG*)journalBytes != QH_JOURNAL_MAGIC,
+		"close after invalidate does not rewrite magic");
+	QHJournalClose(&remounted);
+
+	QhMemStoreDestroy(store);
 	return g_caseFailed;
 }
 
@@ -1637,8 +1738,8 @@ static int TestPreparedRecoveryCommitCancel(void)
 		"new prepared-phase write wins over history");
 	Expect(NT_SUCCESS(QhCoreRecoveryCommit(ctx.Core)),
 		"commit prepared recovery");
-	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_NORMAL,
-		"commit returns to Normal");
+	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_GENERAL,
+		"commit returns to General");
 	Expect(memcmp(QhMemStoreData(ctx.Source), n, sizeof(n)) == 0,
 		"commit preserves prepared-phase new write");
 
@@ -1655,8 +1756,8 @@ static int TestPreparedRecoveryCommitCancel(void)
 		"prepared cancel view serves X");
 	Expect(NT_SUCCESS(QhCoreRecoveryCancel(ctx.Core)),
 		"cancel prepared recovery");
-	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_NORMAL,
-		"cancel returns to Normal");
+	Expect(QhCoreGetPhase(ctx.Core) == QH_CORE_PHASE_GENERAL,
+		"cancel returns to General");
 	Expect(memcmp((PUCHAR)QhMemStoreData(ctx.Source) + 512, y, sizeof(y)) == 0,
 		"cancel performs no physical writeback");
 	Expect(QhCoreRecoveryCommit(ctx.Core) == STATUS_INVALID_DEVICE_STATE,
@@ -1704,6 +1805,161 @@ static int TestFullyCoveredRecoveryReadSkipsSource(void)
 	return g_caseFailed;
 }
 
+static int TestHeaderRegionReadUsesDiscoveredChunk(void)
+{
+	PQH_STORE source = NULL;
+	PQH_STORE journal = NULL;
+	PQH_CORE core = NULL;
+	TEST_FAIL_STORE limited;
+	UCHAR a[512];
+	UCHAR b[512];
+	UINT64 targetTime = 31000;
+	NTSTATUS st;
+
+	Expect(NT_SUCCESS(QhMemStoreCreate(SRC_SIZE, SECTOR, &source)),
+		"create source for header read chunk test");
+	Expect(NT_SUCCESS(QhMemStoreCreate(JNL_SIZE, SECTOR, &journal)),
+		"create journal for header read chunk test");
+	Expect(NT_SUCCESS(QhCoreCreate(source, journal, &core)),
+		"create core for header read chunk test");
+	if (!source || !journal || !core)
+		goto cleanup;
+
+	TestFailStoreInstall(journal, &limited);
+	limited.MaxWriteLength = 64UL * 1024UL;
+	QhCoreSetTime100ns(core, targetTime);
+	Expect(NT_SUCCESS(QhCoreFormatJournal(core)),
+		"format discovers 64KB header-region I/O chunk");
+
+	FillPattern(a, sizeof(a), 0x31);
+	FillPattern(b, sizeof(b), 0x32);
+	Expect(NT_SUCCESS(source->Write(source, 0, sizeof(a), a)),
+		"seed header read chunk source");
+	Expect(NT_SUCCESS(QhCoreWrite(core, 0, sizeof(b), b)),
+		"append record for header read chunk scan");
+
+	limited.ReadCallCount = 0;
+	limited.MaxReadLength = 64UL * 1024UL;
+	limited.OversizeReadCount = 0;
+	limited.LargestSuccessfulRead = 0;
+	limited.TotalReadBytes = 0;
+	st = QhCoreRecoveryBegin(core, targetTime);
+	Expect(NT_SUCCESS(st), "recovery tree builds with cached read chunk");
+	Expect(limited.OversizeReadCount == 0 &&
+		limited.LargestSuccessfulRead == 64UL * 1024UL,
+		"header scan reuses discovered 64KB transfer size");
+	Expect(limited.ReadCallCount == 32 &&
+		limited.TotalReadBytes == QH_JOURNAL_HEADER_REGION_SIZE,
+		"header scan reads one 2MB region in 64KB blocks");
+	if (NT_SUCCESS(st))
+		Expect(NT_SUCCESS(QhCoreRecoveryCancel(core)),
+			"cancel header read chunk recovery");
+
+	TestFailStoreRemove(journal, &limited);
+
+cleanup:
+	QhCoreDestroy(core);
+	QhMemStoreDestroy(journal);
+	QhMemStoreDestroy(source);
+	return g_caseFailed;
+}
+
+static int TestPartialCoverageReadsOnlyLiveGap(void)
+{
+	TEST_CTX ctx;
+	TEST_FAIL_STORE sourceReads;
+	UCHAR original[1536];
+	UCHAR changed[512];
+	UCHAR out[1536];
+	UINT64 targetTime;
+	NTSTATUS st;
+
+	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 32000)),
+		"setup live-gap read test");
+	FillPattern(original, sizeof(original), 0x41);
+	FillPattern(changed, sizeof(changed), 0x42);
+	Expect(NT_SUCCESS(ctx.Source->Write(
+		ctx.Source, 0, sizeof(original), original)),
+		"seed three-sector source");
+	targetTime = QhCoreGetTime100ns(ctx.Core);
+	Expect(NT_SUCCESS(QhCoreWrite(ctx.Core, 0, sizeof(changed), changed)),
+		"journal first covered sector");
+	Expect(NT_SUCCESS(QhCoreWrite(ctx.Core, 1024, sizeof(changed), changed)),
+		"journal third covered sector");
+	Expect(NT_SUCCESS(QhCoreRecoveryBegin(ctx.Core, targetTime)),
+		"prepare history with one live gap");
+
+	TestFailStoreInstall(ctx.Source, &sourceReads);
+	memset(out, 0, sizeof(out));
+	st = QhCoreRead(ctx.Core, 0, sizeof(out), out);
+	Expect(NT_SUCCESS(st) && memcmp(out, original, sizeof(out)) == 0,
+		"mixed recovery read synthesizes journal and live bytes");
+	Expect(sourceReads.ReadCallCount == 1 &&
+		sourceReads.TotalReadBytes == 512 &&
+		sourceReads.LastReadOffset == 512 &&
+		sourceReads.LastReadLength == 512,
+		"partial coverage reads only the uncovered source interval");
+	TestFailStoreRemove(ctx.Source, &sourceReads);
+
+	Expect(NT_SUCCESS(QhCoreRecoveryCancel(ctx.Core)),
+		"cancel live-gap recovery");
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
+static int TestHeaderRegionReadFallbackOnMount(void)
+{
+	PQH_STORE source = NULL;
+	PQH_STORE journal = NULL;
+	PQH_CORE core = NULL;
+	TEST_FAIL_STORE limited;
+	UCHAR a[512];
+	UCHAR b[512];
+	NTSTATUS st;
+
+	Expect(NT_SUCCESS(QhMemStoreCreate(SRC_SIZE, SECTOR, &source)),
+		"create source for header read fallback");
+	Expect(NT_SUCCESS(QhMemStoreCreate(JNL_SIZE, SECTOR, &journal)),
+		"create journal for header read fallback");
+	Expect(NT_SUCCESS(QhCoreCreate(source, journal, &core)),
+		"create core for header read fallback");
+	if (!source || !journal || !core)
+		goto cleanup;
+
+	QhCoreSetTime100ns(core, 33000);
+	Expect(NT_SUCCESS(QhCoreFormatJournal(core)),
+		"format journal before remount fallback");
+	FillPattern(a, sizeof(a), 0x51);
+	FillPattern(b, sizeof(b), 0x52);
+	Expect(NT_SUCCESS(source->Write(source, 0, sizeof(a), a)),
+		"seed remount fallback source");
+	Expect(NT_SUCCESS(QhCoreWrite(core, 0, sizeof(b), b)),
+		"append record before remount fallback");
+	QhCoreDestroy(core);
+	core = NULL;
+
+	Expect(NT_SUCCESS(QhCoreCreate(source, journal, &core)),
+		"recreate core with unknown header read chunk");
+	if (!core)
+		goto cleanup;
+	TestFailStoreInstall(journal, &limited);
+	limited.MaxReadLength = 64UL * 1024UL;
+	st = QhCoreMountJournal(core);
+	Expect(NT_SUCCESS(st), "mount halves header reads down to supported size");
+	Expect(limited.OversizeReadCount == 5 &&
+		limited.LargestSuccessfulRead == 64UL * 1024UL,
+		"header read probes 2MB to 64KB by halving");
+	Expect(limited.ReadLength32Count == 0,
+		"mount and runtime rebuild never issue 32-byte reads");
+	TestFailStoreRemove(journal, &limited);
+
+cleanup:
+	QhCoreDestroy(core);
+	QhMemStoreDestroy(journal);
+	QhMemStoreDestroy(source);
+	return g_caseFailed;
+}
+
 int main(void)
 {
 	int failed = 0;
@@ -1738,10 +1994,14 @@ int main(void)
 	failed += RunCase("Journal format too small", TestJournalFormatTooSmall);
 	failed += RunCase("Journal format write chunk fallback", TestJournalFormatWriteChunkFallback);
 	failed += RunCase("4KiB-sector COW / Preview / Recovery", TestFourKiBSectorCowPreviewRecovery);
-	failed += RunCase("Journal superblock redundancy", TestSuperblockRedundancy);
+	failed += RunCase("Single superblock metadata", TestSingleSuperblockMetadata);
+	failed += RunCase("Journal invalidate rejects remount", TestJournalInvalidateRejectsRemount);
 	failed += RunCase("Journal failure keeps live source unchanged", TestJournalWriteFailureDoesNotWriteSource);
 	failed += RunCase("Prepared Recovery commit/cancel", TestPreparedRecoveryCommitCancel);
 	failed += RunCase("Fully covered Recovery read", TestFullyCoveredRecoveryReadSkipsSource);
+	failed += RunCase("Header-region read chunk reuse", TestHeaderRegionReadUsesDiscoveredChunk);
+	failed += RunCase("Partial coverage reads only live gap", TestPartialCoverageReadsOnlyLiveGap);
+	failed += RunCase("Header-region read fallback on mount", TestHeaderRegionReadFallbackOnMount);
 
 	printf("\n%s (%d failures)\n", failed ? "FAILED" : "ALL PASSED", failed);
 	return failed ? 1 : 0;

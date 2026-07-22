@@ -30,6 +30,60 @@ static void ConOutFmt(const wchar_t* fmt, ...)
 	ConOut(buf);
 }
 
+// Same layout as `hexdump -C`.
+static void HexdumpC(
+	_In_ UINT64 BaseOffset,
+	_In_reads_bytes_(Length) const BYTE* Data,
+	_In_ DWORD Length)
+{
+	DWORD i;
+
+	for (i = 0; i < Length; i += 16)
+	{
+		wchar_t line[96];
+		size_t pos = 0;
+		DWORD j;
+		DWORD lineLen = (Length - i > 16) ? 16 : (Length - i);
+
+		pos += (size_t)swprintf_s(
+			line + pos,
+			_countof(line) - pos,
+			L"%08llx  ",
+			(unsigned long long)(BaseOffset + i));
+
+		for (j = 0; j < 16; ++j)
+		{
+			if (j == 8)
+				pos += (size_t)swprintf_s(line + pos, _countof(line) - pos, L" ");
+			if (j < lineLen)
+			{
+				pos += (size_t)swprintf_s(
+					line + pos,
+					_countof(line) - pos,
+					L"%02x ",
+					Data[i + j]);
+			}
+			else
+			{
+				pos += (size_t)swprintf_s(line + pos, _countof(line) - pos, L"   ");
+			}
+		}
+
+		pos += (size_t)swprintf_s(line + pos, _countof(line) - pos, L" |");
+		for (j = 0; j < lineLen; ++j)
+		{
+			BYTE c = Data[i + j];
+			pos += (size_t)swprintf_s(
+				line + pos,
+				_countof(line) - pos,
+				L"%c",
+				(c >= 0x20 && c <= 0x7e) ? (int)c : (int)'.');
+		}
+		swprintf_s(line + pos, _countof(line) - pos, L"|\n");
+		ConOut(line);
+	}
+}
+
 static BOOL ReadLine(wchar_t* buf, DWORD cch)
 {
 	DWORD n = 0;
@@ -252,7 +306,7 @@ static void PrintTime100nsLabel(_In_ const wchar_t* label, _In_ UINT64 time100ns
 	if (FileTimeToSystemTime(&ft, &st))
 	{
 		ConOutFmt(
-			L"  (%04u-%02u-%02u %02u:%02u:%02u UTC)\n",
+			L"  (%04u-%02u-%02u %02u:%02u:%02u local)\n",
 			st.wYear,
 			st.wMonth,
 			st.wDay,
@@ -351,7 +405,7 @@ static BOOL DoPreviewBegin(HANDLE hDevice)
 	ListVolumes();
 	if (!PromptGuid(L"Protected source volume GUID: ", &req.SourceVolumeGuid))
 		return FALSE;
-	ConOut(L"TargetTime100ns (Windows FILETIME value): ");
+	ConOut(L"TargetTime100ns (local wall-clock FILETIME value): ");
 	if (!ReadLine(line, _countof(line)))
 		return FALSE;
 	req.TargetTime100ns = _wcstoui64(line, NULL, 10);
@@ -382,7 +436,6 @@ static BOOL DoPreviewRead(HANDLE hDevice)
 	BYTE* buffer;
 	DWORD bytesReturned = 0;
 	wchar_t line[64];
-	ULONG dump;
 
 	if (!g_PreviewHandle)
 	{
@@ -420,16 +473,8 @@ static BOOL DoPreviewRead(HANDLE hDevice)
 		return FALSE;
 	}
 
-	ConOutFmt(L"Preview returned %lu bytes (first 256):\n", bytesReturned);
-	dump = min(bytesReturned, 256ul);
-	for (ULONG i = 0; i < dump; ++i)
-	{
-		ConOutFmt(L"%02X ", buffer[i]);
-		if ((i + 1) % 16 == 0)
-			ConOut(L"\n");
-	}
-	if (dump % 16)
-		ConOut(L"\n");
+	ConOutFmt(L"Preview returned %lu bytes:\n", bytesReturned);
+	HexdumpC(req.ByteOffset, buffer, bytesReturned);
 	VirtualFree(buffer, 0, MEM_RELEASE);
 	return TRUE;
 }
@@ -466,7 +511,7 @@ static BOOL DoRecoveryBegin(HANDLE hDevice)
 	ListVolumes();
 	if (!PromptGuid(L"Protected source volume GUID: ", &req.SourceVolumeGuid))
 		return FALSE;
-	ConOut(L"TargetTime100ns (Windows FILETIME value): ");
+	ConOut(L"TargetTime100ns (local wall-clock FILETIME value): ");
 	if (!ReadLine(line, _countof(line)))
 		return FALSE;
 	req.TargetTime100ns = _wcstoui64(line, NULL, 10);
@@ -528,7 +573,7 @@ static BOOL DoRecoveryCommit(HANDLE hDevice)
 		L"Recovery committed. Phase=%lu target=%llu\n",
 		reply.Phase,
 		reply.TargetTime100ns);
-	ConOut(L"Writeback completed and the source volume is back in Normal phase.\n");
+	ConOut(L"Writeback completed and the source volume is back in General phase.\n");
 	return TRUE;
 }
 
@@ -555,7 +600,74 @@ static BOOL DoRecoveryCancel(HANDLE hDevice)
 		return FALSE;
 	}
 
-	ConOut(L"Prepared recovery cancelled; source volume returned to Normal phase.\n");
+	ConOut(L"Prepared recovery cancelled; source volume returned to General phase.\n");
+	return TRUE;
+}
+
+static void PrintGuidLine(_In_ const wchar_t* label, _In_ const GUID* Guid)
+{
+	ConOutFmt(
+		L"%s{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}\n",
+		label,
+		Guid->Data1,
+		Guid->Data2,
+		Guid->Data3,
+		Guid->Data4[0], Guid->Data4[1],
+		Guid->Data4[2], Guid->Data4[3],
+		Guid->Data4[4], Guid->Data4[5],
+		Guid->Data4[6], Guid->Data4[7]);
+}
+
+static BOOL DoQueryStatus(HANDLE hDevice)
+{
+	QH_PHASE_QUERY_REQUEST req = { 0 };
+	QH_PHASE_QUERY_REPLY reply = { 0 };
+	DWORD bytesReturned = 0;
+	GUID zeroGuid = { 0 };
+
+	ListVolumes();
+	if (!PromptGuid(L"Source volume GUID: ", &req.SourceVolumeGuid))
+		return FALSE;
+
+	if (!DeviceIoControl(
+			hDevice,
+			IOCTL_QH_QUERY_PHASE,
+			&req,
+			sizeof(req),
+			&reply,
+			sizeof(reply),
+			&bytesReturned,
+			NULL))
+	{
+		ConOutFmt(L"Query status failed (err=%lu).\n", GetLastError());
+		return FALSE;
+	}
+
+	ConOutFmt(L"Status=%ld ", reply.Status);
+	switch (reply.Status)
+	{
+	case QH_STATUS_UNPROTECTED:
+		ConOut(L"(unprotected)\n");
+		break;
+	case (LONG)QH_PHASE_GENERAL:
+		ConOut(L"(general)\n");
+		break;
+	case (LONG)QH_PHASE_PREVIEW:
+		ConOut(L"(preview)\n");
+		break;
+	case (LONG)QH_PHASE_RECOVERY:
+		ConOut(L"(recovery)\n");
+		break;
+	default:
+		ConOut(L"(unknown)\n");
+		break;
+	}
+
+	if (reply.Status >= 0 &&
+		memcmp(&reply.JournalPartitionGuid, &zeroGuid, sizeof(GUID)) != 0)
+	{
+		PrintGuidLine(L"Journal GUID: ", &reply.JournalPartitionGuid);
+	}
 	return TRUE;
 }
 
@@ -589,7 +701,7 @@ static BOOL DoQueryTimeRange(HANDLE hDevice)
 		return TRUE;
 	}
 
-	ConOut(L"Journal record time range (WallClock100ns / FILETIME):\n");
+	ConOut(L"Journal record time range (WallClock100ns / local):\n");
 	PrintTime100nsLabel(L"  Oldest", reply.OldestRecord100ns);
 	PrintTime100nsLabel(L"  Newest", reply.NewestRecord100ns);
 	return TRUE;
@@ -645,12 +757,13 @@ static void PrintHelp(void)
 		QH_CMD3_MAX_READ_BYTES);
 	ConOut(L"  8  - end preview session\n");
 	ConOut(L"  9  - query journal oldest/newest record time (source GUID)\n");
+	ConOut(L"  s  - query protect status (source GUID -> status + journal GUID)\n");
 	ConOut(L"  e  - enter prepared recovery (source GUID + time; no writeback)\n");
 	ConOut(L"  r  - commit prepared recovery synchronously (writeback to source)\n");
 	ConOut(L"  c  - cancel prepared recovery without writeback\n");
 	ConOut(L"  v  - list volumes\n");
 	ConOut(L"  h  - help\n");
-	ConOut(L"  q  - quit\n");
+	ConOut(L"  q  - quit console (does not stop CDP)\n");
 	PrintMaxReadHint();
 	ConOut(L"\n");
 	if (g_VolumeHandle)
@@ -746,6 +859,12 @@ int wmain(void)
 			if (hDevice != INVALID_HANDLE_VALUE)
 				DoQueryTimeRange(hDevice);
 			break;
+		case L's':
+		case L'S':
+			hDevice = EnsureControlDevice(hDevice);
+			if (hDevice != INVALID_HANDLE_VALUE)
+				DoQueryStatus(hDevice);
+			break;
 		case L'r':
 		case L'R':
 			hDevice = EnsureControlDevice(hDevice);
@@ -787,15 +906,9 @@ int wmain(void)
 done:
 	if (hDevice != INVALID_HANDLE_VALUE)
 	{
+		// Only tear down console-local preview; leave CDP / volume handles alone.
 		if (g_PreviewHandle != 0)
 			DoPreviewEnd(hDevice);
-		if (g_VolumeHandle != 0)
-		{
-			QH_CMD5_REQUEST closeReq = { 0 };
-			closeReq.Code = QH_CMD_5;
-			closeReq.VolumeHandle = g_VolumeHandle;
-			SendCmdBuffered(hDevice, &closeReq, sizeof(closeReq));
-		}
 		CloseHandle(hDevice);
 	}
 	ConOut(L"Bye.\n");

@@ -4,9 +4,13 @@
 
 #ifndef QH_USERMODE
 #include "qh_dev_store.h"
+#if DBG
 #define QH_RECOVERY_DBG(fmt, ...) \
 	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
 		"SysRestoreDriver: [RECOVERY] " fmt, ##__VA_ARGS__)
+#else
+#define QH_RECOVERY_DBG(fmt, ...) ((void)0)
+#endif
 #else
 #define QH_RECOVERY_DBG(fmt, ...) ((void)0)
 #endif
@@ -120,7 +124,7 @@ static NTSTATUS QhCoreSourceWriteDirect(
 static VOID QhCoreInitCommon(_Inout_ PQH_CORE Core)
 {
 	Core->Time100ns = 1;
-	Core->Phase = QH_CORE_PHASE_NORMAL;
+	Core->Phase = QH_CORE_PHASE_GENERAL;
 	QHPreviewTreeInitialize(&Core->PreviewTree);
 	QHPreviewTreeInitialize(&Core->HistoryTree);
 	QHPreviewTreeInitialize(&Core->StagingTree);
@@ -259,7 +263,7 @@ NTSTATUS QhCoreQueryTimeRange(
 QH_CORE_PHASE QhCoreGetPhase(_In_ PQH_CORE Core)
 {
 	if (!Core)
-		return QH_CORE_PHASE_NORMAL;
+		return QH_CORE_PHASE_GENERAL;
 	return (QH_CORE_PHASE)Core->Phase;
 }
 
@@ -407,12 +411,12 @@ static NTSTATUS QhCoreSynthesizeRead(
 	_Out_writes_bytes_(Length) PVOID Buffer)
 {
 	PUCHAR coveredMask = NULL;
-	PUCHAR live = NULL;
 	ULONG coveredCount = 0;
 	NTSTATUS status;
 	ULONG i;
+	ULONG maskBytes = (Length + 7UL) / 8UL;
 
-	coveredMask = (PUCHAR)QH_ALLOC0(Length);
+	coveredMask = (PUCHAR)QH_ALLOC0(maskBytes);
 	if (!coveredMask)
 	{
 		status = STATUS_INSUFFICIENT_RESOURCES;
@@ -450,32 +454,61 @@ static NTSTATUS QhCoreSynthesizeRead(
 	if (coveredCount == Length)
 		goto done;
 
-	live = (PUCHAR)QH_ALLOC(Length);
-	if (!live)
-	{
-		status = STATUS_INSUFFICIENT_RESOURCES;
-		goto done;
-	}
-	status = QhCoreSourceRead(Core, Offset, Length, live);
-	if (!NT_SUCCESS(status))
-		goto done;
-
 	if (coveredCount == 0)
 	{
-		RtlCopyMemory(Buffer, live, Length);
+		status = QhCoreSourceRead(Core, Offset, Length, Buffer);
 	}
 	else
 	{
-		for (i = 0; i < Length; ++i)
+		i = 0;
+		while (i < Length)
 		{
-			if (!coveredMask[i])
-				((PUCHAR)Buffer)[i] = live[i];
+			ULONG runStart;
+
+			// Skip covered bytes a bitmap byte at a time where possible.
+			while (i < Length)
+			{
+				if ((i & 7) == 0 && i + 8 <= Length &&
+					coveredMask[i >> 3] == 0xFF)
+				{
+					i += 8;
+					continue;
+				}
+				if ((coveredMask[i >> 3] &
+					(UCHAR)(1U << (i & 7))) == 0)
+					break;
+				++i;
+			}
+			if (i >= Length)
+				break;
+
+			runStart = i;
+			while (i < Length)
+			{
+				if ((i & 7) == 0 && i + 8 <= Length &&
+					coveredMask[i >> 3] == 0)
+				{
+					i += 8;
+					continue;
+				}
+				if ((coveredMask[i >> 3] &
+					(UCHAR)(1U << (i & 7))) != 0)
+					break;
+				++i;
+			}
+
+			status = QhCoreSourceRead(
+				Core,
+				Offset + runStart,
+				i - runStart,
+				(PUCHAR)Buffer + runStart);
+			if (!NT_SUCCESS(status))
+				goto done;
 		}
 	}
 
 done:
 	QH_FREE(coveredMask);
-	QH_FREE(live);
 	return status;
 }
 
@@ -513,7 +546,7 @@ NTSTATUS QhCorePreviewBegin(_Inout_ PQH_CORE Core, _In_ UINT64 TargetTime100ns)
 {
 	NTSTATUS status;
 
-	if (!Core || Core->Phase != QH_CORE_PHASE_NORMAL)
+	if (!Core || Core->Phase != QH_CORE_PHASE_GENERAL)
 		return STATUS_INVALID_DEVICE_STATE;
 	if (!Core->Journal->Mounted)
 		return STATUS_DEVICE_NOT_READY;
@@ -541,7 +574,7 @@ NTSTATUS QhCorePreviewBegin(_Inout_ PQH_CORE Core, _In_ UINT64 TargetTime100ns)
 	if (!NT_SUCCESS(status) && status != STATUS_NOT_FOUND)
 	{
 		Core->Building = 0;
-		Core->Phase = QH_CORE_PHASE_NORMAL;
+		Core->Phase = QH_CORE_PHASE_GENERAL;
 		return status;
 	}
 	if (status == STATUS_NOT_FOUND)
@@ -555,7 +588,7 @@ NTSTATUS QhCorePreviewBegin(_Inout_ PQH_CORE Core, _In_ UINT64 TargetTime100ns)
 	QH_LOCK_RELEASE(&Core->TreeLock);
 	if (!NT_SUCCESS(status))
 	{
-		Core->Phase = QH_CORE_PHASE_NORMAL;
+		Core->Phase = QH_CORE_PHASE_GENERAL;
 		return status;
 	}
 
@@ -570,7 +603,7 @@ NTSTATUS QhCorePreviewEnd(_Inout_ PQH_CORE Core)
 	QHPreviewTreeFree(&Core->StagingTree);
 	QHPreviewTreeInitialize(&Core->PreviewTree);
 	QHPreviewTreeInitialize(&Core->StagingTree);
-	Core->Phase = QH_CORE_PHASE_NORMAL;
+	Core->Phase = QH_CORE_PHASE_GENERAL;
 	return STATUS_SUCCESS;
 }
 
@@ -760,7 +793,7 @@ NTSTATUS QhCoreRecoveryBegin(_Inout_ PQH_CORE Core, _In_ UINT64 TargetTime100ns)
 {
 	NTSTATUS status;
 
-	if (!Core || Core->Phase != QH_CORE_PHASE_NORMAL)
+	if (!Core || Core->Phase != QH_CORE_PHASE_GENERAL)
 		return STATUS_INVALID_DEVICE_STATE;
 	if (!Core->Journal->Mounted)
 		return STATUS_DEVICE_NOT_READY;
@@ -795,7 +828,7 @@ NTSTATUS QhCoreRecoveryBegin(_Inout_ PQH_CORE Core, _In_ UINT64 TargetTime100ns)
 	if (!NT_SUCCESS(status) && status != STATUS_NOT_FOUND)
 	{
 		Core->Building = 0;
-		Core->Phase = QH_CORE_PHASE_NORMAL;
+		Core->Phase = QH_CORE_PHASE_GENERAL;
 		return status;
 	}
 	if (status == STATUS_NOT_FOUND)
@@ -812,7 +845,7 @@ NTSTATUS QhCoreRecoveryBegin(_Inout_ PQH_CORE Core, _In_ UINT64 TargetTime100ns)
 	QH_LOCK_RELEASE(&Core->TreeLock);
 	if (!NT_SUCCESS(status))
 	{
-		Core->Phase = QH_CORE_PHASE_NORMAL;
+		Core->Phase = QH_CORE_PHASE_GENERAL;
 		return status;
 	}
 
@@ -849,7 +882,7 @@ NTSTATUS QhCoreRecoveryCommit(_Inout_ PQH_CORE Core)
 	QHPreviewTreeInitialize(&Core->StagingTree);
 	Core->TargetTime100ns = 0;
 	Core->SnapshotMaxSequence = 0;
-	Core->Phase = QH_CORE_PHASE_NORMAL;
+	Core->Phase = QH_CORE_PHASE_GENERAL;
 	QH_RECOVERY_DBG("commit complete -> normal\n");
 	return STATUS_SUCCESS;
 }
@@ -871,6 +904,6 @@ NTSTATUS QhCoreRecoveryCancel(_Inout_ PQH_CORE Core)
 	Core->SnapshotMaxSequence = 0;
 	Core->Building = 0;
 	Core->WritebackActive = 0;
-	Core->Phase = QH_CORE_PHASE_NORMAL;
+	Core->Phase = QH_CORE_PHASE_GENERAL;
 	return STATUS_SUCCESS;
 }

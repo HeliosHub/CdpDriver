@@ -9,7 +9,7 @@
 #endif
 
 #define QH_JOURNAL_MAGIC            0x4C4E4A51UL /* 'QJNL' */
-#define QH_JOURNAL_VERSION          6UL
+#define QH_JOURNAL_VERSION          7UL
 #define QH_JOURNAL_MAX_RECORD_DATA  (2UL * 1024UL * 1024UL)
 #define QH_JOURNAL_HEADER_REGION_SIZE (2UL * 1024UL * 1024UL)
 #define QH_JOURNAL_HEADER_LINK_SIZE 32UL
@@ -20,7 +20,7 @@
 // Per-record header stored in 2MB header regions (32 bytes).
 typedef struct _QH_JOURNAL_RECORD_HEADER
 {
-	UINT64 WallClock100ns; // 8
+	UINT64 WallClock100ns; // 8  local wall-clock 100ns (FILETIME epoch)
 	UINT64 VolumeOffset;   // 8  source volume byte offset
 	UINT64 FileOffset;     // 8  payload offset inside CDP partition
 	ULONG DataLength;      // 4
@@ -40,12 +40,11 @@ typedef struct _QH_HEADER_REGION_LINK
 
 C_ASSERT(sizeof(QH_HEADER_REGION_LINK) == 32);
 
-// On-disk layout (v6): alternating header region + its payload area
+// On-disk layout (v7): one superblock, then alternating header/payload areas.
 //   [Superblock]
 //   [HeaderRegion0 2MB][Payload0 ...]
 //   [HeaderRegion1 2MB][Payload1 ...]
 //   ...
-//   [Superblock backup]
 typedef struct _QH_JOURNAL_SUPERBLOCK
 {
 	ULONG Magic;
@@ -54,7 +53,7 @@ typedef struct _QH_JOURNAL_SUPERBLOCK
 	ULONG Flags;
 	UINT64 PartitionSize;
 	UINT64 LastHeaderRegionOff; // newest 2MB header region
-	UINT64 PayloadRegionOff;    // next payload write offset (after last header)
+	GUID SourceVolumeGuid;
 	ULONG Crc32c;
 } QH_JOURNAL_SUPERBLOCK, *PQH_JOURNAL_SUPERBLOCK;
 
@@ -76,8 +75,9 @@ typedef struct _QH_JOURNAL
 	UINT64 OldestHeaderRegionOff;
 	ULONG OldestHeaderIndex;
 	ULONG CurrentHeaderCount;
-	// Largest successful transfer used to initialize a 2MB header region.
-	// Starts at 2MB and is halved on write failure, down to one sector.
+	// Transfer size used for a 2MB header region.  Formatting discovers it
+	// from the largest successful write; preview/recovery scans reuse it for
+	// reads instead of issuing one sector read per 32-byte record header.
 	ULONG HeaderRegionWriteChunk;
 	ULONG NextSequence;
 	UINT64 TotalRecords;
@@ -138,6 +138,9 @@ NTSTATUS QHJournalFormat(_Inout_ PQH_JOURNAL Journal);
 
 NTSTATUS QHJournalMount(_Inout_ PQH_JOURNAL Journal);
 
+// Clear on-disk superblock magic so auto-discovery will not remount this journal.
+NTSTATUS QHJournalInvalidate(_Inout_ PQH_JOURNAL Journal);
+
 NTSTATUS QHJournalAppend(
 	_Inout_ PQH_JOURNAL Journal,
 	_In_ UINT64 VolumeOffset,
@@ -164,7 +167,8 @@ NTSTATUS QHJournalApplyPreviewTree(
 	_In_ UINT64 VolumeOffset,
 	_In_ ULONG DataLength,
 	_Out_writes_bytes_(DataLength) PVOID Buffer,
-	_Out_writes_bytes_(DataLength) PUCHAR CoveredMask,
+	// One bit per output byte; caller supplies (DataLength + 7) / 8 bytes.
+	_Out_writes_bytes_((DataLength + 7) / 8) PUCHAR CoveredMask,
 	_Out_ PULONG CoveredCount);
 
 // Read a single record payload from the journal (FileOffset from record header).
