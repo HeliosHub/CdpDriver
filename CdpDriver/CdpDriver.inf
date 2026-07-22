@@ -1,0 +1,71 @@
+﻿[Version]
+Signature   = "$WINDOWS NT$"
+Class       = Volume
+ClassGuid   = {71a27cdd-812a-11d0-bec7-08002be2092f}
+Provider    = %ProviderName%
+DriverVer   = 05/19/2026,1.0.0.0
+CatalogFile = CdpDriver.cat
+PnpLockdown = 1
+LegacyUninstall = 1
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksFiles.amd64]
+CdpDriver.sys = 1,,
+
+[DestinationDirs]
+DefaultDestDir = 12 ; %SystemRoot%\System32\drivers
+CdpDriver_CopyFiles.NTamd64 = 12
+CdpDriver_DelFiles.NTamd64 = 12
+
+[DefaultInstall.NTamd64]
+CopyFiles = CdpDriver_CopyFiles.NTamd64
+AddReg    = CdpDriver_AddReg
+
+[DefaultInstall.NTamd64.Services]
+AddService = CdpDriver,, CdpDriver_ServiceInstall
+
+[DefaultInstall.NTamd64.Filters]
+AddFilter = CdpDriver,, CdpDriver_FilterInstall
+
+[DefaultUninstall.NTamd64]
+DelFiles = CdpDriver_DelFiles.NTamd64
+DelReg = CdpDriver_DelReg
+
+[DefaultUninstall.NTamd64.Services]
+DelService = CdpDriver,0x00000002
+
+[DefaultUninstall.NTamd64.Filters]
+DelFilter = CdpDriver,, CdpDriver_FilterInstall
+
+[CdpDriver_FilterInstall]
+FilterLevel    = 0x00000100 ; �������ȼ���������ϵͳ�ؼ�����������
+FilterType     = Upper ; �ϲ��������
+FilterClass    = Volume
+
+[CdpDriver_CopyFiles.NTamd64]
+CdpDriver.sys,,,0x00000002 ; �����Ѵ��ڵ��ļ�
+
+[CdpDriver_DelFiles.NTamd64]
+CdpDriver.sys
+
+[CdpDriver_AddReg]
+
+[CdpDriver_DelReg]
+HKLM,SYSTEM\CurrentControlSet\Services\CdpDriver
+
+[CdpDriver_ServiceInstall]
+DisplayName    = %ServiceName%
+Description    = %ServiceDesc%
+ServiceBinary  = %12%\CdpDriver.sys
+ServiceType    = 1 ; SERVICE_KERNEL_DRIVER
+StartType      = 0 ; SERVICE_BOOT_START
+ErrorControl   = 1 ; SERVICE_ERROR_NORMAL
+LoadOrderGroup = "Storage Volume Filters"
+
+[Strings]
+ProviderName = "XuHui.Jiang"
+DiskName     = "CdpDriver Installation Disk"
+ServiceName  = "CdpDriver"
+ServiceDesc  = "Cdp Engine Disk Volume Filter Driver - Provides system restore and protection functionality"
