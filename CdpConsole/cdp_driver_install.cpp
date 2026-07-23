@@ -176,29 +176,70 @@ static BOOL CdpUpdateDriverBinary(_In_ const wchar_t* infPath)
 	return CdpFileExists(dst);
 }
 
-BOOL CdpInstallDriverFromInf(_In_ const wchar_t* infPath)
+static BOOL CdpEnsureDriverService(void)
 {
-	wchar_t cmdLine[MAX_PATH * 2];
+	wchar_t winDir[MAX_PATH];
+	wchar_t sysDst[MAX_PATH];
+	SC_HANDLE scm;
+	SC_HANDLE svc;
+	BOOL ok = FALSE;
 
-	if (!infPath || !infPath[0])
-		return FALSE;
-
-	if (!CdpUpdateDriverBinary(infPath))
-		return FALSE;
-
-	/* Service already present: do not re-run DefaultInstall/AddFilter.
-	   SetupAPI would pop an install-failure dialog and skip the reboot prompt. */
 	if (CdpIsDriverServiceInstalled())
 		return TRUE;
 
+	if (!GetWindowsDirectoryW(winDir, MAX_PATH))
+		return FALSE;
+
 	_snwprintf_s(
-		cmdLine,
-		_countof(cmdLine),
+		sysDst,
+		_countof(sysDst),
 		_TRUNCATE,
-		L"DefaultInstall 132 %s",
-		infPath);
-	InstallHinfSectionW(NULL, NULL, cmdLine, 0);
-	return CdpIsDriverServiceInstalled();
+		L"%s\\System32\\drivers\\CdpDriver.sys",
+		winDir);
+	if (!CdpFileExists(sysDst))
+		return FALSE;
+
+	scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
+	if (!scm)
+		return FALSE;
+
+	svc = CreateServiceW(
+		scm,
+		L"CdpDriver",
+		L"CdpDriver",
+		SERVICE_QUERY_STATUS,
+		SERVICE_KERNEL_DRIVER,
+		SERVICE_BOOT_START,
+		SERVICE_ERROR_NORMAL,
+		sysDst,
+		L"Storage Volume Filters",
+		NULL,
+		NULL,
+		NULL,
+		NULL);
+	if (svc)
+	{
+		ok = TRUE;
+		CloseServiceHandle(svc);
+	}
+
+	CloseServiceHandle(scm);
+	return ok && CdpIsDriverServiceInstalled();
+}
+
+BOOL CdpInstallDriverFromInf(_In_ const wchar_t* infPath)
+{
+	if (!infPath || !infPath[0])
+		return FALSE;
+
+	/* Do not call InstallHinfSection/DefaultInstall here.
+	   On a fresh machine AddFilter+CatalogFile pops a SetupAPI "install failed"
+	   dialog under testsigning, even though SCM fallback would succeed afterward.
+	   Install path: copy .sys -> CreateService -> UpperFilters -> SetupPromptReboot. */
+	if (!CdpUpdateDriverBinary(infPath))
+		return FALSE;
+
+	return CdpEnsureDriverService();
 }
 
 BOOL CdpRegisterVolumeUpperFilter(void)

@@ -700,6 +700,7 @@ static BOOL DoInstallDriver(void)
 		{
 			ConOutFmt(L"Install failed for: %s\n", infPath);
 			ConOut(L"Run as Administrator and ensure test-signing is enabled.\n");
+			ConOut(L"Also use the matching build folder (same tree as CdpConsole.exe).\n");
 		}
 		return FALSE;
 	}
