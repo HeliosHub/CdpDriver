@@ -14,9 +14,35 @@ static void ConOut(const wchar_t* text)
 {
 	DWORD written = 0;
 	HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-	if (!hOut || hOut == INVALID_HANDLE_VALUE)
+	DWORD chars;
+
+	if (!text || !hOut || hOut == INVALID_HANDLE_VALUE)
 		return;
-	WriteConsoleW(hOut, text, (DWORD)wcslen(text), &written, NULL);
+
+	chars = (DWORD)wcslen(text);
+	if (WriteConsoleW(hOut, text, chars, &written, NULL))
+		return;
+
+	/* Redirected stdout (pipe/file): WriteConsole fails; write ACP bytes. */
+	{
+		char stackBuf[1024];
+		char* ansi = stackBuf;
+		BOOL heap = FALSE;
+		int bytes = WideCharToMultiByte(CP_ACP, 0, text, (int)chars, NULL, 0, NULL, NULL);
+		if (bytes <= 0)
+			return;
+		if (bytes > (int)sizeof(stackBuf))
+		{
+			ansi = (char*)malloc((size_t)bytes);
+			if (!ansi)
+				return;
+			heap = TRUE;
+		}
+		WideCharToMultiByte(CP_ACP, 0, text, (int)chars, ansi, bytes, NULL, NULL);
+		WriteFile(hOut, ansi, (DWORD)bytes, &written, NULL);
+		if (heap)
+			free(ansi);
+	}
 }
 
 static void ConOutFmt(const wchar_t* fmt, ...)
@@ -87,12 +113,43 @@ static BOOL ReadLine(wchar_t* buf, DWORD cch)
 {
 	DWORD n = 0;
 	HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
-	if (!ReadConsoleW(hIn, buf, cch - 1, &n, NULL))
+
+	if (!buf || cch == 0)
 		return FALSE;
-	while (n > 0 && (buf[n - 1] == L'\n' || buf[n - 1] == L'\r'))
-		--n;
-	buf[n] = L'\0';
-	return TRUE;
+
+	if (ReadConsoleW(hIn, buf, cch - 1, &n, NULL))
+	{
+		while (n > 0 && (buf[n - 1] == L'\n' || buf[n - 1] == L'\r'))
+			--n;
+		buf[n] = L'\0';
+		return TRUE;
+	}
+
+	/* Redirected stdin: read ACP bytes until newline. */
+	{
+		char ansi[512];
+		DWORD total = 0;
+		DWORD got = 0;
+		for (;;)
+		{
+			if (total >= sizeof(ansi) - 1)
+				break;
+			if (!ReadFile(hIn, ansi + total, 1, &got, NULL) || got == 0)
+			{
+				if (total == 0)
+					return FALSE;
+				break;
+			}
+			if (ansi[total] == '\n')
+				break;
+			if (ansi[total] != '\r')
+				++total;
+		}
+		ansi[total] = '\0';
+		if (!MultiByteToWideChar(CP_ACP, 0, ansi, -1, buf, (int)cch))
+			return FALSE;
+		return TRUE;
+	}
 }
 
 static BOOL ParseGuid(const wchar_t* text, GUID* out)
@@ -589,6 +646,38 @@ static BOOL DoQueryTimeRange(HANDLE hDevice)
 	return TRUE;
 }
 
+static BOOL DoQueryVersion(HANDLE hDevice)
+{
+	Cdp_VERSION_REPLY reply = { 0 };
+	DWORD bytesReturned = 0;
+	DWORD err;
+
+	if (!DeviceIoControl(
+			hDevice,
+			IOCTL_Cdp_QUERY_VERSION,
+			NULL,
+			0,
+			&reply,
+			sizeof(reply),
+			&bytesReturned,
+			NULL))
+	{
+		err = GetLastError();
+		ConOutFmt(L"Query driver version failed (err=%lu).\n", err);
+		if (err == ERROR_INVALID_FUNCTION || err == ERROR_NOT_SUPPORTED)
+		{
+			ConOut(L"Loaded driver is older than this console (missing QUERY_VERSION).\n");
+			ConOut(L"Run 'i' to update CdpDriver.sys, then reboot and try 'd' again.\n");
+		}
+		return FALSE;
+	}
+
+	ConOutFmt(L"Driver version: %hs\n", reply.Version);
+	ConOutFmt(L"Build:          %hs\n", reply.Build);
+	ConOutFmt(L"Journal:        v%lu\n", reply.JournalVersion);
+	return TRUE;
+}
+
 static BOOL DoInstallDriver(void)
 {
 	wchar_t infPath[MAX_PATH];
@@ -639,6 +728,7 @@ static void PrintHelp(void)
 	ConOut(L"  r  - commit prepared recovery synchronously (writeback to source)\n");
 	ConOut(L"  c  - cancel prepared recovery without writeback\n");
 	ConOut(L"  v  - list volumes\n");
+	ConOut(L"  d  - query driver version / build / journal version\n");
 	ConOut(L"  h  - help\n");
 	ConOut(L"  q  - quit console (does not stop CDP)\n");
 	PrintMaxReadHint();
@@ -746,6 +836,12 @@ int wmain(void)
 		case L'v':
 		case L'V':
 			ListVolumes();
+			break;
+		case L'd':
+		case L'D':
+			hDevice = EnsureControlDevice(hDevice);
+			if (hDevice != INVALID_HANDLE_VALUE)
+				DoQueryVersion(hDevice);
 			break;
 		case L'h':
 		case L'H':

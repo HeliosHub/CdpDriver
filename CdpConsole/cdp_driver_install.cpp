@@ -116,12 +116,80 @@ BOOL CdpIsDriverServiceInstalled(void)
 	return installed;
 }
 
+/* Always refresh System32\drivers\CdpDriver.sys from the package next to the INF.
+   Skipping this when the service already exists leaves an old image loaded, so
+   new IOCTLs (e.g. QUERY_VERSION) fail until reboot with a stale binary. */
+static BOOL CdpUpdateDriverBinary(_In_ const wchar_t* infPath)
+{
+	wchar_t fullInf[MAX_PATH];
+	wchar_t dir[MAX_PATH];
+	wchar_t src[MAX_PATH];
+	wchar_t dst[MAX_PATH];
+	wchar_t winDir[MAX_PATH];
+	wchar_t* slash;
+
+	if (!GetFullPathNameW(infPath, MAX_PATH, fullInf, NULL))
+		return FALSE;
+
+	wcsncpy_s(dir, fullInf, _TRUNCATE);
+	slash = wcsrchr(dir, L'\\');
+	if (!slash)
+		return FALSE;
+	*slash = L'\0';
+
+	_snwprintf_s(src, _countof(src), _TRUNCATE, L"%s\\CdpDriver.sys", dir);
+	if (!CdpFileExists(src))
+		return FALSE;
+
+	if (!GetWindowsDirectoryW(winDir, MAX_PATH))
+		return FALSE;
+
+	_snwprintf_s(
+		dst,
+		_countof(dst),
+		_TRUNCATE,
+		L"%s\\System32\\drivers\\CdpDriver.sys",
+		winDir);
+
+	if (CopyFileW(src, dst, FALSE))
+		return TRUE;
+
+	/* Loaded image may lock the file; stage replace for next reboot. */
+	if (GetLastError() == ERROR_SHARING_VIOLATION ||
+		GetLastError() == ERROR_ACCESS_DENIED ||
+		GetLastError() == ERROR_USER_MAPPED_FILE)
+	{
+		wchar_t pending[MAX_PATH];
+		_snwprintf_s(
+			pending,
+			_countof(pending),
+			_TRUNCATE,
+			L"%s\\System32\\drivers\\CdpDriver.sys.new",
+			winDir);
+		if (!CopyFileW(src, pending, FALSE))
+			return CdpFileExists(dst);
+		if (!MoveFileExW(pending, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_DELAY_UNTIL_REBOOT))
+			return CdpFileExists(dst);
+		return TRUE;
+	}
+
+	return CdpFileExists(dst);
+}
+
 BOOL CdpInstallDriverFromInf(_In_ const wchar_t* infPath)
 {
 	wchar_t cmdLine[MAX_PATH * 2];
 
 	if (!infPath || !infPath[0])
 		return FALSE;
+
+	if (!CdpUpdateDriverBinary(infPath))
+		return FALSE;
+
+	/* Service already present: do not re-run DefaultInstall/AddFilter.
+	   SetupAPI would pop an install-failure dialog and skip the reboot prompt. */
+	if (CdpIsDriverServiceInstalled())
+		return TRUE;
 
 	_snwprintf_s(
 		cmdLine,
@@ -234,5 +302,10 @@ BOOL CdpInstallDriverPackage(void)
 	if (!CdpInstallDriverFromInf(infPath))
 		return FALSE;
 
-	return CdpRegisterVolumeUpperFilter();
+	if (!CdpRegisterVolumeUpperFilter())
+		return FALSE;
+
+	/* System Settings Change reboot dialog (same family as INF AddFilter). */
+	(void)SetupPromptReboot(NULL, NULL, FALSE);
+	return TRUE;
 }

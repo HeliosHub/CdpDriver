@@ -3098,6 +3098,35 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 				NT_SUCCESS(status) ? sizeof(*reply) : 0);
 		}
 
+		case IOCTL_Cdp_QUERY_VERSION:
+		{
+			PCdp_VERSION_REPLY reply;
+			ULONG outLen =
+				IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
+
+			if (!Irp->AssociatedIrp.SystemBuffer ||
+				outLen < sizeof(Cdp_VERSION_REPLY))
+			{
+				return CdpCompleteIrp(
+					Irp,
+					STATUS_BUFFER_TOO_SMALL,
+					0);
+			}
+
+			reply = (PCdp_VERSION_REPLY)Irp->AssociatedIrp.SystemBuffer;
+			RtlZeroMemory(reply, sizeof(*reply));
+			reply->JournalVersion = Cdp_JOURNAL_VERSION;
+			(void)RtlStringCbCopyA(
+				reply->Version,
+				sizeof(reply->Version),
+				Cdp_DRIVER_VERSION_STRING);
+			(void)RtlStringCbCopyA(
+				reply->Build,
+				sizeof(reply->Build),
+				Cdp_DRIVER_BUILD_STRING);
+			return CdpCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*reply));
+		}
+
 		default:
 			Cdp_LOG("unknown IOCTL 0x%08X on control device\n",
 				IrpSp->Parameters.DeviceIoControl.IoControlCode);

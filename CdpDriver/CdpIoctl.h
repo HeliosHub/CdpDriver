@@ -1,5 +1,4 @@
 /*
- * Copyright 2026 Xuhui Jiang
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -45,6 +44,7 @@
 // 查询 journal 内最早/最新 COW 记录的 WallClock100ns
 #define IOCTL_Cdp_QUERY_TIME_RANGE CTL_CODE(Cdp_IOCTL_TYPE, 0x80A, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_CANCEL_RECOVERY CTL_CODE(Cdp_IOCTL_TYPE, 0x80B, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_Cdp_QUERY_VERSION   CTL_CODE(Cdp_IOCTL_TYPE, 0x80C, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define Cdp_PHASE_GENERAL  0UL
 #define Cdp_PHASE_PREVIEW  1UL
@@ -57,6 +57,8 @@
 #define Cdp_CMD3_MAX_READ_BYTES (2u * 1024u * 1024u)
 #define Cdp_SECTOR_SIZE_DEFAULT 512u
 #define Cdp_COMMAND_REPLY_MSG_CHARS 64
+#define Cdp_VERSION_STRING_CHARS 32
+#define Cdp_BUILD_STRING_CHARS 32
 
 #pragma pack(push, 8)
 
@@ -161,5 +163,13 @@ typedef struct _Cdp_TIME_RANGE_QUERY_REPLY
 	UINT64 OldestRecord100ns; // earliest surviving WallClock100ns
 	UINT64 NewestRecord100ns; // latest WallClock100ns
 } Cdp_TIME_RANGE_QUERY_REPLY, *PCdp_TIME_RANGE_QUERY_REPLY;
+
+typedef struct _Cdp_VERSION_REPLY
+{
+	ULONG JournalVersion;
+	ULONG Reserved;
+	CHAR Version[Cdp_VERSION_STRING_CHARS];
+	CHAR Build[Cdp_BUILD_STRING_CHARS];
+} Cdp_VERSION_REPLY, *PCdp_VERSION_REPLY;
 
 #pragma pack(pop)

@@ -124,10 +124,17 @@
   <Target Name="CopyDriverToConsoleDeploy" AfterTargets="Build">
     <PropertyGroup>
       <ConsoleDeployDir>$(MSBuildProjectDirectory)\..\x64\$(Configuration)\driver\</ConsoleDeployDir>
+      <!-- WDK package folder holds stamped INF + signed SYS (+ CAT when produced). -->
+      <DriverPackageDir>$(OutDir)$(TargetName)\</DriverPackageDir>
     </PropertyGroup>
+    <ItemGroup>
+      <_CdpDriverDeployFiles Include="$(TargetPath)" />
+      <_CdpDriverDeployFiles Include="$(DriverPackageDir)CdpDriver.inf" Condition="Exists('$(DriverPackageDir)CdpDriver.inf')" />
+      <_CdpDriverDeployFiles Include="$(MSBuildProjectDirectory)\CdpDriver.inf" Condition="!Exists('$(DriverPackageDir)CdpDriver.inf')" />
+      <_CdpDriverDeployFiles Include="$(DriverPackageDir)*.cat" Condition="Exists('$(DriverPackageDir)')" />
+    </ItemGroup>
     <MakeDir Directories="$(ConsoleDeployDir)" />
-    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(ConsoleDeployDir)" SkipUnchangedFiles="true" />
-    <Copy SourceFiles="$(MSBuildProjectDirectory)\CdpDriver.inf" DestinationFolder="$(ConsoleDeployDir)" SkipUnchangedFiles="true" />
-    <Message Importance="High" Text="CdpDriver: Copied $(TargetFileName) and CdpDriver.inf to $(ConsoleDeployDir)" />
+    <Copy SourceFiles="@(_CdpDriverDeployFiles)" DestinationFolder="$(ConsoleDeployDir)" SkipUnchangedFiles="false" />
+    <Message Importance="High" Text="CdpDriver: Copied package files to $(ConsoleDeployDir)" />
   </Target>
 </Project>

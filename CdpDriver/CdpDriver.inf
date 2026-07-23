@@ -40,12 +40,12 @@ DelService = CdpDriver,0x00000002
 DelFilter = CdpDriver,, CdpDriver_FilterInstall
 
 [CdpDriver_FilterInstall]
-FilterLevel    = 0x00000100 ; �������ȼ���������ϵͳ�ؼ�����������
-FilterType     = Upper ; �ϲ��������
+FilterLevel    = 0x00000100
+FilterType     = Upper
 FilterClass    = Volume
 
 [CdpDriver_CopyFiles.NTamd64]
-CdpDriver.sys,,,0x00000002 ; �����Ѵ��ڵ��ļ�
+CdpDriver.sys,,,0x00000002
 
 [CdpDriver_DelFiles.NTamd64]
 CdpDriver.sys
@@ -65,7 +65,7 @@ ErrorControl   = 1 ; SERVICE_ERROR_NORMAL
 LoadOrderGroup = "Storage Volume Filters"
 
 [Strings]
-ProviderName = "XuHui.Jiang"
+ProviderName = "CdpDriver"
 DiskName     = "CdpDriver Installation Disk"
 ServiceName  = "CdpDriver"
-ServiceDesc  = "Cdp Engine Disk Volume Filter Driver - Provides system restore and protection functionality"
+ServiceDesc  = "Cdp Engine Disk Volume Filter Driver"
