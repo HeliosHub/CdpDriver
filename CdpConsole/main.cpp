@@ -646,6 +646,161 @@ static BOOL DoQueryTimeRange(HANDLE hDevice)
 	return TRUE;
 }
 
+static void PrintByteCount(_In_ const wchar_t* label, _In_ UINT64 bytes)
+{
+	ConOutFmt(
+		L"  %s: %llu bytes (%llu MiB)\n",
+		label,
+		bytes,
+		bytes / (1024ULL * 1024ULL));
+}
+
+static BOOL DoQueryJournalUsage(HANDLE hDevice)
+{
+	Cdp_JOURNAL_USAGE_QUERY_REQUEST req = { 0 };
+	Cdp_JOURNAL_USAGE_QUERY_REPLY reply = { 0 };
+	DWORD bytesReturned = 0;
+
+	ListVolumes();
+	if (!PromptGuid(L"Protected source volume GUID: ", &req.SourceVolumeGuid))
+		return FALSE;
+
+	if (!DeviceIoControl(
+			hDevice,
+			IOCTL_Cdp_QUERY_JOURNAL_USAGE,
+			&req,
+			sizeof(req),
+			&reply,
+			sizeof(reply),
+			&bytesReturned,
+			NULL))
+	{
+		ConOutFmt(L"Query journal usage failed (err=%lu).\n", GetLastError());
+		return FALSE;
+	}
+
+	ConOutFmt(L"Journal records: %llu\n", reply.TotalRecords);
+	PrintByteCount(L"Journal partition", reply.JournalPartitionBytes);
+	PrintByteCount(L"Journal metadata", reply.JournalMetadataBytes);
+	PrintByteCount(L"Record payload used", reply.RecordPayloadBytesUsed);
+	PrintByteCount(L"Record payload free", reply.RecordPayloadBytesFree);
+	return TRUE;
+}
+
+static BOOL DoListJournalRecords(HANDLE hDevice)
+{
+	const ULONG batchSize = Cdp_JOURNAL_RECORD_QUERY_MAX_PER_CALL;
+	const SIZE_T bufferSize = sizeof(Cdp_JOURNAL_RECORD_QUERY_REPLY) +
+		(SIZE_T)batchSize * sizeof(Cdp_JOURNAL_RECORD_INFO);
+	Cdp_JOURNAL_RECORD_QUERY_REQUEST req = { 0 };
+	BYTE* buffer;
+	UINT64 nextIndex = 0;
+	UINT64 generation = 0;
+	UINT64 totalRecords = 0;
+	DWORD bytesReturned;
+	BOOL firstPage = TRUE;
+
+	ListVolumes();
+	if (!PromptGuid(L"Protected source volume GUID: ", &req.SourceVolumeGuid))
+		return FALSE;
+
+	buffer = (BYTE*)malloc(bufferSize);
+	if (!buffer)
+	{
+		ConOut(L"Unable to allocate record-list buffer.\n");
+		return FALSE;
+	}
+
+	for (;;)
+	{
+		PCdp_JOURNAL_RECORD_QUERY_REPLY reply;
+		PCdp_JOURNAL_RECORD_INFO records;
+		ULONG i;
+
+		req.StartIndex = nextIndex;
+		req.ExpectedGeneration = generation;
+		req.MaxRecords = batchSize;
+		req.Reserved = 0;
+		bytesReturned = 0;
+		if (!DeviceIoControl(
+				hDevice,
+				IOCTL_Cdp_QUERY_JOURNAL_RECORDS,
+				&req,
+				sizeof(req),
+				buffer,
+				(DWORD)bufferSize,
+				&bytesReturned,
+				NULL))
+		{
+			DWORD err = GetLastError();
+			if (err == ERROR_RETRY)
+			{
+				ConOut(L"Journal changed while listing records; no complete snapshot was produced. Run l again.\n");
+			}
+			else
+			{
+				ConOutFmt(L"List journal records failed (err=%lu).\n", err);
+			}
+			free(buffer);
+			return FALSE;
+		}
+
+		reply = (PCdp_JOURNAL_RECORD_QUERY_REPLY)buffer;
+		if (bytesReturned < sizeof(*reply) ||
+			reply->RecordCount > batchSize ||
+			bytesReturned < sizeof(*reply) +
+				reply->RecordCount * sizeof(Cdp_JOURNAL_RECORD_INFO))
+		{
+			ConOut(L"Driver returned an invalid record-list reply.\n");
+			free(buffer);
+			return FALSE;
+		}
+		if (firstPage)
+		{
+			totalRecords = reply->TotalRecords;
+			generation = reply->Generation;
+			ConOutFmt(
+				L"Journal record list: %llu record(s), oldest first (metadata only)\n",
+				totalRecords);
+			ConOut(L"Index  WallClock100ns  VolumeOffset  JournalOffset  Length  Sequence\n");
+			firstPage = FALSE;
+		}
+		else if (reply->TotalRecords != totalRecords ||
+			reply->Generation != generation)
+		{
+			ConOut(L"Journal changed while listing records; no complete snapshot was produced. Run l again.\n");
+			free(buffer);
+			return FALSE;
+		}
+
+		records = (PCdp_JOURNAL_RECORD_INFO)(reply + 1);
+		for (i = 0; i < reply->RecordCount; ++i)
+		{
+			ConOutFmt(
+				L"%5llu  %llu  %llu  %llu  %lu  %lu\n",
+				nextIndex + i,
+				records[i].WallClock100ns,
+				records[i].VolumeOffset,
+				records[i].FileOffset,
+				records[i].DataLength,
+				records[i].Sequence);
+		}
+
+		nextIndex += reply->RecordCount;
+		if (nextIndex >= totalRecords)
+			break;
+		if (reply->RecordCount == 0)
+		{
+			ConOut(L"Driver returned an incomplete record-list page.\n");
+			free(buffer);
+			return FALSE;
+		}
+	}
+
+	free(buffer);
+	return TRUE;
+}
+
 static BOOL DoQueryVersion(HANDLE hDevice)
 {
 	Cdp_VERSION_REPLY reply = { 0 };
@@ -724,6 +879,8 @@ static void PrintHelp(void)
 		Cdp_CMD3_MAX_READ_BYTES);
 	ConOut(L"  8  - end preview session\n");
 	ConOut(L"  9  - query journal oldest/newest record time (source GUID)\n");
+	ConOut(L"  u  - query journal record payload usage/free space (source GUID)\n");
+	ConOut(L"  l  - list current journal record metadata (source GUID; no payload)\n");
 	ConOut(L"  s  - query protect status (source GUID -> status + journal GUID)\n");
 	ConOut(L"  e  - enter prepared recovery (source GUID + time; no writeback)\n");
 	ConOut(L"  r  - commit prepared recovery synchronously (writeback to source)\n");
@@ -809,6 +966,18 @@ int wmain(void)
 			hDevice = EnsureControlDevice(hDevice);
 			if (hDevice != INVALID_HANDLE_VALUE)
 				DoQueryTimeRange(hDevice);
+			break;
+		case L'u':
+		case L'U':
+			hDevice = EnsureControlDevice(hDevice);
+			if (hDevice != INVALID_HANDLE_VALUE)
+				DoQueryJournalUsage(hDevice);
+			break;
+		case L'l':
+		case L'L':
+			hDevice = EnsureControlDevice(hDevice);
+			if (hDevice != INVALID_HANDLE_VALUE)
+				DoListJournalRecords(hDevice);
 			break;
 		case L's':
 		case L'S':

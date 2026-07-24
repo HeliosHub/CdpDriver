@@ -45,6 +45,9 @@
 #define IOCTL_Cdp_QUERY_TIME_RANGE CTL_CODE(Cdp_IOCTL_TYPE, 0x80A, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_CANCEL_RECOVERY CTL_CODE(Cdp_IOCTL_TYPE, 0x80B, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_QUERY_VERSION   CTL_CODE(Cdp_IOCTL_TYPE, 0x80C, METHOD_BUFFERED, FILE_ANY_ACCESS)
+// Query the current journal payload-space accounting and record metadata.
+#define IOCTL_Cdp_QUERY_JOURNAL_USAGE   CTL_CODE(Cdp_IOCTL_TYPE, 0x80D, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_Cdp_QUERY_JOURNAL_RECORDS CTL_CODE(Cdp_IOCTL_TYPE, 0x80E, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define Cdp_PHASE_GENERAL  0UL
 #define Cdp_PHASE_PREVIEW  1UL
@@ -59,6 +62,7 @@
 #define Cdp_COMMAND_REPLY_MSG_CHARS 64
 #define Cdp_VERSION_STRING_CHARS 32
 #define Cdp_BUILD_STRING_CHARS 32
+#define Cdp_JOURNAL_RECORD_QUERY_MAX_PER_CALL 512u
 
 #pragma pack(push, 8)
 
@@ -163,6 +167,49 @@ typedef struct _Cdp_TIME_RANGE_QUERY_REPLY
 	UINT64 OldestRecord100ns; // earliest surviving WallClock100ns
 	UINT64 NewestRecord100ns; // latest WallClock100ns
 } Cdp_TIME_RANGE_QUERY_REPLY, *PCdp_TIME_RANGE_QUERY_REPLY;
+
+typedef struct _Cdp_JOURNAL_USAGE_QUERY_REQUEST
+{
+	GUID SourceVolumeGuid;
+} Cdp_JOURNAL_USAGE_QUERY_REQUEST, *PCdp_JOURNAL_USAGE_QUERY_REQUEST;
+
+typedef struct _Cdp_JOURNAL_USAGE_QUERY_REPLY
+{
+	UINT64 JournalPartitionBytes;       // total journal partition size
+	UINT64 JournalMetadataBytes;        // superblock + active header regions
+	UINT64 RecordPayloadBytesUsed;      // sector-aligned payload space in use
+	UINT64 RecordPayloadBytesFree;      // free payload space with current headers
+	UINT64 TotalRecords;                // surviving COW record count
+} Cdp_JOURNAL_USAGE_QUERY_REPLY, *PCdp_JOURNAL_USAGE_QUERY_REPLY;
+
+// The returned records contain metadata only.  No payload bytes are returned.
+typedef struct _Cdp_JOURNAL_RECORD_QUERY_REQUEST
+{
+	GUID SourceVolumeGuid;
+	UINT64 StartIndex;          // zero-based, oldest record first
+	UINT64 ExpectedGeneration;  // zero for first page; later pages must echo reply
+	ULONG MaxRecords;           // capped by Cdp_JOURNAL_RECORD_QUERY_MAX_PER_CALL
+	ULONG Reserved;
+} Cdp_JOURNAL_RECORD_QUERY_REQUEST, *PCdp_JOURNAL_RECORD_QUERY_REQUEST;
+
+typedef struct _Cdp_JOURNAL_RECORD_QUERY_REPLY
+{
+	UINT64 TotalRecords;
+	UINT64 Generation;          // changes whenever retained records change
+	ULONG RecordCount;
+	ULONG Reserved;
+} Cdp_JOURNAL_RECORD_QUERY_REPLY, *PCdp_JOURNAL_RECORD_QUERY_REPLY;
+
+typedef struct _Cdp_JOURNAL_RECORD_INFO
+{
+	UINT64 WallClock100ns;
+	UINT64 VolumeOffset;
+	UINT64 FileOffset;
+	ULONG DataLength;
+	ULONG Sequence;
+} Cdp_JOURNAL_RECORD_INFO, *PCdp_JOURNAL_RECORD_INFO;
+
+C_ASSERT(sizeof(Cdp_JOURNAL_RECORD_INFO) == 32);
 
 typedef struct _Cdp_VERSION_REPLY
 {

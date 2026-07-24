@@ -355,6 +355,14 @@ static BOOLEAN CdpJournalIsEmptyLocked(_In_ PCdp_JOURNAL Journal)
 	return Journal->TotalRecords == 0;
 }
 
+static VOID CdpJournalAdvanceRecordGenerationLocked(
+	_Inout_ PCdp_JOURNAL Journal)
+{
+	Journal->RecordGeneration++;
+	if (Journal->RecordGeneration == 0)
+		Journal->RecordGeneration = 1;
+}
+
 static NTSTATUS CdpJournalWriteSuperblockLocked(_Inout_ PCdp_JOURNAL Journal)
 {
 	PVOID allocationBase = NULL;
@@ -716,6 +724,8 @@ static UINT64 CdpJournalContiguousFreeLocked(_In_ PCdp_JOURNAL Journal)
 static NTSTATUS CdpJournalDropOldestLocked(_Inout_ PCdp_JOURNAL Journal)
 {
 	Cdp_HEADER_REGION_LINK link;
+	Cdp_JOURNAL_RECORD_HEADER header;
+	UINT64 alignedSize;
 	ULONG limit;
 	NTSTATUS status;
 
@@ -727,9 +737,26 @@ static NTSTATUS CdpJournalDropOldestLocked(_Inout_ PCdp_JOURNAL Journal)
 		Journal->OldestHeaderRegionOff);
 	if (Journal->OldestHeaderIndex >= limit)
 		return STATUS_DISK_CORRUPT_ERROR;
+	status = CdpJournalReadHeaderAt(
+		Journal,
+		Journal->OldestHeaderRegionOff,
+		Journal->OldestHeaderIndex,
+		&header);
+	if (!NT_SUCCESS(status))
+		return status;
+	if (header.DataLength == 0 ||
+		header.DataLength > Cdp_JOURNAL_MAX_RECORD_DATA)
+	{
+		return STATUS_DISK_CORRUPT_ERROR;
+	}
+	alignedSize = CdpAlignUp64(header.DataLength, Journal->SectorSize);
+	if (alignedSize > Journal->PayloadBytesUsed)
+		return STATUS_DISK_CORRUPT_ERROR;
 
 	Journal->OldestHeaderIndex++;
 	Journal->TotalRecords--;
+	Journal->PayloadBytesUsed -= alignedSize;
+	CdpJournalAdvanceRecordGenerationLocked(Journal);
 
 	if (Journal->OldestHeaderIndex < limit)
 		return CdpJournalRefreshOldestTimeLocked(Journal);
@@ -890,6 +917,7 @@ static NTSTATUS CdpJournalRebuildRuntimeLocked(_Inout_ PCdp_JOURNAL Journal)
 	PUCHAR region = NULL;
 
 	Journal->TotalRecords = 0;
+	Journal->PayloadBytesUsed = 0;
 	Journal->CurrentHeaderCount = 0;
 	Journal->NextSequence = 1;
 	Journal->Oldest100ns = 0;
@@ -977,6 +1005,9 @@ static NTSTATUS CdpJournalRebuildRuntimeLocked(_Inout_ PCdp_JOURNAL Journal)
 			}
 
 			Journal->TotalRecords++;
+			Journal->PayloadBytesUsed += CdpAlignUp64(
+				header.DataLength,
+				Journal->SectorSize);
 			if (header.Sequence >= Journal->NextSequence)
 				Journal->NextSequence = header.Sequence + 1;
 			if (Journal->NextSequence == 0)
@@ -1131,6 +1162,8 @@ NTSTATUS CdpJournalFormat(_Inout_ PCdp_JOURNAL Journal)
 	Journal->CurrentHeaderCount = 0;
 	Journal->NextSequence = 1;
 	Journal->TotalRecords = 0;
+	Journal->PayloadBytesUsed = 0;
+	Journal->RecordGeneration = 1;
 	Journal->Oldest100ns = 0;
 	Journal->Newest100ns = 0;
 
@@ -1196,6 +1229,7 @@ NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal)
 	if (!NT_SUCCESS(status))
 		goto cleanup;
 
+	Journal->RecordGeneration = 1;
 	Journal->Mounted = TRUE;
 
 #ifndef Cdp_USERMODE
@@ -1376,7 +1410,14 @@ NTSTATUS CdpJournalAppend(
 	Journal->NextSequence = writeSeq + 1;
 	if (Journal->NextSequence == 0)
 		Journal->NextSequence = 1;
+	if (Journal->PayloadBytesUsed > MAXUINT64 - alignedSize)
+	{
+		status = STATUS_DISK_CORRUPT_ERROR;
+		goto cleanup;
+	}
 	Journal->TotalRecords++;
+	Journal->PayloadBytesUsed += alignedSize;
+	CdpJournalAdvanceRecordGenerationLocked(Journal);
 	Journal->Newest100ns = writeTime;
 	if (Journal->TotalRecords == 1)
 	{
@@ -1422,6 +1463,257 @@ NTSTATUS CdpJournalQueryTimeRange(
 		*NewestTime100ns = Journal->Newest100ns;
 		status = STATUS_SUCCESS;
 	}
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
+static NTSTATUS CdpJournalCountActiveHeaderRegionsLocked(
+	_Inout_ PCdp_JOURNAL Journal,
+	_Out_ PUINT64 HeaderRegionCount)
+{
+	UINT64 regionOff;
+	UINT64 count;
+	ULONG guard = 0;
+	Cdp_HEADER_REGION_LINK link;
+	NTSTATUS status;
+
+	if (!HeaderRegionCount)
+		return STATUS_INVALID_PARAMETER;
+
+	regionOff = Journal->OldestHeaderRegionOff;
+	count = 1;
+	while (regionOff != Journal->LastHeaderRegionOff)
+	{
+		status = CdpJournalReadRegionLink(Journal, regionOff, &link);
+		if (!NT_SUCCESS(status))
+			return status;
+		if (link.Marker != Cdp_JOURNAL_HEADER_LINK_MARK ||
+			link.NextRegionOff == regionOff)
+		{
+			return STATUS_DISK_CORRUPT_ERROR;
+		}
+		regionOff = link.NextRegionOff;
+		if (++count > 100001ULL || ++guard > 100000UL)
+			return STATUS_DISK_CORRUPT_ERROR;
+	}
+
+	*HeaderRegionCount = count;
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS CdpJournalQueryUsage(
+	_Inout_ PCdp_JOURNAL Journal,
+	_Out_ PUINT64 PartitionBytes,
+	_Out_ PUINT64 MetadataBytes,
+	_Out_ PUINT64 PayloadBytesUsed,
+	_Out_ PUINT64 PayloadBytesFree,
+	_Out_ PUINT64 TotalRecords)
+{
+	UINT64 headerRegionCount;
+	UINT64 metadataBytes;
+	NTSTATUS status;
+
+	if (!Journal || !PartitionBytes || !MetadataBytes ||
+		!PayloadBytesUsed || !PayloadBytesFree || !TotalRecords)
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+
+	*PartitionBytes = 0;
+	*MetadataBytes = 0;
+	*PayloadBytesUsed = 0;
+	*PayloadBytesFree = 0;
+	*TotalRecords = 0;
+
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup;
+	}
+
+	status = CdpJournalCountActiveHeaderRegionsLocked(
+		Journal,
+		&headerRegionCount);
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+	if (headerRegionCount >
+		(MAXUINT64 - Journal->SectorSize) / Cdp_JOURNAL_HEADER_REGION_SIZE)
+	{
+		status = STATUS_DISK_CORRUPT_ERROR;
+		goto cleanup;
+	}
+
+	metadataBytes = Journal->SectorSize +
+		headerRegionCount * Cdp_JOURNAL_HEADER_REGION_SIZE;
+	if (metadataBytes > Journal->PartitionSize ||
+		Journal->PayloadBytesUsed > Journal->PartitionSize - metadataBytes)
+	{
+		status = STATUS_DISK_CORRUPT_ERROR;
+		goto cleanup;
+	}
+
+	*PartitionBytes = Journal->PartitionSize;
+	*MetadataBytes = metadataBytes;
+	*PayloadBytesUsed = Journal->PayloadBytesUsed;
+	*PayloadBytesFree =
+		Journal->PartitionSize - metadataBytes - Journal->PayloadBytesUsed;
+	*TotalRecords = Journal->TotalRecords;
+	status = STATUS_SUCCESS;
+
+cleanup:
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
+NTSTATUS CdpJournalQueryRecordHeaders(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 StartIndex,
+	_In_ UINT64 ExpectedGeneration,
+	_Out_writes_to_(HeaderCapacity, *ReturnedCount) PCdp_JOURNAL_RECORD_HEADER Headers,
+	_In_ ULONG HeaderCapacity,
+	_Out_ PUINT64 TotalRecords,
+	_Out_ PUINT64 Generation,
+	_Out_ PULONG ReturnedCount)
+{
+	UINT64 remaining;
+	UINT64 regionOff;
+	ULONG headerIndex;
+	ULONG returned = 0;
+	ULONG wanted;
+	ULONG guard = 0;
+	NTSTATUS status;
+
+	if (!Journal || !TotalRecords || !Generation || !ReturnedCount ||
+		(HeaderCapacity != 0 && !Headers))
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+
+	*TotalRecords = 0;
+	*Generation = 0;
+	*ReturnedCount = 0;
+
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup;
+	}
+
+	*TotalRecords = Journal->TotalRecords;
+	*Generation = Journal->RecordGeneration;
+	if (ExpectedGeneration != 0 &&
+		ExpectedGeneration != Journal->RecordGeneration)
+	{
+		status = STATUS_RETRY;
+		goto cleanup;
+	}
+	if (StartIndex > Journal->TotalRecords)
+	{
+		status = STATUS_INVALID_PARAMETER;
+		goto cleanup;
+	}
+	if (StartIndex == Journal->TotalRecords || HeaderCapacity == 0)
+	{
+		status = STATUS_SUCCESS;
+		goto cleanup;
+	}
+
+	remaining = Journal->TotalRecords - StartIndex;
+	wanted = remaining < HeaderCapacity ? (ULONG)remaining : HeaderCapacity;
+	regionOff = Journal->OldestHeaderRegionOff;
+	headerIndex = Journal->OldestHeaderIndex;
+	remaining = StartIndex;
+
+	while (remaining != 0)
+	{
+		ULONG limit = CdpJournalRegionHeaderLimit(Journal, regionOff);
+		ULONG available;
+		Cdp_HEADER_REGION_LINK link;
+
+		if (headerIndex >= limit)
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup;
+		}
+		available = limit - headerIndex;
+		if (remaining < available)
+		{
+			headerIndex += (ULONG)remaining;
+			remaining = 0;
+			break;
+		}
+
+		remaining -= available;
+		if (regionOff == Journal->LastHeaderRegionOff)
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup;
+		}
+		status = CdpJournalReadRegionLink(Journal, regionOff, &link);
+		if (!NT_SUCCESS(status))
+			goto cleanup;
+		if (link.Marker != Cdp_JOURNAL_HEADER_LINK_MARK ||
+			link.NextRegionOff == regionOff || ++guard > 100000UL)
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup;
+		}
+		regionOff = link.NextRegionOff;
+		headerIndex = 0;
+	}
+
+	while (returned < wanted)
+	{
+		ULONG limit = CdpJournalRegionHeaderLimit(Journal, regionOff);
+		Cdp_JOURNAL_RECORD_HEADER header;
+
+		if (headerIndex >= limit)
+		{
+			Cdp_HEADER_REGION_LINK link;
+
+			if (regionOff == Journal->LastHeaderRegionOff)
+			{
+				status = STATUS_DISK_CORRUPT_ERROR;
+				goto cleanup;
+			}
+			status = CdpJournalReadRegionLink(Journal, regionOff, &link);
+			if (!NT_SUCCESS(status))
+				goto cleanup;
+			if (link.Marker != Cdp_JOURNAL_HEADER_LINK_MARK ||
+				link.NextRegionOff == regionOff || ++guard > 100000UL)
+			{
+				status = STATUS_DISK_CORRUPT_ERROR;
+				goto cleanup;
+			}
+			regionOff = link.NextRegionOff;
+			headerIndex = 0;
+			continue;
+		}
+
+		status = CdpJournalReadHeaderAt(
+			Journal,
+			regionOff,
+			headerIndex,
+			&header);
+		if (!NT_SUCCESS(status))
+			goto cleanup;
+		if (header.DataLength == 0 ||
+			header.DataLength > Cdp_JOURNAL_MAX_RECORD_DATA)
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup;
+		}
+
+		Headers[returned++] = header;
+		headerIndex++;
+	}
+
+	*ReturnedCount = returned;
+	status = STATUS_SUCCESS;
+
+cleanup:
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	return status;
 }
@@ -1736,32 +2028,43 @@ NTSTATUS CdpPreviewTreeMergeFrom(
 	return status;
 }
 
-static VOID CdpPreviewTreePunchByNode(
+static NTSTATUS CdpPreviewTreePunchByNode(
 	_Inout_ PCdp_PREVIEW_TREE HistoryTree,
 	_In_opt_ PCdp_PREVIEW_TREE_NODE Node)
 {
-	if (!Node)
-		return;
+	NTSTATUS status;
 
-	CdpPreviewTreePunchByNode(HistoryTree, Node->Left);
-	CdpPreviewTreeInvalidateRange(
+	if (!Node)
+		return STATUS_SUCCESS;
+
+	status = CdpPreviewTreePunchByNode(HistoryTree, Node->Left);
+	if (!NT_SUCCESS(status))
+		return status;
+	status = CdpPreviewTreePunchRange(
 		HistoryTree,
 		Node->Start,
 		Node->DataLength);
-	CdpPreviewTreePunchByNode(HistoryTree, Node->Right);
+	if (!NT_SUCCESS(status))
+		return status;
+	return CdpPreviewTreePunchByNode(HistoryTree, Node->Right);
 }
 
-VOID CdpPreviewTreePunchByStaging(
+NTSTATUS CdpPreviewTreePunchByStaging(
 	_Inout_ PCdp_PREVIEW_TREE HistoryTree,
 	_Inout_ PCdp_PREVIEW_TREE StagingTree)
 {
+	NTSTATUS status;
+
 	if (!HistoryTree || !StagingTree)
-		return;
+		return STATUS_INVALID_PARAMETER;
 
 	if (StagingTree->Root)
-		CdpPreviewTreePunchByNode(HistoryTree, StagingTree->Root);
+		status = CdpPreviewTreePunchByNode(HistoryTree, StagingTree->Root);
+	else
+		status = STATUS_SUCCESS;
 
 	CdpPreviewTreeFree(StagingTree);
+	return status;
 }
 
 static VOID CdpPreviewTreeInvalidateOverlaps(
@@ -1958,6 +2261,101 @@ static VOID CdpPreviewTreeCollectAllValid(
 		(*Count)++;
 	}
 	CdpPreviewTreeCollectAllValid(Node->Right, Nodes, Count, Capacity);
+}
+
+NTSTATUS CdpPreviewTreePunchRange(
+	_Inout_ PCdp_PREVIEW_TREE Tree,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength)
+{
+	PCdp_PREVIEW_TREE_NODE* nodes = NULL;
+	Cdp_JOURNAL_RECORD_HEADER* headers = NULL;
+	Cdp_PREVIEW_TREE rebuilt;
+	UINT64 cutEnd;
+	ULONG capacity;
+	ULONG count = 0;
+	ULONG i;
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Tree || DataLength == 0 ||
+		VolumeOffset > MAXUINT64 - DataLength)
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+	if (!Tree->Root || Tree->NodeCount == 0)
+		return STATUS_SUCCESS;
+
+	cutEnd = VolumeOffset + DataLength;
+	capacity = Tree->NodeCount;
+	nodes = (PCdp_PREVIEW_TREE_NODE*)cdpalloc(
+		sizeof(PCdp_PREVIEW_TREE_NODE) * capacity);
+	headers = (Cdp_JOURNAL_RECORD_HEADER*)cdpalloc(
+		sizeof(Cdp_JOURNAL_RECORD_HEADER) * capacity);
+	if (!nodes || !headers)
+	{
+		status = STATUS_INSUFFICIENT_RESOURCES;
+		goto cleanup;
+	}
+
+	CdpPreviewTreeCollectAllValid(Tree->Root, nodes, &count, capacity);
+	for (i = 0; i < count; ++i)
+	{
+		RtlZeroMemory(&headers[i], sizeof(headers[i]));
+		headers[i].WallClock100ns = nodes[i]->WallClock100ns;
+		headers[i].VolumeOffset = nodes[i]->Start;
+		headers[i].FileOffset = nodes[i]->FileOffset;
+		headers[i].DataLength = nodes[i]->DataLength;
+		headers[i].Sequence = nodes[i]->Sequence;
+	}
+
+	CdpPreviewTreeInitialize(&rebuilt);
+	for (i = 0; i < count; ++i)
+	{
+		Cdp_JOURNAL_RECORD_HEADER* header = &headers[i];
+		UINT64 headerEnd = header->VolumeOffset + header->DataLength;
+
+		if (headerEnd <= VolumeOffset || header->VolumeOffset >= cutEnd)
+		{
+			status = CdpPreviewTreeInsertRaw(&rebuilt, header);
+		}
+		else
+		{
+			if (header->VolumeOffset < VolumeOffset)
+			{
+				Cdp_JOURNAL_RECORD_HEADER left = *header;
+				left.DataLength = (ULONG)(VolumeOffset - header->VolumeOffset);
+				status = CdpPreviewTreeInsertRaw(&rebuilt, &left);
+			}
+			if (NT_SUCCESS(status) && headerEnd > cutEnd)
+			{
+				Cdp_JOURNAL_RECORD_HEADER right = *header;
+				right.VolumeOffset = cutEnd;
+				right.FileOffset = header->FileOffset +
+					(cutEnd - header->VolumeOffset);
+				right.DataLength = (ULONG)(headerEnd - cutEnd);
+				status = CdpPreviewTreeInsertRaw(&rebuilt, &right);
+			}
+		}
+		if (!NT_SUCCESS(status))
+			break;
+	}
+
+	if (NT_SUCCESS(status))
+	{
+		CdpPreviewTreeFree(Tree);
+		*Tree = rebuilt;
+	}
+	else
+	{
+		CdpPreviewTreeFree(&rebuilt);
+	}
+
+cleanup:
+	if (nodes)
+		cdpfree(nodes);
+	if (headers)
+		cdpfree(headers);
+	return status;
 }
 
 static int CdpPreviewHeaderCompareSequence(
@@ -2637,34 +3035,52 @@ NTSTATUS CdpJournalReadPayload(
 	_In_ ULONG DataLength,
 	_Out_writes_bytes_(DataLength) PVOID Buffer)
 {
-	UINT64 alignedSize;
-	PVOID allocationBase = NULL;
-	PUCHAR payload;
-	NTSTATUS status;
+	UINT64 currentOffset;
+	ULONG remaining;
+	PUCHAR output;
+	NTSTATUS status = STATUS_SUCCESS;
 
-	if (!Journal || !Journal->Mounted || !Buffer ||
-		DataLength == 0 || DataLength > Cdp_JOURNAL_MAX_RECORD_DATA)
+	if (!Journal || !Journal->Mounted || !Buffer || DataLength == 0)
 	{
 		return STATUS_INVALID_PARAMETER;
 	}
 
-	alignedSize = CdpAlignUp64(DataLength, Journal->SectorSize);
-	payload = (PUCHAR)CdpAllocateAligned(Journal,
-		(SIZE_T)alignedSize,
-		&allocationBase);
-	if (!payload)
-		return STATUS_INSUFFICIENT_RESOURCES;
+	// Coalesced preview/recovery nodes may span many adjacent records.  Keep
+	// each raw I/O at the per-record maximum, but assemble the full logical
+	// payload for the caller.
+	currentOffset = FileOffset;
+	remaining = DataLength;
+	output = (PUCHAR)Buffer;
+	while (remaining != 0)
+	{
+		ULONG chunk = remaining > Cdp_JOURNAL_MAX_RECORD_DATA ?
+			Cdp_JOURNAL_MAX_RECORD_DATA : remaining;
+		UINT64 alignedSize = CdpAlignUp64(chunk, Journal->SectorSize);
+		PVOID allocationBase = NULL;
+		PUCHAR payload = (PUCHAR)CdpAllocateAligned(
+			Journal,
+			(SIZE_T)alignedSize,
+			&allocationBase);
 
-	status = CdpJournalRawIo(
-		Journal,
-		IRP_MJ_READ,
-		FileOffset,
-		(ULONG)alignedSize,
-		payload);
-	if (NT_SUCCESS(status))
-		RtlCopyMemory(Buffer, payload, DataLength);
+		if (!payload)
+			return STATUS_INSUFFICIENT_RESOURCES;
 
+		status = CdpJournalRawIo(
+			Journal,
+			IRP_MJ_READ,
+			currentOffset,
+			(ULONG)alignedSize,
+			payload);
+		if (NT_SUCCESS(status))
+			RtlCopyMemory(output, payload, chunk);
 		cdpfree(allocationBase);
+		if (!NT_SUCCESS(status))
+			break;
+
+		currentOffset += chunk;
+		output += chunk;
+		remaining -= chunk;
+	}
 	return status;
 }
 

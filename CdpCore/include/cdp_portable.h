@@ -42,6 +42,9 @@ typedef LONG NTSTATUS;
 #ifndef STATUS_NOT_FOUND
 #define STATUS_NOT_FOUND                 ((NTSTATUS)0xC0000225L)
 #endif
+#ifndef STATUS_RETRY
+#define STATUS_RETRY                     ((NTSTATUS)0xC000022DL)
+#endif
 #ifndef STATUS_INVALID_DEVICE_STATE
 #define STATUS_INVALID_DEVICE_STATE      ((NTSTATUS)0xC0000184L)
 #endif

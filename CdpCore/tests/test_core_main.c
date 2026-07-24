@@ -1288,6 +1288,249 @@ static int TestQueryTimeRangeWallClocks(void)
 	return g_caseFailed;
 }
 
+static int TestJournalUsageAndRecordHeaders(void)
+{
+	TEST_CTX ctx;
+	UCHAR a[512];
+	UCHAR b[512];
+	Cdp_JOURNAL_RECORD_HEADER headers[2];
+	UINT64 partitionBytes = 0;
+	UINT64 metadataBytes = 0;
+	UINT64 payloadBytesUsed = 0;
+	UINT64 payloadBytesFree = 0;
+	UINT64 totalRecords = 0;
+	UINT64 generation = 0;
+	ULONG returned = 0;
+	UINT64 tFirst = 50500;
+	UINT64 tSecond = 50501;
+	NTSTATUS st;
+
+	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, tFirst)),
+		"setup journal usage/list test");
+	FillPattern(a, sizeof(a), 0x61);
+	FillPattern(b, sizeof(b), 0x62);
+	st = TestAppendJournalRecord(&ctx, tFirst, 0, a, sizeof(a));
+	Expect(NT_SUCCESS(st), "append first record for usage/list");
+	st = TestAppendJournalRecord(&ctx, tSecond, 4096, b, sizeof(b));
+	Expect(NT_SUCCESS(st), "append second record for usage/list");
+
+	st = CdpCoreQueryJournalUsage(
+		ctx.Core,
+		&partitionBytes,
+		&metadataBytes,
+		&payloadBytesUsed,
+		&payloadBytesFree,
+		&totalRecords);
+	Expect(NT_SUCCESS(st), "QueryJournalUsage after two records");
+	Expect(partitionBytes == JNL_SIZE, "journal usage reports partition bytes");
+	Expect(metadataBytes == SECTOR + Cdp_JOURNAL_HEADER_REGION_SIZE,
+		"journal usage reserves superblock and active header region");
+	Expect(payloadBytesUsed == 2 * SECTOR,
+		"journal usage reports sector-aligned record payload bytes");
+	Expect(payloadBytesFree ==
+		JNL_SIZE - metadataBytes - payloadBytesUsed,
+		"journal usage reports remaining record payload bytes");
+	Expect(totalRecords == 2, "journal usage reports surviving record count");
+
+	st = CdpCoreQueryRecordHeaders(
+		ctx.Core,
+		0,
+		0,
+		headers,
+		_countof(headers),
+		&totalRecords,
+		&generation,
+		&returned);
+	Expect(NT_SUCCESS(st), "query all record headers");
+	Expect(totalRecords == 2 && returned == 2,
+		"record header query returns both surviving records");
+	Expect(generation != 0, "record header query returns a generation");
+	Expect(headers[0].WallClock100ns == tFirst &&
+		headers[0].VolumeOffset == 0 &&
+		headers[0].DataLength == sizeof(a),
+		"first record header metadata is returned without payload");
+	Expect(headers[1].WallClock100ns == tSecond &&
+		headers[1].VolumeOffset == 4096 &&
+		headers[1].DataLength == sizeof(b),
+		"second record header metadata is returned without payload");
+
+	st = CdpCoreQueryRecordHeaders(
+		ctx.Core,
+		1,
+		generation,
+		headers,
+		1,
+		&totalRecords,
+		&generation,
+		&returned);
+	Expect(NT_SUCCESS(st), "query record header page after first record");
+	Expect(returned == 1 && headers[0].WallClock100ns == tSecond,
+		"record header paging is oldest-first");
+
+	st = TestAppendJournalRecord(&ctx, tSecond + 1, 8192, a, sizeof(a));
+	Expect(NT_SUCCESS(st), "append record to advance list generation");
+	st = CdpCoreQueryRecordHeaders(
+		ctx.Core,
+		1,
+		generation,
+		headers,
+		1,
+		&totalRecords,
+		&generation,
+		&returned);
+	Expect(st == STATUS_RETRY,
+		"record header query detects a changed journal between pages");
+
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
+static int TestRecoveryCommitCoalescedLargePayload(void)
+{
+	const ULONG transferSize = 4UL * 1024UL * 1024UL;
+	const UINT64 journalSize = 12ULL * 1024ULL * 1024ULL;
+	TEST_CTX ctx;
+	PUCHAR before = NULL;
+	PUCHAR after = NULL;
+	UINT64 targetTime = 61000;
+	ULONG offset;
+	NTSTATUS st;
+
+	Expect(NT_SUCCESS(TestCtxCreate(
+		&ctx,
+		transferSize,
+		journalSize,
+		targetTime)),
+		"setup large coalesced recovery test");
+	before = (PUCHAR)malloc(transferSize);
+	after = (PUCHAR)malloc(transferSize);
+	Expect(before != NULL && after != NULL,
+		"allocate large coalesced recovery buffers");
+	if (!before || !after)
+		goto cleanup;
+
+	FillPattern(before, transferSize, 0x23);
+	FillPattern(after, transferSize, 0xA7);
+	st = ctx.Source->Write(ctx.Source, 0, transferSize, before);
+	Expect(NT_SUCCESS(st), "seed large source before-image");
+	for (offset = 0; offset < transferSize;
+		offset += Cdp_JOURNAL_MAX_RECORD_DATA)
+	{
+		st = TestAppendJournalRecord(
+			&ctx,
+			targetTime + offset / Cdp_JOURNAL_MAX_RECORD_DATA,
+			offset,
+			after + offset,
+			Cdp_JOURNAL_MAX_RECORD_DATA);
+		Expect(NT_SUCCESS(st), "write adjacent maximum-size journal record");
+		if (!NT_SUCCESS(st))
+			goto cleanup;
+	}
+	st = CdpCoreRecoveryBegin(ctx.Core, targetTime);
+	Expect(NT_SUCCESS(st), "prepare recovery with coalesced adjacent records");
+	st = CdpCoreRecoveryCommit(ctx.Core);
+	Expect(NT_SUCCESS(st), "commit reads coalesced payload in chunks");
+	Expect(memcmp(CdpMemStoreData(ctx.Source), before, transferSize) == 0,
+		"coalesced recovery restores the complete large before-image");
+
+cleanup:
+	free(after);
+	free(before);
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
+/* The driver commits through RecoveryCommitStep, not the legacy all-at-once
+ * helper.  Exercise two 4MB coalesced nodes and punch the second one after
+ * the first step, then compare the prepared read view with physical bytes. */
+static int TestRecoveryCommitStepCoalescedLargePayload(void)
+{
+	const ULONG nodeBytes = 4UL * 1024UL * 1024UL;
+	const ULONG totalBytes = 8UL * 1024UL * 1024UL;
+	const UINT64 journalSize = 24ULL * 1024ULL * 1024ULL;
+	TEST_CTX ctx;
+	PUCHAR before = NULL;
+	PUCHAR firstAfter = NULL;
+	PUCHAR secondAfter = NULL;
+	PUCHAR expected = NULL;
+	PUCHAR readView = NULL;
+	UCHAR liveWrite[512];
+	UINT64 targetTime = 61500;
+	ULONG offset;
+	BOOLEAN complete = FALSE;
+	NTSTATUS status = STATUS_SUCCESS;
+
+	Expect(NT_SUCCESS(TestCtxCreate(&ctx, totalBytes, journalSize, targetTime)),
+		"setup step coalesced recovery test");
+	before = (PUCHAR)malloc(totalBytes);
+	firstAfter = (PUCHAR)malloc(nodeBytes);
+	secondAfter = (PUCHAR)malloc(nodeBytes);
+	expected = (PUCHAR)malloc(totalBytes);
+	readView = (PUCHAR)malloc(totalBytes);
+	Expect(before && firstAfter && secondAfter && expected && readView,
+		"allocate step coalesced recovery buffers");
+	if (!before || !firstAfter || !secondAfter || !expected || !readView)
+		goto cleanup;
+
+	FillPattern(before, totalBytes, 0x25);
+	FillPattern(firstAfter, nodeBytes, 0xA5);
+	FillPattern(secondAfter, nodeBytes, 0xB5);
+	FillPattern(liveWrite, sizeof(liveWrite), 0xC5);
+	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, totalBytes, before)),
+		"seed two large before-image nodes");
+	for (offset = 0; offset < nodeBytes;
+		offset += Cdp_JOURNAL_MAX_RECORD_DATA)
+	{
+		status = TestAppendJournalRecord(&ctx,
+			targetTime + offset / Cdp_JOURNAL_MAX_RECORD_DATA,
+			offset, firstAfter + offset, Cdp_JOURNAL_MAX_RECORD_DATA);
+		Expect(NT_SUCCESS(status), "append first coalesced node");
+		if (!NT_SUCCESS(status))
+			goto cleanup;
+	}
+	for (offset = 0; offset < nodeBytes;
+		offset += Cdp_JOURNAL_MAX_RECORD_DATA)
+	{
+		status = TestAppendJournalRecord(&ctx,
+			targetTime + 10 + offset / Cdp_JOURNAL_MAX_RECORD_DATA,
+			nodeBytes + offset, secondAfter + offset,
+			Cdp_JOURNAL_MAX_RECORD_DATA);
+		Expect(NT_SUCCESS(status), "append second coalesced node");
+		if (!NT_SUCCESS(status))
+			goto cleanup;
+	}
+
+	status = CdpCoreRecoveryBegin(ctx.Core, targetTime);
+	Expect(NT_SUCCESS(status), "prepare step coalesced recovery");
+	status = CdpCoreRecoveryCommitStep(ctx.Core, &complete);
+	Expect(NT_SUCCESS(status) && !complete,
+		"first commit step restores only first coalesced node");
+	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, nodeBytes + 512,
+		sizeof(liveWrite), liveWrite)),
+		"new write punches middle of pending coalesced node");
+
+	RtlCopyMemory(expected, before, totalBytes);
+	RtlCopyMemory(expected + nodeBytes + 512, liveWrite, sizeof(liveWrite));
+	status = CdpCoreRead(ctx.Core, 0, totalBytes, readView);
+	Expect(NT_SUCCESS(status) && memcmp(readView, expected, totalBytes) == 0,
+		"prepared coalesced read equals expected final physical image");
+	while (!complete && NT_SUCCESS(status))
+		status = CdpCoreRecoveryCommitStep(ctx.Core, &complete);
+	Expect(NT_SUCCESS(status) && complete,
+		"step commit completes coalesced nodes after punch");
+	Expect(memcmp(CdpMemStoreData(ctx.Source), expected, totalBytes) == 0,
+		"step commit physical image equals prepared read view");
+
+cleanup:
+	free(readView);
+	free(expected);
+	free(secondAfter);
+	free(firstAfter);
+	free(before);
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
 static int TestQueryTimeRangeAfterEviction(void)
 {
 	TEST_CTX ctx;
@@ -1767,6 +2010,371 @@ static int TestPreparedRecoveryCommitCancel(void)
 	return g_caseFailed;
 }
 
+/* A prepared-phase write may overlap only part of one history node.  The
+ * overlap must remain live, while the node's untouched bytes still roll back. */
+static int TestPreparedRecoveryPartialConcurrentWrite(void)
+{
+	TEST_CTX ctx;
+	UCHAR a[1536];
+	UCHAR b[1536];
+	UCHAR n[512];
+	UCHAR expected[1536];
+	UCHAR out[1536];
+	UINT64 t0;
+	NTSTATUS st;
+
+	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 29500)),
+		"setup prepared partial-overlap recovery test");
+	FillPattern(a, sizeof(a), 0x71);
+	FillPattern(b, sizeof(b), 0x72);
+	FillPattern(n, sizeof(n), 0x73);
+	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
+		"seed partial-overlap source A");
+	t0 = CdpCoreGetTime100ns(ctx.Core);
+	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 0, sizeof(b), b)),
+		"COW write full history node B");
+	Expect(NT_SUCCESS(CdpCoreRecoveryBegin(ctx.Core, t0)),
+		"prepare partial-overlap recovery");
+
+	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 512, sizeof(n), n)),
+		"write only the middle sector while recovery is prepared");
+	RtlCopyMemory(expected, a, sizeof(expected));
+	RtlCopyMemory(expected + 512, n, sizeof(n));
+	memset(out, 0, sizeof(out));
+	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
+	Expect(NT_SUCCESS(st) && memcmp(out, expected, sizeof(out)) == 0,
+		"prepared view keeps history on both sides of concurrent middle write");
+
+	Expect(NT_SUCCESS(CdpCoreRecoveryCommit(ctx.Core)),
+		"commit partial-overlap recovery");
+	Expect(memcmp(CdpMemStoreData(ctx.Source), expected, sizeof(expected)) == 0,
+		"commit restores untouched history bytes and preserves concurrent middle write");
+
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
+/* Commit is intentionally stepped one history node at a time.  A write that
+ * arrives between two steps must punch only the still-pending node. */
+static int TestRecoveryCommitInterleavesNewWrite(void)
+{
+	TEST_CTX ctx;
+	UCHAR a[512];
+	UCHAR b[512];
+	UCHAR c[512];
+	UCHAR n[512];
+	BOOLEAN complete = FALSE;
+	UINT64 t0;
+	NTSTATUS st;
+
+	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 29750)),
+		"setup commit-step interleave test");
+	FillPattern(a, sizeof(a), 0x81);
+	FillPattern(b, sizeof(b), 0x82);
+	FillPattern(c, sizeof(c), 0x83);
+	FillPattern(n, sizeof(n), 0x84);
+	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
+		"seed first commit-step range");
+	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 512, sizeof(a), a)),
+		"seed second commit-step range");
+	t0 = CdpCoreGetTime100ns(ctx.Core);
+	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 0, sizeof(b), b)),
+		"write first history node");
+	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 512, sizeof(c), c)),
+		"write second history node");
+	Expect(NT_SUCCESS(CdpCoreRecoveryBegin(ctx.Core, t0)),
+		"prepare commit-step recovery");
+
+	st = CdpCoreRecoveryCommitStep(ctx.Core, &complete);
+	Expect(NT_SUCCESS(st) && !complete,
+		"first commit step restores exactly one node");
+	Expect(memcmp(CdpMemStoreData(ctx.Source), a, sizeof(a)) == 0,
+		"first node restored before interleaved write");
+	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 512, sizeof(n), n)),
+		"new write interleaves before second commit step");
+	st = CdpCoreRecoveryCommitStep(ctx.Core, &complete);
+	Expect(NT_SUCCESS(st) && complete,
+		"second step completes after pending node is punched");
+	Expect(memcmp((PUCHAR)CdpMemStoreData(ctx.Source) + 512, n, sizeof(n)) == 0,
+		"interleaved new write is not overwritten by later commit step");
+
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
+/* These are the five possible relationships between a new write and one
+ * history range [512, 2048): no overlap, full overlap, left/right edge
+ * overlap, and an overlap that splits the history node in two. */
+typedef struct _TEST_OVERLAP_CASE
+{
+	const char* Name;
+	ULONG Offset;
+	ULONG Length;
+} TEST_OVERLAP_CASE;
+
+static const TEST_OVERLAP_CASE g_overlapCases[] =
+{
+	{ "no overlap", 0, 512 },
+	{ "full overlap", 512, 1536 },
+	{ "left edge overlap", 0, 1024 },
+	{ "right edge overlap", 1536, 1024 },
+	{ "middle split overlap", 1024, 512 }
+};
+
+static ULONG g_buildOverlapOffset;
+static ULONG g_buildOverlapLength;
+static UCHAR g_buildOverlapData[1536];
+
+static VOID PreviewBuildHook_OverlapWrite(_Inout_ PCdp_CORE Core)
+{
+	(void)CdpCoreWrite(
+		Core,
+		g_buildOverlapOffset,
+		g_buildOverlapLength,
+		g_buildOverlapData);
+}
+
+static VOID RecoveryBuildHook_OverlapWrite(_Inout_ PCdp_CORE Core)
+{
+	(void)CdpCoreWrite(
+		Core,
+		g_buildOverlapOffset,
+		g_buildOverlapLength,
+		g_buildOverlapData);
+}
+
+static VOID TestSetExpectedRange(
+	_Inout_updates_bytes_(2560) PUCHAR Expected,
+	_In_ ULONG Offset,
+	_In_ ULONG Length,
+	_In_reads_bytes_(Length) const UCHAR* Data)
+{
+	RtlCopyMemory(Expected + Offset, Data, Length);
+}
+
+/* New writes while Recovery is already prepared must both change the read
+ * view and punch only their overlap before each remaining commit step. */
+static int TestPreparedRecoveryOverlapMatrix(void)
+{
+	ULONG index;
+
+	for (index = 0; index < RTL_NUMBER_OF(g_overlapCases); ++index)
+	{
+		const TEST_OVERLAP_CASE* overlap = &g_overlapCases[index];
+		TEST_CTX ctx;
+		UCHAR a[2560];
+		UCHAR b[1536];
+		UCHAR n[1536];
+		UCHAR expected[2560];
+		UCHAR out[2560];
+		UINT64 target;
+		BOOLEAN complete = FALSE;
+		NTSTATUS status;
+
+		Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE,
+			30000 + index * 100)), overlap->Name);
+		FillPattern(a, sizeof(a), (UCHAR)(0xA0 + index));
+		FillPattern(b, sizeof(b), (UCHAR)(0xB0 + index));
+		FillPattern(n, sizeof(n), (UCHAR)(0xC0 + index));
+		Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
+			overlap->Name);
+		target = CdpCoreGetTime100ns(ctx.Core);
+		Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 512, sizeof(b), b)),
+			overlap->Name);
+		Expect(NT_SUCCESS(CdpCoreRecoveryBegin(ctx.Core, target)),
+			overlap->Name);
+
+		Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, overlap->Offset,
+			overlap->Length, n)), overlap->Name);
+		RtlCopyMemory(expected, a, sizeof(expected));
+		TestSetExpectedRange(expected, overlap->Offset, overlap->Length, n);
+		status = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
+		Expect(NT_SUCCESS(status) && memcmp(out, expected, sizeof(out)) == 0,
+			overlap->Name);
+
+		while (!complete && NT_SUCCESS(status))
+			status = CdpCoreRecoveryCommitStep(ctx.Core, &complete);
+		Expect(NT_SUCCESS(status) && complete, overlap->Name);
+		Expect(memcmp(CdpMemStoreData(ctx.Source), expected, sizeof(expected)) == 0,
+			overlap->Name);
+		TestCtxDestroy(&ctx);
+	}
+	return g_caseFailed;
+}
+
+/* Preview keeps its target-time bytes even when a new write overlaps an
+ * existing preview node; its before-image is merged after the main tree. */
+static int TestPreviewOverlapMatrix(void)
+{
+	ULONG index;
+
+	for (index = 0; index < RTL_NUMBER_OF(g_overlapCases); ++index)
+	{
+		const TEST_OVERLAP_CASE* overlap = &g_overlapCases[index];
+		TEST_CTX ctx;
+		UCHAR a[2560];
+		UCHAR b[1536];
+		UCHAR n[1536];
+		UCHAR liveExpected[2560];
+		UCHAR out[2560];
+		UINT64 target;
+		NTSTATUS status;
+
+		Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE,
+			31000 + index * 100)), overlap->Name);
+		FillPattern(a, sizeof(a), (UCHAR)(0xD0 + index));
+		FillPattern(b, sizeof(b), (UCHAR)(0xE0 + index));
+		FillPattern(n, sizeof(n), (UCHAR)(0xF0 + index));
+		Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
+			overlap->Name);
+		target = CdpCoreGetTime100ns(ctx.Core);
+		Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 512, sizeof(b), b)),
+			overlap->Name);
+		Expect(NT_SUCCESS(CdpCorePreviewBegin(ctx.Core, target)), overlap->Name);
+		Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, overlap->Offset,
+			overlap->Length, n)), overlap->Name);
+		status = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
+		Expect(NT_SUCCESS(status) && memcmp(out, a, sizeof(out)) == 0,
+			overlap->Name);
+		Expect(NT_SUCCESS(CdpCorePreviewEnd(ctx.Core)), overlap->Name);
+
+		RtlCopyMemory(liveExpected, a, sizeof(liveExpected));
+		RtlCopyMemory(liveExpected + 512, b, sizeof(b));
+		TestSetExpectedRange(liveExpected, overlap->Offset, overlap->Length, n);
+		Expect(memcmp(CdpMemStoreData(ctx.Source), liveExpected,
+			sizeof(liveExpected)) == 0, overlap->Name);
+		TestCtxDestroy(&ctx);
+	}
+	return g_caseFailed;
+}
+
+/* Commit releases the external mutex between steps.  Exercise every overlap
+ * form against a still-pending node after the first node was written back. */
+static int TestRecoveryCommitInterleaveOverlapMatrix(void)
+{
+	static const TEST_OVERLAP_CASE commitCases[] =
+	{
+		{ "commit no overlap", 0, 512 },
+		{ "commit full overlap", 1536, 1536 },
+		{ "commit left edge overlap", 1024, 1024 },
+		{ "commit right edge overlap", 2560, 1024 },
+		{ "commit middle split overlap", 2048, 512 }
+	};
+	ULONG index;
+
+	for (index = 0; index < RTL_NUMBER_OF(commitCases); ++index)
+	{
+		const TEST_OVERLAP_CASE* overlap = &commitCases[index];
+		TEST_CTX ctx;
+		UCHAR a[4096];
+		UCHAR first[512];
+		UCHAR pending[1536];
+		UCHAR n[1536];
+		UCHAR expected[4096];
+		UCHAR out[4096];
+		UINT64 target;
+		BOOLEAN complete = FALSE;
+		NTSTATUS status;
+
+		Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE,
+			33000 + index * 100)), overlap->Name);
+		FillPattern(a, sizeof(a), (UCHAR)(0x21 + index));
+		FillPattern(first, sizeof(first), (UCHAR)(0x31 + index));
+		FillPattern(pending, sizeof(pending), (UCHAR)(0x41 + index));
+		FillPattern(n, sizeof(n), (UCHAR)(0x51 + index));
+		Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
+			overlap->Name);
+		target = CdpCoreGetTime100ns(ctx.Core);
+		Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 512, sizeof(first), first)),
+			overlap->Name);
+		Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 1536, sizeof(pending), pending)),
+			overlap->Name);
+		Expect(NT_SUCCESS(CdpCoreRecoveryBegin(ctx.Core, target)),
+			overlap->Name);
+
+		status = CdpCoreRecoveryCommitStep(ctx.Core, &complete);
+		Expect(NT_SUCCESS(status) && !complete, overlap->Name);
+		Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, overlap->Offset,
+			overlap->Length, n)), overlap->Name);
+		RtlCopyMemory(expected, a, sizeof(expected));
+		TestSetExpectedRange(expected, overlap->Offset, overlap->Length, n);
+		status = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
+		Expect(NT_SUCCESS(status) && memcmp(out, expected, sizeof(out)) == 0,
+			overlap->Name);
+
+		while (!complete && NT_SUCCESS(status))
+			status = CdpCoreRecoveryCommitStep(ctx.Core, &complete);
+		Expect(NT_SUCCESS(status) && complete, overlap->Name);
+		Expect(memcmp(CdpMemStoreData(ctx.Source), expected, sizeof(expected)) == 0,
+			overlap->Name);
+		TestCtxDestroy(&ctx);
+	}
+	return g_caseFailed;
+}
+
+/* The same overlap matrix is exercised for writes captured while each tree
+ * is being built (the staging-tree path), including the resulting read view
+ * and Recovery's subsequent physical commit. */
+static int TestBuildStagingOverlapMatrix(void)
+{
+	ULONG index;
+
+	for (index = 0; index < RTL_NUMBER_OF(g_overlapCases); ++index)
+	{
+		const TEST_OVERLAP_CASE* overlap = &g_overlapCases[index];
+		TEST_CTX ctx;
+		UCHAR a[2560];
+		UCHAR b[1536];
+		UCHAR expected[2560];
+		UCHAR out[2560];
+		UINT64 target;
+		BOOLEAN complete = FALSE;
+		NTSTATUS status;
+
+		FillPattern(a, sizeof(a), (UCHAR)(0x51 + index));
+		FillPattern(b, sizeof(b), (UCHAR)(0x61 + index));
+		FillPattern(g_buildOverlapData, sizeof(g_buildOverlapData),
+			(UCHAR)(0x71 + index));
+		g_buildOverlapOffset = overlap->Offset;
+		g_buildOverlapLength = overlap->Length;
+
+		Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE,
+			32000 + index * 100)), overlap->Name);
+		Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
+			overlap->Name);
+		target = CdpCoreGetTime100ns(ctx.Core);
+		Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 512, sizeof(b), b)),
+			overlap->Name);
+
+		CdpCoreTestSetPreviewBuildHook(PreviewBuildHook_OverlapWrite);
+		status = CdpCorePreviewBegin(ctx.Core, target);
+		CdpCoreTestSetPreviewBuildHook(NULL);
+		Expect(NT_SUCCESS(status), overlap->Name);
+		status = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
+		Expect(NT_SUCCESS(status) && memcmp(out, a, sizeof(out)) == 0,
+			overlap->Name);
+		Expect(NT_SUCCESS(CdpCorePreviewEnd(ctx.Core)), overlap->Name);
+
+		CdpCoreTestSetRecoveryBuildHook(RecoveryBuildHook_OverlapWrite);
+		status = CdpCoreRecoveryBegin(ctx.Core, target);
+		CdpCoreTestSetRecoveryBuildHook(NULL);
+		Expect(NT_SUCCESS(status), overlap->Name);
+		RtlCopyMemory(expected, a, sizeof(expected));
+		TestSetExpectedRange(expected, overlap->Offset,
+			overlap->Length, g_buildOverlapData);
+		status = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
+		Expect(NT_SUCCESS(status) && memcmp(out, expected, sizeof(out)) == 0,
+			overlap->Name);
+		while (!complete && NT_SUCCESS(status))
+			status = CdpCoreRecoveryCommitStep(ctx.Core, &complete);
+		Expect(NT_SUCCESS(status) && complete, overlap->Name);
+		Expect(memcmp(CdpMemStoreData(ctx.Source), expected, sizeof(expected)) == 0,
+			overlap->Name);
+		TestCtxDestroy(&ctx);
+	}
+	return g_caseFailed;
+}
+
 static int TestFullyCoveredRecoveryReadSkipsSource(void)
 {
 	TEST_CTX ctx;
@@ -1979,6 +2587,9 @@ int main(void)
 	failed += RunCase("Unmounted journal guards", TestUnmountedJournal);
 	failed += RunCase("QueryTimeRange empty journal", TestQueryTimeRangeEmptyJournal);
 	failed += RunCase("QueryTimeRange wall clocks", TestQueryTimeRangeWallClocks);
+	failed += RunCase("Journal usage and record headers", TestJournalUsageAndRecordHeaders);
+	failed += RunCase("Recovery commit coalesced large payload", TestRecoveryCommitCoalescedLargePayload);
+	failed += RunCase("Recovery commit step coalesced large payload", TestRecoveryCommitStepCoalescedLargePayload);
 	failed += RunCase("QueryTimeRange after eviction", TestQueryTimeRangeAfterEviction);
 	failed += RunCase("QueryTimeRange guards", TestQueryTimeRangeGuards);
 	failed += RunCase("Recovery time boundaries", TestRecoveryTimeBoundaries);
@@ -1998,6 +2609,12 @@ int main(void)
 	failed += RunCase("Journal invalidate rejects remount", TestJournalInvalidateRejectsRemount);
 	failed += RunCase("Journal failure keeps live source unchanged", TestJournalWriteFailureDoesNotWriteSource);
 	failed += RunCase("Prepared Recovery commit/cancel", TestPreparedRecoveryCommitCancel);
+	failed += RunCase("Prepared Recovery partial concurrent write", TestPreparedRecoveryPartialConcurrentWrite);
+	failed += RunCase("Recovery commit interleaves new write", TestRecoveryCommitInterleavesNewWrite);
+	failed += RunCase("Prepared Recovery overlap matrix", TestPreparedRecoveryOverlapMatrix);
+	failed += RunCase("Preview overlap matrix", TestPreviewOverlapMatrix);
+	failed += RunCase("Recovery commit interleave overlap matrix", TestRecoveryCommitInterleaveOverlapMatrix);
+	failed += RunCase("Build staging overlap matrix", TestBuildStagingOverlapMatrix);
 	failed += RunCase("Fully covered Recovery read", TestFullyCoveredRecoveryReadSkipsSource);
 	failed += RunCase("Header-region read chunk reuse", TestHeaderRegionReadUsesDiscoveredChunk);
 	failed += RunCase("Partial coverage reads only live gap", TestPartialCoverageReadsOnlyLiveGap);

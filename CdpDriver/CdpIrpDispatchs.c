@@ -6,6 +6,12 @@
 
 static VOID CdpDisableAllCaptureSources(_In_ PCdp_DRIVER_EXTENSION DriverExt);
 
+static NTSTATUS CdpCoreReadAlignedView(
+	_In_ PCdp_DEVICE_EXTENSION DevExt,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_Out_writes_bytes_(Length) PVOID Buffer);
+
 static VOID CdpFillReply(
 	_Out_ PCdp_COMMAND_REPLY Reply,
 	_In_ ULONG Command,
@@ -1704,8 +1710,8 @@ static NTSTATUS CdpReadPreviewSession(
 		NULL);
 	historyLocked = TRUE;
 
-	status = CdpCoreRead(
-		sourceExt->Core,
+	status = CdpCoreReadAlignedView(
+		sourceExt,
 		Request->ByteOffset,
 		Request->ByteLength,
 		OutputBuffer);
@@ -1832,6 +1838,7 @@ static NTSTATUS CdpCommitRecovery(
 	PCdp_DEVICE_EXTENSION sourceExt;
 	UINT64 targetTime;
 	NTSTATUS status;
+	BOOLEAN complete = FALSE;
 
 	RtlZeroMemory(Reply, sizeof(*Reply));
 	sourceExt = CdpFindSourceExtensionByGuid(
@@ -1846,17 +1853,30 @@ static NTSTATUS CdpCommitRecovery(
 		return STATUS_INVALID_DEVICE_STATE;
 	}
 
-	KeWaitForSingleObject(
-		&sourceExt->HistoryMutex,
-		Executive,
-		KernelMode,
-		FALSE,
-		NULL);
-	targetTime = CdpCoreGetTargetTime100ns(sourceExt->Core);
-	status = CdpCoreRecoveryCommit(sourceExt->Core);
-	KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
-	if (!NT_SUCCESS(status))
-		return status;
+	for (;;)
+	{
+		KeWaitForSingleObject(
+			&sourceExt->HistoryMutex,
+			Executive,
+			KernelMode,
+			FALSE,
+			NULL);
+		targetTime = CdpCoreGetTargetTime100ns(sourceExt->Core);
+		status = CdpCoreRecoveryCommitStep(sourceExt->Core, &complete);
+		KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
+		if (!NT_SUCCESS(status))
+		{
+			Cdp_LOG("[PHASE] recovery commit failed target=%llu status=0x%08X\n",
+				targetTime,
+				status);
+			return status;
+		}
+		if (complete)
+			break;
+		// A lock handoff between nodes gives queued normal writes a chance to
+		// capture and punch the remaining history before the next step.
+		YieldProcessor();
+	}
 
 	InterlockedExchange(&sourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
 	Reply->Phase = Cdp_PHASE_GENERAL;
@@ -1938,6 +1958,74 @@ static NTSTATUS CdpQueryTimeRange(
 	return STATUS_SUCCESS;
 }
 
+static NTSTATUS CdpQueryJournalUsage(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ const Cdp_JOURNAL_USAGE_QUERY_REQUEST* Request,
+	_Out_ PCdp_JOURNAL_USAGE_QUERY_REPLY Reply)
+{
+	PCdp_DEVICE_EXTENSION sourceExt;
+
+	RtlZeroMemory(Reply, sizeof(*Reply));
+	sourceExt = CdpFindSourceExtensionByGuid(
+		DriverExt,
+		&Request->SourceVolumeGuid);
+	if (!sourceExt)
+		return STATUS_DEVICE_DOES_NOT_EXIST;
+	if (InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) == 0 ||
+		!sourceExt->Core)
+	{
+		return STATUS_DEVICE_NOT_READY;
+	}
+
+	return CdpCoreQueryJournalUsage(
+		sourceExt->Core,
+		&Reply->JournalPartitionBytes,
+		&Reply->JournalMetadataBytes,
+		&Reply->RecordPayloadBytesUsed,
+		&Reply->RecordPayloadBytesFree,
+		&Reply->TotalRecords);
+}
+
+static NTSTATUS CdpQueryJournalRecords(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ const Cdp_JOURNAL_RECORD_QUERY_REQUEST* Request,
+	_Out_ PCdp_JOURNAL_RECORD_QUERY_REPLY Reply,
+	_In_ ULONG RecordCapacity)
+{
+	PCdp_DEVICE_EXTENSION sourceExt;
+	PCdp_JOURNAL_RECORD_HEADER headers;
+
+	C_ASSERT(sizeof(Cdp_JOURNAL_RECORD_INFO) ==
+		sizeof(Cdp_JOURNAL_RECORD_HEADER));
+	RtlZeroMemory(Reply, sizeof(*Reply));
+	sourceExt = CdpFindSourceExtensionByGuid(
+		DriverExt,
+		&Request->SourceVolumeGuid);
+	if (!sourceExt)
+		return STATUS_DEVICE_DOES_NOT_EXIST;
+	if (InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) == 0 ||
+		!sourceExt->Core)
+	{
+		return STATUS_DEVICE_NOT_READY;
+	}
+
+	if (RecordCapacity > Request->MaxRecords)
+		RecordCapacity = Request->MaxRecords;
+	if (RecordCapacity > Cdp_JOURNAL_RECORD_QUERY_MAX_PER_CALL)
+		RecordCapacity = Cdp_JOURNAL_RECORD_QUERY_MAX_PER_CALL;
+
+	headers = (PCdp_JOURNAL_RECORD_HEADER)(Reply + 1);
+	return CdpCoreQueryRecordHeaders(
+		sourceExt->Core,
+		Request->StartIndex,
+		Request->ExpectedGeneration,
+		headers,
+		RecordCapacity,
+		&Reply->TotalRecords,
+		&Reply->Generation,
+		&Reply->RecordCount);
+}
+
 static NTSTATUS CdpQueryPhase(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const Cdp_PHASE_QUERY_REQUEST* Request,
@@ -1974,7 +2062,9 @@ static NTSTATUS CdpQueryPhase(
 	return STATUS_SUCCESS;
 }
 
-static NTSTATUS CdpRecoveryFillReadBuffer(
+/* The caller holds HistoryMutex.  CdpCore operates on sector-aligned ranges,
+ * while preview/recovery clients may request an arbitrary byte subrange. */
+static NTSTATUS CdpCoreReadAlignedView(
 	_In_ PCdp_DEVICE_EXTENSION DevExt,
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
@@ -1982,6 +2072,55 @@ static NTSTATUS CdpRecoveryFillReadBuffer(
 {
 	NTSTATUS status = STATUS_SUCCESS;
 	ULONG completed = 0;
+	ULONG sectorSize;
+
+	if (!DevExt->Core)
+		return STATUS_DEVICE_NOT_READY;
+	sectorSize = DevExt->SectorSize;
+	if (sectorSize != 512 && sectorSize != 4096)
+		return STATUS_INVALID_DEVICE_REQUEST;
+
+	while (completed < Length)
+	{
+		UINT64 requestOffset = Offset + completed;
+		UINT64 alignedOffset = requestOffset - (requestOffset % sectorSize);
+		ULONG prefix = (ULONG)(requestOffset - alignedOffset);
+		ULONG chunk = Length - completed;
+		ULONG span;
+		PVOID alignedBuffer;
+		if (chunk > Cdp_CMD3_MAX_READ_BYTES - prefix)
+			chunk = Cdp_CMD3_MAX_READ_BYTES - prefix;
+		span = prefix + chunk;
+		span = (span + sectorSize - 1) / sectorSize * sectorSize;
+		alignedBuffer = cdpalloc(span);
+		if (!alignedBuffer)
+		{
+			status = STATUS_INSUFFICIENT_RESOURCES;
+			break;
+		}
+		status = CdpCoreRead(
+			DevExt->Core,
+			alignedOffset,
+			span,
+			alignedBuffer);
+		if (NT_SUCCESS(status))
+			RtlCopyMemory((PUCHAR)Buffer + completed,
+				(PUCHAR)alignedBuffer + prefix, chunk);
+		cdpfree(alignedBuffer);
+		if (!NT_SUCCESS(status))
+			break;
+		completed += chunk;
+	}
+	return status;
+}
+
+static NTSTATUS CdpRecoveryFillReadBuffer(
+	_In_ PCdp_DEVICE_EXTENSION DevExt,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_Out_writes_bytes_(Length) PVOID Buffer)
+{
+	NTSTATUS status;
 
 	if (!DevExt->Core)
 		return STATUS_DEVICE_NOT_READY;
@@ -2000,20 +2139,7 @@ static NTSTATUS CdpRecoveryFillReadBuffer(
 		"[RECOVERY] read mutex acquired offset=%llu len=%lu\n",
 		Offset,
 		Length);
-	while (completed < Length)
-	{
-		ULONG chunk = Length - completed;
-		if (chunk > Cdp_CMD3_MAX_READ_BYTES)
-			chunk = Cdp_CMD3_MAX_READ_BYTES;
-		status = CdpCoreRead(
-			DevExt->Core,
-			Offset + completed,
-			chunk,
-			(PUCHAR)Buffer + completed);
-		if (!NT_SUCCESS(status))
-			break;
-		completed += chunk;
-	}
+	status = CdpCoreReadAlignedView(DevExt, Offset, Length, Buffer);
 	Cdp_DBG(
 		"[RECOVERY] core read end offset=%llu len=%lu status=0x%08X\n",
 		Offset,
@@ -2058,9 +2184,7 @@ NTSTATUS CdpIrpDispatchRead(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 	offset = (UINT64)irpSp->Parameters.Read.ByteOffset.QuadPart;
 	length = irpSp->Parameters.Read.Length;
 	if (!driverExt ||
-		(deviceExt->SectorSize != 512 && deviceExt->SectorSize != 4096) ||
-		(offset % deviceExt->SectorSize) != 0 ||
-		(length % deviceExt->SectorSize) != 0)
+		(deviceExt->SectorSize != 512 && deviceExt->SectorSize != 4096))
 	{
 		return CdpSendToNextDevice(deviceExt->LowerDeviceObject, Irp);
 	}
@@ -3096,6 +3220,79 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 				Irp,
 				status,
 				NT_SUCCESS(status) ? sizeof(*reply) : 0);
+		}
+
+		case IOCTL_Cdp_QUERY_JOURNAL_USAGE:
+		{
+			Cdp_JOURNAL_USAGE_QUERY_REQUEST request;
+			PCdp_JOURNAL_USAGE_QUERY_REPLY reply;
+			ULONG inLen =
+				IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+			ULONG outLen =
+				IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
+			NTSTATUS status;
+
+			if (!DriverExt || !Irp->AssociatedIrp.SystemBuffer ||
+				inLen < sizeof(request) ||
+				outLen < sizeof(Cdp_JOURNAL_USAGE_QUERY_REPLY))
+			{
+				return CdpCompleteIrp(
+					Irp,
+					STATUS_BUFFER_TOO_SMALL,
+					0);
+			}
+
+			request =
+				*(PCdp_JOURNAL_USAGE_QUERY_REQUEST)Irp->AssociatedIrp.SystemBuffer;
+			reply =
+				(PCdp_JOURNAL_USAGE_QUERY_REPLY)Irp->AssociatedIrp.SystemBuffer;
+			status = CdpQueryJournalUsage(DriverExt, &request, reply);
+			return CdpCompleteIrp(
+				Irp,
+				status,
+				NT_SUCCESS(status) ? sizeof(*reply) : 0);
+		}
+
+		case IOCTL_Cdp_QUERY_JOURNAL_RECORDS:
+		{
+			Cdp_JOURNAL_RECORD_QUERY_REQUEST request;
+			PCdp_JOURNAL_RECORD_QUERY_REPLY reply;
+			ULONG inLen =
+				IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+			ULONG outLen =
+				IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
+			ULONG recordCapacity;
+			NTSTATUS status;
+
+			if (!DriverExt || !Irp->AssociatedIrp.SystemBuffer ||
+				inLen < sizeof(request) ||
+				outLen < sizeof(Cdp_JOURNAL_RECORD_QUERY_REPLY))
+			{
+				return CdpCompleteIrp(
+					Irp,
+					STATUS_BUFFER_TOO_SMALL,
+					0);
+			}
+
+			request =
+				*(PCdp_JOURNAL_RECORD_QUERY_REQUEST)Irp->AssociatedIrp.SystemBuffer;
+			reply =
+				(PCdp_JOURNAL_RECORD_QUERY_REPLY)Irp->AssociatedIrp.SystemBuffer;
+			recordCapacity =
+				(outLen - sizeof(*reply)) / sizeof(Cdp_JOURNAL_RECORD_INFO);
+			status = CdpQueryJournalRecords(
+				DriverExt,
+				&request,
+				reply,
+				recordCapacity);
+			return CdpCompleteIrp(
+				Irp,
+				status,
+				NT_SUCCESS(status) ?
+					sizeof(*reply) +
+						(ULONG_PTR)reply->RecordCount *
+							sizeof(Cdp_JOURNAL_RECORD_INFO) :
+					0);
 		}
 
 		case IOCTL_Cdp_QUERY_VERSION:

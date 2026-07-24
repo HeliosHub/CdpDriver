@@ -136,6 +136,8 @@ Version = **7**。v6 及更早版本 journal 需重新 Format。
 | `IOCTL_Cdp_BEGIN/READ/END_PREVIEW` | Preview 会话 |
 | `IOCTL_Cdp_QUERY_PHASE` | 查询 Phase |
 | `IOCTL_Cdp_QUERY_TIME_RANGE` | 查询 journal 最早/最新 COW 记录 WallClock |
+| `IOCTL_Cdp_QUERY_JOURNAL_USAGE` | 查询当前 record 负载已用/剩余空间与日志元数据占用 |
+| `IOCTL_Cdp_QUERY_JOURNAL_RECORDS` | 分页查询当前 record 元数据列表（不返回 payload） |
 | `IOCTL_Cdp_BEGIN_RECOVERY` | 准备 Recovery 历史视图并保持 Recovery Phase |
 | `IOCTL_Cdp_COMMIT_RECOVERY` | 同步回填已准备的历史视图，成功后回到 Normal |
 | `IOCTL_Cdp_CANCEL_RECOVERY` | 取消已准备的 Recovery，不回填 |

@@ -81,6 +81,8 @@ typedef struct _Cdp_JOURNAL
 	ULONG HeaderRegionWriteChunk;
 	ULONG NextSequence;
 	UINT64 TotalRecords;
+	UINT64 PayloadBytesUsed;
+	UINT64 RecordGeneration;
 	UINT64 Oldest100ns;
 	UINT64 Newest100ns;
 	GUID SourceVolumeGuid;
@@ -153,6 +155,30 @@ NTSTATUS CdpJournalQueryTimeRange(
 	_Out_ PUINT64 OldestTime100ns,
 	_Out_ PUINT64 NewestTime100ns);
 
+// Payload-space accounting excludes the superblock and active 2MB header
+// regions.  Used payload bytes are sector-aligned on-disk allocations.
+NTSTATUS CdpJournalQueryUsage(
+	_Inout_ PCdp_JOURNAL Journal,
+	_Out_ PUINT64 PartitionBytes,
+	_Out_ PUINT64 MetadataBytes,
+	_Out_ PUINT64 PayloadBytesUsed,
+	_Out_ PUINT64 PayloadBytesFree,
+	_Out_ PUINT64 TotalRecords);
+
+// Read retained record headers in chronological order.  Headers contain only
+// record metadata; callers never receive journal payload data.  The caller
+// can page with StartIndex and must echo Generation after the first page to
+// detect concurrent capture/eviction.
+NTSTATUS CdpJournalQueryRecordHeaders(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 StartIndex,
+	_In_ UINT64 ExpectedGeneration,
+	_Out_writes_to_(HeaderCapacity, *ReturnedCount) PCdp_JOURNAL_RECORD_HEADER Headers,
+	_In_ ULONG HeaderCapacity,
+	_Out_ PUINT64 TotalRecords,
+	_Out_ PUINT64 Generation,
+	_Out_ PULONG ReturnedCount);
+
 NTSTATUS CdpJournalBuildPreviewTree(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 TargetTime100ns,
@@ -186,8 +212,16 @@ NTSTATUS CdpPreviewTreeInsert(
 	_Inout_ PCdp_PREVIEW_TREE Tree,
 	_In_ const Cdp_JOURNAL_RECORD_HEADER* Header);
 
-// Mark overlapping nodes Invalid (no structural delete). Used by recovery writes.
+// Mark overlapping nodes Invalid (no structural delete). Kept for the
+// allocation-failure safety fallback used by recovery writes.
 VOID CdpPreviewTreeInvalidateRange(
+	_Inout_ PCdp_PREVIEW_TREE Tree,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength);
+
+// Remove only the intersecting byte range from the history tree.  Remaining
+// left/right fragments keep their original journal payload offsets.
+NTSTATUS CdpPreviewTreePunchRange(
 	_Inout_ PCdp_PREVIEW_TREE Tree,
 	_In_ UINT64 VolumeOffset,
 	_In_ ULONG DataLength);
@@ -197,8 +231,8 @@ NTSTATUS CdpPreviewTreeMergeFrom(
 	_Inout_ PCdp_PREVIEW_TREE Source);
 
 // Recovery build finish: Staging holds concurrent new-write ranges;
-// invalidate overlapping HistoryTree nodes, then free Staging.
-VOID CdpPreviewTreePunchByStaging(
+// remove only their overlapping bytes from HistoryTree, then free Staging.
+NTSTATUS CdpPreviewTreePunchByStaging(
 	_Inout_ PCdp_PREVIEW_TREE HistoryTree,
 	_Inout_ PCdp_PREVIEW_TREE StagingTree);
 

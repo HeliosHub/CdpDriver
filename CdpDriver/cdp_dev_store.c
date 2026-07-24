@@ -23,7 +23,14 @@ static NTSTATUS CdpDevStoreRawIo(
 	NTSTATUS status;
 
 	if (!Device || !Buffer || Length == 0)
+	{
+		Cdp_LOG("[DEVSTORE] invalid I/O args device=%p buffer=%p len=%lu major=0x%02X\n",
+			Device,
+			Buffer,
+			Length,
+			MajorFunction);
 		return STATUS_INVALID_PARAMETER;
+	}
 
 	byteOffset.QuadPart = (LONGLONG)Offset;
 	KeInitializeEvent(&event, NotificationEvent, FALSE);
@@ -71,7 +78,22 @@ static NTSTATUS CdpDevStoreRawIo(
 	}
 
 	if (NT_SUCCESS(status) && iosb.Information != Length)
+	{
+		Cdp_LOG("[DEVSTORE] short I/O major=0x%02X offset=%llu len=%lu bytes=%Iu\n",
+			MajorFunction,
+			Offset,
+			Length,
+			iosb.Information);
 		return STATUS_UNEXPECTED_IO_ERROR;
+	}
+	if (!NT_SUCCESS(status))
+	{
+		Cdp_LOG("[DEVSTORE] I/O failed major=0x%02X offset=%llu len=%lu status=0x%08X\n",
+			MajorFunction,
+			Offset,
+			Length,
+			status);
+	}
 	Cdp_DBG("[DEVSTORE] io end irp=%p status=0x%08X "
 		"bytes=%Iu\n",
 		irp,

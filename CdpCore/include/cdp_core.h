@@ -46,6 +46,24 @@ NTSTATUS CdpCoreQueryTimeRange(
 	_Out_ PUINT64 OldestTime100ns,
 	_Out_ PUINT64 NewestTime100ns);
 
+NTSTATUS CdpCoreQueryJournalUsage(
+	_Inout_ PCdp_CORE Core,
+	_Out_ PUINT64 PartitionBytes,
+	_Out_ PUINT64 MetadataBytes,
+	_Out_ PUINT64 PayloadBytesUsed,
+	_Out_ PUINT64 PayloadBytesFree,
+	_Out_ PUINT64 TotalRecords);
+
+NTSTATUS CdpCoreQueryRecordHeaders(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 StartIndex,
+	_In_ UINT64 ExpectedGeneration,
+	_Out_writes_to_(HeaderCapacity, *ReturnedCount) PCdp_JOURNAL_RECORD_HEADER Headers,
+	_In_ ULONG HeaderCapacity,
+	_Out_ PUINT64 TotalRecords,
+	_Out_ PUINT64 Generation,
+	_Out_ PULONG ReturnedCount);
+
 Cdp_CORE_PHASE CdpCoreGetPhase(_In_ PCdp_CORE Core);
 VOID CdpCoreSetPhase(_Inout_ PCdp_CORE Core, _In_ Cdp_CORE_PHASE Phase);
 
@@ -77,6 +95,13 @@ NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100n
 
 /* Write the prepared history back to the source and return to General. */
 NTSTATUS CdpCoreRecoveryCommit(_Inout_ PCdp_CORE Core);
+
+// Apply at most one remaining history node.  The caller may release its
+// external serialization lock between calls so prepared-recovery writes can
+// punch the still-pending portion of the history tree.
+NTSTATUS CdpCoreRecoveryCommitStep(
+	_Inout_ PCdp_CORE Core,
+	_Out_ PBOOLEAN Complete);
 
 /* Discard a prepared history view without writing back. */
 NTSTATUS CdpCoreRecoveryCancel(_Inout_ PCdp_CORE Core);
