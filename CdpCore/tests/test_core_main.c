@@ -1839,6 +1839,28 @@ static int TestSingleSuperblockMetadata(void)
 		"superblock persists source volume GUID");
 	Expect(remounted.PayloadRegionOff == expectedPayloadHead,
 		"mount derives payload head from latest record fileoffset+length");
+	Expect(NT_SUCCESS(CdpJournalSetRecoveryIntent(&remounted, 123456789ULL)),
+		"persist reboot recovery intent");
+	CdpJournalClose(&remounted);
+
+	CdpJournalInitializeWithStore(
+		&remounted, store, &zeroGuid, NULL, NULL);
+	Expect(NT_SUCCESS(CdpJournalMount(&remounted)),
+		"remount journal with reboot recovery intent");
+	Expect(remounted.RecoveryPending &&
+		remounted.RecoveryTargetTime100ns == 123456789ULL,
+		"superblock persists reboot recovery target");
+	Expect(NT_SUCCESS(CdpJournalClearRecoveryIntent(&remounted)),
+		"clear reboot recovery intent");
+	CdpJournalClose(&remounted);
+
+	CdpJournalInitializeWithStore(
+		&remounted, store, &zeroGuid, NULL, NULL);
+	Expect(NT_SUCCESS(CdpJournalMount(&remounted)),
+		"remount journal after clearing reboot recovery intent");
+	Expect(!remounted.RecoveryPending &&
+		remounted.RecoveryTargetTime100ns == 0,
+		"cleared reboot recovery intent stays cleared");
 	CdpJournalClose(&remounted);
 
 	journalBytes[0] ^= 0xFF;

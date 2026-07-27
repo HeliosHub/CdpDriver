@@ -353,7 +353,6 @@ static BOOL DoPreviewBegin(HANDLE hDevice)
 		ConOut(L"Invalid target time.\n");
 		return FALSE;
 	}
-
 	if (!DeviceIoControl(hDevice, IOCTL_Cdp_BEGIN_PREVIEW,
 		&req, sizeof(req), &reply, sizeof(reply), &bytesReturned, NULL))
 	{
@@ -459,6 +458,11 @@ static BOOL DoRecoveryBegin(HANDLE hDevice)
 		ConOut(L"Invalid target time.\n");
 		return FALSE;
 	}
+	ConOut(L"Persist this recovery for automatic begin+commit after reboot? (y/N): ");
+	if (!ReadLine(line, _countof(line)))
+		return FALSE;
+	if (line[0] == L'y' || line[0] == L'Y')
+		req.Flags |= Cdp_RECOVERY_BEGIN_FLAG_ON_REBOOT;
 
 	if (!DeviceIoControl(
 			hDevice,
@@ -474,13 +478,24 @@ static BOOL DoRecoveryBegin(HANDLE hDevice)
 		return FALSE;
 	}
 
-	ConOutFmt(
-		L"Recovery prepared. Phase=%lu target=%llu range=[%llu, %llu]\n",
-		reply.Phase,
-		reply.TargetTime100ns,
-		reply.OldestRecoverable100ns,
-		reply.NewestRecoverable100ns);
-	ConOut(L"No writeback has occurred. Bring the source online, then use r to commit.\n");
+	if ((req.Flags & Cdp_RECOVERY_BEGIN_FLAG_ON_REBOOT) != 0)
+	{
+		ConOutFmt(L"Reboot recovery intent saved. target=%llu range=[%llu, %llu]\n",
+			reply.TargetTime100ns,
+			reply.OldestRecoverable100ns,
+			reply.NewestRecoverable100ns);
+		ConOut(L"No recovery begin was run. After reboot it will automatically begin and commit.\n");
+	}
+	else
+	{
+		ConOutFmt(
+			L"Recovery prepared. Phase=%lu target=%llu range=[%llu, %llu]\n",
+			reply.Phase,
+			reply.TargetTime100ns,
+			reply.OldestRecoverable100ns,
+			reply.NewestRecoverable100ns);
+		ConOut(L"No writeback has occurred. Bring the source online, then use r to commit.\n");
+	}
 	return TRUE;
 }
 

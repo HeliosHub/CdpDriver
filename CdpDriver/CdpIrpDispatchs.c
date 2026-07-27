@@ -2,9 +2,20 @@
 #include "..\CdpCore\include\cdp_core.h"
 #include "..\CdpCore\include\cdp_dev_store.h"
 #include <ntdddisk.h>
+#include <ntddstor.h>
 #include <ntstrsafe.h>
 
 static VOID CdpDisableAllCaptureSources(_In_ PCdp_DRIVER_EXTENSION DriverExt);
+
+static NTSTATUS CdpBeginRecovery(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ const Cdp_RECOVERY_BEGIN_REQUEST* Request,
+	_Out_ PCdp_RECOVERY_BEGIN_REPLY Reply);
+
+static NTSTATUS CdpCommitRecovery(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ const Cdp_RECOVERY_CONTROL_REQUEST* Request,
+	_Out_ PCdp_RECOVERY_COMMIT_REPLY Reply);
 
 static NTSTATUS CdpCoreReadAlignedView(
 	_In_ PCdp_DEVICE_EXTENSION DevExt,
@@ -821,6 +832,24 @@ static NTSTATUS CdpActivateAutoJournal(
 			CdpDevStoreDestroy(sourceStore);
 		return status;
 	}
+	if (!sourceExt->CaptureThreadHandle)
+	{
+		status = CdpStartCaptureWorker(sourceExt);
+		if (!NT_SUCCESS(status))
+		{
+			CdpDisableAndDestroyCapture(sourceExt);
+			return status;
+		}
+	}
+	if (!sourceExt->RecoveryReadThreadHandle)
+	{
+		status = CdpStartRecoveryReadWorker(sourceExt);
+		if (!NT_SUCCESS(status))
+		{
+			CdpDisableAndDestroyCapture(sourceExt);
+			return status;
+		}
+	}
 
 	sourceExt->JournalHandleId = JournalHandleId;
 	InterlockedExchange(&sourceExt->CaptureEnabled, 1);
@@ -1154,15 +1183,43 @@ static NTSTATUS CdpTryActivateReadyPairs(
 			DriverExt,
 			journalHandleId,
 			journalEntry);
-		CdpReleaseVolumeHandleEntry(journalEntry);
 		if (NT_SUCCESS(status))
 		{
+			if (journalEntry->Journal.RecoveryPending)
+			{
+				Cdp_RECOVERY_BEGIN_REQUEST beginRequest;
+				Cdp_RECOVERY_BEGIN_REPLY beginReply;
+				Cdp_RECOVERY_CONTROL_REQUEST commitRequest;
+				Cdp_RECOVERY_COMMIT_REPLY commitReply;
+
+				RtlZeroMemory(&beginRequest, sizeof(beginRequest));
+				beginRequest.SourceVolumeGuid =
+					journalEntry->Journal.SourceVolumeGuid;
+				beginRequest.TargetTime100ns =
+					journalEntry->Journal.RecoveryTargetTime100ns;
+				// The intent is already persisted.  This invocation performs the
+				// actual begin; commit clears the marker on success.
+				beginRequest.Flags = 0;
+				Cdp_LOG("[RECOVERY] reboot intent found target=%llu; auto begin+commit\n",
+					beginRequest.TargetTime100ns);
+				status = CdpBeginRecovery(DriverExt, &beginRequest, &beginReply);
+				if (NT_SUCCESS(status))
+				{
+					RtlZeroMemory(&commitRequest, sizeof(commitRequest));
+					commitRequest.SourceVolumeGuid = beginRequest.SourceVolumeGuid;
+					status = CdpCommitRecovery(DriverExt, &commitRequest, &commitReply);
+				}
+				if (!NT_SUCCESS(status))
+					Cdp_LOG("[RECOVERY] reboot auto recovery failed status=0x%08X\n", status);
+			}
 			Cdp_DBG("[AUTO-CDP] pair activated journalHandle=%llu\n",
 				journalHandleId);
 			++activated;
 			result = STATUS_SUCCESS;
+			CdpReleaseVolumeHandleEntry(journalEntry);
 			continue;
 		}
+		CdpReleaseVolumeHandleEntry(journalEntry);
 		Cdp_LOG("[AUTO-CDP] pair activate failed status=0x%08X\n", status);
 		if (result == STATUS_NOT_FOUND)
 			result = status;
@@ -1752,12 +1809,15 @@ static NTSTATUS CdpBeginRecovery(
 	_Out_ PCdp_RECOVERY_BEGIN_REPLY Reply)
 {
 	PCdp_DEVICE_EXTENSION sourceExt;
+	PCdp_VOLUME_HANDLE_ENTRY journalEntry;
 	UINT64 oldestTime = 0;
 	UINT64 newestTime = 0;
 	LONG previousPhase;
 	NTSTATUS status;
 
 	RtlZeroMemory(Reply, sizeof(*Reply));
+	if ((Request->Flags & ~Cdp_RECOVERY_BEGIN_FLAG_ON_REBOOT) != 0)
+		return STATUS_INVALID_PARAMETER;
 	sourceExt = CdpFindSourceExtensionByGuid(
 		DriverExt,
 		&Request->SourceVolumeGuid);
@@ -1767,6 +1827,35 @@ static NTSTATUS CdpBeginRecovery(
 		return STATUS_DEVICE_NOT_READY;
 	if (!sourceExt->Core)
 		return STATUS_DEVICE_NOT_READY;
+	if ((Request->Flags & Cdp_RECOVERY_BEGIN_FLAG_ON_REBOOT) != 0)
+	{
+		status = CdpCoreQueryTimeRange(sourceExt->Core, &oldestTime, &newestTime);
+		if (status == STATUS_NOT_FOUND)
+		{
+			oldestTime = 0;
+			newestTime = 0;
+			status = STATUS_SUCCESS;
+		}
+		if (!NT_SUCCESS(status))
+			return status;
+		if (oldestTime != 0 && Request->TargetTime100ns < oldestTime)
+			return STATUS_NOT_FOUND;
+		journalEntry = CdpAcquireJournalForSource(DriverExt, sourceExt);
+		if (!journalEntry)
+			return STATUS_DEVICE_NOT_READY;
+		status = CdpJournalSetRecoveryIntent(
+			&journalEntry->Journal, Request->TargetTime100ns);
+		CdpReleaseVolumeHandleEntry(journalEntry);
+		if (!NT_SUCCESS(status))
+			return status;
+		Reply->Phase = Cdp_PHASE_GENERAL;
+		Reply->TargetTime100ns = Request->TargetTime100ns;
+		Reply->OldestRecoverable100ns = oldestTime;
+		Reply->NewestRecoverable100ns = newestTime;
+		Cdp_LOG("[RECOVERY] reboot intent persisted target=%llu; no begin before reboot\n",
+			Request->TargetTime100ns);
+		return STATUS_SUCCESS;
+	}
 	if (CdpAnyPreviewSessionActive(DriverExt))
 		return STATUS_INVALID_DEVICE_STATE;
 	// Recovery services paging reads from a worker and can therefore not be
@@ -1778,7 +1867,6 @@ static NTSTATUS CdpBeginRecovery(
 			InterlockedCompareExchange(&sourceExt->PagingPathCount, 0, 0));
 		return STATUS_DEVICE_BUSY;
 	}
-
 	previousPhase = InterlockedCompareExchange(
 		&sourceExt->Phase,
 		(LONG)Cdp_PHASE_RECOVERY,
@@ -1878,6 +1966,21 @@ static NTSTATUS CdpCommitRecovery(
 		YieldProcessor();
 	}
 
+	{
+		PCdp_VOLUME_HANDLE_ENTRY journalEntry =
+			CdpAcquireJournalForSource(DriverExt, sourceExt);
+		if (journalEntry && journalEntry->Journal.RecoveryPending)
+		{
+			status = CdpJournalClearRecoveryIntent(&journalEntry->Journal);
+			CdpReleaseVolumeHandleEntry(journalEntry);
+			if (!NT_SUCCESS(status))
+				return status;
+		}
+		else if (journalEntry)
+		{
+			CdpReleaseVolumeHandleEntry(journalEntry);
+		}
+	}
 	InterlockedExchange(&sourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
 	Reply->Phase = Cdp_PHASE_GENERAL;
 	Reply->TargetTime100ns = targetTime;
@@ -1915,6 +2018,21 @@ static NTSTATUS CdpCancelRecovery(
 	KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
 	if (!NT_SUCCESS(status))
 		return status;
+	{
+		PCdp_VOLUME_HANDLE_ENTRY journalEntry =
+			CdpAcquireJournalForSource(DriverExt, sourceExt);
+		if (journalEntry && journalEntry->Journal.RecoveryPending)
+		{
+			status = CdpJournalClearRecoveryIntent(&journalEntry->Journal);
+			CdpReleaseVolumeHandleEntry(journalEntry);
+			if (!NT_SUCCESS(status))
+				return status;
+		}
+		else if (journalEntry)
+		{
+			CdpReleaseVolumeHandleEntry(journalEntry);
+		}
+	}
 
 	InterlockedExchange(&sourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
 	Cdp_LOG("[PHASE] recovery cancelled -> normal\n");
@@ -2375,6 +2493,8 @@ static NTSTATUS CdpCaptureBeforeImage(
 	if (!SourceExt->Core)
 		return STATUS_DEVICE_NOT_READY;
 
+	Cdp_LOG("[COW-TRACE] capture begin irp=%p offset=%llu len=%lu\n",
+		Irp, offset, remaining);
 	Cdp_DBG("[COW] capture begin offset=%llu len=%lu\n", offset, remaining);
 
 	while (remaining)
@@ -2401,8 +2521,8 @@ static NTSTATUS CdpCaptureBeforeImage(
 		remaining -= chunk;
 	}
 
-	Cdp_DBG("[COW] capture end status=0x%08X remaining=%lu\n",
-		status, remaining);
+	Cdp_LOG("[COW-TRACE] capture end irp=%p status=0x%08X remaining=%lu\n",
+		Irp, status, remaining);
 	return status;
 }
 
@@ -2498,8 +2618,14 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 				}
 				else
 				{
-					Cdp_DBG("[COW] worker forwarding without capture irp=%p\n",
-						item->Irp);
+					PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(item->Irp);
+					Cdp_LOG("[COW-TRACE] worker bypass irp=%p offset=%lld len=%lu enabled=%ld stopping=%ld driver=%p\n",
+						item->Irp,
+						irpSp->Parameters.Write.ByteOffset.QuadPart,
+						irpSp->Parameters.Write.Length,
+						InterlockedCompareExchange(&devExt->CaptureEnabled, 0, 0),
+						InterlockedCompareExchange(&devExt->CaptureStopping, 0, 0),
+						driverExt);
 				}
 				CdpForwardQueuedWriteSynchronously(devExt, item->Irp);
 				KeReleaseMutex(&devExt->HistoryMutex, FALSE);
@@ -2576,9 +2702,32 @@ NTSTATUS CdpIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 {
 	PCdp_DEVICE_EXTENSION deviceExt = (PCdp_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
 	PCdp_DRIVER_EXTENSION driverExt = IoGetDriverObjectExtension(g_DriverObject, &g_DriverObject);
+	BOOLEAN traceCaptureWrite = FALSE;
+	PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
 
 	if (deviceExt && deviceExt->LowerDeviceObject && driverExt)
 		CdpWaitForAutoDiscoveryIfNeeded(driverExt);
+	if (deviceExt)
+	{
+		traceCaptureWrite =
+			InterlockedCompareExchange(&deviceExt->CaptureEnabled, 0, 0) != 0 ||
+			InterlockedCompareExchange(&deviceExt->CaptureStopping, 0, 0) != 0 ||
+			deviceExt->Core != NULL ||
+			deviceExt->JournalHandleId != 0;
+		if (traceCaptureWrite)
+		{
+			Cdp_LOG("[COW-TRACE] write seen irp=%p offset=%lld len=%lu flags=0x%08lX enabled=%ld stopping=%ld phase=%ld core=%p journal=%llu\n",
+				Irp,
+				irpSp->Parameters.Write.ByteOffset.QuadPart,
+				irpSp->Parameters.Write.Length,
+				Irp->Flags,
+				InterlockedCompareExchange(&deviceExt->CaptureEnabled, 0, 0),
+				InterlockedCompareExchange(&deviceExt->CaptureStopping, 0, 0),
+				InterlockedCompareExchange(&deviceExt->Phase, 0, 0),
+				deviceExt->Core,
+				deviceExt->JournalHandleId);
+		}
+	}
 
 	if (deviceExt && deviceExt->LowerDeviceObject && driverExt &&
 		InterlockedCompareExchange(&deviceExt->CaptureEnabled, 0, 0) != 0 &&
@@ -2597,15 +2746,10 @@ NTSTATUS CdpIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 				InsertTailList(&deviceExt->CaptureQueue, &item->Entry);
 				KeSetEvent(&deviceExt->CaptureEvent, IO_NO_INCREMENT, FALSE);
 				KeReleaseSpinLock(&deviceExt->CaptureQueueLock, oldIrql);
-#if DBG
-				{
-					PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
-					Cdp_DBG("[COW] write queued irp=%p offset=%lld len=%lu\n",
-						Irp,
-						irpSp->Parameters.Write.ByteOffset.QuadPart,
-						irpSp->Parameters.Write.Length);
-				}
-#endif
+				Cdp_LOG("[COW-TRACE] write queued irp=%p offset=%lld len=%lu\n",
+					Irp,
+					irpSp->Parameters.Write.ByteOffset.QuadPart,
+					irpSp->Parameters.Write.Length);
 				return STATUS_PENDING;
 			}
 			KeReleaseSpinLock(&deviceExt->CaptureQueueLock, oldIrql);
@@ -2613,9 +2757,22 @@ NTSTATUS CdpIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 		}
 		else
 		{
-			Cdp_LOG("[COW] queue allocation failed; write passed through irp=%p\n",
-				Irp);
+			Cdp_LOG("[COW-TRACE] queue allocation failed; write bypass irp=%p offset=%lld len=%lu\n",
+				Irp,
+				irpSp->Parameters.Write.ByteOffset.QuadPart,
+				irpSp->Parameters.Write.Length);
 		}
+	}
+	else if (traceCaptureWrite)
+	{
+		Cdp_LOG("[COW-TRACE] write bypass irp=%p offset=%lld len=%lu enabled=%ld stopping=%ld lower=%p driver=%p\n",
+			Irp,
+			irpSp->Parameters.Write.ByteOffset.QuadPart,
+			irpSp->Parameters.Write.Length,
+			InterlockedCompareExchange(&deviceExt->CaptureEnabled, 0, 0),
+			InterlockedCompareExchange(&deviceExt->CaptureStopping, 0, 0),
+			deviceExt->LowerDeviceObject,
+			driverExt);
 	}
 
 	if (deviceExt && deviceExt->LowerDeviceObject)
@@ -3333,6 +3490,32 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 
 	if (!DevExt)
 		return CdpCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);
+
+	if (IrpSp->Parameters.DeviceIoControl.IoControlCode ==
+		IOCTL_STORAGE_MANAGE_DATA_SET_ATTRIBUTES &&
+		DevExt->LowerDeviceObject &&
+		InterlockedCompareExchange(&DevExt->CaptureEnabled, 0, 0) != 0 &&
+		InterlockedCompareExchange(&DevExt->CaptureStopping, 0, 0) == 0 &&
+		IrpSp->Parameters.DeviceIoControl.InputBufferLength >=
+			sizeof(DEVICE_MANAGE_DATA_SET_ATTRIBUTES) &&
+		Irp->AssociatedIrp.SystemBuffer)
+	{
+		PDEVICE_MANAGE_DATA_SET_ATTRIBUTES attributes =
+			(PDEVICE_MANAGE_DATA_SET_ATTRIBUTES)Irp->AssociatedIrp.SystemBuffer;
+		if (attributes->Action == DeviceDsmAction_Trim)
+		{
+			// Keep discarded clusters physically intact while CDP is enabled.
+			// If a cluster is later reused, its real IRP_MJ_WRITE captures the
+			// before-image on demand.  Capturing every deleted byte here would
+			// exhaust the journal during large file deletions.
+			Cdp_LOG("[COW-TRIM] trim suppressed irp=%p rangesOffset=%lu rangesLength=%lu flags=0x%08lX\n",
+				Irp,
+				attributes->DataSetRangesOffset,
+				attributes->DataSetRangesLength,
+				attributes->Flags);
+			return CdpCompleteIrp(Irp, STATUS_SUCCESS, 0);
+		}
+	}
 
 	return CdpSendToNextDevice(DevExt->LowerDeviceObject, Irp);
 }

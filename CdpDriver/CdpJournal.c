@@ -381,13 +381,20 @@ static NTSTATUS CdpJournalWriteSuperblockLocked(_Inout_ PCdp_JOURNAL Journal)
 	superblock->Magic = Cdp_JOURNAL_MAGIC;
 	superblock->Version = Cdp_JOURNAL_VERSION;
 	superblock->SectorSize = Journal->SectorSize;
+	superblock->Flags = Journal->RecoveryPending ?
+		Cdp_JOURNAL_FLAG_RECOVERY_PENDING : 0;
 	superblock->PartitionSize = Journal->PartitionSize;
 	superblock->LastHeaderRegionOff = Journal->LastHeaderRegionOff;
 	superblock->SourceVolumeGuid = Journal->SourceVolumeGuid;
+	superblock->RecoveryTargetTime100ns = Journal->RecoveryTargetTime100ns;
 	superblock->Crc32c = CdpCrc32c(
 		0,
 		superblock,
 		FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, Crc32c));
+	superblock->RecoveryCrc32c = CdpCrc32c(
+		0,
+		superblock,
+		FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, RecoveryCrc32c));
 
 	status = CdpJournalRawIo(
 		Journal,
@@ -420,6 +427,14 @@ static BOOLEAN CdpJournalSuperblockValid(
 		FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, Crc32c));
 	if (crc != Superblock->Crc32c)
 		return FALSE;
+	if ((Superblock->Flags & Cdp_JOURNAL_FLAG_RECOVERY_PENDING) != 0 &&
+		(Superblock->RecoveryTargetTime100ns == 0 ||
+		 CdpCrc32c(0, Superblock,
+			FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, RecoveryCrc32c)) !=
+			Superblock->RecoveryCrc32c))
+	{
+		return FALSE;
+	}
 
 	usableStart = Journal->SectorSize;
 	usableEnd = Journal->PartitionSize;
@@ -1224,6 +1239,10 @@ NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal)
 
 	Journal->LastHeaderRegionOff = superblock->LastHeaderRegionOff;
 	Journal->SourceVolumeGuid = superblock->SourceVolumeGuid;
+	Journal->RecoveryPending =
+		(superblock->Flags & Cdp_JOURNAL_FLAG_RECOVERY_PENDING) != 0;
+	Journal->RecoveryTargetTime100ns = Journal->RecoveryPending ?
+		superblock->RecoveryTargetTime100ns : 0;
 
 	status = CdpJournalRebuildRuntimeLocked(Journal);
 	if (!NT_SUCCESS(status))
@@ -1246,6 +1265,52 @@ cleanup:
 		cdpfree(allocationBase);
 	if (!NT_SUCCESS(status))
 		Journal->Mounted = FALSE;
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
+NTSTATUS CdpJournalSetRecoveryIntent(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 TargetTime100ns)
+{
+	NTSTATUS status;
+
+	if (!Journal || TargetTime100ns == 0)
+		return STATUS_INVALID_PARAMETER;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto done;
+	}
+	Journal->RecoveryPending = TRUE;
+	Journal->RecoveryTargetTime100ns = TargetTime100ns;
+	status = CdpJournalWriteSuperblockLocked(Journal);
+	if (NT_SUCCESS(status))
+		status = CdpJournalFlush(Journal);
+done:
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
+NTSTATUS CdpJournalClearRecoveryIntent(_Inout_ PCdp_JOURNAL Journal)
+{
+	NTSTATUS status;
+
+	if (!Journal)
+		return STATUS_INVALID_PARAMETER;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto done;
+	}
+	Journal->RecoveryPending = FALSE;
+	Journal->RecoveryTargetTime100ns = 0;
+	status = CdpJournalWriteSuperblockLocked(Journal);
+	if (NT_SUCCESS(status))
+		status = CdpJournalFlush(Journal);
+done:
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	return status;
 }

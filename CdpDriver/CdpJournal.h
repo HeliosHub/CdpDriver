@@ -14,6 +14,7 @@
 #define Cdp_JOURNAL_HEADER_REGION_SIZE (2UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_LINK_SIZE 32UL
 #define Cdp_JOURNAL_HEADER_LINK_MARK 0xFFFFFFFFFFFFFFFFULL
+#define Cdp_JOURNAL_FLAG_RECOVERY_PENDING 0x00000001UL
 
 #pragma pack(push, 1)
 
@@ -55,6 +56,9 @@ typedef struct _Cdp_JOURNAL_SUPERBLOCK
 	UINT64 LastHeaderRegionOff; // newest 2MB header region
 	GUID SourceVolumeGuid;
 	ULONG Crc32c;
+	// Kept after the legacy CRC so existing formatted journals remain mountable.
+	UINT64 RecoveryTargetTime100ns;
+	ULONG RecoveryCrc32c;
 } Cdp_JOURNAL_SUPERBLOCK, *PCdp_JOURNAL_SUPERBLOCK;
 
 #pragma pack(pop)
@@ -85,6 +89,8 @@ typedef struct _Cdp_JOURNAL
 	UINT64 RecordGeneration;
 	UINT64 Oldest100ns;
 	UINT64 Newest100ns;
+	BOOLEAN RecoveryPending;
+	UINT64 RecoveryTargetTime100ns;
 	GUID SourceVolumeGuid;
 #ifndef Cdp_USERMODE
 	PDEVICE_OBJECT TargetDevice;
@@ -139,6 +145,12 @@ VOID CdpJournalInitializeWithStore(
 NTSTATUS CdpJournalFormat(_Inout_ PCdp_JOURNAL Journal);
 
 NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal);
+
+NTSTATUS CdpJournalSetRecoveryIntent(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 TargetTime100ns);
+
+NTSTATUS CdpJournalClearRecoveryIntent(_Inout_ PCdp_JOURNAL Journal);
 
 // Clear on-disk superblock magic so auto-discovery will not remount this journal.
 NTSTATUS CdpJournalInvalidate(_Inout_ PCdp_JOURNAL Journal);

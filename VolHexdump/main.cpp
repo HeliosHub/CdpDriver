@@ -3,10 +3,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <wchar.h>
+#include <stdint.h>
 
 static void PrintUsage(void)
 {
 	wprintf(L"Usage:\n");
+	wprintf(L"  VolHexdump <volume-guid> <offset> <size> <output-file>\n");
 	wprintf(L"  VolHexdump <volume-guid>\n");
 	wprintf(L"\n");
 	wprintf(L"Accepted guid forms:\n");
@@ -14,8 +16,10 @@ static void PrintUsage(void)
 	wprintf(L"  xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\n");
 	wprintf(L"  \\\\?\\Volume{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}\n");
 	wprintf(L"\n");
-	wprintf(L"Then enter: <offset> <size>\n");
-	wprintf(L"  offset/size accept decimal or 0x-prefixed hex\n");
+	wprintf(L"  offset/size are relative to the start of the volume and accept decimal or 0x-prefixed hex\n");
+	wprintf(L"  output-file is overwritten if it already exists\n");
+	wprintf(L"\n");
+	wprintf(L"With only <volume-guid>, interactive mode asks for offset, size, and output file.\n");
 	wprintf(L"  q  quit\n");
 }
 
@@ -194,6 +198,92 @@ static BOOL ReadVolumeRange(
 	return TRUE;
 }
 
+static BOOL WriteAll(_In_ HANDLE File, _In_reads_bytes_(Length) const BYTE* Buffer, _In_ DWORD Length)
+{
+	DWORD writtenTotal = 0;
+
+	while (writtenTotal < Length)
+	{
+		DWORD written = 0;
+		if (!WriteFile(File, Buffer + writtenTotal, Length - writtenTotal, &written, NULL))
+			return FALSE;
+		if (written == 0)
+		{
+			SetLastError(ERROR_WRITE_FAULT);
+			return FALSE;
+		}
+		writtenTotal += written;
+	}
+
+	return TRUE;
+}
+
+static BOOL DumpVolumeRangeToFile(
+	_In_ HANDLE Volume,
+	_In_ DWORD SectorSize,
+	_In_ UINT64 Offset,
+	_In_ UINT64 Length,
+	_In_ PCWSTR OutputPath)
+{
+	const DWORD chunkSize = 1024 * 1024;
+	HANDLE output = INVALID_HANDLE_VALUE;
+	BYTE* buffer = NULL;
+	UINT64 done = 0;
+	BOOL ok = FALSE;
+
+	if (Length == 0 || Offset > UINT64_MAX - Length)
+	{
+		SetLastError(ERROR_INVALID_PARAMETER);
+		return FALSE;
+	}
+
+	output = CreateFileW(
+		OutputPath,
+		GENERIC_WRITE,
+		0,
+		NULL,
+		CREATE_ALWAYS,
+		FILE_ATTRIBUTE_NORMAL,
+		NULL);
+	if (output == INVALID_HANDLE_VALUE)
+		return FALSE;
+
+	buffer = (BYTE*)malloc(chunkSize);
+	if (!buffer)
+	{
+		CloseHandle(output);
+		SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+		return FALSE;
+	}
+
+	while (done < Length)
+	{
+		UINT64 remaining = Length - done;
+		DWORD currentLength = (remaining > chunkSize) ? chunkSize : (DWORD)remaining;
+		DWORD bytesRead = 0;
+
+		if (!ReadVolumeRange(Volume, SectorSize, Offset + done, currentLength, buffer, &bytesRead) ||
+			bytesRead != currentLength ||
+			!WriteAll(output, buffer, currentLength))
+		{
+			goto Exit;
+		}
+
+		done += currentLength;
+	}
+
+	ok = FlushFileBuffers(output);
+
+Exit:
+	{
+		DWORD err = ok ? ERROR_SUCCESS : GetLastError();
+		free(buffer);
+		CloseHandle(output);
+		SetLastError(err);
+	}
+	return ok;
+}
+
 int wmain(int argc, wchar_t** argv)
 {
 	WCHAR path[128];
@@ -201,13 +291,13 @@ int wmain(int argc, wchar_t** argv)
 	DWORD sectorSize = 512;
 	WCHAR line[256];
 
-	if (argc != 2 ||
+	if ((argc != 2 && argc != 5) ||
 		wcscmp(argv[1], L"-h") == 0 ||
 		wcscmp(argv[1], L"/?") == 0 ||
 		wcscmp(argv[1], L"--help") == 0)
 	{
 		PrintUsage();
-		return (argc == 2) ? 0 : 1;
+		return (argc == 2 || argc == 5) ? 0 : 1;
 	}
 
 	if (!BuildVolumePath(argv[1], path, _countof(path)))
@@ -241,6 +331,38 @@ int wmain(int argc, wchar_t** argv)
 
 	wprintf(L"Opened read-only: %s\n", path);
 	wprintf(L"SectorSize=%lu\n", sectorSize);
+
+	if (argc == 5)
+	{
+		UINT64 offset = 0;
+		UINT64 size = 0;
+
+		if (!ParseU64(argv[2], &offset) || !ParseU64(argv[3], &size) || size == 0)
+		{
+			fwprintf(stderr, L"Invalid offset or size.\n");
+			CloseHandle(volume);
+			return 1;
+		}
+
+		if (!DumpVolumeRangeToFile(volume, sectorSize, offset, size, argv[4]))
+		{
+			fwprintf(stderr, L"Export failed offset=%llu size=%llu output=%s err=%lu\n",
+				(unsigned long long)offset,
+				(unsigned long long)size,
+				argv[4],
+				GetLastError());
+			CloseHandle(volume);
+			return 1;
+		}
+
+		wprintf(L"Export complete: offset=%llu size=%llu output=%s\n",
+			(unsigned long long)offset,
+			(unsigned long long)size,
+			argv[4]);
+		CloseHandle(volume);
+		return 0;
+	}
+
 	wprintf(L"Enter '<offset> <size>' or 'q' to quit.\n");
 
 	for (;;)
@@ -249,9 +371,7 @@ int wmain(int argc, wchar_t** argv)
 		WCHAR sizeText[64];
 		UINT64 offset = 0;
 		UINT64 size64 = 0;
-		DWORD size = 0;
-		DWORD bytesRead = 0;
-		BYTE* buffer = NULL;
+		WCHAR outputPath[MAX_PATH];
 		int n;
 
 		wprintf(L"> ");
@@ -279,33 +399,44 @@ int wmain(int argc, wchar_t** argv)
 			!ParseU64(offsetText, &offset) ||
 			!ParseU64(sizeText, &size64) ||
 			size64 == 0 ||
-			size64 > (16ULL * 1024ULL * 1024ULL))
+			offset > UINT64_MAX - size64)
 		{
 			wprintf(L"Invalid input. Example: 0 512   or   0x1000 0x100\n");
-			wprintf(L"Size must be 1..16777216\n");
-			continue;
-		}
-		size = (DWORD)size64;
-
-		buffer = (BYTE*)malloc(size);
-		if (!buffer)
-		{
-			wprintf(L"Out of memory\n");
 			continue;
 		}
 
-		if (!ReadVolumeRange(volume, sectorSize, offset, size, buffer, &bytesRead))
+		wprintf(L"Output file: ");
+		fflush(stdout);
+		if (!fgetws(outputPath, _countof(outputPath), stdin))
+			break;
 		{
-			wprintf(L"Read failed offset=%llu size=%lu err=%lu\n",
+			size_t outputLen = wcslen(outputPath);
+			while (outputLen > 0 &&
+				(outputPath[outputLen - 1] == L'\n' || outputPath[outputLen - 1] == L'\r'))
+			{
+				outputPath[--outputLen] = L'\0';
+			}
+		}
+		if (outputPath[0] == L'\0')
+		{
+			wprintf(L"Output path cannot be empty.\n");
+			continue;
+		}
+
+		if (!DumpVolumeRangeToFile(volume, sectorSize, offset, size64, outputPath))
+		{
+			wprintf(L"Export failed offset=%llu size=%llu output=%s err=%lu\n",
 				(unsigned long long)offset,
-				size,
+				(unsigned long long)size64,
+				outputPath,
 				GetLastError());
-			free(buffer);
 			continue;
 		}
 
-		HexdumpC(offset, buffer, bytesRead);
-		free(buffer);
+		wprintf(L"Export complete: offset=%llu size=%llu output=%s\n",
+			(unsigned long long)offset,
+			(unsigned long long)size64,
+			outputPath);
 	}
 
 	CloseHandle(volume);

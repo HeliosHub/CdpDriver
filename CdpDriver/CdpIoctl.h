@@ -134,6 +134,8 @@ typedef struct _Cdp_RECOVERY_BEGIN_REQUEST
 {
 	GUID SourceVolumeGuid;
 	UINT64 TargetTime100ns;
+	ULONG Flags;
+	ULONG Reserved;
 } Cdp_RECOVERY_BEGIN_REQUEST, *PCdp_RECOVERY_BEGIN_REQUEST;
 
 typedef struct _Cdp_RECOVERY_BEGIN_REPLY
@@ -220,3 +222,6 @@ typedef struct _Cdp_VERSION_REPLY
 } Cdp_VERSION_REPLY, *PCdp_VERSION_REPLY;
 
 #pragma pack(pop)
+// Persist this recovery request in the journal.  After a system restart the
+// driver discovers the journal and automatically runs begin + commit.
+#define Cdp_RECOVERY_BEGIN_FLAG_ON_REBOOT 0x00000001UL
