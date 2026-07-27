@@ -912,7 +912,7 @@ static NTSTATUS CdpCoreWritebackHistory(_Inout_ PCdp_CORE Core)
 					if (writeLength > Cdp_JOURNAL_MAX_RECORD_DATA)
 						writeLength = Cdp_JOURNAL_MAX_RECORD_DATA;
 
-					status = CdpCoreWrite(
+					status = CdpCoreSourceWriteDirect(
 						Core,
 						node->Start + writeOffset,
 						writeLength,
@@ -1044,7 +1044,7 @@ NTSTATUS CdpCoreRecoveryCommitStep(
 		ULONG writeLength = node->DataLength - writeOffset;
 		if (writeLength > Cdp_JOURNAL_MAX_RECORD_DATA)
 			writeLength = Cdp_JOURNAL_MAX_RECORD_DATA;
-		status = CdpCoreWrite(
+		status = CdpCoreSourceWriteDirect(
 			Core,
 			node->Start + writeOffset,
 			writeLength,

@@ -1455,8 +1455,13 @@ static int TestRecoveryCommitStepCoalescedLargePayload(void)
 	PUCHAR expected = NULL;
 	PUCHAR readView = NULL;
 	UCHAR liveWrite[512];
+	Cdp_JOURNAL_RECORD_HEADER header;
 	UINT64 targetTime = 61500;
 	ULONG offset;
+	UINT64 totalBeforeCommit = 0;
+	UINT64 totalAfterCommit = 0;
+	UINT64 generation;
+	ULONG returned;
 	BOOLEAN complete = FALSE;
 	NTSTATUS status = STATUS_SUCCESS;
 
@@ -1502,6 +1507,9 @@ static int TestRecoveryCommitStepCoalescedLargePayload(void)
 
 	status = CdpCoreRecoveryBegin(ctx.Core, targetTime);
 	Expect(NT_SUCCESS(status), "prepare step coalesced recovery");
+	status = CdpCoreQueryRecordHeaders(ctx.Core, 0, 0, &header, 1,
+		&totalBeforeCommit, &generation, &returned);
+	Expect(NT_SUCCESS(status), "query journal count before replay COW commit");
 	status = CdpCoreRecoveryCommitStep(ctx.Core, &complete);
 	Expect(NT_SUCCESS(status) && !complete,
 		"first commit step restores only first coalesced node");
@@ -1520,6 +1528,10 @@ static int TestRecoveryCommitStepCoalescedLargePayload(void)
 		"step commit completes coalesced nodes after punch");
 	Expect(memcmp(CdpMemStoreData(ctx.Source), expected, totalBytes) == 0,
 		"step commit physical image equals prepared read view");
+	status = CdpCoreQueryRecordHeaders(ctx.Core, 0, 0, &header, 1,
+		&totalAfterCommit, &generation, &returned);
+	Expect(NT_SUCCESS(status) && totalAfterCommit > totalBeforeCommit,
+		"replay COW appends before-images without changing recovery view");
 
 cleanup:
 	free(readView);
