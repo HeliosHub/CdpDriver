@@ -83,6 +83,10 @@ typedef struct _Cdp_JOURNAL
 	// from the largest successful write; preview/recovery scans reuse it for
 	// reads instead of issuing one sector read per 32-byte record header.
 	ULONG HeaderRegionWriteChunk;
+	// Lazily allocated aligned 2MB scan buffer. Journal.Lock serializes all
+	// users; retained across Preview/Recovery builds and freed by Close.
+	PVOID HeaderScanAllocationBase;
+	PUCHAR HeaderScanBuffer;
 	ULONG NextSequence;
 	UINT64 TotalRecords;
 	UINT64 PayloadBytesUsed;
@@ -90,6 +94,7 @@ typedef struct _Cdp_JOURNAL
 	UINT64 Oldest100ns;
 	UINT64 Newest100ns;
 	BOOLEAN RecoveryPending;
+	BOOLEAN SuperblockDirty;
 	UINT64 RecoveryTargetTime100ns;
 	GUID SourceVolumeGuid;
 #ifndef Cdp_USERMODE
@@ -114,6 +119,7 @@ typedef struct _Cdp_PREVIEW_TREE_NODE
 	UINT64 WallClock100ns;
 	ULONG DataLength;
 	ULONG Sequence;
+	UINT64 MinValidSequence; // subtree minimum Sequence; MAXUINT64 when none
 	LONG Height; // AVL height
 	BOOLEAN Invalid; // Recovery: punched by a newer live write; skip apply/writeback
 	struct _Cdp_PREVIEW_TREE_NODE* Left;
@@ -224,12 +230,11 @@ NTSTATUS CdpPreviewTreeInsert(
 	_Inout_ PCdp_PREVIEW_TREE Tree,
 	_In_ const Cdp_JOURNAL_RECORD_HEADER* Header);
 
-// Mark overlapping nodes Invalid (no structural delete). Kept for the
-// allocation-failure safety fallback used by recovery writes.
-VOID CdpPreviewTreeInvalidateRange(
+// Mark the node identified by its (unique) volume start invalid and refresh
+// the subtree sequence summaries used by stepped Recovery commit.
+NTSTATUS CdpPreviewTreeMarkInvalidByStart(
 	_Inout_ PCdp_PREVIEW_TREE Tree,
-	_In_ UINT64 VolumeOffset,
-	_In_ ULONG DataLength);
+	_In_ UINT64 VolumeOffset);
 
 // Remove only the intersecting byte range from the history tree.  Remaining
 // left/right fragments keep their original journal payload offsets.
@@ -247,14 +252,5 @@ NTSTATUS CdpPreviewTreeMergeFrom(
 NTSTATUS CdpPreviewTreePunchByStaging(
 	_Inout_ PCdp_PREVIEW_TREE HistoryTree,
 	_Inout_ PCdp_PREVIEW_TREE StagingTree);
-
-// Rebuild Tree so intervals do not overlap: per byte keep earliest Sequence.
-// Drops Invalid nodes. Used after History Punch / Preview Merge.
-NTSTATUS CdpPreviewTreeDedupEarliest(
-	_Inout_ PCdp_PREVIEW_TREE Tree);
-
-// Merge volume-adjacent nodes whose journal payloads are also contiguous.
-NTSTATUS CdpPreviewTreeCoalesceAdjacent(
-	_Inout_ PCdp_PREVIEW_TREE Tree);
 
 VOID CdpJournalClose(_Inout_ PCdp_JOURNAL Journal);

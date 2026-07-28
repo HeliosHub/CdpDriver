@@ -94,6 +94,8 @@ Version = **7**。v6 及更早版本 journal 需重新 Format。
 
 当前 `PayloadRegionOff` 不再写入 Superblock。Mount 扫描最新 Header 区，以最后一条有效记录的 `FileOffset + DataLength` 向扇区对齐后重建下一 Payload 写入位置；空日志从最新 Header 区末尾开始。
 
+普通 Append 只持久化并 Flush before-image payload 与 record header，不重复写 Superblock。只有切换到新 Header Region、设置/清除重启 Recovery 意图、Format 和 Close 等持久字段或生命周期发生变化时才写 Superblock；新区域更新失败会保留 `SuperblockDirty`，由后续 Append 重试。
+
 ### 记录头（32 字节）
 
 | 字段 | 含义 |
@@ -106,18 +108,19 @@ Version = **7**。v6 及更早版本 journal 需重新 Format。
 
 ## Preview / Recovery 区间树
 
-按 `VolumeOffset`（`Start`）排序的 **AVL 区间树**，节点维护 `MaxEnd` 做重叠剪枝；插入/查找 O(log n)。构建时按 Sequence 升序去重插入，并合并卷/payload 均连续的相邻区间。
+按 `VolumeOffset`（`Start`）排序的 **AVL 区间树**，节点维护 `MaxEnd` 做重叠剪枝，并维护 `MinValidSequence` 加速 Recovery Commit 选取下一节点。构建时反向单遍读取记录头，读到符合条件的 header 后立即覆盖进树，不保存 header 数组，也不二次读取记录头区域；2MB 对齐扫描缓冲由 Journal 惰性分配，在 Mount/Preview/Recovery 间复用并于 Close 释放。普通 Insert 直接查找已有节点之间的空洞并插入，不再为 DataLength 分配逐字节覆盖位图。
 
 ## Preview：时间点只读视图
 
-1. **BEGIN**：校验源卷 Phase=Normal、全局无其他 Preview；CAS 进入 Preview；冻结 `SnapshotMaxSequence`；扫 journal 收集匹配 header，按 Sequence 升序插入并去重；再合并卷/payload 均连续的相邻区间；构建期间并发 COW 写入 StagingTree，结束后 Merge（Insert 去重）+ Dedup/Coalesce。
+1. **BEGIN**：校验源卷 Phase=Normal、全局无其他 Preview；CAS 进入 Preview；冻结 `SnapshotMaxSequence`；从最新记录头区域开始反向单遍扫描，匹配 header 在读取时直接覆盖进 Preview Tree；构建期间并发 COW 写入 StagingTree，结束后将 StagingTree 合并进 Preview Tree。
 2. **READ**：区间树重叠查询；同字节取最早 `Sequence`；未覆盖空缺用当前卷 live 数据填充。全程持有源卷 `HistoryMutex`，与 COW 捕获互斥。
 3. **END**：销毁会话，Phase → Normal。
 
 ## Recovery：HistoryTree 回填 + 无效标记
 
-1. **BEGIN / Prepare**：冻结 `SnapshotMaxSequence`；扫 journal 收集 `WallClock100ns >= TargetTime100ns` 的 header；按 Sequence 升序插入并去重；**合并连续区间**（卷偏移与 journal payload 均相邻）。构建期间并发新写只记入 StagingTree。结束后 PunchByStaging，再 DedupEarliest（含 Coalesce）丢掉 Invalid，并保持 Recovery Phase。
+1. **BEGIN / Prepare**：冻结 `SnapshotMaxSequence`；从最新记录头区域开始反向单遍扫描 journal，匹配 header 在读取时直接覆盖进 History Tree，较早 before-image 替换较新记录的重叠区间；构建期间并发新写只记入 StagingTree。结束后按 StagingTree 原地删除 History Tree 的重叠区间，并保持 Recovery Phase。
 2. **Prepared**：非分页读由 HistoryTree + live source 合成；允许新写入，新写覆盖的 HistoryTree 范围失效，因此 Commit 后仍保留新数据。
+3. **Commit**：一次只按 `MinValidSequence` 取得一个有效节点并回填；每个节点单独持有外部 `HistoryMutex`，节点完成后释放，因此新写可在节点之间进入并原地 Punch 尚未回填的 HistoryTree。一次性 Core API 也循环复用同一个 CommitStep 实现，不再维护另一套整树写回路径。
 3. **COMMIT**：遍历 HistoryTree 回填源分区（COW 后写下层；`Sequence` 升序；跳过 `Invalid`），成功后清理并回到 Normal。
 4. **CANCEL**：不回填，清理临时树并回到 Normal。
 3. **完成**：清理 HistoryTree / StagingTree，自动回到 Normal；BEGIN IOCTL 此时才同步返回。
@@ -159,7 +162,7 @@ CMD1 参数：`PartitionGuid1`（源卷）、`PartitionGuid2`（journal 分区�
 
 1. Preview / Recovery 依赖 journal 中有足够历史；journal Format 后历史清空。
 2. 全局仅允许一个 Preview 会话。
-3. Recovery Commit 是同步物理回填，执行期间 `HistoryMutex` 会阻塞该源卷的捕获工作线程。
+3. Recovery Commit 是同步物理回填；`HistoryMutex` 只按单个回填节点持有并在节点之间释放，新写可与 Commit 交替执行。
 4. Recovery 阶段的 Paging I/O 当前仍透传 live source；驱动会打印
    `[RECOVERY] paging read bypass` 诊断日志，后续需决定安全的历史合成策略。
 
