@@ -728,8 +728,6 @@ NTSTATUS CdpCorePreviewBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns
 
 	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
 	status = CdpPreviewTreeMergeFrom(&Core->PreviewTree, &Core->StagingTree);
-	if (NT_SUCCESS(status))
-		status = CdpPreviewTreeDedupEarliest(&Core->PreviewTree);
 	Core->Building = 0;
 	Cdp_LOCK_RELEASE(&Core->TreeLock);
 	if (!NT_SUCCESS(status))
@@ -1130,8 +1128,6 @@ NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100n
 
 	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
 	status = CdpPreviewTreePunchByStaging(&Core->HistoryTree, &Core->StagingTree);
-	if (NT_SUCCESS(status))
-		status = CdpPreviewTreeDedupEarliest(&Core->HistoryTree);
 	Core->Building = 0;
 	Cdp_LOCK_RELEASE(&Core->TreeLock);
 	if (!NT_SUCCESS(status))

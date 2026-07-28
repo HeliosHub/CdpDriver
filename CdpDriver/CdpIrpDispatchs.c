@@ -1238,22 +1238,23 @@ static NTSTATUS CdpTryActivateReadyPairs(
 				// The intent is already persisted.  This invocation performs the
 				// actual begin; commit clears the marker on success.
 				beginRequest.Flags = 0;
-				Cdp_LOG("[RECOVERY] reboot intent found target=%llu; diagnostic gated auto begin+commit\n",
+				Cdp_LOG("[RECOVERY] reboot intent found target=%llu; auto begin then release I/O and commit\n",
 					beginRequest.TargetTime100ns);
 				status = CdpBeginRecovery(DriverExt, &beginRequest, &beginReply);
 				if (NT_SUCCESS(status))
 				{
-					// Keep boot I/O behind the discovery gate for the complete
-					// recovery transaction.  Commit writes directly to the lower
-					// source device and does not depend on this dispatch gate.
+					// Begin has established the coherent recovery view.  Release
+					// queued boot I/O now; reads use that view and writes COW/punch
+					// overlapping history while Commit advances node by node.
+					CdpOpenAutoDiscoveryGate(CdpFindStartedSourceByGuid(
+						DriverExt, &beginRequest.SourceVolumeGuid));
+					Cdp_LOG("[RECOVERY] auto begin completed; boot I/O released before commit\n");
 					RtlZeroMemory(&commitRequest, sizeof(commitRequest));
 					commitRequest.SourceVolumeGuid = beginRequest.SourceVolumeGuid;
 					status = CdpCommitRecovery(DriverExt, &commitRequest, &commitReply);
 					if (NT_SUCCESS(status))
 					{
-						CdpOpenAutoDiscoveryGate(CdpFindStartedSourceByGuid(
-							DriverExt, &beginRequest.SourceVolumeGuid));
-						Cdp_LOG("[RECOVERY] diagnostic gated auto begin+commit completed; boot I/O released\n");
+						Cdp_LOG("[RECOVERY] auto commit completed after boot I/O release\n");
 					}
 				}
 				if (!NT_SUCCESS(status))

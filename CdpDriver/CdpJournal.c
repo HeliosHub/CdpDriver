@@ -1919,6 +1919,186 @@ static NTSTATUS CdpPreviewTreeInsertRaw(
 	return STATUS_SUCCESS;
 }
 
+static PCdp_PREVIEW_TREE_NODE CdpPreviewTreeAvlRebalance(
+	_Inout_ PCdp_PREVIEW_TREE_NODE Root)
+{
+	LONG balance;
+
+	if (!Root)
+		return NULL;
+	CdpPreviewTreeNodeUpdate(Root);
+	balance = CdpPreviewTreeNodeHeight(Root->Left) -
+		CdpPreviewTreeNodeHeight(Root->Right);
+	if (balance > 1)
+	{
+		if (CdpPreviewTreeNodeHeight(Root->Left->Left) <
+			CdpPreviewTreeNodeHeight(Root->Left->Right))
+		{
+			Root->Left = CdpPreviewTreeRotateLeft(Root->Left);
+		}
+		return CdpPreviewTreeRotateRight(Root);
+	}
+	if (balance < -1)
+	{
+		if (CdpPreviewTreeNodeHeight(Root->Right->Right) <
+			CdpPreviewTreeNodeHeight(Root->Right->Left))
+		{
+			Root->Right = CdpPreviewTreeRotateRight(Root->Right);
+		}
+		return CdpPreviewTreeRotateLeft(Root);
+	}
+	return Root;
+}
+
+static PCdp_PREVIEW_TREE_NODE CdpPreviewTreeAvlMinimum(
+	_In_ PCdp_PREVIEW_TREE_NODE Root)
+{
+	while (Root->Left)
+		Root = Root->Left;
+	return Root;
+}
+
+static VOID CdpPreviewTreeCopyNodeData(
+	_Inout_ PCdp_PREVIEW_TREE_NODE Dest,
+	_In_ const PCdp_PREVIEW_TREE_NODE Source)
+{
+	Dest->Start = Source->Start;
+	Dest->End = Source->End;
+	Dest->FileOffset = Source->FileOffset;
+	Dest->WallClock100ns = Source->WallClock100ns;
+	Dest->DataLength = Source->DataLength;
+	Dest->Sequence = Source->Sequence;
+	Dest->Invalid = Source->Invalid;
+}
+
+static PCdp_PREVIEW_TREE_NODE CdpPreviewTreeAvlDeleteByStart(
+	_In_opt_ PCdp_PREVIEW_TREE_NODE Root,
+	_In_ UINT64 Start,
+	_Out_ PBOOLEAN Removed)
+{
+	if (!Root)
+		return NULL;
+	if (Start < Root->Start)
+	{
+		Root->Left = CdpPreviewTreeAvlDeleteByStart(
+			Root->Left, Start, Removed);
+	}
+	else if (Start > Root->Start)
+	{
+		Root->Right = CdpPreviewTreeAvlDeleteByStart(
+			Root->Right, Start, Removed);
+	}
+	else if (!Root->Left || !Root->Right)
+	{
+		PCdp_PREVIEW_TREE_NODE child = Root->Left ? Root->Left : Root->Right;
+		cdpfree(Root);
+		*Removed = TRUE;
+		return child;
+	}
+	else
+	{
+		PCdp_PREVIEW_TREE_NODE successor =
+			CdpPreviewTreeAvlMinimum(Root->Right);
+		UINT64 successorStart = successor->Start;
+
+		CdpPreviewTreeCopyNodeData(Root, successor);
+		Root->Right = CdpPreviewTreeAvlDeleteByStart(
+			Root->Right, successorStart, Removed);
+	}
+	return CdpPreviewTreeAvlRebalance(Root);
+}
+
+static PCdp_PREVIEW_TREE_NODE CdpPreviewTreeFindFirstOverlap(
+	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
+	_In_ UINT64 QueryStart,
+	_In_ UINT64 QueryEnd)
+{
+	PCdp_PREVIEW_TREE_NODE hit;
+
+	if (!Node || Node->MaxEnd <= QueryStart)
+		return NULL;
+	if (Node->Left)
+	{
+		hit = CdpPreviewTreeFindFirstOverlap(
+			Node->Left, QueryStart, QueryEnd);
+		if (hit)
+			return hit;
+	}
+	if (!Node->Invalid && Node->Start < QueryEnd && Node->End > QueryStart)
+		return Node;
+	if (Node->Start < QueryEnd && Node->Right)
+		return CdpPreviewTreeFindFirstOverlap(
+			Node->Right, QueryStart, QueryEnd);
+	return NULL;
+}
+
+// Build scans journal headers newest-to-oldest.  A newly scanned header is
+// therefore an earlier before-image and must replace newer overlapping bytes.
+// Remove overlaps in-place, preserve their non-overlapping fragments, then
+// insert the complete earlier header.  No header array or tree-wide rebuild.
+static NTSTATUS CdpPreviewTreeOverlayEarlier(
+	_Inout_ PCdp_PREVIEW_TREE Tree,
+	_In_ const Cdp_JOURNAL_RECORD_HEADER* Header)
+{
+	UINT64 cutStart;
+	UINT64 cutEnd;
+	NTSTATUS status;
+
+	if (!Tree || !Header || Header->DataLength == 0 ||
+		Header->VolumeOffset > MAXUINT64 - Header->DataLength)
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+	cutStart = Header->VolumeOffset;
+	cutEnd = cutStart + Header->DataLength;
+
+	for (;;)
+	{
+		PCdp_PREVIEW_TREE_NODE overlap = CdpPreviewTreeFindFirstOverlap(
+			Tree->Root, cutStart, cutEnd);
+		Cdp_JOURNAL_RECORD_HEADER saved;
+		BOOLEAN removed = FALSE;
+
+		if (!overlap)
+			break;
+		RtlZeroMemory(&saved, sizeof(saved));
+		saved.WallClock100ns = overlap->WallClock100ns;
+		saved.VolumeOffset = overlap->Start;
+		saved.FileOffset = overlap->FileOffset;
+		saved.DataLength = overlap->DataLength;
+		saved.Sequence = overlap->Sequence;
+
+		Tree->Root = CdpPreviewTreeAvlDeleteByStart(
+			Tree->Root, overlap->Start, &removed);
+		if (!removed)
+			return STATUS_DISK_CORRUPT_ERROR;
+		Tree->NodeCount--;
+
+		if (saved.VolumeOffset < cutStart)
+		{
+			Cdp_JOURNAL_RECORD_HEADER left = saved;
+			left.DataLength = (ULONG)(cutStart - saved.VolumeOffset);
+			status = CdpPreviewTreeInsertRaw(Tree, &left);
+			if (!NT_SUCCESS(status))
+				return status;
+		}
+		if (saved.VolumeOffset + saved.DataLength > cutEnd)
+		{
+			Cdp_JOURNAL_RECORD_HEADER right = saved;
+			right.VolumeOffset = cutEnd;
+			right.FileOffset = saved.FileOffset +
+				(cutEnd - saved.VolumeOffset);
+			right.DataLength = (ULONG)(saved.VolumeOffset +
+				saved.DataLength - cutEnd);
+			status = CdpPreviewTreeInsertRaw(Tree, &right);
+			if (!NT_SUCCESS(status))
+				return status;
+		}
+	}
+
+	return CdpPreviewTreeInsertRaw(Tree, Header);
+}
+
 static ULONG CdpBitmapByteCount(_In_ ULONG BitCount)
 {
 	return (BitCount + 7UL) / 8UL;
@@ -2729,12 +2909,8 @@ NTSTATUS CdpJournalBuildPreviewTree(
 	UINT64 regionOff;
 	ULONG guardRegions = 0;
 	BOOLEAN stop = FALSE;
-	Cdp_JOURNAL_RECORD_HEADER* headers = NULL;
 	PVOID regionAllocationBase = NULL;
 	PUCHAR region = NULL;
-	ULONG headerCount = 0;
-	ULONG headerCapacity = 0;
-	ULONG i;
 
 	if (!Tree)
 		return STATUS_INVALID_PARAMETER;
@@ -2771,6 +2947,9 @@ NTSTATUS CdpJournalBuildPreviewTree(
 		goto cleanup_locked;
 	}
 
+	// Single pass, newest-to-oldest.  Each header is immediately overlaid into
+	// the tree; the earlier before-image replaces only overlapping bytes from
+	// newer records.  No record-header array and no second region read.
 	regionOff = Journal->LastHeaderRegionOff;
 	for (;;)
 	{
@@ -2837,33 +3016,9 @@ NTSTATUS CdpJournalBuildPreviewTree(
 				break;
 			}
 
-			if (headerCount >= headerCapacity)
-			{
-				ULONG newCap = headerCapacity ? headerCapacity * 2UL : 256UL;
-				Cdp_JOURNAL_RECORD_HEADER* grown;
-
-				if (newCap < headerCount + 1)
-					newCap = headerCount + 1;
-				grown = (Cdp_JOURNAL_RECORD_HEADER*)cdpalloc(
-					sizeof(Cdp_JOURNAL_RECORD_HEADER) * newCap);
-				if (!grown)
-				{
-					status = STATUS_INSUFFICIENT_RESOURCES;
-					goto cleanup_locked;
-				}
-				if (headers)
-				{
-	RtlCopyMemory(
-						grown,
-						headers,
-						sizeof(Cdp_JOURNAL_RECORD_HEADER) * headerCount);
-					cdpfree(headers);
-				}
-				headers = grown;
-				headerCapacity = newCap;
-			}
-
-			headers[headerCount++] = header;
+			status = CdpPreviewTreeOverlayEarlier(Tree, &header);
+			if (!NT_SUCCESS(status))
+				goto cleanup_locked;
 		}
 
 		if (stop)
@@ -2880,33 +3035,9 @@ NTSTATUS CdpJournalBuildPreviewTree(
 cleanup_locked:
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	if (!NT_SUCCESS(status))
-		goto cleanup;
-
-	// Insert oldest Sequence first; Insert skips already-covered bytes so the
-	// tree never holds overlapping intervals (Preview + Recovery share this).
-	if (headerCount > 0)
-	{
-		CdpPreviewSortHeadersBySequence(headers, headerCount);
-		for (i = 0; i < headerCount; ++i)
-		{
-			status = CdpPreviewTreeInsert(Tree, &headers[i]);
-			if (!NT_SUCCESS(status))
-			{
-				CdpPreviewTreeFree(Tree);
-				break;
-			}
-		}
-		if (NT_SUCCESS(status))
-			status = CdpPreviewTreeCoalesceAdjacent(Tree);
-		if (!NT_SUCCESS(status))
-			CdpPreviewTreeFree(Tree);
-	}
-
-cleanup:
+		CdpPreviewTreeFree(Tree);
 	if (regionAllocationBase)
 		cdpfree(regionAllocationBase);
-	if (headers)
-		cdpfree(headers);
 	return status;
 }
 
