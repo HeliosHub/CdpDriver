@@ -4,6 +4,24 @@
 
 PDRIVER_OBJECT g_DriverObject = NULL;
 
+static VOID CdpBootDriverReinitialize(
+	_In_ PDRIVER_OBJECT DriverObject,
+	_In_opt_ PVOID Context,
+	_In_ ULONG Count)
+{
+	PCdp_DRIVER_EXTENSION driverExtension =
+		(PCdp_DRIVER_EXTENSION)Context;
+
+	UNREFERENCED_PARAMETER(DriverObject);
+	UNREFERENCED_PARAMETER(Count);
+	if (!driverExtension)
+		return;
+
+	InterlockedExchange(&driverExtension->BootEnumerationComplete, 1);
+	Cdp_LOG("[AUTO-CDP] boot volume enumeration complete; starting gated full scan\n");
+	CdpQueueAutoDiscovery(driverExtension);
+}
+
 VOID CdpDeleteFilterDevice(_In_ PDEVICE_OBJECT FilterDeviceObject)
 {
 	PCdp_DEVICE_EXTENSION DevExt = FilterDeviceObject->DeviceExtension;
@@ -99,6 +117,9 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 	KeInitializeEvent(&DeviceExtension->RecoveryReadEvent, NotificationEvent, FALSE);
 	KeInitializeMutex(&DeviceExtension->HistoryMutex, 0);
 	ExInitializeRundownProtection(&DeviceExtension->AutoDiscoveryRundown);
+	InterlockedExchange(&DeviceExtension->AutoDiscoveryGateActive, 1);
+	KeInitializeEvent(&DeviceExtension->AutoDiscoveryGateEvent,
+		NotificationEvent, FALSE);
 	DeviceExtension->SectorSize = Cdp_SECTOR_SIZE_DEFAULT;
 	InterlockedExchange(&DeviceExtension->Phase, Cdp_PHASE_GENERAL);
 
@@ -231,6 +252,14 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 	DriverObject->MajorFunction[IRP_MJ_WRITE] = CdpIrpDispatchWrite;
 	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = CdpIrpDispatchDeviceControl;
 	DriverObject->DriverExtension->AddDevice = CdpAddDevice;
+
+	// All volume devices start with their data-I/O gate closed.  Waiting for
+	// this I/O-manager milestone prevents a source that enumerates before its
+	// journal from being mistaken for an ordinary volume and released early.
+	IoRegisterBootDriverReinitialization(
+		DriverObject,
+		CdpBootDriverReinitialize,
+		DriverExtension);
 
 cleanup:
 	if (!NT_SUCCESS(Status))

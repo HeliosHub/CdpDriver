@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.3.7"
-#define Cdp_DRIVER_BUILD_STRING   "20260724.15"
+#define Cdp_DRIVER_VERSION_STRING "1.3.8"
+#define Cdp_DRIVER_BUILD_STRING   "20260728.1"
 
 // Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.
 // Cdp_DBG: Debug builds only — verbose I/O and path tracing.
@@ -103,6 +103,10 @@ typedef struct _Cdp_DRIVER_EXTENSION
 	volatile LONG AutoDiscoveryQueued;
 	volatile LONG AutoDiscoveryStopping;
 	volatile LONG AutoDiscoverySuppressed;
+	// Set only from the boot-driver reinitialization callback, which the I/O
+	// manager invokes after the boot PnP enumeration/start pass completes.
+	// No volume gate may be opened before this becomes nonzero.
+	volatile LONG BootEnumerationComplete;
 	// 0 until every started volume is classified and no journal is waiting
 	// on a not-yet-started source (or CDP has been enabled).
 	volatile LONG AutoDiscoverySettled;
@@ -138,6 +142,11 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	volatile LONG AutoKind;
 	BOOLEAN VolumeGuidValid;
 	EX_RUNDOWN_REF AutoDiscoveryRundown;
+	// Each newly started volume is held until automatic discovery determines
+	// whether it is a recovery source.  This closes the source-identification
+	// window before CaptureEnabled/Recovery Phase can be established.
+	volatile LONG AutoDiscoveryGateActive;
+	KEVENT AutoDiscoveryGateEvent;
 	GUID VolumeGuid;
 	PDEVICE_OBJECT LowerDeviceObject;
 	PDEVICE_OBJECT PhysicalDeviceObject;

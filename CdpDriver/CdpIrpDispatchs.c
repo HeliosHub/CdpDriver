@@ -874,6 +874,34 @@ static VOID CdpMarkAutoDiscoverySettled(_Inout_ PCdp_DRIVER_EXTENSION DriverExt)
 	KeSetEvent(&DriverExt->AutoDiscoverySettledEvent, IO_NO_INCREMENT, FALSE);
 }
 
+static VOID CdpOpenAutoDiscoveryGate(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
+{
+	if (!DevExt)
+		return;
+	InterlockedExchange(&DevExt->AutoDiscoveryGateActive, 0);
+	KeSetEvent(&DevExt->AutoDiscoveryGateEvent, IO_NO_INCREMENT, FALSE);
+}
+
+static VOID CdpOpenAllAutoDiscoveryGates(_Inout_ PCdp_DRIVER_EXTENSION DriverExt)
+{
+	KIRQL oldIrql;
+	PLIST_ENTRY entry;
+
+	KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &oldIrql);
+	for (entry = DriverExt->DeviceObjectListHead.Flink;
+		entry != &DriverExt->DeviceObjectListHead;
+		entry = entry->Flink)
+	{
+		PCdp_DEVICE_LIST_NODE node =
+			CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
+		PCdp_DEVICE_EXTENSION ext =
+			(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
+		if (ext)
+			CdpOpenAutoDiscoveryGate(ext);
+	}
+	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
+}
+
 static VOID CdpClearAutoDiscoverySettled(_Inout_ PCdp_DRIVER_EXTENSION DriverExt)
 {
 	InterlockedExchange(&DriverExt->AutoDiscoverySettled, 0);
@@ -985,6 +1013,15 @@ static BOOLEAN CdpAutoDiscoveryHasPendingJournal(
 static VOID CdpAutoDiscoveryRefreshSettled(
 	_Inout_ PCdp_DRIVER_EXTENSION DriverExt)
 {
+	if (InterlockedCompareExchange(
+			&DriverExt->BootEnumerationComplete, 0, 0) == 0)
+	{
+		// A source volume can START before its journal volume.  Treating the
+		// currently visible set as complete here would let NTFS mount the source
+		// before a later journal exposes a pending reboot recovery.
+		CdpClearAutoDiscoverySettled(DriverExt);
+		return;
+	}
 	if (InterlockedCompareExchange(&DriverExt->AutoDiscoverySuppressed, 0, 0) != 0 ||
 		InterlockedCompareExchange(&DriverExt->AutoDiscoveryStopping, 0, 0) != 0)
 	{
@@ -998,6 +1035,7 @@ static VOID CdpAutoDiscoveryRefreshSettled(
 		return;
 	}
 	CdpMarkAutoDiscoverySettled(DriverExt);
+	CdpOpenAllAutoDiscoveryGates(DriverExt);
 }
 
 static NTSTATUS CdpClassifyStartedVolume(
@@ -1200,17 +1238,39 @@ static NTSTATUS CdpTryActivateReadyPairs(
 				// The intent is already persisted.  This invocation performs the
 				// actual begin; commit clears the marker on success.
 				beginRequest.Flags = 0;
-				Cdp_LOG("[RECOVERY] reboot intent found target=%llu; auto begin+commit\n",
+				Cdp_LOG("[RECOVERY] reboot intent found target=%llu; diagnostic gated auto begin+commit\n",
 					beginRequest.TargetTime100ns);
 				status = CdpBeginRecovery(DriverExt, &beginRequest, &beginReply);
 				if (NT_SUCCESS(status))
 				{
+					// Keep boot I/O behind the discovery gate for the complete
+					// recovery transaction.  Commit writes directly to the lower
+					// source device and does not depend on this dispatch gate.
 					RtlZeroMemory(&commitRequest, sizeof(commitRequest));
 					commitRequest.SourceVolumeGuid = beginRequest.SourceVolumeGuid;
 					status = CdpCommitRecovery(DriverExt, &commitRequest, &commitReply);
+					if (NT_SUCCESS(status))
+					{
+						CdpOpenAutoDiscoveryGate(CdpFindStartedSourceByGuid(
+							DriverExt, &beginRequest.SourceVolumeGuid));
+						Cdp_LOG("[RECOVERY] diagnostic gated auto begin+commit completed; boot I/O released\n");
+					}
 				}
 				if (!NT_SUCCESS(status))
+				{
 					Cdp_LOG("[RECOVERY] reboot auto recovery failed status=0x%08X\n", status);
+					// A failed Begin must not leave boot I/O behind the discovery
+					// gate forever.  Keep the persisted intent for diagnosis/retry,
+					// but let the current boot continue against the live volume.
+					CdpOpenAutoDiscoveryGate(CdpFindStartedSourceByGuid(
+						DriverExt, &beginRequest.SourceVolumeGuid));
+				}
+			}
+			else
+			{
+				// A normally activated source has no pending reboot recovery.
+				CdpOpenAutoDiscoveryGate(CdpFindStartedSourceByGuid(
+					DriverExt, &journalEntry->Journal.SourceVolumeGuid));
 			}
 			Cdp_DBG("[AUTO-CDP] pair activated journalHandle=%llu\n",
 				journalHandleId);
@@ -1347,6 +1407,7 @@ VOID CdpInitializeAutoDiscovery(_Inout_ PCdp_DRIVER_EXTENSION DriverExt)
 		FALSE);
 	InterlockedExchange(&DriverExt->AutoDiscoverySettled, 0);
 	InterlockedExchange(&DriverExt->AutoDiscoveryRunning, 0);
+	InterlockedExchange(&DriverExt->BootEnumerationComplete, 0);
 	ExInitializeWorkItem(
 		&DriverExt->AutoDiscoveryWorkItem,
 		CdpAutoDiscoveryWorker,
@@ -1357,6 +1418,12 @@ VOID CdpQueueAutoDiscovery(_Inout_ PCdp_DRIVER_EXTENSION DriverExt)
 {
 	if (!DriverExt)
 		return;
+	if (InterlockedCompareExchange(
+			&DriverExt->BootEnumerationComplete, 0, 0) == 0)
+	{
+		Cdp_DBG("[AUTO-CDP] discovery deferred until boot enumeration completes\n");
+		return;
+	}
 	if (InterlockedCompareExchange(&DriverExt->AutoDiscoveryStopping, 0, 0) != 0)
 		return;
 	if (InterlockedCompareExchange(&DriverExt->AutoDiscoverySuppressed, 0, 0) != 0)
@@ -1394,30 +1461,6 @@ VOID CdpStopAutoDiscovery(_Inout_ PCdp_DRIVER_EXTENSION DriverExt)
 			NULL);
 	}
 }
-
-static VOID CdpWaitForAutoDiscoveryIfNeeded(
-	_In_ PCdp_DRIVER_EXTENSION DriverExt)
-{
-	if (!DriverExt)
-		return;
-	if (InterlockedCompareExchange(&DriverExt->AutoDiscoverySettled, 0, 0) != 0)
-		return;
-	if (InterlockedCompareExchange(&DriverExt->AutoDiscoverySuppressed, 0, 0) != 0)
-		return;
-	if (InterlockedCompareExchange(&DriverExt->AutoDiscoveryRunning, 0, 0) != 0)
-		return;
-	if (KeGetCurrentIrql() != PASSIVE_LEVEL)
-		return;
-
-	Cdp_DBG("[AUTO-CDP] write gated until discovery settles\n");
-	KeWaitForSingleObject(
-		&DriverExt->AutoDiscoverySettledEvent,
-		Executive,
-		KernelMode,
-		FALSE,
-		NULL);
-}
-
 
 static PCdp_PREVIEW_SESSION CdpLookupPreviewSessionLocked(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
@@ -1858,15 +1901,9 @@ static NTSTATUS CdpBeginRecovery(
 	}
 	if (CdpAnyPreviewSessionActive(DriverExt))
 		return STATUS_INVALID_DEVICE_STATE;
-	// Recovery services paging reads from a worker and can therefore not be
-	// activated on a volume that backs the system paging path.
-	if (InterlockedCompareExchange(&sourceExt->PagingPathCount, 0, 0) != 0)
-	{
-		Cdp_LOG(
-			"[RECOVERY] begin rejected: pagingPathCount=%ld\n",
-			InterlockedCompareExchange(&sourceExt->PagingPathCount, 0, 0));
-		return STATUS_DEVICE_BUSY;
-	}
+	Cdp_LOG(
+		"[RECOVERY] begin entering recovery pagingPathCount=%ld\n",
+		InterlockedCompareExchange(&sourceExt->PagingPathCount, 0, 0));
 	previousPhase = InterlockedCompareExchange(
 		&sourceExt->Phase,
 		(LONG)Cdp_PHASE_RECOVERY,
@@ -2287,7 +2324,8 @@ NTSTATUS CdpIrpDispatchRead(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 		return CdpCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);
 
 	if (InterlockedCompareExchange(&deviceExt->Phase, 0, 0) !=
-		(LONG)Cdp_PHASE_RECOVERY)
+		(LONG)Cdp_PHASE_RECOVERY &&
+		InterlockedCompareExchange(&deviceExt->AutoDiscoveryGateActive, 0, 0) == 0)
 	{
 		return CdpSendToNextDevice(deviceExt->LowerDeviceObject, Irp);
 	}
@@ -2302,7 +2340,9 @@ NTSTATUS CdpIrpDispatchRead(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 	offset = (UINT64)irpSp->Parameters.Read.ByteOffset.QuadPart;
 	length = irpSp->Parameters.Read.Length;
 	if (!driverExt ||
-		(deviceExt->SectorSize != 512 && deviceExt->SectorSize != 4096))
+		((deviceExt->SectorSize != 512 && deviceExt->SectorSize != 4096) &&
+			InterlockedCompareExchange(
+				&deviceExt->AutoDiscoveryGateActive, 0, 0) == 0))
 	{
 		return CdpSendToNextDevice(deviceExt->LowerDeviceObject, Irp);
 	}
@@ -2314,8 +2354,10 @@ NTSTATUS CdpIrpDispatchRead(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 
 	KeAcquireSpinLock(&deviceExt->RecoveryReadQueueLock, &oldIrql);
 	if (InterlockedCompareExchange(&deviceExt->RecoveryReadStopping, 0, 0) == 0 &&
-		InterlockedCompareExchange(&deviceExt->Phase, 0, 0) ==
-			(LONG)Cdp_PHASE_RECOVERY)
+		(InterlockedCompareExchange(&deviceExt->Phase, 0, 0) ==
+			(LONG)Cdp_PHASE_RECOVERY ||
+			InterlockedCompareExchange(
+				&deviceExt->AutoDiscoveryGateActive, 0, 0) != 0))
 	{
 		IoMarkIrpPending(Irp);
 		InsertTailList(&deviceExt->RecoveryReadQueue, &item->Entry);
@@ -2384,6 +2426,18 @@ static VOID CdpRecoveryReadWorker(_In_ PVOID Context)
 				PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
 				UINT64 offset = (UINT64)irpSp->Parameters.Read.ByteOffset.QuadPart;
 				ULONG length = irpSp->Parameters.Read.Length;
+				if (InterlockedCompareExchange(
+						&devExt->AutoDiscoveryGateActive, 0, 0) != 0)
+				{
+					Cdp_LOG("[AUTO-CDP] read held until source discovery/begin irp=%p offset=%llu len=%lu\n",
+						irp, offset, length);
+					KeWaitForSingleObject(
+						&devExt->AutoDiscoveryGateEvent,
+						Executive,
+						KernelMode,
+						FALSE,
+						NULL);
+				}
 
 				if (InterlockedCompareExchange(
 						&devExt->RecoveryReadStopping, 0, 0) != 0 ||
@@ -2595,6 +2649,22 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 			{
 				PCdp_CAPTURE_ITEM item =
 					CONTAINING_RECORD(entry, Cdp_CAPTURE_ITEM, Entry);
+				PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(item->Irp);
+
+				if (InterlockedCompareExchange(
+						&devExt->AutoDiscoveryGateActive, 0, 0) != 0)
+				{
+					Cdp_LOG("[AUTO-CDP] write held until source discovery/begin irp=%p offset=%lld len=%lu\n",
+						item->Irp,
+						irpSp->Parameters.Write.ByteOffset.QuadPart,
+						irpSp->Parameters.Write.Length);
+					KeWaitForSingleObject(
+						&devExt->AutoDiscoveryGateEvent,
+						Executive,
+						KernelMode,
+						FALSE,
+						NULL);
+				}
 
 				// Capture before-image then apply the original write under one
 				// HistoryMutex so preview cannot observe a torn timeline.
@@ -2618,7 +2688,6 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 				}
 				else
 				{
-					PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(item->Irp);
 					Cdp_LOG("[COW-TRACE] worker bypass irp=%p offset=%lld len=%lu enabled=%ld stopping=%ld driver=%p\n",
 						item->Irp,
 						irpSp->Parameters.Write.ByteOffset.QuadPart,
@@ -2679,6 +2748,7 @@ VOID CdpDisableAndDestroyCapture(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 
 	if (!DevExt)
 		return;
+	CdpOpenAutoDiscoveryGate(DevExt);
 
 	InterlockedExchange(&DevExt->CaptureEnabled, 0);
 	InterlockedExchange(&DevExt->Phase, (LONG)Cdp_PHASE_GENERAL);
@@ -2705,8 +2775,6 @@ NTSTATUS CdpIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 	BOOLEAN traceCaptureWrite = FALSE;
 	PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
 
-	if (deviceExt && deviceExt->LowerDeviceObject && driverExt)
-		CdpWaitForAutoDiscoveryIfNeeded(driverExt);
 	if (deviceExt)
 	{
 		traceCaptureWrite =
@@ -2730,8 +2798,9 @@ NTSTATUS CdpIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 	}
 
 	if (deviceExt && deviceExt->LowerDeviceObject && driverExt &&
-		InterlockedCompareExchange(&deviceExt->CaptureEnabled, 0, 0) != 0 &&
-		InterlockedCompareExchange(&deviceExt->CaptureStopping, 0, 0) == 0)
+		(InterlockedCompareExchange(&deviceExt->AutoDiscoveryGateActive, 0, 0) != 0 ||
+			(InterlockedCompareExchange(&deviceExt->CaptureEnabled, 0, 0) != 0 &&
+				InterlockedCompareExchange(&deviceExt->CaptureStopping, 0, 0) == 0)))
 	{
 		PCdp_CAPTURE_ITEM item = (PCdp_CAPTURE_ITEM)cdpalloc(sizeof(*item));
 		KIRQL oldIrql;
@@ -2740,7 +2809,8 @@ NTSTATUS CdpIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 			item->Irp = Irp;
 			KeAcquireSpinLock(&deviceExt->CaptureQueueLock, &oldIrql);
 			if (InterlockedCompareExchange(&deviceExt->CaptureStopping, 0, 0) == 0 &&
-				InterlockedCompareExchange(&deviceExt->CaptureEnabled, 0, 0) != 0)
+				(InterlockedCompareExchange(&deviceExt->AutoDiscoveryGateActive, 0, 0) != 0 ||
+					InterlockedCompareExchange(&deviceExt->CaptureEnabled, 0, 0) != 0))
 			{
 				IoMarkIrpPending(Irp);
 				InsertTailList(&deviceExt->CaptureQueue, &item->Entry);
@@ -2757,6 +2827,15 @@ NTSTATUS CdpIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 		}
 		else
 		{
+			if (InterlockedCompareExchange(
+						&deviceExt->AutoDiscoveryGateActive, 0, 0) != 0)
+			{
+				Cdp_LOG("[AUTO-CDP] gate queue allocation failed; write blocked irp=%p offset=%lld len=%lu\n",
+					Irp,
+					irpSp->Parameters.Write.ByteOffset.QuadPart,
+					irpSp->Parameters.Write.Length);
+				return CdpCompleteIrp(Irp, STATUS_INSUFFICIENT_RESOURCES, 0);
+			}
 			Cdp_LOG("[COW-TRACE] queue allocation failed; write bypass irp=%p offset=%lld len=%lu\n",
 				Irp,
 				irpSp->Parameters.Write.ByteOffset.QuadPart,
@@ -2901,13 +2980,6 @@ NTSTATUS CdpIrpDispatchPnp(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 	{
 		if (IrpSp->Parameters.UsageNotification.Type != DeviceUsageTypePaging)
 			return CdpSendToNextDevice(DevExt->LowerDeviceObject, Irp);
-		if (IrpSp->Parameters.UsageNotification.InPath &&
-			InterlockedCompareExchange(&DevExt->Phase, 0, 0) ==
-				(LONG)Cdp_PHASE_RECOVERY)
-		{
-			Cdp_LOG("[RECOVERY] paging path activation rejected while active\n");
-			return CdpCompleteIrp(Irp, STATUS_DEVICE_BUSY, 0);
-		}
 
 		BOOLEAN SetPagable = FALSE;
 		if (!IrpSp->Parameters.UsageNotification.InPath &&
