@@ -44,6 +44,11 @@ static void FillPattern(PUCHAR buf, ULONG len, UCHAR seed)
 		buf[i] = (UCHAR)(seed + i);
 }
 
+static UINT64 TestPointerTime100ns(_In_opt_ PVOID Context)
+{
+	return (UINT64)(ULONG_PTR)Context;
+}
+
 static NTSTATUS TestCtxCreateWithSector(
 	_Out_ PTEST_CTX Ctx,
 	_In_ UINT64 SourceSize,
@@ -112,6 +117,9 @@ typedef struct _TEST_FAIL_STORE
 	UINT64 LastReadOffset;
 	ULONG LastReadLength;
 	LONG FailNextWrites;
+	LONG FailNextSuperblockWrites;
+	ULONG WriteCallCount;
+	ULONG SuperblockWriteCount;
 	ULONG MaxWriteLength;
 	ULONG OversizeWriteCount;
 	ULONG LargestSuccessfulWrite;
@@ -163,6 +171,16 @@ static NTSTATUS TestFailStoreWrite(
 	PTEST_FAIL_STORE fail = (PTEST_FAIL_STORE)Store->Context;
 	NTSTATUS status;
 
+	++fail->WriteCallCount;
+	if (Offset == 0 && Length == Store->SectorSize)
+	{
+		++fail->SuperblockWriteCount;
+		if (fail->FailNextSuperblockWrites > 0)
+		{
+			--fail->FailNextSuperblockWrites;
+			return STATUS_IO_DEVICE_ERROR;
+		}
+	}
 	if (fail->FailNextWrites > 0)
 	{
 		--fail->FailNextWrites;
@@ -197,6 +215,9 @@ static VOID TestFailStoreInstall(_Inout_ PCdp_STORE Store, _Out_ PTEST_FAIL_STOR
 	Fail->LastReadOffset = 0;
 	Fail->LastReadLength = 0;
 	Fail->FailNextWrites = 0;
+	Fail->FailNextSuperblockWrites = 0;
+	Fail->WriteCallCount = 0;
+	Fail->SuperblockWriteCount = 0;
 	Fail->MaxWriteLength = 0;
 	Fail->OversizeWriteCount = 0;
 	Fail->LargestSuccessfulWrite = 0;
@@ -894,13 +915,21 @@ static int TestJournalDropOldest(void)
 static int TestJournalPayloadTailWrap(void)
 {
 	TEST_CTX ctx;
+	TEST_FAIL_STORE journalReads;
 	UCHAR buf[512];
 	UINT64 oldestBefore = 0;
 	UINT64 newestBefore = 0;
 	UINT64 oldestAfter = 0;
 	UINT64 newestAfter = 0;
+	UINT64 partitionBytes = 0;
+	UINT64 metadataBytes = 0;
+	UINT64 payloadBytesUsed = 0;
+	UINT64 payloadBytesFree = 0;
+	UINT64 totalRecords = 0;
+	UINT64 previousRecords = 0;
 	UINT64 firstTime = 30000;
 	ULONG i;
+	BOOLEAN regionDropped = FALSE;
 	NTSTATUS st;
 	ULONG tailFillRecords;
 
@@ -924,6 +953,8 @@ static int TestJournalPayloadTailWrap(void)
 
 	st = CdpCoreQueryTimeRange(ctx.Core, &oldestBefore, &newestBefore);
 	Expect(NT_SUCCESS(st), "QueryTimeRange before tail wrap");
+	TestFailStoreInstall(ctx.Journal, &journalReads);
+	journalReads.MaxReadLength = SECTOR;
 
 	/* Next append must wrap payload cursor off the end and still succeed. */
 	FillPattern(buf, sizeof(buf), 0xEE);
@@ -934,6 +965,15 @@ static int TestJournalPayloadTailWrap(void)
 		buf,
 		sizeof(buf));
 	Expect(NT_SUCCESS(st), "append after tail wrap");
+	st = CdpCoreQueryJournalUsage(
+		ctx.Core,
+		&partitionBytes,
+		&metadataBytes,
+		&payloadBytesUsed,
+		&payloadBytesFree,
+		&totalRecords);
+	Expect(NT_SUCCESS(st), "query usage while approaching tail pressure");
+	previousRecords = totalRecords;
 
 	st = TestAppendJournalRecord(
 		&ctx,
@@ -942,6 +982,69 @@ static int TestJournalPayloadTailWrap(void)
 		buf,
 		sizeof(buf));
 	Expect(NT_SUCCESS(st), "append continues after wrap (drop-oldest if needed)");
+	st = CdpCoreQueryJournalUsage(
+		ctx.Core,
+		&partitionBytes,
+		&metadataBytes,
+		&payloadBytesUsed,
+		&payloadBytesFree,
+		&totalRecords);
+	Expect(NT_SUCCESS(st), "query usage after wrapped append");
+	if (NT_SUCCESS(st) && totalRecords < previousRecords)
+	{
+		regionDropped = TRUE;
+		Expect(totalRecords == 1,
+			"tail pressure drops the complete oldest header region");
+	}
+	previousRecords = totalRecords;
+
+	for (i = 0; i < 32 && !regionDropped; ++i)
+	{
+		st = TestAppendJournalRecord(
+			&ctx,
+			firstTime + tailFillRecords + 2 + i,
+			512,
+			buf,
+			sizeof(buf));
+		Expect(NT_SUCCESS(st), "append until whole-region reclamation");
+		st = CdpCoreQueryJournalUsage(
+			ctx.Core,
+			&partitionBytes,
+			&metadataBytes,
+			&payloadBytesUsed,
+			&payloadBytesFree,
+			&totalRecords);
+		Expect(NT_SUCCESS(st), "query usage during whole-region reclamation");
+		if (NT_SUCCESS(st) && totalRecords < previousRecords)
+		{
+			regionDropped = TRUE;
+			Expect(totalRecords == 1,
+				"tail pressure drops the complete oldest header region");
+		}
+		previousRecords = totalRecords;
+	}
+	Expect(regionDropped,
+		"tail pressure eventually triggers whole-region reclamation");
+
+	st = TestAppendJournalRecord(
+		&ctx,
+		firstTime + tailFillRecords + 40,
+		1024,
+		buf,
+		sizeof(buf));
+	Expect(NT_SUCCESS(st), "append after whole-region reclamation");
+	st = CdpCoreQueryJournalUsage(
+		ctx.Core,
+		&partitionBytes,
+		&metadataBytes,
+		&payloadBytesUsed,
+		&payloadBytesFree,
+		&totalRecords);
+	Expect(NT_SUCCESS(st) && totalRecords == 2,
+		"new records accumulate after whole-region reclamation");
+	Expect(journalReads.OversizeReadCount == 0 &&
+		journalReads.LargestSuccessfulRead <= SECTOR,
+		"whole-region reclamation does not read the 2MB header region");
 
 	st = CdpCoreQueryTimeRange(ctx.Core, &oldestAfter, &newestAfter);
 	Expect(NT_SUCCESS(st), "QueryTimeRange after tail wrap");
@@ -954,6 +1057,7 @@ static int TestJournalPayloadTailWrap(void)
 			"tail wrap triggered additional eviction");
 	}
 
+	TestFailStoreRemove(ctx.Journal, &journalReads);
 	TestCtxDestroy(&ctx);
 	return g_caseFailed;
 }
@@ -969,6 +1073,14 @@ static int TestJournalTinyPartitionLargeRecord(void)
 	UINT64 oldest = 0;
 	UINT64 newest = 0;
 	UINT64 firstTime = 40000;
+	UINT64 partitionBytes = 0;
+	UINT64 metadataBytes = 0;
+	UINT64 payloadUsedBeforeMount = 0;
+	UINT64 payloadFreeBeforeMount = 0;
+	UINT64 totalBeforeMount = 0;
+	UINT64 payloadUsedAfterMount = 0;
+	UINT64 payloadFreeAfterMount = 0;
+	UINT64 totalAfterMount = 0;
 	ULONG i;
 	NTSTATUS st;
 	PCdp_CORE remounted = NULL;
@@ -1019,6 +1131,14 @@ static int TestJournalTinyPartitionLargeRecord(void)
 	Expect(memcmp(outBuf, smallBuf, sizeof(smallBuf)) == 0,
 		"preview near newest shows before-image of recent 512 write");
 	CdpCorePreviewEnd(ctx.Core);
+	st = CdpCoreQueryJournalUsage(
+		ctx.Core,
+		&partitionBytes,
+		&metadataBytes,
+		&payloadUsedBeforeMount,
+		&payloadFreeBeforeMount,
+		&totalBeforeMount);
+	Expect(NT_SUCCESS(st), "query occupied span before churn remount");
 
 	CdpCoreDestroy(ctx.Core);
 	ctx.Core = NULL;
@@ -1029,6 +1149,18 @@ static int TestJournalTinyPartitionLargeRecord(void)
 	st = CdpCoreQueryTimeRange(remounted, &oldest, &newest);
 	Expect(NT_SUCCESS(st) && newest > oldest,
 		"journal metadata survives remount after wrap/evict");
+	st = CdpCoreQueryJournalUsage(
+		remounted,
+		&partitionBytes,
+		&metadataBytes,
+		&payloadUsedAfterMount,
+		&payloadFreeAfterMount,
+		&totalAfterMount);
+	Expect(NT_SUCCESS(st) &&
+		payloadUsedAfterMount == payloadUsedBeforeMount &&
+		payloadFreeAfterMount == payloadFreeBeforeMount &&
+		totalAfterMount == totalBeforeMount,
+		"remount rebuilds identical occupied ring-span accounting");
 
 	CdpCoreDestroy(remounted);
 	TestCtxDestroy(&ctx);
@@ -1293,7 +1425,7 @@ static int TestJournalUsageAndRecordHeaders(void)
 	TEST_CTX ctx;
 	UCHAR a[512];
 	UCHAR b[512];
-	Cdp_JOURNAL_RECORD_HEADER headers[2];
+	Cdp_JOURNAL_RECORD headers[2];
 	UINT64 partitionBytes = 0;
 	UINT64 metadataBytes = 0;
 	UINT64 payloadBytesUsed = 0;
@@ -1455,7 +1587,7 @@ static int TestRecoveryCommitStepCoalescedLargePayload(void)
 	PUCHAR expected = NULL;
 	PUCHAR readView = NULL;
 	UCHAR liveWrite[512];
-	Cdp_JOURNAL_RECORD_HEADER header;
+	Cdp_JOURNAL_RECORD header;
 	UINT64 targetTime = 61500;
 	ULONG offset;
 	UINT64 totalBeforeCommit = 0;
@@ -1800,7 +1932,9 @@ static int TestSingleSuperblockMetadata(void)
 		{ 0x90, 0xAB, 0xCD, 0xEF, 1, 2, 3, 4 }
 	};
 	GUID zeroGuid = { 0 };
-	Cdp_JOURNAL_RECORD_HEADER lastHeader;
+	Cdp_JOURNAL_RECORD lastHeader;
+	Cdp_PREVIEW_TREE scanTree;
+	PUCHAR cachedScanBuffer;
 	PUCHAR journalBytes;
 	UCHAR payload[513];
 	UINT64 expectedPayloadHead;
@@ -1839,9 +1973,25 @@ static int TestSingleSuperblockMetadata(void)
 		"superblock persists source volume GUID");
 	Expect(remounted.PayloadRegionOff == expectedPayloadHead,
 		"mount derives payload head from latest record fileoffset+length");
+	cachedScanBuffer = remounted.HeaderScanBuffer;
+	Expect(cachedScanBuffer != NULL,
+		"mount retains aligned header scan buffer");
+	st = CdpJournalBuildPreviewTree(
+		&remounted,
+		lastHeader.WallClock100ns,
+		remounted.NextSequence,
+		TRUE,
+		&scanTree);
+	Expect(NT_SUCCESS(st), "preview build reuses mounted header scan buffer");
+	Expect(remounted.HeaderScanBuffer == cachedScanBuffer,
+		"preview build keeps the same header scan allocation");
+	CdpPreviewTreeFree(&scanTree);
 	Expect(NT_SUCCESS(CdpJournalSetRecoveryIntent(&remounted, 123456789ULL)),
 		"persist reboot recovery intent");
 	CdpJournalClose(&remounted);
+	Expect(remounted.HeaderScanBuffer == NULL &&
+		remounted.HeaderScanAllocationBase == NULL,
+		"journal close releases cached header scan buffer");
 
 	CdpJournalInitializeWithStore(
 		&remounted, store, &zeroGuid, NULL, NULL);
@@ -1874,6 +2024,111 @@ static int TestSingleSuperblockMetadata(void)
 	return g_caseFailed;
 }
 
+static int TestJournalGlobalSequenceCrossesUlong(void)
+{
+	PCdp_STORE store = NULL;
+	Cdp_JOURNAL journal;
+	Cdp_JOURNAL remounted;
+	Cdp_PREVIEW_TREE tree;
+	Cdp_HEADER_REGION_LINK* link;
+	Cdp_JOURNAL_RECORD_HEADER* diskHeaders;
+	Cdp_JOURNAL_RECORD records[3];
+	GUID sourceGuid = {
+		0x9A29D38E, 0x2468, 0x1357,
+		{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 }
+	};
+	GUID zeroGuid = { 0 };
+	UCHAR payload[512];
+	PUCHAR bytes;
+	UINT64 total = 0;
+	UINT64 generation = 0;
+	ULONG returned = 0;
+	ULONG i;
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &store)),
+		"create journal for 64-bit sequence rollover test");
+	if (!store)
+		return g_caseFailed;
+	CdpJournalInitializeWithStore(
+		&journal, store, &sourceGuid, NULL, NULL);
+	Expect(NT_SUCCESS(CdpJournalFormat(&journal)),
+		"format journal for 64-bit sequence rollover test");
+
+	bytes = (PUCHAR)CdpMemStoreData(store);
+	diskHeaders = (Cdp_JOURNAL_RECORD_HEADER*)(bytes + SECTOR);
+	link = (Cdp_HEADER_REGION_LINK*)(
+		bytes + SECTOR + Cdp_JOURNAL_HEADER_REGION_SIZE -
+		Cdp_JOURNAL_HEADER_LINK_SIZE);
+	link->StartSequence = 0xFFFFFFFEULL;
+	link->Reserved = 0;
+	journal.CurrentHeaderRegionStartSequence = link->StartSequence;
+	journal.NextSequence = link->StartSequence;
+	journal.QueryTime100ns = TestPointerTime100ns;
+
+	FillPattern(payload, sizeof(payload), 0x39);
+	for (i = 0; i < RTL_NUMBER_OF(records); ++i)
+	{
+		journal.QueryTimeContext = (PVOID)(ULONG_PTR)(90000 + i);
+		status = CdpJournalAppend(
+			&journal,
+			(UINT64)i * 4096,
+			sizeof(payload),
+			payload,
+			&records[i]);
+		Expect(NT_SUCCESS(status),
+			"append across 32-bit global sequence boundary");
+	}
+	Expect(link->Reserved == 0,
+		"header-region Reserved remains zero");
+	Expect(diskHeaders[0].Sequence == 0 &&
+		diskHeaders[1].Sequence == 1 &&
+		diskHeaders[2].Sequence == 2,
+		"on-disk record Sequence remains region-local");
+	Expect(records[0].Sequence == 0xFFFFFFFEULL &&
+		records[1].Sequence == 0xFFFFFFFFULL &&
+		records[2].Sequence == 0x100000000ULL,
+		"append returns monotonically increasing 64-bit global Sequence");
+
+	RtlZeroMemory(records, sizeof(records));
+	status = CdpJournalQueryRecordHeaders(
+		&journal, 0, 0, records, RTL_NUMBER_OF(records),
+		&total, &generation, &returned);
+	Expect(NT_SUCCESS(status) && total == 3 && returned == 3,
+		"query records across 32-bit global sequence boundary");
+	Expect(records[0].Sequence == 0xFFFFFFFEULL &&
+		records[1].Sequence == 0xFFFFFFFFULL &&
+		records[2].Sequence == 0x100000000ULL,
+		"query decodes region-local Sequence to global UINT64");
+
+	status = CdpJournalBuildPreviewTree(
+		&journal, 90000, 0x100000000ULL, TRUE, &tree);
+	Expect(NT_SUCCESS(status) && tree.NodeCount == 2,
+		"preview max-sequence filtering remains 64-bit at rollover");
+	CdpPreviewTreeFree(&tree);
+	CdpJournalClose(&journal);
+
+	CdpJournalInitializeWithStore(
+		&remounted, store, &zeroGuid, NULL, NULL);
+	status = CdpJournalMount(&remounted);
+	Expect(NT_SUCCESS(status),
+		"remount journal containing crossed 32-bit sequence boundary");
+	Expect(remounted.NextSequence == 0x100000001ULL,
+		"remount rebuilds the next global UINT64 Sequence");
+	CdpJournalClose(&remounted);
+
+	link->Reserved = 1;
+	CdpJournalInitializeWithStore(
+		&remounted, store, &zeroGuid, NULL, NULL);
+	status = CdpJournalMount(&remounted);
+	Expect(status == STATUS_DISK_CORRUPT_ERROR,
+		"mount rejects a nonzero header-region Reserved field");
+	CdpJournalClose(&remounted);
+	link->Reserved = 0;
+	CdpMemStoreDestroy(store);
+	return g_caseFailed;
+}
+
 /* Stop-CDP must clear superblock magic so a later mount (auto-discovery) fails. */
 static int TestJournalInvalidateRejectsRemount(void)
 {
@@ -1885,7 +2140,7 @@ static int TestJournalInvalidateRejectsRemount(void)
 		{ 0x00, 0x00, 0x10, 0x80, 0x02, 0x00, 0x00, 0x00 }
 	};
 	GUID zeroGuid = { 0 };
-	Cdp_JOURNAL_RECORD_HEADER header;
+	Cdp_JOURNAL_RECORD header;
 	PUCHAR journalBytes;
 	UCHAR payload[512];
 	NTSTATUS st;
@@ -1928,6 +2183,62 @@ static int TestJournalInvalidateRejectsRemount(void)
 		"close after invalidate does not rewrite magic");
 	CdpJournalClose(&remounted);
 
+	CdpMemStoreDestroy(store);
+	return g_caseFailed;
+}
+
+static int TestAppendWritesSuperblockOnlyForNewRegion(void)
+{
+	PCdp_STORE store = NULL;
+	Cdp_JOURNAL journal;
+	TEST_FAIL_STORE trace;
+	GUID sourceGuid = {
+		0xA7372451, 0x1000, 0x2000,
+		{ 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0 }
+	};
+	Cdp_JOURNAL_RECORD header;
+	UCHAR payload[512];
+
+	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &store)),
+		"create journal for superblock append test");
+	if (!store)
+		return g_caseFailed;
+	CdpJournalInitializeWithStore(
+		&journal, store, &sourceGuid, NULL, NULL);
+	Expect(NT_SUCCESS(CdpJournalFormat(&journal)),
+		"format journal for superblock append test");
+	FillPattern(payload, sizeof(payload), 0x6A);
+	TestFailStoreInstall(store, &trace);
+
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 0, sizeof(payload), payload, &header)),
+		"ordinary append succeeds without superblock rewrite");
+	Expect(trace.SuperblockWriteCount == 0,
+		"ordinary append does not write superblock sector");
+
+	// Force the next append through the real new-region allocation path
+	// without writing 65,535 records merely to exhaust the current region.
+	journal.CurrentHeaderCount = Cdp_JOURNAL_HEADERS_PER_REGION;
+	trace.FailNextSuperblockWrites = 1;
+	Expect(CdpJournalAppend(
+		&journal, 512, sizeof(payload), payload, &header) ==
+		STATUS_IO_DEVICE_ERROR,
+		"new-region append reports superblock persistence failure");
+	Expect(trace.SuperblockWriteCount == 1 && journal.SuperblockDirty,
+		"failed new-region superblock remains dirty for retry");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 1024, sizeof(payload), payload, &header)),
+		"next append retries dirty new-region superblock");
+	Expect(trace.SuperblockWriteCount == 2 && !journal.SuperblockDirty,
+		"successful retry clears dirty superblock");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 1536, sizeof(payload), payload, &header)),
+		"ordinary append after superblock retry succeeds");
+	Expect(trace.SuperblockWriteCount == 2,
+		"later ordinary append does not rewrite superblock");
+
+	TestFailStoreRemove(store, &trace);
+	CdpJournalClose(&journal);
 	CdpMemStoreDestroy(store);
 	return g_caseFailed;
 }
@@ -2602,6 +2913,121 @@ cleanup:
 	return g_caseFailed;
 }
 
+static int TestPreviewTreeMinValidSequenceSummary(void)
+{
+	Cdp_PREVIEW_TREE tree;
+	Cdp_JOURNAL_RECORD header;
+
+	CdpPreviewTreeInitialize(&tree);
+	RtlZeroMemory(&header, sizeof(header));
+	header.VolumeOffset = 4096;
+	header.FileOffset = 4096;
+	header.DataLength = 512;
+	header.Sequence = 30;
+	Expect(NT_SUCCESS(CdpPreviewTreeInsert(&tree, &header)),
+		"insert later sequence for subtree-min test");
+	header.VolumeOffset = 0;
+	header.FileOffset = 0;
+	header.DataLength = 512;
+	header.Sequence = 10;
+	Expect(NT_SUCCESS(CdpPreviewTreeInsert(&tree, &header)),
+		"insert earliest sequence for subtree-min test");
+	header.VolumeOffset = 512;
+	header.FileOffset = 512;
+	header.DataLength = 1536;
+	header.Sequence = 20;
+	Expect(NT_SUCCESS(CdpPreviewTreeInsert(&tree, &header)),
+		"insert splittable sequence for subtree-min test");
+	Expect(tree.Root && tree.Root->MinValidSequence == 10,
+		"subtree summary selects earliest valid sequence");
+
+	Expect(NT_SUCCESS(CdpPreviewTreeMarkInvalidByStart(&tree, 0)),
+		"invalidate earliest node by start");
+	Expect(tree.Root && tree.Root->MinValidSequence == 20,
+		"subtree summary advances after commit invalidation");
+	Expect(NT_SUCCESS(CdpPreviewTreePunchRange(&tree, 1024, 512)),
+		"split pending node around concurrent write");
+	Expect(tree.Root && tree.Root->MinValidSequence == 20,
+		"subtree summary survives AVL split and reinsertion");
+	Expect(NT_SUCCESS(CdpPreviewTreeMarkInvalidByStart(&tree, 512)),
+		"invalidate left split fragment");
+	Expect(tree.Root && tree.Root->MinValidSequence == 20,
+		"right split fragment remains the earliest node");
+	Expect(NT_SUCCESS(CdpPreviewTreeMarkInvalidByStart(&tree, 1536)),
+		"invalidate right split fragment");
+	Expect(tree.Root && tree.Root->MinValidSequence == 30,
+		"subtree summary advances past both split fragments");
+	Expect(NT_SUCCESS(CdpPreviewTreeMarkInvalidByStart(&tree, 4096)),
+		"invalidate final valid node");
+	Expect(tree.Root && tree.Root->MinValidSequence == MAXUINT64,
+		"subtree summary reports no remaining valid node");
+
+	CdpPreviewTreeFree(&tree);
+	return g_caseFailed;
+}
+
+static VOID TestCollectTreeNodes(
+	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
+	_Out_writes_(Capacity) PCdp_PREVIEW_TREE_NODE* Nodes,
+	_Inout_ PULONG Count,
+	_In_ ULONG Capacity)
+{
+	if (!Node || *Count >= Capacity)
+		return;
+	TestCollectTreeNodes(Node->Left, Nodes, Count, Capacity);
+	if (*Count < Capacity)
+		Nodes[(*Count)++] = Node;
+	TestCollectTreeNodes(Node->Right, Nodes, Count, Capacity);
+}
+
+static int TestPreviewTreeGapInsert(void)
+{
+	Cdp_PREVIEW_TREE tree;
+	Cdp_JOURNAL_RECORD header;
+	PCdp_PREVIEW_TREE_NODE nodes[8];
+	ULONG count = 0;
+	static const UINT64 expectedStart[] = { 0, 512, 1024, 1536, 2048 };
+	static const UINT64 expectedEnd[] = { 512, 1024, 1536, 2048, 2560 };
+	static const UINT64 expectedSequence[] = { 30, 10, 30, 20, 30 };
+	static const UINT64 expectedFileOffset[] =
+		{ 10000, 20000, 11024, 30000, 12048 };
+	ULONG i;
+
+	CdpPreviewTreeInitialize(&tree);
+	RtlZeroMemory(&header, sizeof(header));
+	header.VolumeOffset = 512;
+	header.FileOffset = 20000;
+	header.DataLength = 512;
+	header.Sequence = 10;
+	Expect(NT_SUCCESS(CdpPreviewTreeInsert(&tree, &header)),
+		"insert first existing range for gap test");
+	header.VolumeOffset = 1536;
+	header.FileOffset = 30000;
+	header.Sequence = 20;
+	Expect(NT_SUCCESS(CdpPreviewTreeInsert(&tree, &header)),
+		"insert second existing range for gap test");
+	header.VolumeOffset = 0;
+	header.FileOffset = 10000;
+	header.DataLength = 2560;
+	header.Sequence = 30;
+	Expect(NT_SUCCESS(CdpPreviewTreeInsert(&tree, &header)),
+		"insert spanning range through multiple tree holes");
+
+	TestCollectTreeNodes(tree.Root, nodes, &count, RTL_NUMBER_OF(nodes));
+	Expect(count == RTL_NUMBER_OF(expectedStart) && tree.NodeCount == count,
+		"gap insert creates only uncovered fragments");
+	for (i = 0; i < count && i < RTL_NUMBER_OF(expectedStart); ++i)
+	{
+		Expect(nodes[i]->Start == expectedStart[i] &&
+			nodes[i]->End == expectedEnd[i] &&
+			nodes[i]->Sequence == expectedSequence[i] &&
+			nodes[i]->FileOffset == expectedFileOffset[i],
+			"gap insert preserves interval priority and payload offsets");
+	}
+	CdpPreviewTreeFree(&tree);
+	return g_caseFailed;
+}
+
 int main(void)
 {
 	int failed = 0;
@@ -2640,7 +3066,9 @@ int main(void)
 	failed += RunCase("Journal format write chunk fallback", TestJournalFormatWriteChunkFallback);
 	failed += RunCase("4KiB-sector COW / Preview / Recovery", TestFourKiBSectorCowPreviewRecovery);
 	failed += RunCase("Single superblock metadata", TestSingleSuperblockMetadata);
+	failed += RunCase("Journal UINT64 global sequence rollover", TestJournalGlobalSequenceCrossesUlong);
 	failed += RunCase("Journal invalidate rejects remount", TestJournalInvalidateRejectsRemount);
+	failed += RunCase("Append superblock write policy", TestAppendWritesSuperblockOnlyForNewRegion);
 	failed += RunCase("Journal failure keeps live source unchanged", TestJournalWriteFailureDoesNotWriteSource);
 	failed += RunCase("Prepared Recovery commit/cancel", TestPreparedRecoveryCommitCancel);
 	failed += RunCase("Prepared Recovery partial concurrent write", TestPreparedRecoveryPartialConcurrentWrite);
@@ -2653,6 +3081,8 @@ int main(void)
 	failed += RunCase("Header-region read chunk reuse", TestHeaderRegionReadUsesDiscoveredChunk);
 	failed += RunCase("Partial coverage reads only live gap", TestPartialCoverageReadsOnlyLiveGap);
 	failed += RunCase("Header-region read fallback on mount", TestHeaderRegionReadFallbackOnMount);
+	failed += RunCase("Preview tree min valid sequence summary", TestPreviewTreeMinValidSequenceSummary);
+	failed += RunCase("Preview tree interval gap insert", TestPreviewTreeGapInsert);
 
 	printf("\n%s (%d failures)\n", failed ? "FAILED" : "ALL PASSED", failed);
 	return failed ? 1 : 0;

@@ -9,11 +9,10 @@
 #endif
 
 #define Cdp_JOURNAL_MAGIC            0x4C4E4A51UL /* 'QJNL' */
-#define Cdp_JOURNAL_VERSION          7UL
+#define Cdp_JOURNAL_VERSION          8UL
 #define Cdp_JOURNAL_MAX_RECORD_DATA  (2UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_REGION_SIZE (2UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_LINK_SIZE 32UL
-#define Cdp_JOURNAL_HEADER_LINK_MARK 0xFFFFFFFFFFFFFFFFULL
 #define Cdp_JOURNAL_FLAG_RECOVERY_PENDING 0x00000001UL
 
 #pragma pack(push, 1)
@@ -25,7 +24,7 @@ typedef struct _Cdp_JOURNAL_RECORD_HEADER
 	UINT64 VolumeOffset;   // 8  source volume byte offset
 	UINT64 FileOffset;     // 8  payload offset inside CDP partition
 	ULONG DataLength;      // 4
-	ULONG Sequence;        // 4
+	ULONG Sequence;        // 4  zero-based index within this header region
 } Cdp_JOURNAL_RECORD_HEADER, *PCdp_JOURNAL_RECORD_HEADER;
 
 C_ASSERT(sizeof(Cdp_JOURNAL_RECORD_HEADER) == 32);
@@ -33,15 +32,15 @@ C_ASSERT(sizeof(Cdp_JOURNAL_RECORD_HEADER) == 32);
 // Last 32 bytes of each 2MB header region.
 typedef struct _Cdp_HEADER_REGION_LINK
 {
-	UINT64 Marker;         // must be 0xFF..
 	UINT64 PrevRegionOff;  // previous header region (may be self)
 	UINT64 NextRegionOff;  // next header region (may be self)
-	UINT64 Reserved;
+	UINT64 StartSequence;  // global sequence of header[0]
+	UINT64 Reserved;       // must be zero
 } Cdp_HEADER_REGION_LINK, *PCdp_HEADER_REGION_LINK;
 
 C_ASSERT(sizeof(Cdp_HEADER_REGION_LINK) == 32);
 
-// On-disk layout (v7): one superblock, then alternating header/payload areas.
+// On-disk layout (v8): one superblock, then alternating header/payload areas.
 //   [Superblock]
 //   [HeaderRegion0 2MB][Payload0 ...]
 //   [HeaderRegion1 2MB][Payload1 ...]
@@ -63,6 +62,20 @@ typedef struct _Cdp_JOURNAL_SUPERBLOCK
 
 #pragma pack(pop)
 
+// Decoded runtime/query record. Unlike the on-disk header, Sequence is the
+// 64-bit global value: RegionLink.StartSequence + Header.Sequence.
+typedef struct _Cdp_JOURNAL_RECORD
+{
+	UINT64 WallClock100ns;
+	UINT64 VolumeOffset;
+	UINT64 FileOffset;
+	UINT64 Sequence;
+	ULONG DataLength;
+	ULONG Reserved;
+} Cdp_JOURNAL_RECORD, *PCdp_JOURNAL_RECORD;
+
+C_ASSERT(sizeof(Cdp_JOURNAL_RECORD) == 40);
+
 #define Cdp_JOURNAL_HEADERS_PER_REGION \
 	((Cdp_JOURNAL_HEADER_REGION_SIZE - Cdp_JOURNAL_HEADER_LINK_SIZE) / \
 		sizeof(Cdp_JOURNAL_RECORD_HEADER))
@@ -77,19 +90,25 @@ typedef struct _Cdp_JOURNAL
 	UINT64 PayloadRegionOff;
 
 	UINT64 OldestHeaderRegionOff;
+	UINT64 CurrentHeaderRegionStartSequence;
 	ULONG OldestHeaderIndex;
 	ULONG CurrentHeaderCount;
 	// Transfer size used for a 2MB header region.  Formatting discovers it
 	// from the largest successful write; preview/recovery scans reuse it for
 	// reads instead of issuing one sector read per 32-byte record header.
 	ULONG HeaderRegionWriteChunk;
-	ULONG NextSequence;
+	// Lazily allocated aligned 2MB scan buffer. Journal.Lock serializes all
+	// users; retained across Preview/Recovery builds and freed by Close.
+	PVOID HeaderScanAllocationBase;
+	PUCHAR HeaderScanBuffer;
+	UINT64 NextSequence;
 	UINT64 TotalRecords;
 	UINT64 PayloadBytesUsed;
 	UINT64 RecordGeneration;
 	UINT64 Oldest100ns;
 	UINT64 Newest100ns;
 	BOOLEAN RecoveryPending;
+	BOOLEAN SuperblockDirty;
 	UINT64 RecoveryTargetTime100ns;
 	GUID SourceVolumeGuid;
 #ifndef Cdp_USERMODE
@@ -113,7 +132,8 @@ typedef struct _Cdp_PREVIEW_TREE_NODE
 	UINT64 FileOffset;
 	UINT64 WallClock100ns;
 	ULONG DataLength;
-	ULONG Sequence;
+	UINT64 Sequence;
+	UINT64 MinValidSequence; // subtree minimum Sequence; MAXUINT64 when none
 	LONG Height; // AVL height
 	BOOLEAN Invalid; // Recovery: punched by a newer live write; skip apply/writeback
 	struct _Cdp_PREVIEW_TREE_NODE* Left;
@@ -160,7 +180,7 @@ NTSTATUS CdpJournalAppend(
 	_In_ UINT64 VolumeOffset,
 	_In_ ULONG DataLength,
 	_In_reads_bytes_(DataLength) const VOID* BeforeImage,
-	_Out_opt_ PCdp_JOURNAL_RECORD_HEADER WrittenHeader);
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
 
 NTSTATUS CdpJournalQueryTimeRange(
 	_Inout_ PCdp_JOURNAL Journal,
@@ -168,7 +188,8 @@ NTSTATUS CdpJournalQueryTimeRange(
 	_Out_ PUINT64 NewestTime100ns);
 
 // Payload-space accounting excludes the superblock and active 2MB header
-// regions.  Used payload bytes are sector-aligned on-disk allocations.
+// regions. Used bytes are the occupied ring spans, including any tail gap
+// skipped when a payload allocation wraps to the usable-area start.
 NTSTATUS CdpJournalQueryUsage(
 	_Inout_ PCdp_JOURNAL Journal,
 	_Out_ PUINT64 PartitionBytes,
@@ -177,7 +198,7 @@ NTSTATUS CdpJournalQueryUsage(
 	_Out_ PUINT64 PayloadBytesFree,
 	_Out_ PUINT64 TotalRecords);
 
-// Read retained record headers in chronological order.  Headers contain only
+// Read retained records in chronological order. Records contain only
 // record metadata; callers never receive journal payload data.  The caller
 // can page with StartIndex and must echo Generation after the first page to
 // detect concurrent capture/eviction.
@@ -185,8 +206,8 @@ NTSTATUS CdpJournalQueryRecordHeaders(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 StartIndex,
 	_In_ UINT64 ExpectedGeneration,
-	_Out_writes_to_(HeaderCapacity, *ReturnedCount) PCdp_JOURNAL_RECORD_HEADER Headers,
-	_In_ ULONG HeaderCapacity,
+	_Out_writes_to_(RecordCapacity, *ReturnedCount) PCdp_JOURNAL_RECORD Records,
+	_In_ ULONG RecordCapacity,
 	_Out_ PUINT64 TotalRecords,
 	_Out_ PUINT64 Generation,
 	_Out_ PULONG ReturnedCount);
@@ -194,7 +215,7 @@ NTSTATUS CdpJournalQueryRecordHeaders(
 NTSTATUS CdpJournalBuildPreviewTree(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 TargetTime100ns,
-	_In_ ULONG MaxSequence,
+	_In_ UINT64 MaxSequence,
 	_In_ BOOLEAN IncludeTargetTime,
 	_Out_ PCdp_PREVIEW_TREE Tree);
 
@@ -222,14 +243,13 @@ VOID CdpPreviewTreeFree(_Inout_ PCdp_PREVIEW_TREE Tree);
 
 NTSTATUS CdpPreviewTreeInsert(
 	_Inout_ PCdp_PREVIEW_TREE Tree,
-	_In_ const Cdp_JOURNAL_RECORD_HEADER* Header);
+	_In_ const Cdp_JOURNAL_RECORD* Record);
 
-// Mark overlapping nodes Invalid (no structural delete). Kept for the
-// allocation-failure safety fallback used by recovery writes.
-VOID CdpPreviewTreeInvalidateRange(
+// Mark the node identified by its (unique) volume start invalid and refresh
+// the subtree sequence summaries used by stepped Recovery commit.
+NTSTATUS CdpPreviewTreeMarkInvalidByStart(
 	_Inout_ PCdp_PREVIEW_TREE Tree,
-	_In_ UINT64 VolumeOffset,
-	_In_ ULONG DataLength);
+	_In_ UINT64 VolumeOffset);
 
 // Remove only the intersecting byte range from the history tree.  Remaining
 // left/right fragments keep their original journal payload offsets.
@@ -247,14 +267,5 @@ NTSTATUS CdpPreviewTreeMergeFrom(
 NTSTATUS CdpPreviewTreePunchByStaging(
 	_Inout_ PCdp_PREVIEW_TREE HistoryTree,
 	_Inout_ PCdp_PREVIEW_TREE StagingTree);
-
-// Rebuild Tree so intervals do not overlap: per byte keep earliest Sequence.
-// Drops Invalid nodes. Used after History Punch / Preview Merge.
-NTSTATUS CdpPreviewTreeDedupEarliest(
-	_Inout_ PCdp_PREVIEW_TREE Tree);
-
-// Merge volume-adjacent nodes whose journal payloads are also contiguous.
-NTSTATUS CdpPreviewTreeCoalesceAdjacent(
-	_Inout_ PCdp_PREVIEW_TREE Tree);
 
 VOID CdpJournalClose(_Inout_ PCdp_JOURNAL Journal);

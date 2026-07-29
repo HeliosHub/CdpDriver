@@ -792,7 +792,7 @@ static BOOL DoListJournalRecords(HANDLE hDevice)
 		for (i = 0; i < reply->RecordCount; ++i)
 		{
 			ConOutFmt(
-				L"%5llu  %llu  %llu  %llu  %lu  %lu\n",
+				L"%5llu  %llu  %llu  %llu  %lu  %llu\n",
 				nextIndex + i,
 				records[i].WallClock100ns,
 				records[i].VolumeOffset,

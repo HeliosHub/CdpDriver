@@ -58,14 +58,13 @@ NTSTATUS CdpCoreQueryRecordHeaders(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 StartIndex,
 	_In_ UINT64 ExpectedGeneration,
-	_Out_writes_to_(HeaderCapacity, *ReturnedCount) PCdp_JOURNAL_RECORD_HEADER Headers,
-	_In_ ULONG HeaderCapacity,
+	_Out_writes_to_(RecordCapacity, *ReturnedCount) PCdp_JOURNAL_RECORD Records,
+	_In_ ULONG RecordCapacity,
 	_Out_ PUINT64 TotalRecords,
 	_Out_ PUINT64 Generation,
 	_Out_ PULONG ReturnedCount);
 
 Cdp_CORE_PHASE CdpCoreGetPhase(_In_ PCdp_CORE Core);
-VOID CdpCoreSetPhase(_Inout_ PCdp_CORE Core, _In_ Cdp_CORE_PHASE Phase);
 
 /* Full COW write (before-image + journal + source write). */
 NTSTATUS CdpCoreWrite(
@@ -79,7 +78,7 @@ NTSTATUS CdpCoreCaptureAppend(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
-	_Out_opt_ PCdp_JOURNAL_RECORD_HEADER WrittenHeader);
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
 
 NTSTATUS CdpCoreRead(
 	_Inout_ PCdp_CORE Core,
@@ -105,8 +104,6 @@ NTSTATUS CdpCoreRecoveryCommitStep(
 
 /* Discard a prepared history view without writing back. */
 NTSTATUS CdpCoreRecoveryCancel(_Inout_ PCdp_CORE Core);
-
-VOID CdpCoreSetWritebackActive(_Inout_ PCdp_CORE Core, _In_ LONG Value);
 
 #ifdef Cdp_USERMODE
 typedef void (*Cdp_CORE_TEST_BUILD_HOOK)(_Inout_ struct _Cdp_CORE* Core);

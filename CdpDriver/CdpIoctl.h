@@ -207,11 +207,12 @@ typedef struct _Cdp_JOURNAL_RECORD_INFO
 	UINT64 WallClock100ns;
 	UINT64 VolumeOffset;
 	UINT64 FileOffset;
+	UINT64 Sequence;
 	ULONG DataLength;
-	ULONG Sequence;
+	ULONG Reserved;
 } Cdp_JOURNAL_RECORD_INFO, *PCdp_JOURNAL_RECORD_INFO;
 
-C_ASSERT(sizeof(Cdp_JOURNAL_RECORD_INFO) == 32);
+C_ASSERT(sizeof(Cdp_JOURNAL_RECORD_INFO) == 40);
 
 typedef struct _Cdp_VERSION_REPLY
 {

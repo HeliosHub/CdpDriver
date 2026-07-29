@@ -65,7 +65,7 @@ struct _Cdp_CORE
 	Cdp_PREVIEW_TREE StagingTree;
 	Cdp_LOCK TreeLock;
 	UINT64 TargetTime100ns;
-	ULONG SnapshotMaxSequence;
+	UINT64 SnapshotMaxSequence;
 	LONG Building;
 	LONG WritebackActive;
 	NTSTATUS RecoveryFailureStatus;
@@ -294,8 +294,8 @@ NTSTATUS CdpCoreQueryRecordHeaders(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 StartIndex,
 	_In_ UINT64 ExpectedGeneration,
-	_Out_writes_to_(HeaderCapacity, *ReturnedCount) PCdp_JOURNAL_RECORD_HEADER Headers,
-	_In_ ULONG HeaderCapacity,
+	_Out_writes_to_(RecordCapacity, *ReturnedCount) PCdp_JOURNAL_RECORD Records,
+	_In_ ULONG RecordCapacity,
 	_Out_ PUINT64 TotalRecords,
 	_Out_ PUINT64 Generation,
 	_Out_ PULONG ReturnedCount)
@@ -306,8 +306,8 @@ NTSTATUS CdpCoreQueryRecordHeaders(
 		Core->Journal,
 		StartIndex,
 		ExpectedGeneration,
-		Headers,
-		HeaderCapacity,
+		Records,
+		RecordCapacity,
 		TotalRecords,
 		Generation,
 		ReturnedCount);
@@ -320,21 +320,9 @@ Cdp_CORE_PHASE CdpCoreGetPhase(_In_ PCdp_CORE Core)
 	return (Cdp_CORE_PHASE)Core->Phase;
 }
 
-VOID CdpCoreSetPhase(_Inout_ PCdp_CORE Core, _In_ Cdp_CORE_PHASE Phase)
-{
-	if (Core)
-		Core->Phase = (LONG)Phase;
-}
-
-VOID CdpCoreSetWritebackActive(_Inout_ PCdp_CORE Core, _In_ LONG Value)
-{
-	if (Core)
-		Core->WritebackActive = Value;
-}
-
 static NTSTATUS CdpCoreAfterAppend(
 	_Inout_ PCdp_CORE Core,
-	_In_ const Cdp_JOURNAL_RECORD_HEADER* Hdr,
+	_In_ const Cdp_JOURNAL_RECORD* Record,
 	_In_ UINT64 Offset,
 	_In_ ULONG Length)
 {
@@ -344,12 +332,12 @@ static NTSTATUS CdpCoreAfterAppend(
 		Cdp_LOCK_ACQUIRE(&Core->TreeLock);
 		if (Core->Building)
 		{
-			if (Hdr->Sequence >= Core->SnapshotMaxSequence)
-				(void)CdpPreviewTreeInsert(&Core->StagingTree, Hdr);
+			if (Record->Sequence >= Core->SnapshotMaxSequence)
+				(void)CdpPreviewTreeInsert(&Core->StagingTree, Record);
 		}
 		else
 		{
-			(void)CdpPreviewTreeInsert(&Core->PreviewTree, Hdr);
+			(void)CdpPreviewTreeInsert(&Core->PreviewTree, Record);
 		}
 		Cdp_LOCK_RELEASE(&Core->TreeLock);
 		return STATUS_SUCCESS;
@@ -359,28 +347,28 @@ static NTSTATUS CdpCoreAfterAppend(
 		Cdp_LOCK_ACQUIRE(&Core->TreeLock);
 		if (Core->Building)
 		{
-			if (Hdr->Sequence >= Core->SnapshotMaxSequence)
+			if (Record->Sequence >= Core->SnapshotMaxSequence)
 			{
 				Cdp_RECOVERY_TRACE(
-					"build-time concurrent record seq=%lu volumeOff=%llu len=%lu "
+					"build-time concurrent record seq=%llu volumeOff=%llu len=%lu "
 					"journalOff=%llu -> staging\n",
-					Hdr->Sequence,
+					Record->Sequence,
 					Offset,
 					Length,
-					Hdr->FileOffset);
-				(void)CdpPreviewTreeInsert(&Core->StagingTree, Hdr);
+					Record->FileOffset);
+				(void)CdpPreviewTreeInsert(&Core->StagingTree, Record);
 			}
 		}
 		else
 		{
 			/* Do not overwrite a source range changed after recovery was prepared. */
 			Cdp_RECOVERY_TRACE(
-				"prepared-time concurrent record seq=%lu volumeOff=%llu len=%lu "
+				"prepared-time concurrent record seq=%llu volumeOff=%llu len=%lu "
 				"journalOff=%llu -> punch history range\n",
-				Hdr->Sequence,
+				Record->Sequence,
 				Offset,
 				Length,
-				Hdr->FileOffset);
+				Record->FileOffset);
 			punchStatus = CdpPreviewTreePunchRange(
 				&Core->HistoryTree,
 				Offset,
@@ -388,9 +376,9 @@ static NTSTATUS CdpCoreAfterAppend(
 			if (!NT_SUCCESS(punchStatus))
 			{
 				Cdp_RECOVERY_ERR(
-					"history punch failed seq=%lu volumeOff=%llu len=%lu status=0x%08X; "
+					"history punch failed seq=%llu volumeOff=%llu len=%lu status=0x%08X; "
 					"recovery is failed\n",
-					Hdr->Sequence,
+					Record->Sequence,
 					Offset,
 					Length,
 					punchStatus);
@@ -407,11 +395,11 @@ NTSTATUS CdpCoreCaptureAppend(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
-	_Out_opt_ PCdp_JOURNAL_RECORD_HEADER WrittenHeader)
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord)
 {
 	PUCHAR before = NULL;
 	NTSTATUS status;
-	Cdp_JOURNAL_RECORD_HEADER hdr;
+	Cdp_JOURNAL_RECORD record;
 
 	if (!Core || Length == 0)
 		return STATUS_INVALID_PARAMETER;
@@ -433,7 +421,7 @@ NTSTATUS CdpCoreCaptureAppend(
 			Offset,
 			Length);
 	}
-	status = CdpJournalAppend(Core->Journal, Offset, Length, before, &hdr);
+	status = CdpJournalAppend(Core->Journal, Offset, Length, before, &record);
 	if (!NT_SUCCESS(status))
 	{
 		if (Core->WritebackActive)
@@ -451,20 +439,20 @@ NTSTATUS CdpCoreCaptureAppend(
 	{
 		Cdp_RECOVERY_DBG(
 			"capture journal append end offset=%llu len=%lu "
-			"seq=%lu journalOff=%llu status=0x%08X\n",
+			"seq=%llu journalOff=%llu status=0x%08X\n",
 			Offset,
 			Length,
-			hdr.Sequence,
-			hdr.FileOffset,
+			record.Sequence,
+			record.FileOffset,
 			status);
 	}
 
-	status = CdpCoreAfterAppend(Core, &hdr, Offset, Length);
+	status = CdpCoreAfterAppend(Core, &record, Offset, Length);
 	if (!NT_SUCCESS(status))
 		goto done;
 	Core->Time100ns += 1;
-	if (WrittenHeader)
-		*WrittenHeader = hdr;
+	if (WrittenRecord)
+		*WrittenRecord = record;
 
 done:
 	Cdp_FREE(before);
@@ -478,12 +466,12 @@ NTSTATUS CdpCoreWrite(
 	_In_reads_bytes_(Length) const VOID* Data)
 {
 	NTSTATUS status;
-	Cdp_JOURNAL_RECORD_HEADER hdr;
+	Cdp_JOURNAL_RECORD record;
 
 	if (!Core || !Data || Length == 0)
 		return STATUS_INVALID_PARAMETER;
 
-	status = CdpCoreCaptureAppend(Core, Offset, Length, &hdr);
+	status = CdpCoreCaptureAppend(Core, Offset, Length, &record);
 	if (!NT_SUCCESS(status))
 		return status;
 
@@ -751,240 +739,34 @@ NTSTATUS CdpCorePreviewEnd(_Inout_ PCdp_CORE Core)
 	return STATUS_SUCCESS;
 }
 
-static NTSTATUS CdpCoreWritebackHistory(_Inout_ PCdp_CORE Core)
-{
-	PCdp_PREVIEW_TREE_NODE* all = NULL;
-	ULONG capacity;
-	ULONG count = 0;
-	ULONG i;
-	ULONG writeRuns = 0;
-	UINT64 writeBytes = 0;
-	NTSTATUS status = STATUS_SUCCESS;
-	PCdp_PREVIEW_TREE_NODE stack[64];
-	LONG sp = 0;
-	PCdp_PREVIEW_TREE_NODE cur;
-
-	if (!Core->HistoryTree.Root || Core->HistoryTree.NodeCount == 0)
-	{
-		Cdp_RECOVERY_DBG("writeback skipped: history tree is empty\n");
-		return STATUS_SUCCESS;
-	}
-
-	capacity = Core->HistoryTree.NodeCount;
-	all = (PCdp_PREVIEW_TREE_NODE*)Cdp_ALLOC0(
-		sizeof(PCdp_PREVIEW_TREE_NODE) * capacity);
-	if (!all)
-	{
-		Cdp_RECOVERY_ERR("writeback allocation failed nodes=%lu\n", capacity);
-		return STATUS_INSUFFICIENT_RESOURCES;
-	}
-
-	cur = Core->HistoryTree.Root;
-	while (cur || sp > 0)
-	{
-		while (cur)
-		{
-			if (sp >= 64)
-			{
-				Cdp_RECOVERY_ERR("writeback tree depth exceeds stack nodes=%lu\n",
-					Core->HistoryTree.NodeCount);
-				status = STATUS_INSUFFICIENT_RESOURCES;
-				goto done;
-			}
-			stack[sp++] = cur;
-			cur = cur->Left;
-		}
-		cur = stack[--sp];
-		if (!cur->Invalid && count < capacity)
-			all[count++] = cur;
-		cur = cur->Right;
-	}
-
-	for (i = 1; i < count; ++i)
-	{
-		PCdp_PREVIEW_TREE_NODE key = all[i];
-		ULONG j = i;
-		while (j > 0 && all[j - 1]->Sequence > key->Sequence)
-		{
-			all[j] = all[j - 1];
-			--j;
-		}
-		all[j] = key;
-	}
-
-	Core->WritebackActive = 1;
-	Cdp_RECOVERY_TRACE("writeback begin nodes=%lu\n", count);
-#ifdef Cdp_USERMODE
-	if (g_writebackHook)
-		g_writebackHook(Core);
-#endif
-	for (i = 0; i < count; ++i)
-	{
-		PCdp_PREVIEW_TREE_NODE node = all[i];
-		PUCHAR payload;
-		PUCHAR mask;
-		ULONG idx;
-		ULONG runStart;
-		ULONG a;
-		ULONG nodeWriteRuns = 0;
-		UINT64 nodeWriteBytes = 0;
-
-		if (node->Invalid)
-			continue;
-
-		payload = (PUCHAR)Cdp_ALLOC(node->DataLength);
-		mask = (PUCHAR)Cdp_ALLOC(node->DataLength);
-		if (!payload || !mask)
-		{
-			Cdp_RECOVERY_ERR(
-				"writeback node allocation failed index=%lu seq=%lu offset=%llu len=%lu\n",
-				i,
-				node->Sequence,
-				node->Start,
-				node->DataLength);
-			status = STATUS_INSUFFICIENT_RESOURCES;
-			Cdp_FREE(payload);
-			Cdp_FREE(mask);
-			break;
-		}
-
-		status = CdpJournalReadPayload(
-			Core->Journal,
-			node->FileOffset,
-			node->DataLength,
-			payload);
-		if (!NT_SUCCESS(status))
-		{
-			Cdp_RECOVERY_ERR(
-				"journal payload read failed index=%lu seq=%lu volumeOff=%llu "
-				"journalOff=%llu len=%lu status=0x%08X\n",
-				i,
-				node->Sequence,
-				node->Start,
-				node->FileOffset,
-				node->DataLength,
-				status);
-			Cdp_FREE(payload);
-			Cdp_FREE(mask);
-			break;
-		}
-
-		Cdp_RECOVERY_TRACE(
-			"historyNode index=%lu firstSeq=%lu time=%llu volumeOff=%llu len=%lu "
-			"journalOff=%llu\n",
-			i,
-			node->Sequence,
-			node->WallClock100ns,
-			node->Start,
-			node->DataLength,
-			node->FileOffset);
-
-		RtlFillMemory(mask, node->DataLength, 1);
-		for (a = 0; a < i; ++a)
-		{
-			PCdp_PREVIEW_TREE_NODE an = all[a];
-			UINT64 o0 = an->Start > node->Start ? an->Start : node->Start;
-			UINT64 o1 = an->End < node->End ? an->End : node->End;
-			UINT64 b;
-			if (an->Invalid)
-				continue;
-			for (b = o0; b < o1; ++b)
-				mask[(ULONG)(b - node->Start)] = 0;
-		}
-
-		idx = 0;
-		while (idx < node->DataLength)
-		{
-			while (idx < node->DataLength && mask[idx] == 0)
-				++idx;
-			if (idx >= node->DataLength)
-				break;
-			runStart = idx;
-			while (idx < node->DataLength && mask[idx] != 0)
-				++idx;
-			{
-				ULONG writeOffset = runStart;
-				while (writeOffset < idx)
-				{
-					ULONG writeLength = idx - writeOffset;
-					if (writeLength > Cdp_JOURNAL_MAX_RECORD_DATA)
-						writeLength = Cdp_JOURNAL_MAX_RECORD_DATA;
-
-					status = CdpCoreSourceWriteDirect(
-						Core,
-						node->Start + writeOffset,
-						writeLength,
-						payload + writeOffset);
-					Cdp_RECOVERY_TRACE(
-						"restore recordIndex=%lu seq=%lu volumeOff=%llu len=%lu "
-						"journalOff=%llu status=0x%08X\n",
-						i,
-						node->Sequence,
-						node->Start + writeOffset,
-						writeLength,
-						node->FileOffset + writeOffset,
-						status);
-					if (!NT_SUCCESS(status))
-					{
-						Cdp_RECOVERY_ERR(
-							"source writeback failed index=%lu seq=%lu volumeOff=%llu "
-							"len=%lu journalOff=%llu status=0x%08X\n",
-							i,
-							node->Sequence,
-							node->Start + writeOffset,
-							writeLength,
-							node->FileOffset + writeOffset,
-							status);
-						Cdp_FREE(payload);
-						Cdp_FREE(mask);
-						goto done;
-					}
-					++writeRuns;
-					writeBytes += writeLength;
-					++nodeWriteRuns;
-					nodeWriteBytes += writeLength;
-					writeOffset += writeLength;
-				}
-			}
-		}
-		if (nodeWriteRuns == 0)
-		{
-			Cdp_RECOVERY_TRACE(
-				"skip historyNode=%lu firstSeq=%lu volumeOff=%llu len=%lu reason=covered-by-newer-record\n",
-				i, node->Sequence, node->Start, node->DataLength);
-		}
-		else
-		{
-			Cdp_RECOVERY_TRACE(
-				"historyNode complete index=%lu firstSeq=%lu restoredRuns=%lu restoredBytes=%llu\n",
-				i, node->Sequence, nodeWriteRuns, nodeWriteBytes);
-		}
-		Cdp_FREE(payload);
-		Cdp_FREE(mask);
-	}
-
-done:
-	Core->WritebackActive = 0;
-	Cdp_RECOVERY_TRACE(
-		"writeback end status=0x%08X nodes=%lu runs=%lu bytes=%llu\n",
-		status,
-		count,
-		writeRuns,
-		writeBytes);
-	Cdp_FREE(all);
-	return status;
-}
-
 static PCdp_PREVIEW_TREE_NODE CdpCoreFindEarliestHistoryNode(
-	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
-	_In_opt_ PCdp_PREVIEW_TREE_NODE Best)
+	_In_opt_ PCdp_PREVIEW_TREE_NODE Node)
 {
-	if (!Node)
-		return Best;
-	Best = CdpCoreFindEarliestHistoryNode(Node->Left, Best);
-	if (!Node->Invalid && (!Best || Node->Sequence < Best->Sequence))
-		Best = Node;
-	return CdpCoreFindEarliestHistoryNode(Node->Right, Best);
+	UINT64 targetSequence;
+
+	if (!Node || Node->MinValidSequence == MAXUINT64)
+		return NULL;
+	targetSequence = Node->MinValidSequence;
+
+	while (Node)
+	{
+		if (Node->Left &&
+			Node->Left->MinValidSequence == targetSequence)
+		{
+			Node = Node->Left;
+			continue;
+		}
+		if (!Node->Invalid && Node->Sequence == targetSequence)
+			return Node;
+		if (Node->Right &&
+			Node->Right->MinValidSequence == targetSequence)
+		{
+			Node = Node->Right;
+			continue;
+		}
+		break;
+	}
+	return NULL;
 }
 
 NTSTATUS CdpCoreRecoveryCommitStep(
@@ -1007,7 +789,7 @@ NTSTATUS CdpCoreRecoveryCommitStep(
 
 	*Complete = FALSE;
 	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
-	node = CdpCoreFindEarliestHistoryNode(Core->HistoryTree.Root, NULL);
+	node = CdpCoreFindEarliestHistoryNode(Core->HistoryTree.Root);
 	if (!node)
 	{
 		CdpPreviewTreeFree(&Core->HistoryTree);
@@ -1035,7 +817,7 @@ NTSTATUS CdpCoreRecoveryCommitStep(
 
 	Core->WritebackActive = 1;
 	Cdp_RECOVERY_TRACE(
-		"commit step seq=%lu volumeOff=%llu len=%lu journalOff=%llu\n",
+		"commit step seq=%llu volumeOff=%llu len=%lu journalOff=%llu\n",
 		node->Sequence, node->Start, node->DataLength, node->FileOffset);
 	while (writeOffset < node->DataLength)
 	{
@@ -1048,7 +830,7 @@ NTSTATUS CdpCoreRecoveryCommitStep(
 			writeLength,
 			payload + writeOffset);
 		Cdp_RECOVERY_TRACE(
-			"restore seq=%lu volumeOff=%llu len=%lu journalOff=%llu status=0x%08X\n",
+			"restore seq=%llu volumeOff=%llu len=%lu journalOff=%llu status=0x%08X\n",
 			node->Sequence,
 			node->Start + writeOffset,
 			writeLength,
@@ -1063,11 +845,17 @@ NTSTATUS CdpCoreRecoveryCommitStep(
 	if (NT_SUCCESS(status))
 	{
 		Cdp_LOCK_ACQUIRE(&Core->TreeLock);
-		node->Invalid = TRUE;
+		status = CdpPreviewTreeMarkInvalidByStart(
+			&Core->HistoryTree, node->Start);
+		if (!NT_SUCCESS(status))
+			Core->RecoveryFailureStatus = status;
 		Cdp_LOCK_RELEASE(&Core->TreeLock);
-		Cdp_RECOVERY_TRACE(
-			"commit step complete seq=%lu runs=%lu bytes=%lu\n",
-			node->Sequence, writeRuns, node->DataLength);
+		if (NT_SUCCESS(status))
+		{
+			Cdp_RECOVERY_TRACE(
+				"commit step complete seq=%llu runs=%lu bytes=%lu\n",
+				node->Sequence, writeRuns, node->DataLength);
+		}
 	}
 
 done:
@@ -1091,7 +879,7 @@ NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100n
 	Core->TargetTime100ns = TargetTime100ns;
 	Core->SnapshotMaxSequence = Core->Journal->NextSequence;
 	Cdp_RECOVERY_TRACE(
-		"begin target=%llu snapshotMaxSeq=%lu records=%llu range=[%llu,%llu]\n",
+		"begin target=%llu snapshotMaxSeq=%llu records=%llu range=[%llu,%llu]\n",
 		TargetTime100ns,
 		Core->SnapshotMaxSequence,
 		Core->Journal->TotalRecords,
@@ -1145,7 +933,8 @@ NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100n
 
 NTSTATUS CdpCoreRecoveryCommit(_Inout_ PCdp_CORE Core)
 {
-	NTSTATUS status;
+	NTSTATUS status = STATUS_SUCCESS;
+	BOOLEAN complete = FALSE;
 
 	if (!Core || Core->Phase != Cdp_CORE_PHASE_RECOVERY || Core->Building)
 		return STATUS_INVALID_DEVICE_STATE;
@@ -1160,25 +949,27 @@ NTSTATUS CdpCoreRecoveryCommit(_Inout_ PCdp_CORE Core)
 		"commit begin target=%llu nodes=%lu\n",
 		Core->TargetTime100ns,
 		Core->HistoryTree.NodeCount);
-	status = CdpCoreWritebackHistory(Core);
-	if (!NT_SUCCESS(status))
+#ifdef Cdp_USERMODE
+	if (g_writebackHook)
 	{
-		Cdp_RECOVERY_TRACE(
-			"commit failed status=0x%08X; remaining in Recovery\n",
-			status);
-		return status;
+		Core->WritebackActive = 1;
+		g_writebackHook(Core);
+		Core->WritebackActive = 0;
 	}
+#endif
 
-	CdpPreviewTreeFree(&Core->HistoryTree);
-	CdpPreviewTreeFree(&Core->StagingTree);
-	CdpPreviewTreeInitialize(&Core->HistoryTree);
-	CdpPreviewTreeInitialize(&Core->StagingTree);
-	Core->TargetTime100ns = 0;
-	Core->SnapshotMaxSequence = 0;
-	Core->RecoveryFailureStatus = STATUS_SUCCESS;
-	Core->Phase = Cdp_CORE_PHASE_GENERAL;
-	Cdp_RECOVERY_TRACE("commit complete -> normal\n");
-	return STATUS_SUCCESS;
+	while (!complete)
+	{
+		status = CdpCoreRecoveryCommitStep(Core, &complete);
+		if (!NT_SUCCESS(status))
+		{
+			Cdp_RECOVERY_TRACE(
+				"commit failed status=0x%08X; remaining in Recovery\n",
+				status);
+			return status;
+		}
+	}
+	return status;
 }
 
 NTSTATUS CdpCoreRecoveryCancel(_Inout_ PCdp_CORE Core)

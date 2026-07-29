@@ -28,7 +28,7 @@ Windows 卷过滤驱动：对受保护卷做 **写前镜像（COW）**，把被�
 
 ## 项目状态
 
-当前实现：**COW Journal v7**（单 Superblock + 2MB 头区/负载区交替）+ Preview + Recovery 阶段机。Superblock 持久化源卷 GUID，驱动重启后会自动识别日志卷并恢复 CDP 绑定。
+当前实现：**COW Journal v8**（单 Superblock + 2MB 头区/负载区交替）+ Preview + Recovery 阶段机。Superblock 持久化源卷 GUID，驱动重启后会自动识别日志卷并恢复 CDP 绑定。
 
 ## 依赖
 
@@ -99,7 +99,7 @@ Phase，此时不回填且允许新写入；新写入覆盖的历史范围会失
 
 ## 已知限制
 
-- Journal 格式变更（当前 v7，单 Superblock + 源卷 GUID）后需重新 Format；v6 分区不能直接挂载
+- Journal 格式变更（当前 v8，RegionLink 保存 64 位 `StartSequence`）后需重新 Format；v7 及更早分区不能直接挂载
 - 全局仅一个 Preview 会话
 - Recovery Commit 是同步物理回填，执行期间可能阻塞源卷写入
 - Recovery 阶段的 Paging I/O 当前仍透传到 live source，并输出诊断日志

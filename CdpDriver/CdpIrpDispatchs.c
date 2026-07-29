@@ -2149,10 +2149,10 @@ static NTSTATUS CdpQueryJournalRecords(
 	_In_ ULONG RecordCapacity)
 {
 	PCdp_DEVICE_EXTENSION sourceExt;
-	PCdp_JOURNAL_RECORD_HEADER headers;
+	PCdp_JOURNAL_RECORD records;
 
 	C_ASSERT(sizeof(Cdp_JOURNAL_RECORD_INFO) ==
-		sizeof(Cdp_JOURNAL_RECORD_HEADER));
+		sizeof(Cdp_JOURNAL_RECORD));
 	RtlZeroMemory(Reply, sizeof(*Reply));
 	sourceExt = CdpFindSourceExtensionByGuid(
 		DriverExt,
@@ -2170,12 +2170,12 @@ static NTSTATUS CdpQueryJournalRecords(
 	if (RecordCapacity > Cdp_JOURNAL_RECORD_QUERY_MAX_PER_CALL)
 		RecordCapacity = Cdp_JOURNAL_RECORD_QUERY_MAX_PER_CALL;
 
-	headers = (PCdp_JOURNAL_RECORD_HEADER)(Reply + 1);
+	records = (PCdp_JOURNAL_RECORD)(Reply + 1);
 	return CdpCoreQueryRecordHeaders(
 		sourceExt->Core,
 		Request->StartIndex,
 		Request->ExpectedGeneration,
-		headers,
+		records,
 		RecordCapacity,
 		&Reply->TotalRecords,
 		&Reply->Generation,
@@ -2538,7 +2538,7 @@ static NTSTATUS CdpCaptureBeforeImage(
 	UINT64 offset = (UINT64)irpSp->Parameters.Write.ByteOffset.QuadPart;
 	ULONG remaining = irpSp->Parameters.Write.Length;
 	NTSTATUS status = STATUS_SUCCESS;
-	Cdp_JOURNAL_RECORD_HEADER writtenHdr;
+	Cdp_JOURNAL_RECORD writtenRecord;
 	BOOLEAN seqLogged = FALSE;
 
 	UNREFERENCED_PARAMETER(DriverExt);
@@ -2557,7 +2557,7 @@ static NTSTATUS CdpCaptureBeforeImage(
 		ULONG chunk = remaining > Cdp_JOURNAL_MAX_RECORD_DATA ?
 			Cdp_JOURNAL_MAX_RECORD_DATA : remaining;
 
-		status = CdpCoreCaptureAppend(SourceExt->Core, offset, chunk, &writtenHdr);
+		status = CdpCoreCaptureAppend(SourceExt->Core, offset, chunk, &writtenRecord);
 		if (!NT_SUCCESS(status))
 		{
 			Cdp_LOG("[COW] core capture failed status=0x%08X offset=%llu len=%lu\n",
@@ -2567,8 +2567,8 @@ static NTSTATUS CdpCaptureBeforeImage(
 		if (!seqLogged)
 		{
 			// Print journal record Sequence once per before-image capture.
-			Cdp_DBG("[COW] journal seq=%lu offset=%llu len=%lu\n",
-				writtenHdr.Sequence, offset, chunk);
+			Cdp_DBG("[COW] journal seq=%llu offset=%llu len=%lu\n",
+				writtenRecord.Sequence, offset, chunk);
 			seqLogged = TRUE;
 		}
 		Cdp_DBG("[COW] core capture ok offset=%llu len=%lu\n", offset, chunk);
