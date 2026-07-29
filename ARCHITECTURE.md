@@ -162,9 +162,10 @@ CMD1 参数：`PartitionGuid1`（源卷）、`PartitionGuid2`（journal 分区�
 
 1. Preview / Recovery 依赖 journal 中有足够历史；journal Format 后历史清空。
 2. 全局仅允许一个 Preview 会话。
-3. Recovery Commit 是同步物理回填；`HistoryMutex` 只按单个回填节点持有并在节点之间释放，新写可与 Commit 交替执行。
-4. Recovery 阶段的 Paging I/O 当前仍透传 live source；驱动会打印
-   `[RECOVERY] paging read bypass` 诊断日志，后续需决定安全的历史合成策略。
+3. journal 空间不足时整体淘汰最旧 HeaderRegion，而不是逐条淘汰 record；一个区域内尚存的历史会一起失效。
+4. Recovery Begin 构建历史视图期间排队源卷应用层读写；扫描时间较长时会增加开始阶段的 I/O 延迟。
+5. Recovery Commit 对调用方同步；`HistoryMutex` 只按单个回填节点持有并在节点之间释放，新写可与 Commit 交替执行，但两者仍会竞争源卷和 journal I/O 带宽。
+6. Recovery 阶段的 Paging I/O 由工作线程合成历史视图；若 MDL 无法安全映射，则对应 I/O 返回失败，不会绕过历史视图读取 live source。
 
 ## 未来规划
 

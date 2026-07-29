@@ -101,8 +101,10 @@ Phase，此时不回填且允许新写入；新写入覆盖的历史范围会失
 
 - Journal 格式变更（当前 v8，RegionLink 保存 64 位 `StartSequence`）后需重新 Format；v7 及更早分区不能直接挂载
 - 全局仅一个 Preview 会话
-- Recovery Commit 是同步物理回填，执行期间可能阻塞源卷写入
-- Recovery 阶段的 Paging I/O 当前仍透传到 live source，并输出诊断日志
+- 可恢复时间窗口取决于 journal 容量；空间不足时会整体淘汰最旧 HeaderRegion，而不是逐条淘汰 record，因此保留粒度较粗
+- Recovery Begin 构建历史视图期间会排队该源卷的应用层读写；journal 较大、历史记录较多时，开始阶段可能产生可感知的 I/O 延迟
+- Recovery Commit 对发起命令的调用方是同步操作；回填锁按单个 history 节点获取和释放，新写可在节点之间进入并使重叠历史区间失效，但回填仍会占用源卷和 journal 的 I/O 带宽
+- Recovery 阶段的 Paging I/O 通过工作线程执行历史视图合成，不再直接透传 live source；该路径依赖可安全映射的 MDL，映射失败时对应 I/O 会失败
 
 ## 版权与许可
 

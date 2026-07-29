@@ -1039,10 +1039,7 @@ static NTSTATUS CdpJournalAllocateHeaderRegionLocked(
 		return status;
 
 	Journal->LastHeaderRegionOff = candidate;
-<<<<<<< HEAD
 	Journal->CurrentHeaderRegionStartSequence = Journal->NextSequence;
-=======
->>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 	Journal->SuperblockDirty = TRUE;
 	Journal->CurrentHeaderCount = 0;
 	// Payload for this header region starts immediately after it.
@@ -1058,11 +1055,8 @@ static NTSTATUS CdpJournalRebuildRuntimeLocked(_Inout_ PCdp_JOURNAL Journal)
 	UINT64 oldestOff;
 	ULONG guard = 0;
 	Cdp_HEADER_REGION_LINK link;
-<<<<<<< HEAD
 	UINT64 expectedSequence = 0;
 	BOOLEAN haveExpectedSequence = FALSE;
-=======
->>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 	NTSTATUS status = STATUS_SUCCESS;
 	PUCHAR region = NULL;
 
@@ -1684,7 +1678,6 @@ NTSTATUS CdpJournalAppend(
 	}
 
 	if (Journal->SuperblockDirty)
-<<<<<<< HEAD
 	{
 		// Make the new region, link, payload and record header durable before
 		// publishing the region through the superblock.
@@ -1698,11 +1691,6 @@ NTSTATUS CdpJournalAppend(
 	{
 		status = CdpJournalFlush(Journal);
 	}
-=======
-		status = CdpJournalWriteSuperblockLocked(Journal);
-	if (NT_SUCCESS(status))
-		status = CdpJournalFlush(Journal);
->>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 
 cleanup:
 	if (allocationBase)
@@ -2136,7 +2124,6 @@ static NTSTATUS CdpPreviewTreeInsertRaw(
 		return STATUS_INSUFFICIENT_RESOURCES;
 
 	RtlZeroMemory(node, sizeof(*node));
-<<<<<<< HEAD
 	node->Start = Record->VolumeOffset;
 	node->End = Record->VolumeOffset + Record->DataLength;
 	node->MaxEnd = node->End;
@@ -2145,16 +2132,6 @@ static NTSTATUS CdpPreviewTreeInsertRaw(
 	node->DataLength = Record->DataLength;
 	node->Sequence = Record->Sequence;
 	node->MinValidSequence = Record->Sequence;
-=======
-	node->Start = Header->VolumeOffset;
-	node->End = Header->VolumeOffset + Header->DataLength;
-	node->MaxEnd = node->End;
-	node->FileOffset = Header->FileOffset;
-	node->WallClock100ns = Header->WallClock100ns;
-	node->DataLength = Header->DataLength;
-	node->Sequence = Header->Sequence;
-	node->MinValidSequence = Header->Sequence;
->>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 	node->Height = 1;
 	node->Invalid = FALSE;
 
@@ -2293,11 +2270,7 @@ static NTSTATUS CdpPreviewTreeRemoveRangeInPlace(
 	{
 		PCdp_PREVIEW_TREE_NODE overlap = CdpPreviewTreeFindFirstOverlap(
 			Tree->Root, CutStart, CutEnd);
-<<<<<<< HEAD
 		Cdp_JOURNAL_RECORD saved;
-=======
-		Cdp_JOURNAL_RECORD_HEADER saved;
->>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 		BOOLEAN removed = FALSE;
 
 		if (!overlap)
@@ -2317,11 +2290,7 @@ static NTSTATUS CdpPreviewTreeRemoveRangeInPlace(
 
 		if (saved.VolumeOffset < CutStart)
 		{
-<<<<<<< HEAD
 			Cdp_JOURNAL_RECORD left = saved;
-=======
-			Cdp_JOURNAL_RECORD_HEADER left = saved;
->>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 			left.DataLength = (ULONG)(CutStart - saved.VolumeOffset);
 			status = CdpPreviewTreeInsertRaw(Tree, &left);
 			if (!NT_SUCCESS(status))
@@ -2329,11 +2298,7 @@ static NTSTATUS CdpPreviewTreeRemoveRangeInPlace(
 		}
 		if (saved.VolumeOffset + saved.DataLength > CutEnd)
 		{
-<<<<<<< HEAD
 			Cdp_JOURNAL_RECORD right = saved;
-=======
-			Cdp_JOURNAL_RECORD_HEADER right = saved;
->>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 			right.VolumeOffset = CutEnd;
 			right.FileOffset = saved.FileOffset +
 				(CutEnd - saved.VolumeOffset);
@@ -2346,31 +2311,6 @@ static NTSTATUS CdpPreviewTreeRemoveRangeInPlace(
 	}
 	return STATUS_SUCCESS;
 }
-<<<<<<< HEAD
-=======
-
-// Build scans journal headers newest-to-oldest.  A newly scanned header is
-// therefore an earlier before-image and must replace newer overlapping bytes.
-// Remove overlaps in-place, preserve their non-overlapping fragments, then
-// insert the complete earlier header.  No header array or tree-wide rebuild.
-static NTSTATUS CdpPreviewTreeOverlayEarlier(
-	_Inout_ PCdp_PREVIEW_TREE Tree,
-	_In_ const Cdp_JOURNAL_RECORD_HEADER* Header)
-{
-	NTSTATUS status;
-	UINT64 cutEnd;
-
-	if (!Tree || !Header || Header->DataLength == 0 ||
-		Header->VolumeOffset > MAXUINT64 - Header->DataLength)
-	{
-		return STATUS_INVALID_PARAMETER;
-	}
-	cutEnd = Header->VolumeOffset + Header->DataLength;
-	status = CdpPreviewTreeRemoveRangeInPlace(
-		Tree, Header->VolumeOffset, cutEnd);
-	if (!NT_SUCCESS(status))
-		return status;
->>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 
 // Build scans journal headers newest-to-oldest.  A newly scanned header is
 // therefore an earlier before-image and must replace newer overlapping bytes.
@@ -2430,44 +2370,25 @@ static VOID CdpBitmapSetRange(
 
 NTSTATUS CdpPreviewTreeInsert(
 	_Inout_ PCdp_PREVIEW_TREE Tree,
-<<<<<<< HEAD
 	_In_ const Cdp_JOURNAL_RECORD* Record)
-=======
-	_In_ const Cdp_JOURNAL_RECORD_HEADER* Header)
->>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 {
 	UINT64 cursor;
 	UINT64 end;
 	NTSTATUS status = STATUS_SUCCESS;
 
-<<<<<<< HEAD
 	if (!Tree || !Record)
 		return STATUS_INVALID_PARAMETER;
 	if (Record->DataLength == 0)
 		return STATUS_SUCCESS;
 	if (Record->VolumeOffset > MAXUINT64 - Record->DataLength)
-=======
-	if (!Tree || !Header)
-		return STATUS_INVALID_PARAMETER;
-	if (Header->DataLength == 0)
-		return STATUS_SUCCESS;
-	if (Header->VolumeOffset > MAXUINT64 - Header->DataLength)
->>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 		return STATUS_INVALID_PARAMETER;
 
 	// Empty tree: raw insert.
 	if (!Tree->Root)
-<<<<<<< HEAD
 		return CdpPreviewTreeInsertRaw(Tree, Record);
 
 	cursor = Record->VolumeOffset;
 	end = cursor + Record->DataLength;
-=======
-		return CdpPreviewTreeInsertRaw(Tree, Header);
-
-	cursor = Header->VolumeOffset;
-	end = cursor + Header->DataLength;
->>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 	while (cursor < end)
 	{
 		PCdp_PREVIEW_TREE_NODE overlap = CdpPreviewTreeFindFirstOverlap(
@@ -2477,17 +2398,10 @@ NTSTATUS CdpPreviewTreeInsert(
 
 		if (!overlap)
 		{
-<<<<<<< HEAD
 			Cdp_JOURNAL_RECORD frag = *Record;
 			frag.VolumeOffset = cursor;
 			frag.FileOffset = Record->FileOffset +
 				(cursor - Record->VolumeOffset);
-=======
-			Cdp_JOURNAL_RECORD_HEADER frag = *Header;
-			frag.VolumeOffset = cursor;
-			frag.FileOffset = Header->FileOffset +
-				(cursor - Header->VolumeOffset);
->>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 			frag.DataLength = (ULONG)(end - cursor);
 			status = CdpPreviewTreeInsertRaw(Tree, &frag);
 			break;
@@ -2499,19 +2413,11 @@ NTSTATUS CdpPreviewTreeInsert(
 		overlapEnd = overlap->End;
 		if (overlapStart > cursor)
 		{
-<<<<<<< HEAD
 			Cdp_JOURNAL_RECORD frag = *Record;
 			UINT64 gapEnd = overlapStart < end ? overlapStart : end;
 			frag.VolumeOffset = cursor;
 			frag.FileOffset = Record->FileOffset +
 				(cursor - Record->VolumeOffset);
-=======
-			Cdp_JOURNAL_RECORD_HEADER frag = *Header;
-			UINT64 gapEnd = overlapStart < end ? overlapStart : end;
-			frag.VolumeOffset = cursor;
-			frag.FileOffset = Header->FileOffset +
-				(cursor - Header->VolumeOffset);
->>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 			frag.DataLength = (ULONG)(gapEnd - cursor);
 			status = CdpPreviewTreeInsertRaw(Tree, &frag);
 			if (!NT_SUCCESS(status))
@@ -2653,11 +2559,7 @@ typedef struct _Cdp_PREVIEW_HIT
 	UINT64 End;
 	UINT64 FileOffset;
 	ULONG DataLength;
-<<<<<<< HEAD
 	UINT64 Sequence;
-=======
-	ULONG Sequence;
->>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 } Cdp_PREVIEW_HIT, *PCdp_PREVIEW_HIT;
 
 static ULONG CdpPreviewTreeCountOverlaps(
@@ -2747,15 +2649,9 @@ NTSTATUS CdpPreviewTreePunchRange(
 }
 
 NTSTATUS CdpJournalBuildPreviewTree(
-<<<<<<< HEAD
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 TargetTime100ns,
 	_In_ UINT64 MaxSequence,
-=======
-	_Inout_ PCdp_JOURNAL Journal,
-	_In_ UINT64 TargetTime100ns,
-	_In_ ULONG MaxSequence,
->>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 	_In_ BOOLEAN IncludeTargetTime,
 	_Out_ PCdp_PREVIEW_TREE Tree)
 {
@@ -2978,11 +2874,7 @@ NTSTATUS CdpJournalApplyPreviewTree(
 		ULONG copyLength;
 
 		Cdp_JOURNAL_DIAG(
-<<<<<<< HEAD
 			"hit begin index=%lu/%lu seq=%llu node=[%llu,%llu) "
-=======
-			"hit begin index=%lu/%lu seq=%lu node=[%llu,%llu) "
->>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 			"dataLen=%lu fileOff=%llu\n",
 			i,
 			hitCount,
