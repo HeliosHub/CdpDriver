@@ -28,7 +28,7 @@ Windows 卷过滤驱动：对受保护卷做 **写前镜像（COW）**，把被�
 
 ## 项目状态
 
-当前实现：**COW Journal v8**（单 Superblock + 2MB 头区/负载区交替）+ Preview + Recovery 阶段机。Superblock 持久化源卷 GUID，驱动重启后会自动识别日志卷并恢复 CDP 绑定。
+当前实现：**COW Journal v9**（单 Superblock + 1MB 头区/负载区交替）+ Preview + Recovery 阶段机。Superblock 持久化源卷 GUID，驱动重启后会自动识别日志卷并恢复 CDP 绑定。
 
 ## 依赖
 
@@ -68,6 +68,7 @@ Windows 卷过滤驱动：对受保护卷做 **写前镜像（COW）**，把被�
     - `4` / `3` / `5` — 打开卷句柄 / 按句柄读扇区 / 关闭句柄（单次读最大 2MB）
     - `6` / `7` / `8` — Preview 开始 / 读（单次最大 2MB）/ 结束
     - `9` — 查询 journal 最早/最新 COW 记录时间（需已 CMD1 配置捕获）
+    - `t` — 将本地时间 `年-月-日 时:分:秒` 转换为 Preview/Recovery 使用的 `WallClock100ns` 整数
     - `e` — 按目标 FILETIME 准备 Recovery 历史视图，不回填
     - `r` — 同步提交已准备的 Recovery，回填完成后自动回到 Normal
     - `c` — 取消已准备的 Recovery，不回填
@@ -99,7 +100,8 @@ Phase，此时不回填且允许新写入；新写入覆盖的历史范围会失
 
 ## 已知限制
 
-- Journal 格式变更（当前 v8，RegionLink 保存 64 位 `StartSequence`）后需重新 Format；v7 及更早分区不能直接挂载
+- 当前开发格式为 Journal v9，HeaderRegion 固定为 1MB；不提供旧开发格式的兼容或迁移
+- 单个 PayloadRegion 的跨度上限按日志卷容量的 1/10 控制；达到阈值会提前切换 HeaderRegion，因此 HeaderRegion 可能未写满
 - 全局仅一个 Preview 会话
 - 可恢复时间窗口取决于 journal 容量；空间不足时会整体淘汰最旧 HeaderRegion，而不是逐条淘汰 record，因此保留粒度较粗
 - Recovery Begin 构建历史视图期间会排队该源卷的应用层读写；journal 较大、历史记录较多时，开始阶段可能产生可感知的 I/O 延迟

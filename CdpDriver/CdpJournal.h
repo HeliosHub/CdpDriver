@@ -9,15 +9,16 @@
 #endif
 
 #define Cdp_JOURNAL_MAGIC            0x4C4E4A51UL /* 'QJNL' */
-#define Cdp_JOURNAL_VERSION          8UL
+#define Cdp_JOURNAL_VERSION          9UL
 #define Cdp_JOURNAL_MAX_RECORD_DATA  (2UL * 1024UL * 1024UL)
-#define Cdp_JOURNAL_HEADER_REGION_SIZE (2UL * 1024UL * 1024UL)
+#define Cdp_JOURNAL_HEADER_REGION_SIZE (1UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_LINK_SIZE 32UL
+#define Cdp_JOURNAL_PAYLOAD_REGION_CAPACITY_DIVISOR 10ULL
 #define Cdp_JOURNAL_FLAG_RECOVERY_PENDING 0x00000001UL
 
 #pragma pack(push, 1)
 
-// Per-record header stored in 2MB header regions (32 bytes).
+// Per-record header stored in 1MB header regions (32 bytes).
 typedef struct _Cdp_JOURNAL_RECORD_HEADER
 {
 	UINT64 WallClock100ns; // 8  local wall-clock 100ns (FILETIME epoch)
@@ -29,7 +30,7 @@ typedef struct _Cdp_JOURNAL_RECORD_HEADER
 
 C_ASSERT(sizeof(Cdp_JOURNAL_RECORD_HEADER) == 32);
 
-// Last 32 bytes of each 2MB header region.
+// Last 32 bytes of each 1MB header region.
 typedef struct _Cdp_HEADER_REGION_LINK
 {
 	UINT64 PrevRegionOff;  // previous header region (may be self)
@@ -40,10 +41,10 @@ typedef struct _Cdp_HEADER_REGION_LINK
 
 C_ASSERT(sizeof(Cdp_HEADER_REGION_LINK) == 32);
 
-// On-disk layout (v8): one superblock, then alternating header/payload areas.
+// On-disk layout (v9): one superblock, then alternating header/payload areas.
 //   [Superblock]
-//   [HeaderRegion0 2MB][Payload0 ...]
-//   [HeaderRegion1 2MB][Payload1 ...]
+//   [HeaderRegion0 1MB][Payload0 ...]
+//   [HeaderRegion1 1MB][Payload1 ...]
 //   ...
 typedef struct _Cdp_JOURNAL_SUPERBLOCK
 {
@@ -52,10 +53,10 @@ typedef struct _Cdp_JOURNAL_SUPERBLOCK
 	ULONG SectorSize;
 	ULONG Flags;
 	UINT64 PartitionSize;
-	UINT64 LastHeaderRegionOff; // newest 2MB header region
+	UINT64 LastHeaderRegionOff; // newest 1MB header region
 	GUID SourceVolumeGuid;
 	ULONG Crc32c;
-	// Kept after the legacy CRC so existing formatted journals remain mountable.
+	// Kept after the legacy CRC to preserve the superblock field ordering.
 	UINT64 RecoveryTargetTime100ns;
 	ULONG RecoveryCrc32c;
 } Cdp_JOURNAL_SUPERBLOCK, *PCdp_JOURNAL_SUPERBLOCK;
@@ -80,6 +81,8 @@ C_ASSERT(sizeof(Cdp_JOURNAL_RECORD) == 40);
 	((Cdp_JOURNAL_HEADER_REGION_SIZE - Cdp_JOURNAL_HEADER_LINK_SIZE) / \
 		sizeof(Cdp_JOURNAL_RECORD_HEADER))
 
+C_ASSERT(Cdp_JOURNAL_HEADERS_PER_REGION == 32767);
+
 typedef struct _Cdp_JOURNAL
 {
 	BOOLEAN Mounted;
@@ -93,11 +96,11 @@ typedef struct _Cdp_JOURNAL
 	UINT64 CurrentHeaderRegionStartSequence;
 	ULONG OldestHeaderIndex;
 	ULONG CurrentHeaderCount;
-	// Transfer size used for a 2MB header region.  Formatting discovers it
+	// Transfer size used for a 1MB header region. Formatting discovers it
 	// from the largest successful write; preview/recovery scans reuse it for
 	// reads instead of issuing one sector read per 32-byte record header.
 	ULONG HeaderRegionWriteChunk;
-	// Lazily allocated aligned 2MB scan buffer. Journal.Lock serializes all
+	// Lazily allocated aligned 1MB scan buffer. Journal.Lock serializes all
 	// users; retained across Preview/Recovery builds and freed by Close.
 	PVOID HeaderScanAllocationBase;
 	PUCHAR HeaderScanBuffer;
@@ -187,7 +190,7 @@ NTSTATUS CdpJournalQueryTimeRange(
 	_Out_ PUINT64 OldestTime100ns,
 	_Out_ PUINT64 NewestTime100ns);
 
-// Payload-space accounting excludes the superblock and active 2MB header
+// Payload-space accounting excludes the superblock and active 1MB header
 // regions. Used bytes are the occupied ring spans, including any tail gap
 // skipped when a payload allocation wraps to the usable-area start.
 NTSTATUS CdpJournalQueryUsage(

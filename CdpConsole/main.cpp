@@ -334,6 +334,69 @@ static void PrintTime100nsLabel(_In_ const wchar_t* label, _In_ UINT64 time100ns
 	}
 }
 
+static BOOL DoConvertLocalTimeTo100ns(void)
+{
+	wchar_t line[128];
+	wchar_t extra = L'\0';
+	SYSTEMTIME st = { 0 };
+	SYSTEMTIME verify = { 0 };
+	FILETIME ft = { 0 };
+	ULARGE_INTEGER value;
+	unsigned year;
+	unsigned month;
+	unsigned day;
+	unsigned hour;
+	unsigned minute;
+	unsigned second;
+	int fields;
+
+	ConOut(L"Local time (year-month-day hour:minute:second): ");
+	if (!ReadLine(line, _countof(line)))
+		return FALSE;
+
+	fields = swscanf_s(
+		line,
+		L" %u-%u-%u %u:%u:%u %c",
+		&year,
+		&month,
+		&day,
+		&hour,
+		&minute,
+		&second,
+		&extra,
+		(unsigned)1);
+	if (fields != 6 || year > 0xFFFFU || month > 0xFFFFU ||
+		day > 0xFFFFU || hour > 0xFFFFU || minute > 0xFFFFU ||
+		second > 0xFFFFU)
+	{
+		ConOut(L"Invalid time. Expected: year-month-day hour:minute:second\n");
+		return FALSE;
+	}
+	st.wYear = (WORD)year;
+	st.wMonth = (WORD)month;
+	st.wDay = (WORD)day;
+	st.wHour = (WORD)hour;
+	st.wMinute = (WORD)minute;
+	st.wSecond = (WORD)second;
+	if (!SystemTimeToFileTime(&st, &ft) ||
+		!FileTimeToSystemTime(&ft, &verify) ||
+		verify.wYear != st.wYear ||
+		verify.wMonth != st.wMonth ||
+		verify.wDay != st.wDay ||
+		verify.wHour != st.wHour ||
+		verify.wMinute != st.wMinute ||
+		verify.wSecond != st.wSecond)
+	{
+		ConOut(L"Invalid time. Expected: year-month-day hour:minute:second\n");
+		return FALSE;
+	}
+
+	value.LowPart = ft.dwLowDateTime;
+	value.HighPart = ft.dwHighDateTime;
+	ConOutFmt(L"WallClock100ns: %llu\n", value.QuadPart);
+	return TRUE;
+}
+
 static BOOL DoPreviewBegin(HANDLE hDevice)
 {
 	Cdp_PREVIEW_BEGIN_REQUEST req = { 0 };
@@ -902,6 +965,7 @@ static void PrintHelp(void)
 	ConOut(L"  c  - cancel prepared recovery without writeback\n");
 	ConOut(L"  v  - list volumes\n");
 	ConOut(L"  d  - query driver version / build / journal version\n");
+	ConOut(L"  t  - convert local time (year-month-day hour:minute:second) to WallClock100ns\n");
 	ConOut(L"  h  - help\n");
 	ConOut(L"  q  - quit console (does not stop CDP)\n");
 	PrintMaxReadHint();
@@ -1027,6 +1091,10 @@ int wmain(void)
 			hDevice = EnsureControlDevice(hDevice);
 			if (hDevice != INVALID_HANDLE_VALUE)
 				DoQueryVersion(hDevice);
+			break;
+		case L't':
+		case L'T':
+			DoConvertLocalTimeTo100ns();
 			break;
 		case L'h':
 		case L'H':

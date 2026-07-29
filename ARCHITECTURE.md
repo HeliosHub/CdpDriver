@@ -14,7 +14,7 @@
 | `CdpConsole` | 安装/注册驱动、配置捕获（CMD1/2）、卷句柄读写（CMD3–5）、Preview、查询 journal 时间范围 |
 | `CdpCore` | 用户态库：内存模拟源卷+journal，单测 COW/Preview/Recovery（见 `CdpCore/README.md`） |
 
-当前 journal 磁盘格式版本为 **v8**（单 Superblock + 2MB 头区/负载区交替）。每个 HeaderRegion 尾部保存 64 位 `StartSequence`；旧版 journal 分区需重新 Format。
+当前 journal 磁盘格式版本为 **v9**（单 Superblock + 1MB 头区/负载区交替）。每个 HeaderRegion 尾部保存 64 位 `StartSequence`；开发阶段不提供旧格式兼容或迁移。
 
 ## 驱动在设备栈中的位置
 
@@ -58,38 +58,38 @@
 - `BEGIN_RECOVERY` 只准备历史视图并保持 Recovery；`COMMIT_RECOVERY`
   回填成功后进入 Normal，`CANCEL_RECOVERY` 不回填并进入 Normal。
 
-## Journal 布局（v8）
+## Journal 布局（v9）
 
-独立 CDP 分区采用 **2MB 记录头区 + 对应负载区** 交替排列：
+独立 CDP 分区采用 **1MB 记录头区 + 对应负载区** 交替排列：
 
 ```
 +------------------+  扇区 0
 | Superblock 主    |
 +------------------+
-| HeaderRegion 0   |  2MB（密排 32B 记录头 + 尾部 RegionLink）
+| HeaderRegion 0   |  1MB（密排 32B 记录头 + 尾部 RegionLink）
 | Payload 0        |  本区内记录的 before-image（紧随其后追加）
 +------------------+
-| HeaderRegion 1   |  2MB
+| HeaderRegion 1   |  1MB
 | Payload 1        |
 +------------------+
 | …                |
-| HeaderRegion n   |  2MB
+| HeaderRegion n   |  1MB
 | Payload n        |
 +------------------+
 ```
 
-- **只有当前 2MB Header 槽用尽**时，才在 `PayloadRegionOff`（或回绕到可用区起点）新开一对 `Header[2MB]+Payload`。
-- **Payload 写到分区尾不够**：写游标绕回可用区起点，**不**新开 Header；尾部跳过的空隙计入当前区域占用。空间仍不够则整体淘汰最旧 HeaderRegion 及其全部 record/payload，回收时仅读取相邻 RegionLink 并按环形跨度扣减，不扫描 2MB 记录头区。
+- 当前 1MB Header 槽用尽，或追加下一条记录会使本 PayloadRegion 跨度超过日志卷容量的 1/10 时，在 `PayloadRegionOff`（或回绕到可用区起点）新开一对 `Header[1MB]+Payload`。因此非最新 HeaderRegion 允许未写满，其有效记录数由下一 HeaderRegion 的 `StartSequence` 差值确定，无需扫描空记录头。
+- **Payload 写到分区尾不够**：写游标绕回可用区起点，**不**新开 Header；尾部跳过的空隙计入当前区域占用。空间仍不够则整体淘汰最旧 HeaderRegion 及其全部 record/payload，回收时仅读取相邻 RegionLink 并按环形跨度扣减，不扫描 1MB 记录头区。
 - 记录头里的 `FileOffset` 指向该条 payload 的绝对偏移。
 - Header 区间用 `RegionLink`（Prev/Next）串成链，Mount / Preview 扫描 / 淘汰最旧 HeaderRegion 时使用；淘汰后将新 oldest 的 `PrevRegionOff` 指向自身，避免重启重新发现旧区域。
 
-Version = **7**。v6 及更早版本 journal 需重新 Format。
+Version = **9**。只实现和验证当前开发格式。
 
 ### Superblock
 
 | 字段 | 含义 |
 |------|------|
-| `LastHeaderRegionOff` | 最新 2MB Header 区起点 |
+| `LastHeaderRegionOff` | 最新 1MB Header 区起点 |
 | `SourceVolumeGuid` | 与该 journal 配对的源卷 Volume GUID |
 
 当前 `PayloadRegionOff` 不再写入 Superblock。Mount 扫描最新 Header 区，以最后一条有效记录的 `FileOffset + DataLength` 向扇区对齐后重建下一 Payload 写入位置；空日志从最新 Header 区末尾开始。
@@ -108,7 +108,7 @@ Version = **7**。v6 及更早版本 journal 需重新 Format。
 
 ## Preview / Recovery 区间树
 
-按 `VolumeOffset`（`Start`）排序的 **AVL 区间树**，节点维护 `MaxEnd` 做重叠剪枝，并维护 `MinValidSequence` 加速 Recovery Commit 选取下一节点。构建时反向单遍读取记录头，读到符合条件的 header 后立即覆盖进树，不保存 header 数组，也不二次读取记录头区域；2MB 对齐扫描缓冲由 Journal 惰性分配，在 Mount/Preview/Recovery 间复用并于 Close 释放。普通 Insert 直接查找已有节点之间的空洞并插入，不再为 DataLength 分配逐字节覆盖位图。
+按 `VolumeOffset`（`Start`）排序的 **AVL 区间树**，节点维护 `MaxEnd` 做重叠剪枝，并维护 `MinValidSequence` 加速 Recovery Commit 选取下一节点。构建时反向单遍读取记录头，读到符合条件的 header 后立即覆盖进树，不保存 header 数组，也不二次读取记录头区域；1MB 对齐扫描缓冲由 Journal 惰性分配，在 Mount/Preview/Recovery 间复用并于 Close 释放。普通 Insert 直接查找已有节点之间的空洞并插入，不再为 DataLength 分配逐字节覆盖位图。
 
 ## Preview：时间点只读视图
 
@@ -156,7 +156,7 @@ CMD1 参数：`PartitionGuid1`（源卷）、`PartitionGuid2`（journal 分区�
 
 ## 捕获启用
 
-首次由控制设备 **CMD1** 格式化/开启 COW（源卷 GUID + journal 分区 GUID），**CMD2** 停止。重启后，驱动在 AddDevice 完成并延迟 30 秒后扫描首扇区 magic，避开 PnP START/Mount Manager 启动关键路径；随后自动挂载 v8 journal，并根据 Superblock 的 `SourceVolumeGuid` 打开源卷、绑定 Core 和重新使能捕获。
+首次由控制设备 **CMD1** 格式化/开启 COW（源卷 GUID + journal 分区 GUID），**CMD2** 停止。重启后，驱动在 AddDevice 完成并延迟 30 秒后扫描首扇区 magic，避开 PnP START/Mount Manager 启动关键路径；随后自动挂载 v9 journal，并根据 Superblock 的 `SourceVolumeGuid` 打开源卷、绑定 Core 和重新使能捕获。
 
 ## 已知限制
 

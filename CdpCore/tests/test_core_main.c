@@ -24,11 +24,11 @@ static void ExpectStatus(NTSTATUS s, NTSTATUS want, const char* msg)
 	Expect(s == want, msg);
 }
 
-#define SRC_SIZE   (64ULL * 1024)
-#define JNL_SIZE   (8ULL * 1024 * 1024)
-#define SMALL_JNL_SIZE (3ULL * 1024 * 1024)
-#define TINY_JNL_SIZE  (2098688ULL + 16384ULL)
-#define SECTOR     512
+#define SECTOR         512
+#define SRC_SIZE       (64ULL * 1024)
+#define JNL_SIZE       (8ULL * 1024 * 1024)
+#define SMALL_JNL_SIZE (Cdp_JOURNAL_HEADER_REGION_SIZE + 1ULL * 1024 * 1024)
+#define TINY_JNL_SIZE  (Cdp_JOURNAL_HEADER_REGION_SIZE + 3ULL * SECTOR + 16384ULL)
 
 typedef struct _TEST_CTX
 {
@@ -933,8 +933,9 @@ static int TestJournalPayloadTailWrap(void)
 	NTSTATUS st;
 	ULONG tailFillRecords;
 
-	/* First payload region contiguous space ~= 3MB - 2MB header - superblocks. */
-	tailFillRecords = (SMALL_JNL_SIZE - (2ULL * 1024 * 1024) - 4096ULL) / 512;
+	/* First payload region space ~= journal - fixed header region - metadata. */
+	tailFillRecords = (ULONG)((SMALL_JNL_SIZE -
+		Cdp_JOURNAL_HEADER_REGION_SIZE - 4096ULL) / 512ULL);
 
 	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, SMALL_JNL_SIZE, firstTime)),
 		"setup small journal");
@@ -1044,7 +1045,7 @@ static int TestJournalPayloadTailWrap(void)
 		"new records accumulate after whole-region reclamation");
 	Expect(journalReads.OversizeReadCount == 0 &&
 		journalReads.LargestSuccessfulRead <= SECTOR,
-		"whole-region reclamation does not read the 2MB header region");
+		"whole-region reclamation does not read the 1MB header region");
 
 	st = CdpCoreQueryTimeRange(ctx.Core, &oldestAfter, &newestAfter);
 	Expect(NT_SUCCESS(st), "QueryTimeRange after tail wrap");
@@ -1848,8 +1849,8 @@ static int TestJournalFormatWriteChunkFallback(void)
 
 	st = CdpCoreFormatJournal(core);
 	Expect(NT_SUCCESS(st), "format falls back to supported write size");
-	Expect(limited.OversizeWriteCount == 5,
-		"format probes 2MB down to 64KB");
+	Expect(limited.OversizeWriteCount == 4,
+		"format probes 1MB down to 64KB");
 	Expect(limited.LargestSuccessfulWrite == 64UL * 1024UL,
 		"format selects 64KB as largest successful write");
 
@@ -1945,13 +1946,10 @@ static int TestSingleSuperblockMetadata(void)
 	if (!store)
 		return g_caseFailed;
 	journalBytes = (PUCHAR)CdpMemStoreData(store);
-	*(ULONG*)(journalBytes + store->Size - SECTOR) = Cdp_JOURNAL_MAGIC;
 	CdpJournalInitializeWithStore(
 		&journal, store, &sourceGuid, NULL, NULL);
 	Expect(NT_SUCCESS(CdpJournalFormat(&journal)),
 		"format single-superblock journal");
-	Expect(*(ULONG*)(journalBytes + store->Size - SECTOR) != Cdp_JOURNAL_MAGIC,
-		"format removes stale backup superblock from partition tail");
 
 	FillPattern(payload, sizeof(payload), 0x71);
 	Expect(NT_SUCCESS(CdpJournalAppend(
@@ -2217,7 +2215,7 @@ static int TestAppendWritesSuperblockOnlyForNewRegion(void)
 		"ordinary append does not write superblock sector");
 
 	// Force the next append through the real new-region allocation path
-	// without writing 65,535 records merely to exhaust the current region.
+	// without filling every record slot merely to exhaust the current region.
 	journal.CurrentHeaderCount = Cdp_JOURNAL_HEADERS_PER_REGION;
 	trace.FailNextSuperblockWrites = 1;
 	Expect(CdpJournalAppend(
@@ -2801,9 +2799,9 @@ static int TestHeaderRegionReadUsesDiscoveredChunk(void)
 	Expect(limited.OversizeReadCount == 0 &&
 		limited.LargestSuccessfulRead == 64UL * 1024UL,
 		"header scan reuses discovered 64KB transfer size");
-	Expect(limited.ReadCallCount == 32 &&
+	Expect(limited.ReadCallCount == 16 &&
 		limited.TotalReadBytes == Cdp_JOURNAL_HEADER_REGION_SIZE,
-		"header scan reads one 2MB region in 64KB blocks");
+		"header scan reads one 1MB region in 64KB blocks");
 	if (NT_SUCCESS(st))
 		Expect(NT_SUCCESS(CdpCoreRecoveryCancel(core)),
 			"cancel header read chunk recovery");
@@ -2899,9 +2897,9 @@ static int TestHeaderRegionReadFallbackOnMount(void)
 	limited.MaxReadLength = 64UL * 1024UL;
 	st = CdpCoreMountJournal(core);
 	Expect(NT_SUCCESS(st), "mount halves header reads down to supported size");
-	Expect(limited.OversizeReadCount == 5 &&
+	Expect(limited.OversizeReadCount == 4 &&
 		limited.LargestSuccessfulRead == 64UL * 1024UL,
-		"header read probes 2MB to 64KB by halving");
+		"header read probes 1MB to 64KB by halving");
 	Expect(limited.ReadLength32Count == 0,
 		"mount and runtime rebuild never issue 32-byte reads");
 	TestFailStoreRemove(journal, &limited);
@@ -3028,6 +3026,113 @@ static int TestPreviewTreeGapInsert(void)
 	return g_caseFailed;
 }
 
+static int TestPayloadThresholdRotatesPartialHeaderRegion(void)
+{
+	const UINT64 journalSize = 8ULL * 1024ULL * 1024ULL;
+	const ULONG payloadSize = 512UL * 1024UL;
+	PCdp_STORE store = NULL;
+	Cdp_JOURNAL journal;
+	Cdp_JOURNAL remounted;
+	Cdp_JOURNAL_RECORD written;
+	Cdp_JOURNAL_RECORD records[2];
+	Cdp_PREVIEW_TREE tree;
+	GUID sourceGuid = { 0 };
+	PUCHAR payload = NULL;
+	UINT64 firstRegion;
+	UINT64 total = 0;
+	UINT64 generation = 0;
+	UINT64 partitionBytes = 0;
+	UINT64 metadataBytes = 0;
+	UINT64 payloadUsed = 0;
+	UINT64 payloadFree = 0;
+	ULONG returned = 0;
+	NTSTATUS st;
+
+	Expect(NT_SUCCESS(CdpMemStoreCreate(journalSize, SECTOR, &store)),
+		"create journal for payload threshold rotation");
+	if (!store)
+		return g_caseFailed;
+	payload = (PUCHAR)malloc(payloadSize);
+	Expect(payload != NULL, "allocate threshold test payload");
+	if (!payload)
+	{
+		CdpMemStoreDestroy(store);
+		return g_caseFailed;
+	}
+	FillPattern(payload, payloadSize, 0x51);
+
+	CdpJournalInitializeWithStore(
+		&journal,
+		store,
+		&sourceGuid,
+		TestPointerTime100ns,
+		(PVOID)(ULONG_PTR)70000);
+	Expect(NT_SUCCESS(CdpJournalFormat(&journal)),
+		"format journal for payload threshold rotation");
+	firstRegion = journal.LastHeaderRegionOff;
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 0, payloadSize, payload, &written)),
+		"append first payload below one-tenth threshold");
+	Expect(journal.LastHeaderRegionOff == firstRegion &&
+		journal.CurrentHeaderCount == 1,
+		"first payload stays in initial header region");
+
+	journal.QueryTimeContext = (PVOID)(ULONG_PTR)70001;
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, payloadSize, payloadSize, payload, &written)),
+		"append crossing one-tenth threshold");
+	Expect(journal.LastHeaderRegionOff != firstRegion &&
+		journal.CurrentHeaderCount == 1,
+		"threshold rotates a partially filled header region");
+	Expect(journal.NextSequence == 3,
+		"sequence remains continuous across partial header regions");
+
+	st = CdpJournalQueryRecordHeaders(
+		&journal, 0, 0, records, RTL_NUMBER_OF(records),
+		&total, &generation, &returned);
+	Expect(NT_SUCCESS(st) && total == 2 && returned == 2 &&
+		records[0].Sequence == 1 && records[1].Sequence == 2,
+		"record listing derives partial-region count from StartSequence");
+	st = CdpJournalQueryUsage(
+		&journal,
+		&partitionBytes,
+		&metadataBytes,
+		&payloadUsed,
+		&payloadFree,
+		&total);
+	Expect(NT_SUCCESS(st) &&
+		metadataBytes == SECTOR + 2ULL * Cdp_JOURNAL_HEADER_REGION_SIZE,
+		"usage counts both active partial header regions");
+
+	CdpPreviewTreeInitialize(&tree);
+	st = CdpJournalBuildPreviewTree(
+		&journal, 70000, journal.NextSequence, TRUE, &tree);
+	Expect(NT_SUCCESS(st) && tree.NodeCount == 2,
+		"preview scans partially filled non-current header region");
+	CdpPreviewTreeFree(&tree);
+	CdpJournalClose(&journal);
+
+	CdpJournalInitializeWithStore(
+		&remounted, store, &sourceGuid, NULL, NULL);
+	st = CdpJournalMount(&remounted);
+	Expect(NT_SUCCESS(st) && remounted.TotalRecords == 2 &&
+		remounted.CurrentHeaderCount == 1,
+		"mount rebuilds partially filled non-current header region");
+	if (NT_SUCCESS(st))
+	{
+		returned = 0;
+		st = CdpJournalQueryRecordHeaders(
+			&remounted, 0, 0, records, RTL_NUMBER_OF(records),
+			&total, &generation, &returned);
+		Expect(NT_SUCCESS(st) && total == 2 && returned == 2,
+			"record listing survives remount after threshold rotation");
+	}
+	CdpJournalClose(&remounted);
+	free(payload);
+	CdpMemStoreDestroy(store);
+	return g_caseFailed;
+}
+
 int main(void)
 {
 	int failed = 0;
@@ -3083,6 +3188,8 @@ int main(void)
 	failed += RunCase("Header-region read fallback on mount", TestHeaderRegionReadFallbackOnMount);
 	failed += RunCase("Preview tree min valid sequence summary", TestPreviewTreeMinValidSequenceSummary);
 	failed += RunCase("Preview tree interval gap insert", TestPreviewTreeGapInsert);
+	failed += RunCase("Payload threshold rotates partial header region",
+		TestPayloadThresholdRotatesPartialHeaderRegion);
 
 	printf("\n%s (%d failures)\n", failed ? "FAILED" : "ALL PASSED", failed);
 	return failed ? 1 : 0;

@@ -642,7 +642,7 @@ static NTSTATUS CdpJournalInitHeaderRegion(
 		}
 
 		// Cache the largest transfer that succeeded.  Later header regions
-		// start directly with this size instead of probing from 2MB again.
+		// start directly with this size instead of probing from 1MB again.
 		Journal->HeaderRegionWriteChunk = chunk;
 		offset += transfer;
 	}
@@ -654,13 +654,52 @@ static NTSTATUS CdpJournalInitHeaderRegion(
 	return STATUS_SUCCESS;
 }
 
-static ULONG CdpJournalRegionHeaderLimit(
+// A non-current region may be only partially filled when its payload span
+// reaches the rotation threshold. Its exact record count is persisted
+// implicitly by the next region's StartSequence, so only that region's link
+// sector is needed; the unused header slots never need to be scanned.
+static NTSTATUS CdpJournalGetRegionHeaderLimitLocked(
 	_In_ PCdp_JOURNAL Journal,
-	_In_ UINT64 RegionOff)
+	_In_ UINT64 RegionOff,
+	_In_ const Cdp_HEADER_REGION_LINK* Link,
+	_Out_ PULONG Limit,
+	_Out_opt_ PCdp_HEADER_REGION_LINK NextLink)
 {
+	Cdp_HEADER_REGION_LINK next;
+	UINT64 count;
+	NTSTATUS status;
+
+	if (!Journal || !Link || !Limit)
+		return STATUS_INVALID_PARAMETER;
 	if (RegionOff == Journal->LastHeaderRegionOff)
-		return Journal->CurrentHeaderCount;
-	return Cdp_JOURNAL_HEADERS_PER_REGION;
+	{
+		if (Journal->CurrentHeaderCount > Cdp_JOURNAL_HEADERS_PER_REGION)
+			return STATUS_DISK_CORRUPT_ERROR;
+		*Limit = Journal->CurrentHeaderCount;
+		if (NextLink)
+			RtlZeroMemory(NextLink, sizeof(*NextLink));
+		return STATUS_SUCCESS;
+	}
+	if (Link->NextRegionOff == RegionOff)
+		return STATUS_DISK_CORRUPT_ERROR;
+
+	status = CdpJournalReadRegionLink(Journal, Link->NextRegionOff, &next);
+	if (!NT_SUCCESS(status))
+		return status;
+	if (!CdpJournalRegionLinkValid(Journal, &next) ||
+		next.PrevRegionOff != RegionOff ||
+		next.StartSequence <= Link->StartSequence)
+	{
+		return STATUS_DISK_CORRUPT_ERROR;
+	}
+	count = next.StartSequence - Link->StartSequence;
+	if (count == 0 || count > Cdp_JOURNAL_HEADERS_PER_REGION)
+		return STATUS_DISK_CORRUPT_ERROR;
+
+	*Limit = (ULONG)count;
+	if (NextLink)
+		*NextLink = next;
+	return STATUS_SUCCESS;
 }
 
 static NTSTATUS CdpJournalReadHeaderAt(
@@ -821,14 +860,18 @@ static NTSTATUS CdpJournalDropOldestRegionLocked(
 		return STATUS_NOT_FOUND;
 
 	regionOff = Journal->OldestHeaderRegionOff;
-	limit = CdpJournalRegionHeaderLimit(
-		Journal,
-		regionOff);
-	if (Journal->OldestHeaderIndex >= limit)
-		return STATUS_DISK_CORRUPT_ERROR;
-
 	status = CdpJournalReadRegionLink(Journal, regionOff, &link);
 	if (!NT_SUCCESS(status) || !CdpJournalRegionLinkValid(Journal, &link))
+		return STATUS_DISK_CORRUPT_ERROR;
+	status = CdpJournalGetRegionHeaderLimitLocked(
+		Journal,
+		regionOff,
+		&link,
+		&limit,
+		&nextLink);
+	if (!NT_SUCCESS(status))
+		return status;
+	if (Journal->OldestHeaderIndex >= limit)
 		return STATUS_DISK_CORRUPT_ERROR;
 
 	if (regionOff == Journal->LastHeaderRegionOff)
@@ -844,16 +887,6 @@ static NTSTATUS CdpJournalDropOldestRegionLocked(
 
 		if (link.NextRegionOff == regionOff ||
 			link.StartSequence > MAXUINT64 - Journal->OldestHeaderIndex)
-		{
-			return STATUS_DISK_CORRUPT_ERROR;
-		}
-		status = CdpJournalReadRegionLink(
-			Journal,
-			link.NextRegionOff,
-			&nextLink);
-		if (!NT_SUCCESS(status) ||
-			!CdpJournalRegionLinkValid(Journal, &nextLink) ||
-			nextLink.PrevRegionOff != regionOff)
 		{
 			return STATUS_DISK_CORRUPT_ERROR;
 		}
@@ -956,8 +989,41 @@ static NTSTATUS CdpJournalEnsureContiguousLocked(
 	}
 }
 
-// Place a new 2MB header region at the current payload cursor, then start a
-// fresh payload area immediately after it: ...[Pprev][Hnew 2MB][Pnew...]
+static NTSTATUS CdpJournalPayloadRotationNeededLocked(
+	_In_ PCdp_JOURNAL Journal,
+	_In_ UINT64 NextPayloadBytes,
+	_Out_ PBOOLEAN RotationNeeded)
+{
+	UINT64 payloadSpan;
+	UINT64 threshold;
+	NTSTATUS status;
+
+	if (!Journal || !RotationNeeded || NextPayloadBytes == 0)
+		return STATUS_INVALID_PARAMETER;
+	*RotationNeeded = FALSE;
+	if (Journal->CurrentHeaderCount == 0)
+		return STATUS_SUCCESS;
+
+	status = CdpJournalRingDistance(
+		Journal,
+		Journal->LastHeaderRegionOff + Cdp_JOURNAL_HEADER_REGION_SIZE,
+		Journal->PayloadRegionOff,
+		&payloadSpan);
+	if (!NT_SUCCESS(status))
+		return status;
+
+	threshold = Journal->PartitionSize /
+		Cdp_JOURNAL_PAYLOAD_REGION_CAPACITY_DIVISOR;
+	if (threshold == 0 || payloadSpan >= threshold ||
+		NextPayloadBytes > threshold - payloadSpan)
+	{
+		*RotationNeeded = TRUE;
+	}
+	return STATUS_SUCCESS;
+}
+
+// Place a new 1MB header region at the current payload cursor, then start a
+// fresh payload area immediately after it: ...[Pprev][Hnew 1MB][Pnew...]
 static NTSTATUS CdpJournalAllocateHeaderRegionLocked(
 	_Inout_ PCdp_JOURNAL Journal,
 	_Out_ PUINT64 NewRegionOff)
@@ -975,7 +1041,7 @@ static NTSTATUS CdpJournalAllocateHeaderRegionLocked(
 	if (candidate + Cdp_JOURNAL_HEADER_REGION_SIZE > usableEnd)
 		candidate = usableStart;
 
-	// Reclaim until [candidate, candidate+2MB) does not overlap the oldest live unit.
+	// Reclaim until the candidate 1MB range does not overlap the oldest live unit.
 	while (!CdpJournalIsEmptyLocked(Journal))
 	{
 		UINT64 old = Journal->OldestHeaderRegionOff;
@@ -1101,6 +1167,7 @@ static NTSTATUS CdpJournalRebuildRuntimeLocked(_Inout_ PCdp_JOURNAL Journal)
 	for (;;)
 	{
 		ULONG index;
+		ULONG limit = Cdp_JOURNAL_HEADERS_PER_REGION;
 		BOOLEAN isLast = (regionOff == Journal->LastHeaderRegionOff);
 
 		status = CdpJournalReadHeaderRegion(Journal, regionOff, region);
@@ -1116,6 +1183,17 @@ static NTSTATUS CdpJournalRebuildRuntimeLocked(_Inout_ PCdp_JOURNAL Journal)
 			status = STATUS_DISK_CORRUPT_ERROR;
 			goto cleanup;
 		}
+		if (!isLast)
+		{
+			status = CdpJournalGetRegionHeaderLimitLocked(
+				Journal,
+				regionOff,
+				&link,
+				&limit,
+				NULL);
+			if (!NT_SUCCESS(status))
+				goto cleanup;
+		}
 		if (haveExpectedSequence && link.StartSequence != expectedSequence)
 		{
 			status = STATUS_DISK_CORRUPT_ERROR;
@@ -1127,7 +1205,7 @@ static NTSTATUS CdpJournalRebuildRuntimeLocked(_Inout_ PCdp_JOURNAL Journal)
 			Journal->NextSequence = link.StartSequence;
 		}
 
-		for (index = 0; index < Cdp_JOURNAL_HEADERS_PER_REGION; ++index)
+		for (index = 0; index < limit; ++index)
 		{
 			Cdp_JOURNAL_RECORD_HEADER header;
 
@@ -1277,8 +1355,6 @@ NTSTATUS CdpJournalFormat(_Inout_ PCdp_JOURNAL Journal)
 	UINT64 headerOff;
 	UINT64 minSize;
 	NTSTATUS status;
-	PVOID tailAllocationBase = NULL;
-	PUCHAR tailSector = NULL;
 
 	minSize = (UINT64)Journal->SectorSize +
 		Cdp_JOURNAL_HEADER_REGION_SIZE + (UINT64)Journal->SectorSize;
@@ -1309,27 +1385,6 @@ NTSTATUS CdpJournalFormat(_Inout_ PCdp_JOURNAL Journal)
 	if (!NT_SUCCESS(status))
 		goto cleanup;
 
-	// v8 has no backup superblock. Explicitly erase a stale legacy backup when
-	// reformatting; the sector remains normal payload capacity afterwards.
-	tailSector = (PUCHAR)CdpAllocateAligned(
-		Journal,
-		Journal->SectorSize,
-		&tailAllocationBase);
-	if (!tailSector)
-	{
-		status = STATUS_INSUFFICIENT_RESOURCES;
-		goto cleanup;
-	}
-	RtlZeroMemory(tailSector, Journal->SectorSize);
-	status = CdpJournalRawIo(
-		Journal,
-		IRP_MJ_WRITE,
-		Journal->PartitionSize - Journal->SectorSize,
-		Journal->SectorSize,
-		tailSector);
-	if (!NT_SUCCESS(status))
-		goto cleanup;
-
 	Journal->LastHeaderRegionOff = headerOff;
 	Journal->CurrentHeaderRegionStartSequence = 1;
 	// Payload area 0 starts immediately after header region 0.
@@ -1352,8 +1407,6 @@ NTSTATUS CdpJournalFormat(_Inout_ PCdp_JOURNAL Journal)
 		Journal->Mounted = TRUE;
 
 cleanup:
-	if (tailAllocationBase)
-		cdpfree(tailAllocationBase);
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	return status;
 }
@@ -1542,6 +1595,7 @@ NTSTATUS CdpJournalAppend(
 	PUCHAR payloadBuffer = NULL;
 	UINT64 writeSeq;
 	UINT64 writeTime;
+	BOOLEAN rotateHeaderRegion;
 	NTSTATUS status = STATUS_SUCCESS;
 
 	if (!Journal->Mounted || !BeforeImage ||
@@ -1559,8 +1613,20 @@ NTSTATUS CdpJournalAppend(
 
 	alignedSize = CdpAlignUp64(DataLength, Journal->SectorSize);
 
-	// New header region only when the current 2MB header slots are exhausted.
-	if (Journal->CurrentHeaderCount >= Cdp_JOURNAL_HEADERS_PER_REGION)
+	// Rotate either when header slots are exhausted or when appending this
+	// payload would make the current payload span exceed 10% of the journal.
+	rotateHeaderRegion =
+		Journal->CurrentHeaderCount >= Cdp_JOURNAL_HEADERS_PER_REGION;
+	if (!rotateHeaderRegion)
+	{
+		status = CdpJournalPayloadRotationNeededLocked(
+			Journal,
+			alignedSize,
+			&rotateHeaderRegion);
+		if (!NT_SUCCESS(status))
+			goto cleanup;
+	}
+	if (rotateHeaderRegion)
 	{
 		UINT64 newRegion = 0;
 		status = CdpJournalAllocateHeaderRegionLocked(Journal, &newRegion);
@@ -1838,10 +1904,12 @@ NTSTATUS CdpJournalQueryRecordHeaders(
 	UINT64 remaining;
 	UINT64 regionOff;
 	ULONG headerIndex;
+	ULONG limit;
 	ULONG returned = 0;
 	ULONG wanted;
 	ULONG guard = 0;
 	Cdp_HEADER_REGION_LINK link;
+	Cdp_HEADER_REGION_LINK nextLink;
 	NTSTATUS status;
 
 	if (!Journal || !TotalRecords || !Generation || !ReturnedCount ||
@@ -1891,10 +1959,13 @@ NTSTATUS CdpJournalQueryRecordHeaders(
 		status = STATUS_DISK_CORRUPT_ERROR;
 		goto cleanup;
 	}
+	status = CdpJournalGetRegionHeaderLimitLocked(
+		Journal, regionOff, &link, &limit, &nextLink);
+	if (!NT_SUCCESS(status))
+		goto cleanup;
 
 	while (remaining != 0)
 	{
-		ULONG limit = CdpJournalRegionHeaderLimit(Journal, regionOff);
 		ULONG available;
 		if (headerIndex >= limit)
 		{
@@ -1915,28 +1986,22 @@ NTSTATUS CdpJournalQueryRecordHeaders(
 			status = STATUS_DISK_CORRUPT_ERROR;
 			goto cleanup;
 		}
-		status = CdpJournalReadRegionLink(Journal, regionOff, &link);
-		if (!NT_SUCCESS(status))
-			goto cleanup;
-		if (!CdpJournalRegionLinkValid(Journal, &link) ||
-			link.NextRegionOff == regionOff || ++guard > 100000UL)
+		if (link.NextRegionOff == regionOff || ++guard > 100000UL)
 		{
 			status = STATUS_DISK_CORRUPT_ERROR;
 			goto cleanup;
 		}
 		regionOff = link.NextRegionOff;
+		link = nextLink;
 		headerIndex = 0;
-		status = CdpJournalReadRegionLink(Journal, regionOff, &link);
-		if (!NT_SUCCESS(status) || !CdpJournalRegionLinkValid(Journal, &link))
-		{
-			status = STATUS_DISK_CORRUPT_ERROR;
+		status = CdpJournalGetRegionHeaderLimitLocked(
+			Journal, regionOff, &link, &limit, &nextLink);
+		if (!NT_SUCCESS(status))
 			goto cleanup;
-		}
 	}
 
 	while (returned < wanted)
 	{
-		ULONG limit = CdpJournalRegionHeaderLimit(Journal, regionOff);
 		Cdp_JOURNAL_RECORD_HEADER header;
 		Cdp_JOURNAL_RECORD record;
 
@@ -1947,23 +2012,18 @@ NTSTATUS CdpJournalQueryRecordHeaders(
 				status = STATUS_DISK_CORRUPT_ERROR;
 				goto cleanup;
 			}
-			status = CdpJournalReadRegionLink(Journal, regionOff, &link);
-			if (!NT_SUCCESS(status))
-				goto cleanup;
-			if (!CdpJournalRegionLinkValid(Journal, &link) ||
-				link.NextRegionOff == regionOff || ++guard > 100000UL)
+			if (link.NextRegionOff == regionOff || ++guard > 100000UL)
 			{
 				status = STATUS_DISK_CORRUPT_ERROR;
 				goto cleanup;
 			}
 			regionOff = link.NextRegionOff;
+			link = nextLink;
 			headerIndex = 0;
-			status = CdpJournalReadRegionLink(Journal, regionOff, &link);
-			if (!NT_SUCCESS(status) || !CdpJournalRegionLinkValid(Journal, &link))
-			{
-				status = STATUS_DISK_CORRUPT_ERROR;
+			status = CdpJournalGetRegionHeaderLimitLocked(
+				Journal, regionOff, &link, &limit, &nextLink);
+			if (!NT_SUCCESS(status))
 				goto cleanup;
-			}
 			continue;
 		}
 
@@ -2657,6 +2717,7 @@ NTSTATUS CdpJournalBuildPreviewTree(
 {
 	NTSTATUS status = STATUS_SUCCESS;
 	UINT64 regionOff;
+	UINT64 regionEndSequence;
 	ULONG guardRegions = 0;
 	BOOLEAN stop = FALSE;
 	PUCHAR region = NULL;
@@ -2696,6 +2757,7 @@ NTSTATUS CdpJournalBuildPreviewTree(
 	// the tree; the earlier before-image replaces only overlapping bytes from
 	// newer records.  No record-header array and no second region read.
 	regionOff = Journal->LastHeaderRegionOff;
+	regionEndSequence = Journal->NextSequence;
 	for (;;)
 	{
 		Cdp_HEADER_REGION_LINK link;
@@ -2723,11 +2785,22 @@ NTSTATUS CdpJournalBuildPreviewTree(
 			status = STATUS_DISK_CORRUPT_ERROR;
 			goto cleanup_locked;
 		}
+		if (regionEndSequence <= link.StartSequence ||
+			regionEndSequence - link.StartSequence >
+				Cdp_JOURNAL_HEADERS_PER_REGION)
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup_locked;
+		}
 
 		isLast = (regionOff == Journal->LastHeaderRegionOff);
 		isOldest = (regionOff == Journal->OldestHeaderRegionOff);
-		limit = isLast ?
-			Journal->CurrentHeaderCount : Cdp_JOURNAL_HEADERS_PER_REGION;
+		limit = (ULONG)(regionEndSequence - link.StartSequence);
+		if (isLast && limit != Journal->CurrentHeaderCount)
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup_locked;
+		}
 
 		for (index = (LONG)limit - 1; index >= 0; --index)
 		{
@@ -2777,6 +2850,7 @@ NTSTATUS CdpJournalBuildPreviewTree(
 			break;
 		if (link.PrevRegionOff == regionOff)
 			break;
+		regionEndSequence = link.StartSequence;
 		regionOff = link.PrevRegionOff;
 	}
 
