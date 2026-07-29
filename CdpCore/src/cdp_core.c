@@ -853,7 +853,11 @@ NTSTATUS CdpCoreRecoveryCommitStep(
 		if (NT_SUCCESS(status))
 		{
 			Cdp_RECOVERY_TRACE(
+<<<<<<< HEAD
 				"commit step complete seq=%llu runs=%lu bytes=%lu\n",
+=======
+				"commit step complete seq=%lu runs=%lu bytes=%lu\n",
+>>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 				node->Sequence, writeRuns, node->DataLength);
 		}
 	}

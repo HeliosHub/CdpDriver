@@ -1932,7 +1932,11 @@ static int TestSingleSuperblockMetadata(void)
 		{ 0x90, 0xAB, 0xCD, 0xEF, 1, 2, 3, 4 }
 	};
 	GUID zeroGuid = { 0 };
+<<<<<<< HEAD
 	Cdp_JOURNAL_RECORD lastHeader;
+=======
+	Cdp_JOURNAL_RECORD_HEADER lastHeader;
+>>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 	Cdp_PREVIEW_TREE scanTree;
 	PUCHAR cachedScanBuffer;
 	PUCHAR journalBytes;
@@ -2196,7 +2200,11 @@ static int TestAppendWritesSuperblockOnlyForNewRegion(void)
 		0xA7372451, 0x1000, 0x2000,
 		{ 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0 }
 	};
+<<<<<<< HEAD
 	Cdp_JOURNAL_RECORD header;
+=======
+	Cdp_JOURNAL_RECORD_HEADER header;
+>>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 	UCHAR payload[512];
 
 	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &store)),
@@ -2916,7 +2924,11 @@ cleanup:
 static int TestPreviewTreeMinValidSequenceSummary(void)
 {
 	Cdp_PREVIEW_TREE tree;
+<<<<<<< HEAD
 	Cdp_JOURNAL_RECORD header;
+=======
+	Cdp_JOURNAL_RECORD_HEADER header;
+>>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 
 	CdpPreviewTreeInitialize(&tree);
 	RtlZeroMemory(&header, sizeof(header));
@@ -2983,12 +2995,20 @@ static VOID TestCollectTreeNodes(
 static int TestPreviewTreeGapInsert(void)
 {
 	Cdp_PREVIEW_TREE tree;
+<<<<<<< HEAD
 	Cdp_JOURNAL_RECORD header;
+=======
+	Cdp_JOURNAL_RECORD_HEADER header;
+>>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 	PCdp_PREVIEW_TREE_NODE nodes[8];
 	ULONG count = 0;
 	static const UINT64 expectedStart[] = { 0, 512, 1024, 1536, 2048 };
 	static const UINT64 expectedEnd[] = { 512, 1024, 1536, 2048, 2560 };
+<<<<<<< HEAD
 	static const UINT64 expectedSequence[] = { 30, 10, 30, 20, 30 };
+=======
+	static const ULONG expectedSequence[] = { 30, 10, 30, 20, 30 };
+>>>>>>> faaed1ac902afe9773bf0e5b5a716293e1be66ba
 	static const UINT64 expectedFileOffset[] =
 		{ 10000, 20000, 11024, 30000, 12048 };
 	ULONG i;
