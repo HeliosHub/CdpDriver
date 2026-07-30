@@ -2728,7 +2728,10 @@ VOID CdpStopCaptureWorker(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	PVOID threadObject = NULL;
 
 	if (!threadHandle)
+	{
+		InterlockedExchange(&DevExt->CaptureStopping, 0);
 		return;
+	}
 	InterlockedExchange(&DevExt->CaptureStopping, 1);
 	KeSetEvent(&DevExt->CaptureEvent, IO_NO_INCREMENT, FALSE);
 
@@ -2741,6 +2744,10 @@ VOID CdpStopCaptureWorker(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 
 	ZwClose(threadHandle);
 	DevExt->CaptureThreadHandle = NULL;
+	// The worker has fully exited and no queued write can still reference the
+	// stopping state. Clear it so ordinary writes after CMD2 do not continue
+	// producing misleading "write seen/write bypass" trace messages.
+	InterlockedExchange(&DevExt->CaptureStopping, 0);
 }
 
 VOID CdpDisableAndDestroyCapture(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
