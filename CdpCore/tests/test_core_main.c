@@ -886,15 +886,20 @@ static int TestJournalDropOldest(void)
 		"oldest record evicted (ring dropped early entries)");
 	Expect(newest >= firstTime + 2599, "newest retains latest write");
 
-	/* Core maps journal NOT_FOUND (target < oldest) to empty tree + SUCCESS. */
+	/* A request before the retained range is clamped to the oldest record. */
 	st = CdpCorePreviewBegin(ctx.Core, firstTime + 50);
 	Expect(NT_SUCCESS(st),
-		"preview before oldest evicted succeeds (empty tree fallback)");
-	FillPattern(expectLive, sizeof(expectLive), (UCHAR)(2599 & 0xFF));
+		"preview before oldest succeeds at oldest fallback");
+	Expect(CdpCoreGetTargetTime100ns(ctx.Core) == oldest,
+		"preview target is clamped to oldest retained time");
+	FillPattern(
+		expectLive,
+		sizeof(expectLive),
+		(UCHAR)((oldest - firstTime - 1) & 0xFF));
 	memset(out, 0, sizeof(out));
 	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
 	Expect(NT_SUCCESS(st) && memcmp(out, expectLive, sizeof(out)) == 0,
-		"preview before oldest reads live (evicted journal unavailable)");
+		"preview before oldest reconstructs the oldest retained view");
 	CdpCorePreviewEnd(ctx.Core);
 
 	st = CdpCorePreviewBegin(ctx.Core, newest);
@@ -1193,7 +1198,6 @@ static int TestRecoveryTimeBoundaries(void)
 	UCHAR a[512];
 	UCHAR b[512];
 	UCHAR c[512];
-	UCHAR liveBefore[512];
 	UINT64 oldest = 0;
 	UINT64 newest = 0;
 	NTSTATUS st;
@@ -1209,12 +1213,15 @@ static int TestRecoveryTimeBoundaries(void)
 
 	st = CdpCoreQueryTimeRange(ctx.Core, &oldest, &newest);
 	Expect(NT_SUCCESS(st), "QueryTimeRange after COWs");
-	memcpy(liveBefore, CdpMemStoreData(ctx.Source), sizeof(liveBefore));
-
-	st = TestRecoveryOneShot(ctx.Core, oldest - 1);
-	Expect(NT_SUCCESS(st), "RecoveryBegin before oldest succeeds (empty history)");
-	Expect(memcmp(CdpMemStoreData(ctx.Source), liveBefore, sizeof(liveBefore)) == 0,
-		"Recovery before oldest leaves live source unchanged");
+	st = CdpCoreRecoveryBegin(ctx.Core, oldest - 1);
+	Expect(NT_SUCCESS(st), "RecoveryBegin before oldest succeeds at oldest fallback");
+	Expect(CdpCoreGetTargetTime100ns(ctx.Core) == oldest,
+		"Recovery target is clamped to oldest retained time");
+	if (NT_SUCCESS(st))
+		st = CdpCoreRecoveryCommit(ctx.Core);
+	Expect(NT_SUCCESS(st), "Recovery before oldest commits oldest retained view");
+	Expect(memcmp(CdpMemStoreData(ctx.Source), a, sizeof(a)) == 0,
+		"Recovery before oldest restores oldest record before-image");
 
 	st = TestRecoveryOneShot(ctx.Core, oldest);
 	Expect(NT_SUCCESS(st), "RecoveryBegin at oldest includes oldest record");

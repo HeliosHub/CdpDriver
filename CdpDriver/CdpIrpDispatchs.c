@@ -1543,6 +1543,7 @@ static NTSTATUS CdpBeginPreviewSession(
 	UINT64 sourceHandleId = 0;
 	UINT64 oldestTime = 0;
 	UINT64 newestTime = 0;
+	UINT64 targetTime = Request->TargetTime100ns;
 	BOOLEAN phaseTransitioned = FALSE;
 	NTSTATUS status;
 
@@ -1596,11 +1597,8 @@ static NTSTATUS CdpBeginPreviewSession(
 	{
 		goto cleanup;
 	}
-	else if (Request->TargetTime100ns < oldestTime)
-	{
-		status = STATUS_NOT_FOUND;
-		goto cleanup;
-	}
+	else if (targetTime < oldestTime)
+		targetTime = oldestTime;
 
 	status = CdpOpenVolumeHandle(
 		DriverExt,
@@ -1634,7 +1632,7 @@ static NTSTATUS CdpBeginPreviewSession(
 	RtlZeroMemory(session, sizeof(*session));
 	session->HandleId =
 		(UINT64)InterlockedIncrement64(&DriverExt->PreviewSessionNextId);
-	session->TargetTime100ns = Request->TargetTime100ns;
+	session->TargetTime100ns = targetTime;
 	session->SourceVolumeHandleId = sourceHandleId;
 	session->JournalEntry = journalEntry;
 	session->SourceVolumeGuid = Request->SourceVolumeGuid;
@@ -1654,7 +1652,7 @@ static NTSTATUS CdpBeginPreviewSession(
 	InsertTailList(&DriverExt->PreviewSessionList, &session->Entry);
 	ExReleaseFastMutex(&DriverExt->PreviewSessionMutex);
 
-	status = CdpCorePreviewBegin(sourceExt->Core, Request->TargetTime100ns);
+	status = CdpCorePreviewBegin(sourceExt->Core, targetTime);
 	if (!NT_SUCCESS(status))
 	{
 		ExAcquireFastMutex(&DriverExt->PreviewSessionMutex);
@@ -1662,6 +1660,7 @@ static NTSTATUS CdpBeginPreviewSession(
 		ExReleaseFastMutex(&DriverExt->PreviewSessionMutex);
 		goto cleanup;
 	}
+	session->TargetTime100ns = CdpCoreGetTargetTime100ns(sourceExt->Core);
 	Reply->PreviewHandle = session->HandleId;
 	Reply->TargetTime100ns = session->TargetTime100ns;
 	Reply->OldestRecoverable100ns = oldestTime;
@@ -1856,6 +1855,7 @@ static NTSTATUS CdpBeginRecovery(
 	PCdp_VOLUME_HANDLE_ENTRY journalEntry;
 	UINT64 oldestTime = 0;
 	UINT64 newestTime = 0;
+	UINT64 targetTime = Request->TargetTime100ns;
 	LONG previousPhase;
 	NTSTATUS status;
 
@@ -1882,22 +1882,22 @@ static NTSTATUS CdpBeginRecovery(
 		}
 		if (!NT_SUCCESS(status))
 			return status;
-		if (oldestTime != 0 && Request->TargetTime100ns < oldestTime)
-			return STATUS_NOT_FOUND;
+		if (oldestTime != 0 && targetTime < oldestTime)
+			targetTime = oldestTime;
 		journalEntry = CdpAcquireJournalForSource(DriverExt, sourceExt);
 		if (!journalEntry)
 			return STATUS_DEVICE_NOT_READY;
 		status = CdpJournalSetRecoveryIntent(
-			&journalEntry->Journal, Request->TargetTime100ns);
+			&journalEntry->Journal, targetTime);
 		CdpReleaseVolumeHandleEntry(journalEntry);
 		if (!NT_SUCCESS(status))
 			return status;
 		Reply->Phase = Cdp_PHASE_GENERAL;
-		Reply->TargetTime100ns = Request->TargetTime100ns;
+		Reply->TargetTime100ns = targetTime;
 		Reply->OldestRecoverable100ns = oldestTime;
 		Reply->NewestRecoverable100ns = newestTime;
 		Cdp_LOG("[RECOVERY] reboot intent persisted target=%llu; no begin before reboot\n",
-			Request->TargetTime100ns);
+			targetTime);
 		return STATUS_SUCCESS;
 	}
 	if (CdpAnyPreviewSessionActive(DriverExt))
@@ -1927,11 +1927,8 @@ static NTSTATUS CdpBeginRecovery(
 		InterlockedExchange(&sourceExt->Phase, previousPhase);
 		return status;
 	}
-	else if (Request->TargetTime100ns < oldestTime)
-	{
-		InterlockedExchange(&sourceExt->Phase, previousPhase);
-		return STATUS_NOT_FOUND;
-	}
+	else if (targetTime < oldestTime)
+		targetTime = oldestTime;
 
 	KeWaitForSingleObject(
 		&sourceExt->HistoryMutex,
@@ -1939,7 +1936,7 @@ static NTSTATUS CdpBeginRecovery(
 		KernelMode,
 		FALSE,
 		NULL);
-	status = CdpCoreRecoveryBegin(sourceExt->Core, Request->TargetTime100ns);
+	status = CdpCoreRecoveryBegin(sourceExt->Core, targetTime);
 	KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
 	if (!NT_SUCCESS(status))
 	{
@@ -1948,11 +1945,12 @@ static NTSTATUS CdpBeginRecovery(
 	}
 
 	Reply->Phase = Cdp_PHASE_RECOVERY;
-	Reply->TargetTime100ns = Request->TargetTime100ns;
+	targetTime = CdpCoreGetTargetTime100ns(sourceExt->Core);
+	Reply->TargetTime100ns = targetTime;
 	Reply->OldestRecoverable100ns = oldestTime;
 	Reply->NewestRecoverable100ns = newestTime;
 	Cdp_LOG("[PHASE] recovery prepared target=%llu; waiting for commit\n",
-		Request->TargetTime100ns);
+		targetTime);
 	return STATUS_SUCCESS;
 }
 
@@ -2032,6 +2030,8 @@ static NTSTATUS CdpCancelRecovery(
 	_In_ const Cdp_RECOVERY_CONTROL_REQUEST* Request)
 {
 	PCdp_DEVICE_EXTENSION sourceExt;
+	PCdp_VOLUME_HANDLE_ENTRY journalEntry;
+	LONG phase;
 	NTSTATUS status;
 
 	sourceExt = CdpFindSourceExtensionByGuid(
@@ -2039,12 +2039,30 @@ static NTSTATUS CdpCancelRecovery(
 		&Request->SourceVolumeGuid);
 	if (!sourceExt)
 		return STATUS_DEVICE_DOES_NOT_EXIST;
-	if (!sourceExt->Core ||
-		InterlockedCompareExchange(&sourceExt->Phase, 0, 0) !=
-			(LONG)Cdp_PHASE_RECOVERY)
+	phase = InterlockedCompareExchange(&sourceExt->Phase, 0, 0);
+	if (phase != (LONG)Cdp_PHASE_RECOVERY)
 	{
+		// A reboot Recovery request only persists the intent and deliberately
+		// leaves the source in General phase.  CMD 'c' must be able to cancel
+		// that pending intent before reboot.
+		if (phase == (LONG)Cdp_PHASE_GENERAL)
+		{
+			journalEntry = CdpAcquireJournalForSource(DriverExt, sourceExt);
+			if (journalEntry && journalEntry->Journal.RecoveryPending)
+			{
+				status = CdpJournalClearRecoveryIntent(&journalEntry->Journal);
+				CdpReleaseVolumeHandleEntry(journalEntry);
+				if (NT_SUCCESS(status))
+					Cdp_LOG("[RECOVERY] pending reboot intent cancelled in General phase\n");
+				return status;
+			}
+			if (journalEntry)
+				CdpReleaseVolumeHandleEntry(journalEntry);
+		}
 		return STATUS_INVALID_DEVICE_STATE;
 	}
+	if (!sourceExt->Core)
+		return STATUS_DEVICE_NOT_READY;
 
 	KeWaitForSingleObject(
 		&sourceExt->HistoryMutex,
@@ -2056,23 +2074,20 @@ static NTSTATUS CdpCancelRecovery(
 	KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
 	if (!NT_SUCCESS(status))
 		return status;
-	{
-		PCdp_VOLUME_HANDLE_ENTRY journalEntry =
-			CdpAcquireJournalForSource(DriverExt, sourceExt);
-		if (journalEntry && journalEntry->Journal.RecoveryPending)
-		{
-			status = CdpJournalClearRecoveryIntent(&journalEntry->Journal);
-			CdpReleaseVolumeHandleEntry(journalEntry);
-			if (!NT_SUCCESS(status))
-				return status;
-		}
-		else if (journalEntry)
-		{
-			CdpReleaseVolumeHandleEntry(journalEntry);
-		}
-	}
 
 	InterlockedExchange(&sourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
+	journalEntry = CdpAcquireJournalForSource(DriverExt, sourceExt);
+	if (journalEntry && journalEntry->Journal.RecoveryPending)
+	{
+		status = CdpJournalClearRecoveryIntent(&journalEntry->Journal);
+		CdpReleaseVolumeHandleEntry(journalEntry);
+		if (!NT_SUCCESS(status))
+			return status;
+	}
+	else if (journalEntry)
+	{
+		CdpReleaseVolumeHandleEntry(journalEntry);
+	}
 	Cdp_LOG("[PHASE] recovery cancelled -> normal\n");
 	return STATUS_SUCCESS;
 }
@@ -2548,7 +2563,7 @@ static NTSTATUS CdpCaptureBeforeImage(
 	if (!SourceExt->Core)
 		return STATUS_DEVICE_NOT_READY;
 
-	Cdp_LOG("[COW-TRACE] capture begin irp=%p offset=%llu len=%lu\n",
+	Cdp_DBG("[COW-TRACE] capture begin irp=%p offset=%llu len=%lu\n",
 		Irp, offset, remaining);
 	Cdp_DBG("[COW] capture begin offset=%llu len=%lu\n", offset, remaining);
 
@@ -2576,7 +2591,7 @@ static NTSTATUS CdpCaptureBeforeImage(
 		remaining -= chunk;
 	}
 
-	Cdp_LOG("[COW-TRACE] capture end irp=%p status=0x%08X remaining=%lu\n",
+	Cdp_DBG("[COW-TRACE] capture end irp=%p status=0x%08X remaining=%lu\n",
 		Irp, status, remaining);
 	return status;
 }
@@ -2689,7 +2704,7 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 				}
 				else
 				{
-					Cdp_LOG("[COW-TRACE] worker bypass irp=%p offset=%lld len=%lu enabled=%ld stopping=%ld driver=%p\n",
+					Cdp_DBG("[COW-TRACE] worker bypass irp=%p offset=%lld len=%lu enabled=%ld stopping=%ld driver=%p\n",
 						item->Irp,
 						irpSp->Parameters.Write.ByteOffset.QuadPart,
 						irpSp->Parameters.Write.Length,
@@ -2792,7 +2807,7 @@ NTSTATUS CdpIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 			deviceExt->JournalHandleId != 0;
 		if (traceCaptureWrite)
 		{
-			Cdp_LOG("[COW-TRACE] write seen irp=%p offset=%lld len=%lu flags=0x%08lX enabled=%ld stopping=%ld phase=%ld core=%p journal=%llu\n",
+			Cdp_DBG("[COW-TRACE] write seen irp=%p offset=%lld len=%lu flags=0x%08lX enabled=%ld stopping=%ld phase=%ld core=%p journal=%llu\n",
 				Irp,
 				irpSp->Parameters.Write.ByteOffset.QuadPart,
 				irpSp->Parameters.Write.Length,
@@ -2824,7 +2839,7 @@ NTSTATUS CdpIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 				InsertTailList(&deviceExt->CaptureQueue, &item->Entry);
 				KeSetEvent(&deviceExt->CaptureEvent, IO_NO_INCREMENT, FALSE);
 				KeReleaseSpinLock(&deviceExt->CaptureQueueLock, oldIrql);
-				Cdp_LOG("[COW-TRACE] write queued irp=%p offset=%lld len=%lu\n",
+				Cdp_DBG("[COW-TRACE] write queued irp=%p offset=%lld len=%lu\n",
 					Irp,
 					irpSp->Parameters.Write.ByteOffset.QuadPart,
 					irpSp->Parameters.Write.Length);
@@ -2844,7 +2859,7 @@ NTSTATUS CdpIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 					irpSp->Parameters.Write.Length);
 				return CdpCompleteIrp(Irp, STATUS_INSUFFICIENT_RESOURCES, 0);
 			}
-			Cdp_LOG("[COW-TRACE] queue allocation failed; write bypass irp=%p offset=%lld len=%lu\n",
+			Cdp_DBG("[COW-TRACE] queue allocation failed; write bypass irp=%p offset=%lld len=%lu\n",
 				Irp,
 				irpSp->Parameters.Write.ByteOffset.QuadPart,
 				irpSp->Parameters.Write.Length);
@@ -2852,7 +2867,7 @@ NTSTATUS CdpIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 	}
 	else if (traceCaptureWrite)
 	{
-		Cdp_LOG("[COW-TRACE] write bypass irp=%p offset=%lld len=%lu enabled=%ld stopping=%ld lower=%p driver=%p\n",
+		Cdp_DBG("[COW-TRACE] write bypass irp=%p offset=%lld len=%lu enabled=%ld stopping=%ld lower=%p driver=%p\n",
 			Irp,
 			irpSp->Parameters.Write.ByteOffset.QuadPart,
 			irpSp->Parameters.Write.Length,

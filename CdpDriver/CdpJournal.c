@@ -2742,10 +2742,7 @@ NTSTATUS CdpJournalBuildPreviewTree(
 		goto cleanup_locked;
 	}
 	if (TargetTime100ns < Journal->Oldest100ns)
-	{
-		status = STATUS_NOT_FOUND;
-		goto cleanup_locked;
-	}
+		TargetTime100ns = Journal->Oldest100ns;
 
 	status = CdpJournalGetHeaderScanBufferLocked(Journal, &region);
 	if (!NT_SUCCESS(status))

@@ -102,6 +102,8 @@ Phase，此时不回填且允许新写入；新写入覆盖的历史范围会失
 
 - 当前开发格式为 Journal v9，HeaderRegion 固定为 1MB；不提供旧开发格式的兼容或迁移
 - 单个 PayloadRegion 的跨度上限按日志卷容量的 1/10 控制；达到阈值会提前切换 HeaderRegion，因此 HeaderRegion 可能未写满
+- Preview 或 Recovery 请求时间早于当前 oldest record 时，自动按 oldest 时间点执行；普通 Recovery、重启 Recovery 和返回的有效时间保持一致
+- `CdpConsole c` 除了取消已进入 Recovery Phase 的恢复，也可在重启前取消仅持久化于 Superblock 的重启 Recovery 标记
 - 全局仅一个 Preview 会话
 - 可恢复时间窗口取决于 journal 容量；空间不足时会整体淘汰最旧 HeaderRegion，而不是逐条淘汰 record，因此保留粒度较粗
 - Recovery Begin 构建历史视图期间会排队该源卷的应用层读写；journal 较大、历史记录较多时，开始阶段可能产生可感知的 I/O 延迟

@@ -129,6 +129,8 @@ Version = **9**。只实现和验证当前开发格式。
 
 > Preview 与 Recovery 都收集 `WallClock100ns >= TargetTime100ns` 的记录。Preview 的 Staging→PreviewTree 仍是 **Merge 插入**（补扫盘遗漏的 before-image）。Recovery 的 Staging 语义不同：表示“这些区间已被新写覆盖，History 应跳过”，故用 **Punch** 而非 Merge。
 
+若请求的 Preview/Recovery 时间早于 journal 当前 oldest record，入口会将有效时间提升到 oldest；该规则同样用于持久化的重启 Recovery 标记。
+
 ## 控制接口（IOCTL）
 
 | IOCTL | 用途 |

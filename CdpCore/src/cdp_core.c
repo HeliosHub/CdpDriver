@@ -676,18 +676,48 @@ NTSTATUS CdpCoreRead(
 	return CdpCoreSourceRead(Core, Offset, Length, Buffer);
 }
 
+static NTSTATUS CdpCoreResolveTargetTime(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 RequestedTime100ns,
+	_Out_ PUINT64 EffectiveTime100ns)
+{
+	UINT64 oldestTime;
+	UINT64 newestTime;
+	NTSTATUS status;
+
+	if (!Core || !EffectiveTime100ns)
+		return STATUS_INVALID_PARAMETER;
+	*EffectiveTime100ns = RequestedTime100ns;
+	status = CdpJournalQueryTimeRange(
+		Core->Journal,
+		&oldestTime,
+		&newestTime);
+	if (status == STATUS_NOT_FOUND)
+		return STATUS_SUCCESS;
+	if (!NT_SUCCESS(status))
+		return status;
+	if (RequestedTime100ns < oldestTime)
+		*EffectiveTime100ns = oldestTime;
+	return STATUS_SUCCESS;
+}
+
 NTSTATUS CdpCorePreviewBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns)
 {
 	NTSTATUS status;
+	UINT64 effectiveTargetTime100ns;
 
 	if (!Core || Core->Phase != Cdp_CORE_PHASE_GENERAL)
 		return STATUS_INVALID_DEVICE_STATE;
 	if (!Core->Journal->Mounted)
 		return STATUS_DEVICE_NOT_READY;
+	status = CdpCoreResolveTargetTime(
+		Core, TargetTime100ns, &effectiveTargetTime100ns);
+	if (!NT_SUCCESS(status))
+		return status;
 
 	Core->Phase = Cdp_CORE_PHASE_PREVIEW;
 	Core->Building = 1;
-	Core->TargetTime100ns = TargetTime100ns;
+	Core->TargetTime100ns = effectiveTargetTime100ns;
 	Core->SnapshotMaxSequence = Core->Journal->NextSequence;
 	CdpPreviewTreeFree(&Core->PreviewTree);
 	CdpPreviewTreeFree(&Core->StagingTree);
@@ -701,7 +731,7 @@ NTSTATUS CdpCorePreviewBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns
 
 	status = CdpJournalBuildPreviewTree(
 		Core->Journal,
-		TargetTime100ns,
+		effectiveTargetTime100ns,
 		Core->SnapshotMaxSequence,
 		TRUE,
 		&Core->PreviewTree);
@@ -867,20 +897,25 @@ done:
 NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns)
 {
 	NTSTATUS status;
+	UINT64 effectiveTargetTime100ns;
 
 	if (!Core || Core->Phase != Cdp_CORE_PHASE_GENERAL)
 		return STATUS_INVALID_DEVICE_STATE;
 	if (!Core->Journal->Mounted)
 		return STATUS_DEVICE_NOT_READY;
+	status = CdpCoreResolveTargetTime(
+		Core, TargetTime100ns, &effectiveTargetTime100ns);
+	if (!NT_SUCCESS(status))
+		return status;
 
 	Core->Phase = Cdp_CORE_PHASE_RECOVERY;
 	Core->Building = 1;
 	Core->RecoveryFailureStatus = STATUS_SUCCESS;
-	Core->TargetTime100ns = TargetTime100ns;
+	Core->TargetTime100ns = effectiveTargetTime100ns;
 	Core->SnapshotMaxSequence = Core->Journal->NextSequence;
 	Cdp_RECOVERY_TRACE(
 		"begin target=%llu snapshotMaxSeq=%llu records=%llu range=[%llu,%llu]\n",
-		TargetTime100ns,
+		effectiveTargetTime100ns,
 		Core->SnapshotMaxSequence,
 		Core->Journal->TotalRecords,
 		Core->Journal->Oldest100ns,
@@ -897,7 +932,7 @@ NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100n
 
 	status = CdpJournalBuildPreviewTree(
 		Core->Journal,
-		TargetTime100ns,
+		effectiveTargetTime100ns,
 		Core->SnapshotMaxSequence,
 		TRUE,
 		&Core->HistoryTree);
