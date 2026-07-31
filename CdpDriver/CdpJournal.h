@@ -9,12 +9,17 @@
 #endif
 
 #define Cdp_JOURNAL_MAGIC            0x4C4E4A51UL /* 'QJNL' */
-#define Cdp_JOURNAL_VERSION          9UL
+#define Cdp_JOURNAL_VERSION          10UL
 #define Cdp_JOURNAL_MAX_RECORD_DATA  (2UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_REGION_SIZE (1UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_LINK_SIZE 32UL
 #define Cdp_JOURNAL_PAYLOAD_REGION_CAPACITY_DIVISOR 10ULL
 #define Cdp_JOURNAL_FLAG_RECOVERY_PENDING 0x00000001UL
+#define Cdp_JOURNAL_FLAG_CREDENTIAL_CONFIGURED 0x00000002UL
+#define Cdp_CREDENTIAL_KDF_PBKDF2_SHA256 1UL
+#define Cdp_CREDENTIAL_SALT_BYTES 16UL
+#define Cdp_CREDENTIAL_VERIFIER_BYTES 32UL
+#define Cdp_CREDENTIAL_DEFAULT_ITERATIONS 200000UL
 
 #pragma pack(push, 1)
 
@@ -41,7 +46,17 @@ typedef struct _Cdp_HEADER_REGION_LINK
 
 C_ASSERT(sizeof(Cdp_HEADER_REGION_LINK) == 32);
 
-// On-disk layout (v9): one superblock, then alternating header/payload areas.
+typedef struct _Cdp_CREDENTIAL_DESCRIPTOR
+{
+	GUID CredentialId;
+	ULONG KdfAlgorithm;
+	ULONG KdfIterations;
+	UCHAR Salt[Cdp_CREDENTIAL_SALT_BYTES];
+	UCHAR Verifier[Cdp_CREDENTIAL_VERIFIER_BYTES];
+	UINT64 AuthEpoch;
+} Cdp_CREDENTIAL_DESCRIPTOR, *PCdp_CREDENTIAL_DESCRIPTOR;
+
+// On-disk layout (v10): one superblock, then alternating header/payload areas.
 //   [Superblock]
 //   [HeaderRegion0 1MB][Payload0 ...]
 //   [HeaderRegion1 1MB][Payload1 ...]
@@ -59,6 +74,8 @@ typedef struct _Cdp_JOURNAL_SUPERBLOCK
 	// Kept after the legacy CRC to preserve the superblock field ordering.
 	UINT64 RecoveryTargetTime100ns;
 	ULONG RecoveryCrc32c;
+	Cdp_CREDENTIAL_DESCRIPTOR Credential;
+	ULONG MetadataCrc32c;
 } Cdp_JOURNAL_SUPERBLOCK, *PCdp_JOURNAL_SUPERBLOCK;
 
 #pragma pack(pop)
@@ -113,6 +130,8 @@ typedef struct _Cdp_JOURNAL
 	BOOLEAN RecoveryPending;
 	BOOLEAN SuperblockDirty;
 	UINT64 RecoveryTargetTime100ns;
+	BOOLEAN CredentialConfigured;
+	Cdp_CREDENTIAL_DESCRIPTOR Credential;
 	GUID SourceVolumeGuid;
 #ifndef Cdp_USERMODE
 	PDEVICE_OBJECT TargetDevice;
@@ -174,6 +193,14 @@ NTSTATUS CdpJournalSetRecoveryIntent(
 	_In_ UINT64 TargetTime100ns);
 
 NTSTATUS CdpJournalClearRecoveryIntent(_Inout_ PCdp_JOURNAL Journal);
+
+NTSTATUS CdpJournalSetCredential(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ const Cdp_CREDENTIAL_DESCRIPTOR* Credential);
+
+BOOLEAN CdpJournalGetCredential(
+	_In_ PCdp_JOURNAL Journal,
+	_Out_ PCdp_CREDENTIAL_DESCRIPTOR Credential);
 
 // Clear on-disk superblock magic so auto-discovery will not remount this journal.
 NTSTATUS CdpJournalInvalidate(_Inout_ PCdp_JOURNAL Journal);

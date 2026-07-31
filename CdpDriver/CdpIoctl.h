@@ -48,6 +48,9 @@
 // Query the current journal payload-space accounting and record metadata.
 #define IOCTL_Cdp_QUERY_JOURNAL_USAGE   CTL_CODE(Cdp_IOCTL_TYPE, 0x80D, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_QUERY_JOURNAL_RECORDS CTL_CODE(Cdp_IOCTL_TYPE, 0x80E, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_Cdp_AUTHENTICATE          CTL_CODE(Cdp_IOCTL_TYPE, 0x80F, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_Cdp_QUERY_CREDENTIAL      CTL_CODE(Cdp_IOCTL_TYPE, 0x810, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_Cdp_CHANGE_PASSWORD       CTL_CODE(Cdp_IOCTL_TYPE, 0x811, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define Cdp_PHASE_GENERAL  0UL
 #define Cdp_PHASE_PREVIEW  1UL
@@ -63,6 +66,7 @@
 #define Cdp_VERSION_STRING_CHARS 32
 #define Cdp_BUILD_STRING_CHARS 32
 #define Cdp_JOURNAL_RECORD_QUERY_MAX_PER_CALL 512u
+#define Cdp_PASSWORD_MAX_UTF8_BYTES 128u
 
 #pragma pack(push, 8)
 
@@ -73,6 +77,36 @@ typedef struct _Cdp_CMD1_REQUEST
 	GUID PartitionGuid2;    // dedicated journal partition
 	ULONG FormatJournal;    // nonzero: initialize journal; zero: mount existing journal
 } Cdp_CMD1_REQUEST, *PCdp_CMD1_REQUEST;
+
+typedef struct _Cdp_CMD1_REQUEST_V2
+{
+	ULONG Code;
+	GUID PartitionGuid1;
+	GUID PartitionGuid2;
+	ULONG FormatJournal;
+	ULONG PasswordLength;
+	UCHAR Password[Cdp_PASSWORD_MAX_UTF8_BYTES];
+} Cdp_CMD1_REQUEST_V2, *PCdp_CMD1_REQUEST_V2;
+
+typedef struct _Cdp_AUTH_REQUEST
+{
+	ULONG PasswordLength;
+	UCHAR Password[Cdp_PASSWORD_MAX_UTF8_BYTES];
+} Cdp_AUTH_REQUEST, *PCdp_AUTH_REQUEST;
+
+typedef struct _Cdp_CREDENTIAL_STATUS_REPLY
+{
+	ULONG Configured;
+	ULONG JournalCount;
+	GUID CredentialId;
+	UINT64 AuthEpoch;
+} Cdp_CREDENTIAL_STATUS_REPLY, *PCdp_CREDENTIAL_STATUS_REPLY;
+
+typedef struct _Cdp_CHANGE_PASSWORD_REQUEST
+{
+	ULONG PasswordLength;
+	UCHAR Password[Cdp_PASSWORD_MAX_UTF8_BYTES];
+} Cdp_CHANGE_PASSWORD_REQUEST, *PCdp_CHANGE_PASSWORD_REQUEST;
 
 typedef struct _Cdp_CMD2_REQUEST
 {

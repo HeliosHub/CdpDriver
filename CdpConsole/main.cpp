@@ -249,6 +249,71 @@ static BOOL PromptGuid(const wchar_t* prompt, GUID* out)
 	return TRUE;
 }
 
+static BOOL PromptPasswordUtf8(
+	_In_ const wchar_t* prompt,
+	_Out_writes_bytes_(Cdp_PASSWORD_MAX_UTF8_BYTES) UCHAR* password,
+	_Out_ PULONG passwordLength)
+{
+	wchar_t wide[Cdp_PASSWORD_MAX_UTF8_BYTES] = { 0 };
+	HANDLE hIn = GetStdHandle(STD_INPUT_HANDLE);
+	DWORD oldMode = 0;
+	BOOL hasMode = GetConsoleMode(hIn, &oldMode);
+	int bytes;
+
+	*passwordLength = 0;
+	SecureZeroMemory(password, Cdp_PASSWORD_MAX_UTF8_BYTES);
+	ConOut(prompt);
+	if (hasMode)
+		SetConsoleMode(hIn, oldMode & ~ENABLE_ECHO_INPUT);
+	if (!ReadLine(wide, _countof(wide)))
+	{
+		if (hasMode) SetConsoleMode(hIn, oldMode);
+		return FALSE;
+	}
+	if (hasMode)
+	{
+		SetConsoleMode(hIn, oldMode);
+		ConOut(L"\n");
+	}
+	bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, wide, -1,
+		(char*)password, Cdp_PASSWORD_MAX_UTF8_BYTES, NULL, NULL);
+	SecureZeroMemory(wide, sizeof(wide));
+	if (bytes <= 1)
+		return FALSE;
+	*passwordLength = (ULONG)(bytes - 1);
+	return TRUE;
+}
+
+static BOOL QueryCredentialStatus(
+	_In_ HANDLE hDevice,
+	_Out_ PCdp_CREDENTIAL_STATUS_REPLY reply)
+{
+	DWORD returned = 0;
+	ZeroMemory(reply, sizeof(*reply));
+	return DeviceIoControl(hDevice, IOCTL_Cdp_QUERY_CREDENTIAL,
+		NULL, 0, reply, sizeof(*reply), &returned, NULL) &&
+		returned >= sizeof(*reply);
+}
+
+static BOOL AuthenticatePassword(HANDLE hDevice)
+{
+	Cdp_AUTH_REQUEST request = { 0 };
+	DWORD returned = 0;
+	BOOL ok;
+	if (!PromptPasswordUtf8(L"Protection password: ", request.Password,
+		&request.PasswordLength))
+	{
+		ConOut(L"Password cannot be empty.\n");
+		return FALSE;
+	}
+	ok = DeviceIoControl(hDevice, IOCTL_Cdp_AUTHENTICATE,
+		&request, sizeof(request), NULL, 0, &returned, NULL);
+	SecureZeroMemory(&request, sizeof(request));
+	if (!ok)
+		ConOutFmt(L"Password authentication failed (err=%lu).\n", GetLastError());
+	return ok;
+}
+
 static BOOL SendCmdBuffered(HANDLE hDevice, const void* req, DWORD reqSize)
 {
 	Cdp_COMMAND_REPLY reply = { 0 };
@@ -269,7 +334,8 @@ static BOOL SendCmdBuffered(HANDLE hDevice, const void* req, DWORD reqSize)
 
 static BOOL DoCommand1(HANDLE hDevice)
 {
-	Cdp_CMD1_REQUEST req = { 0 };
+	Cdp_CMD1_REQUEST_V2 req = { 0 };
+	Cdp_CREDENTIAL_STATUS_REPLY credential = { 0 };
 	wchar_t line[16];
 	req.Code = Cdp_CMD_1;
 	ListVolumes();
@@ -281,7 +347,35 @@ static BOOL DoCommand1(HANDLE hDevice)
 	if (!ReadLine(line, _countof(line)))
 		return FALSE;
 	req.FormatJournal = (line[0] == L'y' || line[0] == L'Y') ? 1 : 0;
-	return SendCmdBuffered(hDevice, &req, sizeof(req));
+	if (req.FormatJournal &&
+		(!QueryCredentialStatus(hDevice, &credential) || !credential.Configured))
+	{
+		UCHAR confirmation[Cdp_PASSWORD_MAX_UTF8_BYTES] = { 0 };
+		ULONG confirmationLength = 0;
+		if (!PromptPasswordUtf8(L"Create global protection password: ",
+			req.Password, &req.PasswordLength) || req.PasswordLength < 6)
+		{
+			ConOut(L"Password must contain at least 6 UTF-8 bytes.\n");
+			SecureZeroMemory(&req, sizeof(req));
+			return FALSE;
+		}
+		if (!PromptPasswordUtf8(L"Confirm protection password: ",
+			confirmation, &confirmationLength) ||
+			confirmationLength != req.PasswordLength ||
+			memcmp(confirmation, req.Password, req.PasswordLength) != 0)
+		{
+			ConOut(L"Passwords do not match.\n");
+			SecureZeroMemory(confirmation, sizeof(confirmation));
+			SecureZeroMemory(&req, sizeof(req));
+			return FALSE;
+		}
+		SecureZeroMemory(confirmation, sizeof(confirmation));
+	}
+	{
+		BOOL ok = SendCmdBuffered(hDevice, &req, sizeof(req));
+		SecureZeroMemory(&req, sizeof(req));
+		return ok;
+	}
 }
 
 static BOOL DoCommand2(HANDLE hDevice)
@@ -292,8 +386,72 @@ static BOOL DoCommand2(HANDLE hDevice)
 	ListVolumes();
 	if (!PromptGuid(L"Protected source volume GUID to stop: ", &req.SourceVolumeGuid))
 		return FALSE;
+	if (!AuthenticatePassword(hDevice))
+		return FALSE;
 	ConOut(L"Stopping capture for source...\n");
 	return SendCmdBuffered(hDevice, &req, sizeof(req));
+}
+
+static BOOL DoPasswordManagement(HANDLE hDevice)
+{
+	Cdp_CREDENTIAL_STATUS_REPLY status = { 0 };
+	wchar_t line[32] = { 0 };
+	if (!QueryCredentialStatus(hDevice, &status))
+	{
+		ConOutFmt(L"Query credential status failed (err=%lu).\n", GetLastError());
+		return FALSE;
+	}
+	ConOutFmt(L"Credential: %s, journals=%lu, epoch=%llu\n",
+		status.Configured ? L"configured" : L"not configured",
+		status.JournalCount, status.AuthEpoch);
+	ConOut(L"Password action [s=set first journal, v=verify, c=change, Enter=status]: ");
+	if (!ReadLine(line, _countof(line)) || line[0] == L'\0')
+		return TRUE;
+	if (line[0] == L's' || line[0] == L'S')
+	{
+		if (status.Configured)
+		{
+			ConOut(L"A global password already exists. Use change instead.\n");
+			return FALSE;
+		}
+		ConOut(L"The first password is set atomically while formatting the first journal.\n");
+		return DoCommand1(hDevice);
+	}
+	if (line[0] == L'v' || line[0] == L'V')
+		return AuthenticatePassword(hDevice);
+	if (line[0] == L'c' || line[0] == L'C')
+	{
+		Cdp_CHANGE_PASSWORD_REQUEST request = { 0 };
+		UCHAR confirmation[Cdp_PASSWORD_MAX_UTF8_BYTES] = { 0 };
+		ULONG confirmationLength = 0;
+		DWORD returned = 0;
+		BOOL ok;
+		if (!status.Configured || !AuthenticatePassword(hDevice))
+			return FALSE;
+		if (!PromptPasswordUtf8(L"New protection password: ",
+			request.Password, &request.PasswordLength) || request.PasswordLength < 6 ||
+			!PromptPasswordUtf8(L"Confirm new password: ",
+				confirmation, &confirmationLength) ||
+			confirmationLength != request.PasswordLength ||
+			memcmp(confirmation, request.Password, request.PasswordLength) != 0)
+		{
+			ConOut(L"New passwords are invalid or do not match.\n");
+			SecureZeroMemory(&request, sizeof(request));
+			SecureZeroMemory(confirmation, sizeof(confirmation));
+			return FALSE;
+		}
+		ok = DeviceIoControl(hDevice, IOCTL_Cdp_CHANGE_PASSWORD,
+			&request, sizeof(request), NULL, 0, &returned, NULL);
+		SecureZeroMemory(&request, sizeof(request));
+		SecureZeroMemory(confirmation, sizeof(confirmation));
+		if (!ok)
+			ConOutFmt(L"Change password failed (err=%lu).\n", GetLastError());
+		else
+			ConOut(L"Global protection password changed.\n");
+		return ok;
+	}
+	ConOut(L"Unknown password action.\n");
+	return FALSE;
 }
 
 static void PrintMaxReadHint(void)
@@ -407,6 +565,8 @@ static BOOL DoPreviewBegin(HANDLE hDevice)
 	ListVolumes();
 	if (!PromptGuid(L"Protected source volume GUID: ", &req.SourceVolumeGuid))
 		return FALSE;
+	if (!AuthenticatePassword(hDevice))
+		return FALSE;
 	ConOut(L"TargetTime100ns (local wall-clock FILETIME value): ");
 	if (!ReadLine(line, _countof(line)))
 		return FALSE;
@@ -512,6 +672,8 @@ static BOOL DoRecoveryBegin(HANDLE hDevice)
 	ListVolumes();
 	if (!PromptGuid(L"Protected source volume GUID: ", &req.SourceVolumeGuid))
 		return FALSE;
+	if (!AuthenticatePassword(hDevice))
+		return FALSE;
 	ConOut(L"TargetTime100ns (local wall-clock FILETIME value): ");
 	if (!ReadLine(line, _countof(line)))
 		return FALSE;
@@ -571,6 +733,8 @@ static BOOL DoRecoveryCommit(HANDLE hDevice)
 	ListVolumes();
 	if (!PromptGuid(L"Prepared source volume GUID: ", &req.SourceVolumeGuid))
 		return FALSE;
+	if (!AuthenticatePassword(hDevice))
+		return FALSE;
 
 	if (!DeviceIoControl(
 			hDevice,
@@ -601,6 +765,8 @@ static BOOL DoRecoveryCancel(HANDLE hDevice)
 
 	ListVolumes();
 	if (!PromptGuid(L"Prepared source volume GUID: ", &req.SourceVolumeGuid))
+		return FALSE;
+	if (!AuthenticatePassword(hDevice))
 		return FALSE;
 
 	if (!DeviceIoControl(
@@ -780,6 +946,8 @@ static BOOL DoListJournalRecords(HANDLE hDevice)
 
 	ListVolumes();
 	if (!PromptGuid(L"Protected source volume GUID: ", &req.SourceVolumeGuid))
+		return FALSE;
+	if (!AuthenticatePassword(hDevice))
 		return FALSE;
 
 	buffer = (BYTE*)malloc(bufferSize);
@@ -963,6 +1131,7 @@ static void PrintHelp(void)
 	ConOut(L"  e  - enter prepared recovery (source GUID + time; no writeback)\n");
 	ConOut(L"  r  - commit prepared recovery synchronously (writeback to source)\n");
 	ConOut(L"  c  - cancel prepared recovery without writeback\n");
+	ConOut(L"  p  - set / verify / change the shared protection password\n");
 	ConOut(L"  v  - list volumes\n");
 	ConOut(L"  d  - query driver version / build / journal version\n");
 	ConOut(L"  t  - convert local time (year-month-day hour:minute:second) to WallClock100ns\n");
@@ -1081,6 +1250,12 @@ int wmain(void)
 			hDevice = EnsureControlDevice(hDevice);
 			if (hDevice != INVALID_HANDLE_VALUE)
 				DoRecoveryCancel(hDevice);
+			break;
+		case L'p':
+		case L'P':
+			hDevice = EnsureControlDevice(hDevice);
+			if (hDevice != INVALID_HANDLE_VALUE)
+				DoPasswordManagement(hDevice);
 			break;
 		case L'v':
 		case L'V':

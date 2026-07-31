@@ -467,10 +467,14 @@ static NTSTATUS CdpJournalWriteSuperblockLocked(_Inout_ PCdp_JOURNAL Journal)
 	superblock->SectorSize = Journal->SectorSize;
 	superblock->Flags = Journal->RecoveryPending ?
 		Cdp_JOURNAL_FLAG_RECOVERY_PENDING : 0;
+	if (Journal->CredentialConfigured)
+		superblock->Flags |= Cdp_JOURNAL_FLAG_CREDENTIAL_CONFIGURED;
 	superblock->PartitionSize = Journal->PartitionSize;
 	superblock->LastHeaderRegionOff = Journal->LastHeaderRegionOff;
 	superblock->SourceVolumeGuid = Journal->SourceVolumeGuid;
 	superblock->RecoveryTargetTime100ns = Journal->RecoveryTargetTime100ns;
+	if (Journal->CredentialConfigured)
+		superblock->Credential = Journal->Credential;
 	superblock->Crc32c = CdpCrc32c(
 		0,
 		superblock,
@@ -479,6 +483,10 @@ static NTSTATUS CdpJournalWriteSuperblockLocked(_Inout_ PCdp_JOURNAL Journal)
 		0,
 		superblock,
 		FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, RecoveryCrc32c));
+	superblock->MetadataCrc32c = CdpCrc32c(
+		0,
+		superblock,
+		FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, MetadataCrc32c));
 
 	status = CdpJournalRawIo(
 		Journal,
@@ -518,6 +526,19 @@ static BOOLEAN CdpJournalSuperblockValid(
 		 CdpCrc32c(0, Superblock,
 			FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, RecoveryCrc32c)) !=
 			Superblock->RecoveryCrc32c))
+	{
+		return FALSE;
+	}
+	if (CdpCrc32c(0, Superblock,
+		FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, MetadataCrc32c)) !=
+		Superblock->MetadataCrc32c)
+	{
+		return FALSE;
+	}
+	if ((Superblock->Flags & Cdp_JOURNAL_FLAG_CREDENTIAL_CONFIGURED) != 0 &&
+		(Superblock->Credential.KdfAlgorithm != Cdp_CREDENTIAL_KDF_PBKDF2_SHA256 ||
+		 Superblock->Credential.KdfIterations == 0 ||
+		 Superblock->Credential.AuthEpoch == 0))
 	{
 		return FALSE;
 	}
@@ -1459,6 +1480,12 @@ NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal)
 		(superblock->Flags & Cdp_JOURNAL_FLAG_RECOVERY_PENDING) != 0;
 	Journal->RecoveryTargetTime100ns = Journal->RecoveryPending ?
 		superblock->RecoveryTargetTime100ns : 0;
+	Journal->CredentialConfigured =
+		(superblock->Flags & Cdp_JOURNAL_FLAG_CREDENTIAL_CONFIGURED) != 0;
+	if (Journal->CredentialConfigured)
+		Journal->Credential = superblock->Credential;
+	else
+		RtlZeroMemory(&Journal->Credential, sizeof(Journal->Credential));
 	Journal->SuperblockDirty = FALSE;
 
 	status = CdpJournalRebuildRuntimeLocked(Journal);
@@ -1532,6 +1559,50 @@ NTSTATUS CdpJournalClearRecoveryIntent(_Inout_ PCdp_JOURNAL Journal)
 done:
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	return status;
+}
+
+NTSTATUS CdpJournalSetCredential(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ const Cdp_CREDENTIAL_DESCRIPTOR* Credential)
+{
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Journal || !Credential ||
+		Credential->KdfAlgorithm != Cdp_CREDENTIAL_KDF_PBKDF2_SHA256 ||
+		Credential->KdfIterations == 0 || Credential->AuthEpoch == 0)
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	Journal->Credential = *Credential;
+	Journal->CredentialConfigured = TRUE;
+	if (Journal->Mounted)
+	{
+		Journal->SuperblockDirty = TRUE;
+		status = CdpJournalWriteSuperblockLocked(Journal);
+		if (NT_SUCCESS(status))
+			status = CdpJournalFlush(Journal);
+	}
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
+BOOLEAN CdpJournalGetCredential(
+	_In_ PCdp_JOURNAL Journal,
+	_Out_ PCdp_CREDENTIAL_DESCRIPTOR Credential)
+{
+	BOOLEAN configured;
+
+	if (!Journal || !Credential)
+		return FALSE;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	configured = Journal->CredentialConfigured;
+	if (configured)
+		*Credential = Journal->Credential;
+	else
+		RtlZeroMemory(Credential, sizeof(*Credential));
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return configured;
 }
 
 NTSTATUS CdpJournalInvalidate(_Inout_ PCdp_JOURNAL Journal)

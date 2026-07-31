@@ -103,6 +103,7 @@
   <ItemGroup>
     <ClCompile Include="Driver.c" />
     <ClCompile Include="CdpJournal.c" />
+	<ClCompile Include="CdpCredential.c" />
     <ClCompile Include="CdpIrpDispatchs.c" />
     <ClCompile Include="cdp_dev_store.c" />
     <ClCompile Include="..\CdpCore\src\cdp_core.c" />
@@ -112,12 +113,18 @@
     <ClInclude Include="CdpIoctl.h" />
     <ClInclude Include="CdpIrpDispatchs.h" />
     <ClInclude Include="CdpJournal.h" />
+	<ClInclude Include="CdpCredential.h" />
     <ClInclude Include="..\CdpCore\include\cdp_alloc.h" />
     <ClInclude Include="..\CdpCore\include\cdp_core.h" />
     <ClInclude Include="..\CdpCore\include\cdp_dev_store.h" />
     <ClInclude Include="..\CdpCore\include\cdp_portable.h" />
     <ClInclude Include="..\CdpCore\include\cdp_store.h" />
   </ItemGroup>
+  <ItemDefinitionGroup>
+    <Link>
+      <AdditionalDependencies>Cng.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>

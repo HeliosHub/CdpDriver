@@ -251,6 +251,8 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 	DriverObject->MajorFunction[IRP_MJ_READ] = CdpIrpDispatchRead;
 	DriverObject->MajorFunction[IRP_MJ_WRITE] = CdpIrpDispatchWrite;
 	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = CdpIrpDispatchDeviceControl;
+	DriverObject->MajorFunction[IRP_MJ_CREATE] = CdpIrpDispatchCreateClose;
+	DriverObject->MajorFunction[IRP_MJ_CLOSE] = CdpIrpDispatchCreateClose;
 	DriverObject->DriverExtension->AddDevice = CdpAddDevice;
 
 	// All volume devices start with their data-I/O gate closed.  Waiting for

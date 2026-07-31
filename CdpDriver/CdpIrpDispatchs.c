@@ -1,5 +1,6 @@
 ﻿#include "CdpIrpDispatchs.h"
 #include "..\CdpCore\include\cdp_core.h"
+#include "CdpCredential.h"
 #include "..\CdpCore\include\cdp_dev_store.h"
 #include <ntdddisk.h>
 #include <ntddstor.h>
@@ -189,6 +190,54 @@ static PCdp_VOLUME_HANDLE_ENTRY CdpLookupVolumeHandleLocked(
 		entry = entry->Flink;
 	}
 	return NULL;
+}
+
+static NTSTATUS CdpGetSharedCredential(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_Out_ PCdp_CREDENTIAL_DESCRIPTOR Credential,
+	_Out_opt_ PULONG JournalCount)
+{
+	PLIST_ENTRY entry;
+	BOOLEAN found = FALSE;
+	ULONG count = 0;
+	NTSTATUS status = STATUS_NOT_FOUND;
+
+	RtlZeroMemory(Credential, sizeof(*Credential));
+	ExAcquireFastMutex(&DriverExt->VolumeHandleMutex);
+	for (entry = DriverExt->VolumeHandleList.Flink;
+		entry != &DriverExt->VolumeHandleList; entry = entry->Flink)
+	{
+		PCdp_VOLUME_HANDLE_ENTRY item =
+			CONTAINING_RECORD(entry, Cdp_VOLUME_HANDLE_ENTRY, Entry);
+		Cdp_CREDENTIAL_DESCRIPTOR current;
+		if (item->Closing || !item->Journal.Mounted ||
+			!CdpJournalGetCredential(&item->Journal, &current))
+		{
+			continue;
+		}
+		if (!found)
+		{
+			*Credential = current;
+			found = TRUE;
+			status = STATUS_SUCCESS;
+		}
+		else if (RtlCompareMemory(Credential, &current, sizeof(current)) !=
+			sizeof(current))
+		{
+			status = STATUS_OBJECT_TYPE_MISMATCH;
+			break;
+		}
+		++count;
+	}
+	ExReleaseFastMutex(&DriverExt->VolumeHandleMutex);
+	if (JournalCount)
+		*JournalCount = count;
+	if (status == STATUS_NOT_FOUND &&
+		InterlockedCompareExchange(&DriverExt->AutoDiscoverySettled, 0, 0) == 0)
+	{
+		return STATUS_DEVICE_NOT_READY;
+	}
+	return status;
 }
 
 // Find our filter's LowerDeviceObject for a volume PDO / stack member.
@@ -580,11 +629,51 @@ static PCdp_DEVICE_EXTENSION CdpFindSourceExtensionByGuid(
 	return found;
 }
 
+static BOOLEAN CdpControlHandleAuthorized(
+	_In_ PIRP Irp,
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ const GUID* SourceVolumeGuid)
+{
+	PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+	PCdp_CONTROL_FILE_CONTEXT context =
+		(PCdp_CONTROL_FILE_CONTEXT)irpSp->FileObject->FsContext;
+	PCdp_DEVICE_EXTENSION sourceExt;
+	PCdp_VOLUME_HANDLE_ENTRY journalEntry;
+	Cdp_CREDENTIAL_DESCRIPTOR credential;
+	BOOLEAN authorized = FALSE;
+
+	if (!context || !context->Authenticated)
+		return FALSE;
+	if (KeQueryInterruptTime() >= context->ExpiresAt100ns)
+	{
+		RtlSecureZeroMemory(context, sizeof(*context));
+		return FALSE;
+	}
+	sourceExt = CdpFindSourceExtensionByGuid(DriverExt, SourceVolumeGuid);
+	journalEntry = CdpAcquireJournalForSource(DriverExt, sourceExt);
+	if (!journalEntry)
+		return FALSE;
+	if (CdpJournalGetCredential(&journalEntry->Journal, &credential) &&
+		RtlCompareMemory(&context->CredentialId, &credential.CredentialId,
+			sizeof(GUID)) == sizeof(GUID) &&
+		context->AuthEpoch == credential.AuthEpoch)
+	{
+		authorized = TRUE;
+		/* Keep an active privileged operation alive without extending an idle
+		 * control handle indefinitely.  In particular, e -> mount work -> r
+		 * must not lose authorization merely because the middle step is slow. */
+		context->ExpiresAt100ns = KeQueryInterruptTime() + 60ULL * 60ULL * 10000000ULL;
+	}
+	CdpReleaseVolumeHandleEntry(journalEntry);
+	return authorized;
+}
+
 static NTSTATUS CdpConfigureCaptureInternal(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const GUID* SourceVolumeGuid,
 	_In_ const GUID* JournalPartitionGuid,
 	_In_ BOOLEAN FormatJournal,
+	_In_opt_ const Cdp_CREDENTIAL_DESCRIPTOR* Credential,
 	_Out_ PUINT64 JournalHandleId)
 {
 	UINT64 sourceHandleId = 0;
@@ -658,9 +747,27 @@ static NTSTATUS CdpConfigureCaptureInternal(
 		journalEntry->PartitionSize,
 		journalEntry->SectorSize,
 		SourceVolumeGuid);
+	if (FormatJournal)
+	{
+		if (!Credential)
+		{
+			CdpReleaseVolumeHandleEntry(journalEntry);
+			(void)CdpCloseVolumeHandle(DriverExt, journalHandleId);
+			return STATUS_PASSWORD_RESTRICTION;
+		}
+		status = CdpJournalSetCredential(&journalEntry->Journal, Credential);
+		if (!NT_SUCCESS(status))
+		{
+			CdpReleaseVolumeHandleEntry(journalEntry);
+			(void)CdpCloseVolumeHandle(DriverExt, journalHandleId);
+			return status;
+		}
+	}
 	status = FormatJournal ?
 		CdpJournalFormat(&journalEntry->Journal) :
 		CdpJournalMount(&journalEntry->Journal);
+	if (NT_SUCCESS(status) && !journalEntry->Journal.CredentialConfigured)
+		status = STATUS_PASSWORD_RESTRICTION;
 	if (NT_SUCCESS(status) && !FormatJournal &&
 		RtlCompareMemory(
 			&journalEntry->Journal.SourceVolumeGuid,
@@ -745,6 +852,7 @@ static NTSTATUS CdpConfigureCapture(
 	_In_ const GUID* SourceVolumeGuid,
 	_In_ const GUID* JournalPartitionGuid,
 	_In_ BOOLEAN FormatJournal,
+	_In_opt_ const Cdp_CREDENTIAL_DESCRIPTOR* Credential,
 	_Out_ PUINT64 JournalHandleId)
 {
 	NTSTATUS status;
@@ -762,6 +870,7 @@ static NTSTATUS CdpConfigureCapture(
 		SourceVolumeGuid,
 		JournalPartitionGuid,
 		FormatJournal,
+		Credential,
 		JournalHandleId);
 	KeReleaseMutex(&DriverExt->CaptureConfigMutex, FALSE);
 	return status;
@@ -1097,7 +1206,7 @@ static NTSTATUS CdpClassifyStartedVolume(
 		sectorSize,
 		&zeroGuid);
 	status = CdpJournalMount(&journalEntry->Journal);
-	if (NT_SUCCESS(status) &&
+	if (NT_SUCCESS(status) && journalEntry->Journal.CredentialConfigured &&
 		!CdpGuidIsZero(&journalEntry->Journal.SourceVolumeGuid))
 	{
 		GUID journalGuid = { 0 };
@@ -1844,6 +1953,39 @@ NTSTATUS CdpIrpDispatchDefault(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Ir
 		return CdpSendToNextDevice(DeviceExtension->LowerDeviceObject, Irp);
 
 	return CdpCompleteIrp(Irp, STATUS_SUCCESS, 0);
+}
+
+NTSTATUS CdpIrpDispatchCreateClose(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
+{
+	PCdp_DRIVER_EXTENSION driverExt =
+		IoGetDriverObjectExtension(g_DriverObject, &g_DriverObject);
+	PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+
+	if (driverExt && DeviceObject == driverExt->ControlDevice)
+	{
+		if (irpSp->MajorFunction == IRP_MJ_CREATE)
+		{
+			PCdp_CONTROL_FILE_CONTEXT context =
+				(PCdp_CONTROL_FILE_CONTEXT)cdpalloc(sizeof(*context));
+			if (!context)
+				return CdpCompleteIrp(Irp, STATUS_INSUFFICIENT_RESOURCES, 0);
+			RtlZeroMemory(context, sizeof(*context));
+			irpSp->FileObject->FsContext = context;
+		}
+		else if (irpSp->MajorFunction == IRP_MJ_CLOSE)
+		{
+			PCdp_CONTROL_FILE_CONTEXT context =
+				(PCdp_CONTROL_FILE_CONTEXT)irpSp->FileObject->FsContext;
+			irpSp->FileObject->FsContext = NULL;
+			if (context)
+			{
+				RtlSecureZeroMemory(context, sizeof(*context));
+				cdpfree(context);
+			}
+		}
+		return CdpCompleteIrp(Irp, STATUS_SUCCESS, 0);
+	}
+	return CdpIrpDispatchDefault(DeviceObject, Irp);
 }
 
 static NTSTATUS CdpBeginRecovery(
@@ -3108,6 +3250,209 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 			return CdpCompleteIrp(Irp, STATUS_SUCCESS, sizeof(BOOLEAN));
 		}
 
+		case IOCTL_Cdp_QUERY_CREDENTIAL:
+		{
+			PCdp_CREDENTIAL_STATUS_REPLY reply;
+			Cdp_CREDENTIAL_DESCRIPTOR credential;
+			ULONG count = 0;
+			NTSTATUS status;
+			if (!Irp->AssociatedIrp.SystemBuffer ||
+				IrpSp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(*reply))
+			{
+				return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+			}
+			reply = (PCdp_CREDENTIAL_STATUS_REPLY)Irp->AssociatedIrp.SystemBuffer;
+			RtlZeroMemory(reply, sizeof(*reply));
+			status = CdpGetSharedCredential(DriverExt, &credential, &count);
+			if (status == STATUS_NOT_FOUND)
+				return CdpCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*reply));
+			if (!NT_SUCCESS(status))
+				return CdpCompleteIrp(Irp, status, 0);
+			reply->Configured = 1;
+			reply->JournalCount = count;
+			reply->CredentialId = credential.CredentialId;
+			reply->AuthEpoch = credential.AuthEpoch;
+			return CdpCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*reply));
+		}
+
+		case IOCTL_Cdp_AUTHENTICATE:
+		{
+			Cdp_AUTH_REQUEST request;
+			Cdp_CREDENTIAL_DESCRIPTOR credential;
+			PCdp_CONTROL_FILE_CONTEXT context =
+				(PCdp_CONTROL_FILE_CONTEXT)IrpSp->FileObject->FsContext;
+			NTSTATUS status;
+			UINT64 now = KeQueryInterruptTime();
+			if (!context || !Irp->AssociatedIrp.SystemBuffer ||
+				IrpSp->Parameters.DeviceIoControl.InputBufferLength < sizeof(request))
+			{
+				return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+			}
+			request = *(PCdp_AUTH_REQUEST)Irp->AssociatedIrp.SystemBuffer;
+			RtlSecureZeroMemory(Irp->AssociatedIrp.SystemBuffer, sizeof(request));
+			if (request.PasswordLength == 0 ||
+				request.PasswordLength > Cdp_PASSWORD_MAX_UTF8_BYTES)
+			{
+				RtlSecureZeroMemory(&request, sizeof(request));
+				return CdpCompleteIrp(Irp, STATUS_INVALID_PARAMETER, 0);
+			}
+			if ((UINT64)InterlockedCompareExchange64(
+				&DriverExt->AuthBlockedUntil100ns, 0, 0) > now)
+			{
+				RtlSecureZeroMemory(&request, sizeof(request));
+				return CdpCompleteIrp(Irp, STATUS_ACCOUNT_LOCKED_OUT, 0);
+			}
+			status = CdpGetSharedCredential(DriverExt, &credential, NULL);
+			if (NT_SUCCESS(status) &&
+				!CdpCredentialVerify(request.Password, request.PasswordLength, &credential))
+			{
+				status = STATUS_ACCESS_DENIED;
+			}
+			RtlSecureZeroMemory(&request, sizeof(request));
+			if (!NT_SUCCESS(status))
+			{
+				if (status == STATUS_ACCESS_DENIED &&
+					InterlockedIncrement(&DriverExt->AuthFailureCount) >= 5)
+				{
+					InterlockedExchange(&DriverExt->AuthFailureCount, 0);
+					InterlockedExchange64(&DriverExt->AuthBlockedUntil100ns,
+						(LONGLONG)(now + 60ULL * 60ULL * 10000000ULL));
+					status = STATUS_ACCOUNT_LOCKED_OUT;
+				}
+				RtlSecureZeroMemory(context, sizeof(*context));
+				return CdpCompleteIrp(Irp, status, 0);
+			}
+			context->Authenticated = TRUE;
+			InterlockedExchange(&DriverExt->AuthFailureCount, 0);
+			InterlockedExchange64(&DriverExt->AuthBlockedUntil100ns, 0);
+			context->CredentialId = credential.CredentialId;
+			context->AuthEpoch = credential.AuthEpoch;
+			context->ExpiresAt100ns = KeQueryInterruptTime() + 60ULL * 60ULL * 10000000ULL;
+			return CdpCompleteIrp(Irp, STATUS_SUCCESS, 0);
+		}
+
+		case IOCTL_Cdp_CHANGE_PASSWORD:
+		{
+			Cdp_CHANGE_PASSWORD_REQUEST request;
+			Cdp_CREDENTIAL_DESCRIPTOR oldCredential;
+			Cdp_CREDENTIAL_DESCRIPTOR newCredential;
+			PCdp_CONTROL_FILE_CONTEXT context =
+				(PCdp_CONTROL_FILE_CONTEXT)IrpSp->FileObject->FsContext;
+			PLIST_ENTRY entry;
+			PCdp_VOLUME_HANDLE_ENTRY* journalEntries = NULL;
+			ULONG journalCapacity = 0;
+			ULONG journalCount = 0;
+			ULONG changedCount = 0;
+			ULONG journalIndex;
+			NTSTATUS status;
+			if (!context || !context->Authenticated ||
+				KeQueryInterruptTime() >= context->ExpiresAt100ns ||
+				!Irp->AssociatedIrp.SystemBuffer ||
+				IrpSp->Parameters.DeviceIoControl.InputBufferLength < sizeof(request))
+			{
+				return CdpCompleteIrp(Irp, STATUS_ACCESS_DENIED, 0);
+			}
+			request = *(PCdp_CHANGE_PASSWORD_REQUEST)Irp->AssociatedIrp.SystemBuffer;
+			RtlSecureZeroMemory(Irp->AssociatedIrp.SystemBuffer, sizeof(request));
+			if (request.PasswordLength == 0 ||
+				request.PasswordLength > Cdp_PASSWORD_MAX_UTF8_BYTES)
+			{
+				RtlSecureZeroMemory(&request, sizeof(request));
+				return CdpCompleteIrp(Irp, STATUS_INVALID_PARAMETER, 0);
+			}
+			status = CdpGetSharedCredential(DriverExt, &oldCredential, NULL);
+			if (!NT_SUCCESS(status) ||
+				RtlCompareMemory(&context->CredentialId, &oldCredential.CredentialId,
+					sizeof(GUID)) != sizeof(GUID) ||
+				context->AuthEpoch != oldCredential.AuthEpoch)
+			{
+				RtlSecureZeroMemory(&request, sizeof(request));
+				return CdpCompleteIrp(Irp, STATUS_ACCESS_DENIED, 0);
+			}
+			status = CdpCredentialCreate(
+				request.Password, request.PasswordLength, &newCredential);
+			RtlSecureZeroMemory(&request, sizeof(request));
+			if (!NT_SUCCESS(status))
+				return CdpCompleteIrp(Irp, status, 0);
+			newCredential.CredentialId = oldCredential.CredentialId;
+			newCredential.AuthEpoch = oldCredential.AuthEpoch + 1;
+			if (newCredential.AuthEpoch == 0)
+				newCredential.AuthEpoch = 1;
+
+			/*
+			 * Pin matching journal entries while holding the list mutex, then drop
+			 * that mutex before writing/flushing superblocks. Raw disk I/O can re-enter
+			 * this driver and must never run under VolumeHandleMutex.
+			 */
+			ExAcquireFastMutex(&DriverExt->VolumeHandleMutex);
+			for (entry = DriverExt->VolumeHandleList.Flink;
+				entry != &DriverExt->VolumeHandleList; entry = entry->Flink)
+			{
+				++journalCapacity;
+			}
+			if (journalCapacity != 0)
+			{
+				journalEntries = (PCdp_VOLUME_HANDLE_ENTRY*)cdpalloc(
+					sizeof(*journalEntries) * journalCapacity);
+			}
+			if (journalCapacity != 0 && !journalEntries)
+			{
+				ExReleaseFastMutex(&DriverExt->VolumeHandleMutex);
+				RtlSecureZeroMemory(&newCredential, sizeof(newCredential));
+				RtlSecureZeroMemory(&oldCredential, sizeof(oldCredential));
+				return CdpCompleteIrp(Irp, STATUS_INSUFFICIENT_RESOURCES, 0);
+			}
+			for (entry = DriverExt->VolumeHandleList.Flink;
+				entry != &DriverExt->VolumeHandleList; entry = entry->Flink)
+			{
+				PCdp_VOLUME_HANDLE_ENTRY item =
+					CONTAINING_RECORD(entry, Cdp_VOLUME_HANDLE_ENTRY, Entry);
+				Cdp_CREDENTIAL_DESCRIPTOR current;
+				if (item->Closing || !item->Journal.Mounted ||
+					!CdpJournalGetCredential(&item->Journal, &current) ||
+					RtlCompareMemory(&oldCredential, &current, sizeof(current)) !=
+						sizeof(current))
+				{
+					continue;
+				}
+				InterlockedIncrement(&item->ReferenceCount);
+				journalEntries[journalCount++] = item;
+			}
+			ExReleaseFastMutex(&DriverExt->VolumeHandleMutex);
+
+			status = journalCount != 0 ? STATUS_SUCCESS : STATUS_NOT_FOUND;
+			for (journalIndex = 0; journalIndex < journalCount; ++journalIndex)
+			{
+				status = CdpJournalSetCredential(
+					&journalEntries[journalIndex]->Journal, &newCredential);
+				changedCount = journalIndex + 1;
+				if (!NT_SUCCESS(status))
+					break;
+			}
+			if (!NT_SUCCESS(status))
+			{
+				NTSTATUS originalStatus = status;
+				for (journalIndex = 0; journalIndex < changedCount; ++journalIndex)
+				{
+					(void)CdpJournalSetCredential(
+						&journalEntries[journalIndex]->Journal, &oldCredential);
+				}
+				status = originalStatus;
+			}
+			for (journalIndex = 0; journalIndex < journalCount; ++journalIndex)
+				CdpReleaseVolumeHandleEntry(journalEntries[journalIndex]);
+			if (journalEntries)
+				cdpfree(journalEntries);
+			if (NT_SUCCESS(status))
+			{
+				context->CredentialId = newCredential.CredentialId;
+				context->AuthEpoch = newCredential.AuthEpoch;
+			}
+			RtlSecureZeroMemory(&newCredential, sizeof(newCredential));
+			RtlSecureZeroMemory(&oldCredential, sizeof(oldCredential));
+			return CdpCompleteIrp(Irp, status, 0);
+		}
+
 		case IOCTL_Cdp_SEND_COMMAND:
 		{
 			PULONG pCode;
@@ -3128,15 +3473,42 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 			{
 			case Cdp_CMD_1:
 			{
-				Cdp_CMD1_REQUEST local;
+				Cdp_CMD1_REQUEST_V2 local;
+				Cdp_CREDENTIAL_DESCRIPTOR credential;
+				const Cdp_CREDENTIAL_DESCRIPTOR* credentialPtr = NULL;
 				UINT64 handleId = 0;
 				NTSTATUS Status;
 
 				if (inLen < sizeof(Cdp_CMD1_REQUEST))
 					return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
 
-				local = *(PCdp_CMD1_REQUEST)Irp->AssociatedIrp.SystemBuffer;
+				RtlZeroMemory(&local, sizeof(local));
+				RtlCopyMemory(&local, Irp->AssociatedIrp.SystemBuffer,
+					inLen < sizeof(local) ? inLen : sizeof(local));
 				reply = (PCdp_COMMAND_REPLY)Irp->AssociatedIrp.SystemBuffer;
+				RtlZeroMemory(&credential, sizeof(credential));
+				if (local.FormatJournal != 0)
+				{
+					Status = CdpGetSharedCredential(DriverExt, &credential, NULL);
+					if (Status == STATUS_NOT_FOUND)
+					{
+						if (inLen < sizeof(Cdp_CMD1_REQUEST_V2) ||
+							local.PasswordLength == 0 ||
+							local.PasswordLength > Cdp_PASSWORD_MAX_UTF8_BYTES)
+						{
+							RtlSecureZeroMemory(&local, sizeof(local));
+							return CdpCompleteIrp(Irp, STATUS_PASSWORD_RESTRICTION, 0);
+						}
+						Status = CdpCredentialCreate(local.Password,
+							local.PasswordLength, &credential);
+					}
+					if (!NT_SUCCESS(Status))
+					{
+						RtlSecureZeroMemory(&local, sizeof(local));
+						return CdpCompleteIrp(Irp, Status, 0);
+					}
+					credentialPtr = &credential;
+				}
 
 				Cdp_DBG("CMD1 received\n");
 				Cdp_LOG("version=%s journal=v%lu build=%s\n",
@@ -3150,7 +3522,10 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 					&local.PartitionGuid1,
 					&local.PartitionGuid2,
 					local.FormatJournal != 0,
+					credentialPtr,
 					&handleId);
+				RtlSecureZeroMemory(local.Password, sizeof(local.Password));
+				RtlSecureZeroMemory(Irp->AssociatedIrp.SystemBuffer, inLen);
 				if (!NT_SUCCESS(Status))
 				{
 					Cdp_LOG("CMD1 configure failed status=0x%08X\n", Status);
@@ -3176,6 +3551,14 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 
 				local = *(PCdp_CMD2_REQUEST)Irp->AssociatedIrp.SystemBuffer;
 				reply = (PCdp_COMMAND_REPLY)Irp->AssociatedIrp.SystemBuffer;
+				if (!CdpControlHandleAuthorized(
+					Irp, DriverExt, &local.SourceVolumeGuid))
+				{
+					CdpFillReply(reply, Cdp_CMD_2, (ULONG)STATUS_ACCESS_DENIED, 0,
+						L"ERROR: password authentication required");
+					return CdpCompleteIrp(Irp, STATUS_ACCESS_DENIED,
+						sizeof(Cdp_COMMAND_REPLY));
+				}
 
 				Cdp_DBG("CMD2 received\n");
 				CdpDbgGuid("  Source", &local.SourceVolumeGuid);
@@ -3384,6 +3767,11 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 			}
 			request =
 				*(PCdp_RECOVERY_BEGIN_REQUEST)Irp->AssociatedIrp.SystemBuffer;
+			if (!CdpControlHandleAuthorized(Irp, DriverExt,
+				&request.SourceVolumeGuid))
+			{
+				return CdpCompleteIrp(Irp, STATUS_ACCESS_DENIED, 0);
+			}
 			reply =
 				(PCdp_RECOVERY_BEGIN_REPLY)Irp->AssociatedIrp.SystemBuffer;
 			status = CdpBeginRecovery(DriverExt, &request, reply);
@@ -3414,6 +3802,11 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 			}
 			request =
 				*(PCdp_RECOVERY_CONTROL_REQUEST)Irp->AssociatedIrp.SystemBuffer;
+			if (!CdpControlHandleAuthorized(Irp, DriverExt,
+				&request.SourceVolumeGuid))
+			{
+				return CdpCompleteIrp(Irp, STATUS_ACCESS_DENIED, 0);
+			}
 			reply =
 				(PCdp_RECOVERY_COMMIT_REPLY)Irp->AssociatedIrp.SystemBuffer;
 			status = CdpCommitRecovery(DriverExt, &request, reply);
@@ -3440,6 +3833,11 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 			}
 			request =
 				*(PCdp_RECOVERY_CONTROL_REQUEST)Irp->AssociatedIrp.SystemBuffer;
+			if (!CdpControlHandleAuthorized(Irp, DriverExt,
+				&request.SourceVolumeGuid))
+			{
+				return CdpCompleteIrp(Irp, STATUS_ACCESS_DENIED, 0);
+			}
 			status = CdpCancelRecovery(DriverExt, &request);
 			return CdpCompleteIrp(Irp, status, 0);
 		}
@@ -3528,6 +3926,11 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 
 			request =
 				*(PCdp_JOURNAL_RECORD_QUERY_REQUEST)Irp->AssociatedIrp.SystemBuffer;
+			if (!CdpControlHandleAuthorized(Irp, DriverExt,
+				&request.SourceVolumeGuid))
+			{
+				return CdpCompleteIrp(Irp, STATUS_ACCESS_DENIED, 0);
+			}
 			reply =
 				(PCdp_JOURNAL_RECORD_QUERY_REPLY)Irp->AssociatedIrp.SystemBuffer;
 			recordCapacity =

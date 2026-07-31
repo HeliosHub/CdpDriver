@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.3.15"
-#define Cdp_DRIVER_BUILD_STRING   "20260730.4"
+#define Cdp_DRIVER_VERSION_STRING "1.4.0"
+#define Cdp_DRIVER_BUILD_STRING   "20260731.1"
 
 // Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.
 // Cdp_DBG: Debug builds only — verbose I/O and path tracing.
@@ -113,7 +113,17 @@ typedef struct _Cdp_DRIVER_EXTENSION
 	volatile LONG AutoDiscoveryRunning;
 	KEVENT AutoDiscoveryIdle;
 	KEVENT AutoDiscoverySettledEvent;
+	volatile LONG AuthFailureCount;
+	volatile LONGLONG AuthBlockedUntil100ns;
 } Cdp_DRIVER_EXTENSION, *PCdp_DRIVER_EXTENSION;
+
+typedef struct _Cdp_CONTROL_FILE_CONTEXT
+{
+	BOOLEAN Authenticated;
+	GUID CredentialId;
+	UINT64 AuthEpoch;
+	UINT64 ExpiresAt100ns;
+} Cdp_CONTROL_FILE_CONTEXT, *PCdp_CONTROL_FILE_CONTEXT;
 
 typedef struct _Cdp_CORE Cdp_CORE, *PCdp_CORE;
 
