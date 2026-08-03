@@ -188,8 +188,16 @@ static NTSTATUS CdpJournalDecodeRecord(
 	_In_ const Cdp_JOURNAL_RECORD_HEADER* Header,
 	_Out_ PCdp_JOURNAL_RECORD Record)
 {
+	ULONG localSequence;
+	ULONG recordFlags;
+
+	localSequence = Header ?
+		(Header->Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) : 0;
+	recordFlags = Header ?
+		(Header->Sequence & Cdp_JOURNAL_RECORD_FLAGS_MASK) : 0;
 	if (!Link || !Header || !Record ||
-		Link->StartSequence > MAXUINT64 - Header->Sequence)
+		(recordFlags & ~Cdp_JOURNAL_RECORD_FLAG_BACKFILL) != 0 ||
+		Link->StartSequence > MAXUINT64 - localSequence)
 	{
 		return STATUS_INTEGER_OVERFLOW;
 	}
@@ -197,8 +205,9 @@ static NTSTATUS CdpJournalDecodeRecord(
 	Record->WallClock100ns = Header->WallClock100ns;
 	Record->VolumeOffset = Header->VolumeOffset;
 	Record->FileOffset = Header->FileOffset;
-	Record->Sequence = Link->StartSequence + Header->Sequence;
+	Record->Sequence = Link->StartSequence + localSequence;
 	Record->DataLength = Header->DataLength;
+	Record->Flags = recordFlags;
 	return STATUS_SUCCESS;
 }
 
@@ -1246,7 +1255,9 @@ static NTSTATUS CdpJournalRebuildRuntimeLocked(_Inout_ PCdp_JOURNAL Journal)
 				break;
 			}
 			if (header.DataLength == 0 ||
-				header.Sequence != index ||
+				(header.Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) != index ||
+				(header.Sequence & Cdp_JOURNAL_RECORD_FLAGS_MASK &
+					~Cdp_JOURNAL_RECORD_FLAG_BACKFILL) != 0 ||
 				header.DataLength > Cdp_JOURNAL_MAX_RECORD_DATA ||
 				header.FileOffset < CdpJournalUsableStart(Journal) ||
 				header.FileOffset > CdpJournalUsableEnd(Journal) ||
@@ -1259,13 +1270,13 @@ static NTSTATUS CdpJournalRebuildRuntimeLocked(_Inout_ PCdp_JOURNAL Journal)
 			}
 
 			Journal->TotalRecords++;
-			if (link.StartSequence > MAXUINT64 - header.Sequence ||
-				link.StartSequence + header.Sequence == MAXUINT64)
+			if (link.StartSequence > MAXUINT64 - index ||
+				link.StartSequence + index == MAXUINT64)
 			{
 				status = STATUS_INTEGER_OVERFLOW;
 				goto cleanup;
 			}
-			expectedSequence = link.StartSequence + header.Sequence + 1;
+			expectedSequence = link.StartSequence + index + 1;
 			haveExpectedSequence = TRUE;
 			if (isLast)
 				Journal->NextSequence = expectedSequence;
@@ -1658,6 +1669,23 @@ NTSTATUS CdpJournalAppend(
 	_In_reads_bytes_(DataLength) const VOID* BeforeImage,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord)
 {
+	return CdpJournalAppendEx(
+		Journal,
+		VolumeOffset,
+		DataLength,
+		BeforeImage,
+		0,
+		WrittenRecord);
+}
+
+NTSTATUS CdpJournalAppendEx(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_In_reads_bytes_(DataLength) const VOID* BeforeImage,
+	_In_ ULONG RecordFlags,
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord)
+{
 	Cdp_JOURNAL_RECORD_HEADER header;
 	Cdp_JOURNAL_RECORD record;
 	UINT64 payloadOff;
@@ -1670,6 +1698,7 @@ NTSTATUS CdpJournalAppend(
 	NTSTATUS status = STATUS_SUCCESS;
 
 	if (!Journal->Mounted || !BeforeImage ||
+		(RecordFlags & ~Cdp_JOURNAL_RECORD_FLAG_BACKFILL) != 0 ||
 		DataLength == 0 || DataLength > Cdp_JOURNAL_MAX_RECORD_DATA)
 	{
 		return STATUS_INVALID_PARAMETER;
@@ -1774,7 +1803,7 @@ NTSTATUS CdpJournalAppend(
 	header.VolumeOffset = VolumeOffset;
 	header.FileOffset = payloadOff;
 	header.DataLength = DataLength;
-	header.Sequence = Journal->CurrentHeaderCount;
+	header.Sequence = Journal->CurrentHeaderCount | RecordFlags;
 
 	status = CdpJournalWriteHeaderAt(
 		Journal,
@@ -1811,6 +1840,7 @@ NTSTATUS CdpJournalAppend(
 		record.FileOffset = header.FileOffset;
 		record.Sequence = writeSeq;
 		record.DataLength = header.DataLength;
+		record.Flags = RecordFlags;
 		*WrittenRecord = record;
 	}
 
@@ -2106,7 +2136,9 @@ NTSTATUS CdpJournalQueryRecordHeaders(
 		if (!NT_SUCCESS(status))
 			goto cleanup;
 		if (header.DataLength == 0 ||
-			header.Sequence != headerIndex ||
+			(header.Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) != headerIndex ||
+			(header.Sequence & Cdp_JOURNAL_RECORD_FLAGS_MASK &
+				~Cdp_JOURNAL_RECORD_FLAG_BACKFILL) != 0 ||
 			header.DataLength > Cdp_JOURNAL_MAX_RECORD_DATA)
 		{
 			status = STATUS_DISK_CORRUPT_ERROR;
@@ -2888,7 +2920,10 @@ NTSTATUS CdpJournalBuildPreviewTree(
 			if (header.DataLength == 0 ||
 				header.DataLength > Cdp_JOURNAL_MAX_RECORD_DATA ||
 				header.VolumeOffset > MAXUINT64 - header.DataLength ||
-				header.Sequence != (ULONG)index)
+				(header.Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) !=
+					(ULONG)index ||
+				(header.Sequence & Cdp_JOURNAL_RECORD_FLAGS_MASK &
+					~Cdp_JOURNAL_RECORD_FLAG_BACKFILL) != 0)
 			{
 				continue;
 			}
@@ -2899,9 +2934,13 @@ NTSTATUS CdpJournalBuildPreviewTree(
 			if (record.Sequence >= MaxSequence)
 				continue;
 
-			if (IncludeTargetTime ?
-				header.WallClock100ns < TargetTime100ns :
-				header.WallClock100ns <= TargetTime100ns)
+			/* Backfill records are replay-protection COWs created while a
+			 * Recovery is active.  During target-time discovery they always
+			 * enter the tree and never satisfy the time stop condition. */
+			if ((record.Flags & Cdp_JOURNAL_RECORD_FLAG_BACKFILL) == 0 &&
+				(IncludeTargetTime ?
+					header.WallClock100ns < TargetTime100ns :
+					header.WallClock100ns <= TargetTime100ns))
 			{
 				stop = TRUE;
 				break;

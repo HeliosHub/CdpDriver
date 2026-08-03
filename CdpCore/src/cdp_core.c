@@ -397,6 +397,21 @@ NTSTATUS CdpCoreCaptureAppend(
 	_In_ ULONG Length,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord)
 {
+	ULONG recordFlags = 0;
+
+	if (Core && Core->Phase == Cdp_CORE_PHASE_RECOVERY)
+		recordFlags = Cdp_JOURNAL_RECORD_FLAG_BACKFILL;
+	return CdpCoreCaptureAppendEx(
+		Core, Offset, Length, recordFlags, WrittenRecord);
+}
+
+NTSTATUS CdpCoreCaptureAppendEx(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_In_ ULONG RecordFlags,
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord)
+{
 	PUCHAR before = NULL;
 	NTSTATUS status;
 	Cdp_JOURNAL_RECORD record;
@@ -421,7 +436,13 @@ NTSTATUS CdpCoreCaptureAppend(
 			Offset,
 			Length);
 	}
-	status = CdpJournalAppend(Core->Journal, Offset, Length, before, &record);
+	status = CdpJournalAppendEx(
+		Core->Journal,
+		Offset,
+		Length,
+		before,
+		RecordFlags,
+		&record);
 	if (!NT_SUCCESS(status))
 	{
 		if (Core->WritebackActive)
@@ -854,7 +875,10 @@ NTSTATUS CdpCoreRecoveryCommitStep(
 		ULONG writeLength = node->DataLength - writeOffset;
 		if (writeLength > Cdp_JOURNAL_MAX_RECORD_DATA)
 			writeLength = Cdp_JOURNAL_MAX_RECORD_DATA;
-		status = CdpCoreSourceWriteDirect(
+		/* Recovery writeback is itself protected by COW.  WritebackActive
+		 * prevents the resulting BACKFILL record from punching or entering
+		 * the in-flight HistoryTree. */
+		status = CdpCoreWrite(
 			Core,
 			node->Start + writeOffset,
 			writeLength,

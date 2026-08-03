@@ -1525,6 +1525,196 @@ static int TestJournalUsageAndRecordHeaders(void)
 	return g_caseFailed;
 }
 
+static int TestRecordSequenceFlagsAndRemount(void)
+{
+	TEST_CTX ctx;
+	Cdp_JOURNAL_RECORD records[2];
+	PCdp_JOURNAL_SUPERBLOCK superblock;
+	PCdp_JOURNAL_RECORD_HEADER diskHeaders;
+	Cdp_JOURNAL remounted;
+	GUID sourceGuid = { 0 };
+	UCHAR a[512];
+	UCHAR b[512];
+	UINT64 total = 0;
+	UINT64 generation = 0;
+	ULONG returned = 0;
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 50600)),
+		"setup sequence flag test");
+	FillPattern(a, sizeof(a), 0x63);
+	FillPattern(b, sizeof(b), 0x64);
+	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
+		"seed source for flagged append");
+	status = CdpCoreCaptureAppend(ctx.Core, 0, sizeof(a), NULL);
+	Expect(NT_SUCCESS(status), "append ordinary record");
+	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(b), b)),
+		"apply ordinary live write");
+	status = CdpCoreCaptureAppendEx(ctx.Core, 0, sizeof(b),
+		Cdp_JOURNAL_RECORD_FLAG_BACKFILL, NULL);
+	Expect(NT_SUCCESS(status), "append backfill record");
+
+	status = CdpCoreQueryRecordHeaders(ctx.Core, 0, 0, records,
+		RTL_NUMBER_OF(records), &total, &generation, &returned);
+	Expect(NT_SUCCESS(status) && total == 2 && returned == 2,
+		"query ordinary and backfill records");
+	Expect(records[0].Sequence == 1 && records[0].Flags == 0 &&
+		records[1].Sequence == 2 &&
+		records[1].Flags == Cdp_JOURNAL_RECORD_FLAG_BACKFILL,
+		"decoded records separate global sequence from flags");
+
+	superblock = (PCdp_JOURNAL_SUPERBLOCK)CdpMemStoreData(ctx.Journal);
+	diskHeaders = (PCdp_JOURNAL_RECORD_HEADER)(
+		(PUCHAR)CdpMemStoreData(ctx.Journal) + superblock->LastHeaderRegionOff);
+	Expect(diskHeaders[0].Sequence == 0 &&
+		diskHeaders[1].Sequence ==
+			(Cdp_JOURNAL_RECORD_FLAG_BACKFILL | 1UL),
+		"disk header stores low-16 index and high-16 backfill flag");
+
+	CdpCoreDestroy(ctx.Core);
+	ctx.Core = NULL;
+	CdpJournalInitializeWithStore(
+		&remounted, ctx.Journal, &sourceGuid, NULL, NULL);
+	status = CdpJournalMount(&remounted);
+	Expect(NT_SUCCESS(status), "remount journal containing flagged header");
+	if (NT_SUCCESS(status))
+	{
+		returned = 0;
+		status = CdpJournalQueryRecordHeaders(&remounted, 0, 0, records,
+			RTL_NUMBER_OF(records), &total, &generation, &returned);
+		Expect(NT_SUCCESS(status) && returned == 2 &&
+			records[1].Sequence == 2 &&
+			records[1].Flags == Cdp_JOURNAL_RECORD_FLAG_BACKFILL,
+			"remount preserves backfill flag and global sequence");
+	}
+	CdpJournalClose(&remounted);
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
+static int TestBackfillTargetScanContinuesPastTimeStop(void)
+{
+	TEST_CTX ctx;
+	UCHAR initial[1024];
+	UCHAR live[1024];
+	UCHAR out[1024];
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 50700)),
+		"setup backfill target scan test");
+	FillPattern(initial, sizeof(initial), 0x65);
+	FillPattern(live, sizeof(live), 0x75);
+	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0,
+		sizeof(initial), initial)), "seed two target-scan ranges");
+
+	CdpCoreSetTime100ns(ctx.Core, 100);
+	status = CdpCoreCaptureAppend(ctx.Core, 0, 512, NULL);
+	Expect(NT_SUCCESS(status), "append normal record newer than target");
+	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, 512, live)),
+		"apply normal live write");
+
+	CdpCoreSetTime100ns(ctx.Core, 50);
+	status = CdpCoreCaptureAppendEx(ctx.Core, 512, 512,
+		Cdp_JOURNAL_RECORD_FLAG_BACKFILL, NULL);
+	Expect(NT_SUCCESS(status), "append backfill record satisfying time stop");
+	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 512, 512, live + 512)),
+		"apply backfill live write");
+	/* The artificial backfill timestamp is intentionally older than the
+	 * preceding physical record. Remount rebuilds the true min/max range just
+	 * as a reboot would, while preserving physical record order. */
+	CdpCoreDestroy(ctx.Core);
+	ctx.Core = NULL;
+	status = CdpCoreCreate(ctx.Source, ctx.Journal, &ctx.Core);
+	Expect(NT_SUCCESS(status), "recreate core for backfill target scan");
+	if (NT_SUCCESS(status))
+	{
+		status = CdpCoreMountJournal(ctx.Core);
+		Expect(NT_SUCCESS(status), "remount out-of-order backfill timestamps");
+	}
+	if (!NT_SUCCESS(status))
+	{
+		TestCtxDestroy(&ctx);
+		return g_caseFailed;
+	}
+
+	status = CdpCorePreviewBegin(ctx.Core, 75);
+	Expect(NT_SUCCESS(status), "preview scans through backfill time stop");
+	status = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(out, initial, sizeof(initial)) == 0,
+		"preview inserts backfill and preceding normal record");
+	Expect(NT_SUCCESS(CdpCorePreviewEnd(ctx.Core)),
+		"end backfill preview");
+
+	status = CdpCoreRecoveryBegin(ctx.Core, 75);
+	Expect(NT_SUCCESS(status), "recovery scans through backfill time stop");
+	status = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(out, initial, sizeof(initial)) == 0,
+		"recovery inserts backfill and preceding normal record");
+	Expect(NT_SUCCESS(CdpCoreRecoveryCancel(ctx.Core)),
+		"cancel backfill scan recovery");
+
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
+static int TestRecoveryCowRecordsAreBackfill(void)
+{
+	TEST_CTX ctx;
+	UCHAR original[512];
+	UCHAR changed[512];
+	UCHAR concurrent[512];
+	Cdp_JOURNAL_RECORD records[4];
+	UINT64 target;
+	UINT64 total = 0;
+	UINT64 generation = 0;
+	ULONG returned = 0;
+	BOOLEAN complete = FALSE;
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 50800)),
+		"setup recovery backfill COW test");
+	FillPattern(original, sizeof(original), 0x66);
+	FillPattern(changed, sizeof(changed), 0x76);
+	FillPattern(concurrent, sizeof(concurrent), 0x86);
+	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0,
+		sizeof(original), original)), "seed recovery source");
+	target = CdpCoreGetTime100ns(ctx.Core);
+	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 0,
+		sizeof(changed), changed)), "create ordinary recovery history");
+	Expect(NT_SUCCESS(CdpCoreRecoveryBegin(ctx.Core, target)),
+		"prepare recovery before flagged COWs");
+	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 512,
+		sizeof(concurrent), concurrent)),
+		"normal write during recovery appends backfill COW");
+	while (!complete)
+	{
+		status = CdpCoreRecoveryCommitStep(ctx.Core, &complete);
+		if (!NT_SUCCESS(status))
+			break;
+	}
+	Expect(NT_SUCCESS(status) && complete,
+		"recovery writeback completes through COW");
+	Expect(memcmp(CdpMemStoreData(ctx.Source), original,
+		sizeof(original)) == 0 &&
+		memcmp((PUCHAR)CdpMemStoreData(ctx.Source) + 512,
+			concurrent, sizeof(concurrent)) == 0,
+		"writeback restores history and preserves concurrent range");
+
+	status = CdpCoreQueryRecordHeaders(ctx.Core, 0, 0, records,
+		RTL_NUMBER_OF(records), &total, &generation, &returned);
+	Expect(NT_SUCCESS(status) && total == 3 && returned == 3,
+		"ordinary, concurrent, and writeback COW records are retained");
+	Expect(records[0].Flags == 0 &&
+		records[1].Flags == Cdp_JOURNAL_RECORD_FLAG_BACKFILL &&
+		records[2].Flags == Cdp_JOURNAL_RECORD_FLAG_BACKFILL,
+		"all Recovery-phase COWs, including writeback, are backfill");
+
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
 static int TestRecoveryCommitCoalescedLargePayload(void)
 {
 	const ULONG transferSize = 4UL * 1024UL * 1024UL;
@@ -3160,6 +3350,9 @@ int main(void)
 	failed += RunCase("QueryTimeRange empty journal", TestQueryTimeRangeEmptyJournal);
 	failed += RunCase("QueryTimeRange wall clocks", TestQueryTimeRangeWallClocks);
 	failed += RunCase("Journal usage and record headers", TestJournalUsageAndRecordHeaders);
+	failed += RunCase("Record sequence flags and remount", TestRecordSequenceFlagsAndRemount);
+	failed += RunCase("Backfill target scan continues", TestBackfillTargetScanContinuesPastTimeStop);
+	failed += RunCase("Recovery COW records are backfill", TestRecoveryCowRecordsAreBackfill);
 	failed += RunCase("Recovery commit coalesced large payload", TestRecoveryCommitCoalescedLargePayload);
 	failed += RunCase("Recovery commit step coalesced large payload", TestRecoveryCommitStepCoalescedLargePayload);
 	failed += RunCase("QueryTimeRange after eviction", TestQueryTimeRangeAfterEviction);

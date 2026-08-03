@@ -80,6 +80,14 @@ NTSTATUS CdpCoreCaptureAppend(
 	_In_ ULONG Length,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
 
+/* Driver path with explicit on-disk Cdp_JOURNAL_RECORD_FLAG_* bits. */
+NTSTATUS CdpCoreCaptureAppendEx(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_In_ ULONG RecordFlags,
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
+
 NTSTATUS CdpCoreRead(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,

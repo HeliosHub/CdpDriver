@@ -1,177 +1,225 @@
 # 架构设计
 
-## 概述
+## 1. 总体结构
 
-本项目是一个 Windows **卷过滤驱动**，对受保护卷的写入做 **Copy-on-Write（写前镜像）**：每次写操作先把被覆盖的旧数据追加到独立的 **CDP/Journal 分区**，再把原始写透传到下层设备。磁盘上始终是最新数据；历史 before-image 留在 journal 中，用于：
+CdpDriver 是 Volume Upper Filter。写入先在 PASSIVE_LEVEL 的捕获工作线程中读取源卷 before-image，追加到独立 Journal，再同步提交原始写 IRP。源卷保存实时数据，Journal 保存历史数据。
 
-- **Preview**：按时间点只读重建历史视图；包含时间戳等于目标时间的 COW 记录
-- **Recovery**：先准备目标时间视图，再显式提交同步回填；包含时间戳等于目标时间的 COW 记录
+```text
+文件系统（NTFS 等）
+        │
+CdpDriver（Volume Upper Filter）
+        │
+卷设备 / 磁盘驱动
 
-配套工具：
-
-| 组件 | 作用 |
-|------|------|
-| `CdpConsole` | 安装/注册驱动、配置捕获（CMD1/2）、卷句柄读写（CMD3–5）、Preview、查询 journal 时间范围 |
-| `CdpCore` | 用户态库：内存模拟源卷+journal，单测 COW/Preview/Recovery（见 `CdpCore/README.md`） |
-
-当前 journal 磁盘格式版本为 **v9**（单 Superblock + 1MB 头区/负载区交替）。每个 HeaderRegion 尾部保存 64 位 `StartSequence`；开发阶段不提供旧格式兼容或迁移。
-
-## 驱动在设备栈中的位置
-
-```
-文件系统驱动 (NTFS 等)
-|
-本驱动（Volume Upper Filter）
-|
-卷设备
-|
-磁盘驱动
+          COW payload + metadata
+        └────────────────────────> 专用 Journal 卷
 ```
 
-写路径：`IRP_MJ_WRITE` →（若 `CaptureEnabled`）排队到捕获工作线程 → 读 before-image → `CdpJournalAppend` → 同步转发原写。  
-读路径：默认透传；仅在 **Recovery** 阶段对非分页读做历史合成。
+| 组件 | 职责 |
+|---|---|
+| `CdpDriver` | PnP、IRP/IOCTL、启动 Gate、工作线程、真实设备 Store、认证 |
+| `CdpCore` | COW、Preview/Recovery Phase、区间树、逐节点 Commit |
+| `CdpJournal` | v11 磁盘布局、Append/Mount/扫描/淘汰、Superblock |
+| `CdpConsole` | 安装、配置、查询、Preview/Recovery、密码控制 |
+| `CdpCore.Tests` | 使用内存 Store 对核心算法做用户态单元测试 |
 
-## 核心设计思想
+## 2. Phase 状态机
 
-### 为什么用 COW Journal，而不是写重定向
+每个受保护源卷有独立 Phase：
 
-早期方案曾把写入重定向到空闲扇区，靠“重启丢弃映射”做还原。当前实现改为：
+| 值 | 名称 | 行为 |
+|---|---|---|
+| 0 | `Cdp_PHASE_GENERAL` | 正常 COW，普通读取透传 |
+| 1 | `Cdp_PHASE_PREVIEW` | 正常 COW；允许 Preview IOCTL 读取历史视图 |
+| 2 | `Cdp_PHASE_RECOVERY` | 读取历史视图；允许新写并 Punch 尚未回填的重叠历史 |
 
-1. **受保护卷上的数据始终是最新的**——文件系统与应用看到真实落盘内容，无需维护 `$Bitmap` / 扇区映射表。
-2. **历史保存在独立分区**——容量、寿命与受保护卷解耦；journal 满时直接淘汰最旧 HeaderRegion（环式推进）。
-3. **可按时间点回溯**——Preview / Recovery 基于 wall-clock + sequence，而不是“仅重启还原”。
+全局只允许一个 Preview 会话。Preview 与 Recovery 互斥。Recovery Begin 只准备视图；Commit 或 Cancel 成功后回到 General。
 
-## 卷工作阶段（Phase）
+## 3. 写入、TRIM 与读取
 
-每个源卷 `Cdp_DEVICE_EXTENSION.Phase`：
+### 3.1 普通写入
 
-| 值 | 宏 | 行为 |
-|----|-----|------|
-| 0 | `Cdp_PHASE_NORMAL` | COW 捕获（若已 CMD1）；读透传 |
-| 1 | `Cdp_PHASE_PREVIEW` | 同 Normal 的写捕获；允许 Preview IOCTL |
-| 2 | `Cdp_PHASE_RECOVERY` | 一次性同步回填过程中的临时状态 |
-
-约束：
-
-- **全局同时只能有一个 Preview 会话**；`BEGIN_PREVIEW` 要求当前为 Normal，成功后进入 Preview。
-- **Recovery 只能从 Normal 进入**；存在 Preview 会话时拒绝 `BEGIN_RECOVERY`。
-- `BEGIN_RECOVERY` 只准备历史视图并保持 Recovery；`COMMIT_RECOVERY`
-  回填成功后进入 Normal，`CANCEL_RECOVERY` 不回填并进入 Normal。
-
-## Journal 布局（v9）
-
-独立 CDP 分区采用 **1MB 记录头区 + 对应负载区** 交替排列：
-
-```
-+------------------+  扇区 0
-| Superblock 主    |
-+------------------+
-| HeaderRegion 0   |  1MB（密排 32B 记录头 + 尾部 RegionLink）
-| Payload 0        |  本区内记录的 before-image（紧随其后追加）
-+------------------+
-| HeaderRegion 1   |  1MB
-| Payload 1        |
-+------------------+
-| …                |
-| HeaderRegion n   |  1MB
-| Payload n        |
-+------------------+
+```text
+IRP_MJ_WRITE
+  → 入捕获队列
+  → 获取 HistoryMutex
+  → 读取源卷 before-image
+  → CdpJournalAppend
+  → 根据 Phase 更新 Staging/HistoryTree
+  → 同步提交原始写 IRP
+  → 释放 HistoryMutex
 ```
 
-- 当前 1MB Header 槽用尽，或追加下一条记录会使本 PayloadRegion 跨度超过日志卷容量的 1/10 时，在 `PayloadRegionOff`（或回绕到可用区起点）新开一对 `Header[1MB]+Payload`。因此非最新 HeaderRegion 允许未写满，其有效记录数由下一 HeaderRegion 的 `StartSequence` 差值确定，无需扫描空记录头。
-- **Payload 写到分区尾不够**：写游标绕回可用区起点，**不**新开 Header；尾部跳过的空隙计入当前区域占用。空间仍不够则整体淘汰最旧 HeaderRegion 及其全部 record/payload，回收时仅读取相邻 RegionLink 并按环形跨度扣减，不扫描 1MB 记录头区。
-- 记录头里的 `FileOffset` 指向该条 payload 的绝对偏移。
-- Header 区间用 `RegionLink`（Prev/Next）串成链，Mount / Preview 扫描 / 淘汰最旧 HeaderRegion 时使用；淘汰后将新 oldest 的 `PrevRegionOff` 指向自身，避免重启重新发现旧区域。
+捕获或 HistoryTree Punch/拆分失败会让该写 IRP 失败，并记录 RecoveryFailureStatus；不会让写入继续后再用“整节点失效”掩盖错误。
 
-Version = **9**。只实现和验证当前开发格式。
+### 3.2 TRIM
 
-### Superblock
+当保护开启且收到 `IOCTL_STORAGE_MANAGE_DATA_SET_ATTRIBUTES / DeviceDsmAction_Trim` 时，驱动返回成功但不把 TRIM 发给下层。这样删除文件不会使尚未被覆盖的历史扇区被设备清除，也避免删除大量文件时立即产生同等规模的 Journal payload。簇被复用后的真实写仍由 `IRP_MJ_WRITE` 捕获。停止保护后 DSM/TRIM 正常透传。
+
+### 3.3 读取
+
+- General：直接下发源卷。
+- Preview：源卷正常读不改变；`READ_PREVIEW` 通过 PreviewTree + live source 合成。
+- Recovery：普通和 Paging Read 都通过 HistoryTree + live source 合成。
+- 非扇区对齐的 Preview/Recovery 读取先扩大到扇区对齐范围，完成历史覆盖后再返回原请求子区间。
+- Recovery Paging I/O 在专用工作线程中映射 MDL 并合成；映射或合成失败时返回错误，不回退为 live source 透传。
+
+## 4. Journal v11 磁盘布局
+
+```text
++-------------------------+  offset 0
+| Superblock（占一扇区）  |
++-------------------------+
+| HeaderRegion 0（1 MiB） |
+| PayloadRegion 0         |
++-------------------------+
+| HeaderRegion 1（1 MiB） |
+| PayloadRegion 1         |
++-------------------------+
+| ...                     |
++-------------------------+
+```
+
+### 4.1 Record Header
+
+磁盘 Record Header 固定 32 字节：
+
+| 字段 | 大小 | 含义 |
+|---|---:|---|
+| `WallClock100ns` | 8 | 本地 wall-clock，FILETIME epoch |
+| `VolumeOffset` | 8 | 源卷字节偏移 |
+| `FileOffset` | 8 | payload 在 Journal 卷上的绝对字节偏移 |
+| `DataLength` | 4 | before-image 有效长度 |
+| `Sequence` | 4 | 低16位为 HeaderRegion 内索引；高16位为 Record Flags |
+
+每个 1 MiB HeaderRegion 最后 32 字节是 `Cdp_HEADER_REGION_LINK`：
 
 | 字段 | 含义 |
-|------|------|
-| `LastHeaderRegionOff` | 最新 1MB Header 区起点 |
-| `SourceVolumeGuid` | 与该 journal 配对的源卷 Volume GUID |
+|---|---|
+| `PrevRegionOff` | 上一个 HeaderRegion 偏移；单区时可指向自身 |
+| `NextRegionOff` | 下一个 HeaderRegion 偏移；最新区可指向自身 |
+| `StartSequence` | 本区第一条 Record 的 64 位全局序号 |
+| `Reserved` | 固定写 0 |
 
-当前 `PayloadRegionOff` 不再写入 Superblock。Mount 扫描最新 Header 区，以最后一条有效记录的 `FileOffset + DataLength` 向扇区对齐后重建下一 Payload 写入位置；空日志从最新 Header 区末尾开始。
+当前定义 `Cdp_JOURNAL_RECORD_FLAG_BACKFILL = 0x80000000`，其余高位 Flag 保留。运行时全局 Sequence 为 `StartSequence + (Header.Sequence & 0xFFFF)`；当前 HeaderRegion 只有32767个可用 Record 槽，低16位足够表示全部区域内索引。
 
-普通 Append 只持久化并 Flush before-image payload 与 record header，不重复写 Superblock。只有切换到新 Header Region、设置/清除重启 Recovery 意图、Format 和 Close 等持久字段或生命周期发生变化时才写 Superblock；新区域更新失败会保留 `SuperblockDirty`，由后续 Append 重试。
+### 4.2 Superblock
 
-### 记录头（32 字节）
+Superblock 关键字段：
 
 | 字段 | 含义 |
-|------|------|
-| `WallClock100ns` | 写入时刻 |
-| `VolumeOffset` | 源卷字节偏移 |
-| `FileOffset` | journal 内 payload 绝对偏移 |
-| `DataLength` | before-image 长度 |
-| `Sequence` | 从 0 开始的区域内 32 位序号；全局序号为 `RegionLink.StartSequence + Sequence` |
+|---|---|
+| `Magic` / `Version` / `SectorSize` | 格式识别与校验；当前 Version=11 |
+| `PartitionSize` | 格式化时的 Journal 容量 |
+| `LastHeaderRegionOff` | 最新 HeaderRegion 偏移 |
+| `SourceVolumeGuid` | 与该 Journal 配对的源卷 |
+| `Flags` | Recovery Pending、Credential Configured 等标记 |
+| `RecoveryTargetTime100ns` | 重启恢复目标时间 |
+| `Credential` | KDF、Salt、Verifier、CredentialId、AuthEpoch |
+| `Crc32c` / `RecoveryCrc32c` / `MetadataCrc32c` | 基础字段、恢复意图和扩展元数据校验 |
 
-## Preview / Recovery 区间树
+普通 Append 不更新 Superblock，只持久化并 Flush payload 与 Record Header。新建 HeaderRegion、设置/清除 Recovery 意图、修改凭据、Format/Close 等才更新 Superblock；失败时保留 `SuperblockDirty` 供后续 Append 重试。
 
-按 `VolumeOffset`（`Start`）排序的 **AVL 区间树**，节点维护 `MaxEnd` 做重叠剪枝，并维护 `MinValidSequence` 加速 Recovery Commit 选取下一节点。构建时反向单遍读取记录头，读到符合条件的 header 后立即覆盖进树，不保存 header 数组，也不二次读取记录头区域；1MB 对齐扫描缓冲由 Journal 惰性分配，在 Mount/Preview/Recovery 间复用并于 Close 释放。普通 Insert 直接查找已有节点之间的空洞并插入，不再为 DataLength 分配逐字节覆盖位图。
+### 4.3 区域切换、Mount 与淘汰
 
-## Preview：时间点只读视图
+- Header 槽用尽，或当前 PayloadRegion 跨度将超过 Journal 容量 `1/10` 时，新建 HeaderRegion。
+- 因 Payload 阈值可提前切区，HeaderRegion 可以未写满。
+- 后继区域存在时，当前区 Record 数可由相邻 `StartSequence` 差得到。
+- 最新区域未写满时，Mount 只扫描最新 HeaderRegion 找到最后一条有效 Record，并以 `FileOffset + DataLength` 对齐后重建写游标；不需要扫描其他区域。
+- 空间不足时整区淘汰 oldest HeaderRegion。淘汰边界由 RegionLink 和最后一条 Record 计算，只读取必要扇区，不读取整个 1 MiB HeaderRegion。
 
-1. **BEGIN**：校验源卷 Phase=Normal、全局无其他 Preview；CAS 进入 Preview；冻结 `SnapshotMaxSequence`；从最新记录头区域开始反向单遍扫描，匹配 header 在读取时直接覆盖进 Preview Tree；构建期间并发 COW 写入 StagingTree，结束后将 StagingTree 合并进 Preview Tree。
-2. **READ**：区间树重叠查询；同字节取最早 `Sequence`；未覆盖空缺用当前卷 live 数据填充。全程持有源卷 `HistoryMutex`，与 COW 捕获互斥。
-3. **END**：销毁会话，Phase → Normal。
+## 5. Preview 构建与读取
 
-## Recovery：HistoryTree 回填 + 无效标记
+Preview/Recovery 共用按 `VolumeOffset` 排序的 AVL 区间树。节点维护 `MaxEnd` 以加速重叠查询，并维护 `MinValidSequence` 以选择下一回填节点。
 
-1. **BEGIN / Prepare**：冻结 `SnapshotMaxSequence`；从最新记录头区域开始反向单遍扫描 journal，匹配 header 在读取时直接覆盖进 History Tree，较早 before-image 替换较新记录的重叠区间；构建期间并发新写只记入 StagingTree。结束后按 StagingTree 原地删除 History Tree 的重叠区间，并保持 Recovery Phase。
-2. **Prepared**：非分页读由 HistoryTree + live source 合成；允许新写入，新写覆盖的 HistoryTree 范围失效，因此 Commit 后仍保留新数据。
-3. **Commit**：一次只按 `MinValidSequence` 取得一个有效节点并回填；每个节点单独持有外部 `HistoryMutex`，节点完成后释放，因此新写可在节点之间进入并原地 Punch 尚未回填的 HistoryTree。一次性 Core API 也循环复用同一个 CommitStep 实现，不再维护另一套整树写回路径。
-3. **COMMIT**：遍历 HistoryTree 回填源分区（COW 后写下层；`Sequence` 升序；跳过 `Invalid`），成功后清理并回到 Normal。
-4. **CANCEL**：不回填，清理临时树并回到 Normal。
-3. **完成**：清理 HistoryTree / StagingTree，自动回到 Normal；BEGIN IOCTL 此时才同步返回。
+Preview Begin 冻结 `SnapshotMaxSequence`，从最新 HeaderRegion 向旧区域单遍扫描；每读到一个符合 `WallClock100ns >= TargetTime100ns` 的 Record 就直接覆盖插入 PreviewTree，不保存 Header 数组，也不二次读取区域。若当前 Record 带 `BACKFILL`，则不应用时间停止条件：该 Record 仍入树并继续向前扫描，直到普通 Record 满足停止条件或到达 oldest。构建期间的新 COW 进入 StagingTree；构建结束后合并到 PreviewTree，补上扫描快照之后的 before-image。
 
-回填期间的 COW 设 `WritebackActive`，避免把自己刚回填的写再标成 Invalid。
+Preview Read 先查询 PreviewTree，再用当前源卷数据填充空缺。相同字节范围选更早的 Sequence，得到目标时间视图。
 
-> Preview 与 Recovery 都收集 `WallClock100ns >= TargetTime100ns` 的记录。Preview 的 Staging→PreviewTree 仍是 **Merge 插入**（补扫盘遗漏的 before-image）。Recovery 的 Staging 语义不同：表示“这些区间已被新写覆盖，History 应跳过”，故用 **Punch** 而非 Merge。
+## 6. Recovery 全阶段
 
-若请求的 Preview/Recovery 时间早于 journal 当前 oldest record，入口会将有效时间提升到 oldest；该规则同样用于持久化的重启 Recovery 标记。
+### 6.1 Begin
 
-## 控制接口（IOCTL）
+1. 将源卷应用层读写排入队列，避免历史树尚未完成时观察到半构建视图。
+2. 冻结 `SnapshotMaxSequence`，从新到旧单遍扫描 Journal，读取 Record 时直接构建 HistoryTree。
+3. 构建期间的新写在完成 COW 后记入 StagingTree。
+4. 扫描结束后用 StagingTree Punch HistoryTree 的重叠字节；这表示这些范围在 Begin 期间已经产生了更新，不能再被旧历史覆盖。
+5. 保持 Recovery Phase，Begin 返回并放行排队 I/O。
+
+请求时间早于 oldest 时，入口把有效目标时间提升为 oldest。Preview、普通 Recovery 和重启 Recovery 规则一致。
+
+### 6.2 Prepared 与并发新写
+
+Recovery 读取始终先查询 HistoryTree，再从 live source 填充空缺。新写仍执行 COW，然后在 `HistoryMutex` 下 Punch 尚未回填 HistoryTree 的重叠部分。部分重叠会把节点裁剪或拆成左右片段，并重新平衡 AVL 树、刷新 `MaxEnd/MinValidSequence`。内存分配或调整失败会使 Recovery 失败。
+
+Recovery Begin 开始后，所有应用新写 COW 都设置 `BACKFILL`。构建期正常进入 StagingTree，Prepared/Commit 期间正常 Punch 尚未回填的重叠 History；Flag 只改变后续目标时间扫描语义，不改变当前 Recovery 的并发写处理。
+
+### 6.3 Commit
+
+驱动反复调用 `CdpCoreRecoveryCommitStep`：
+
+1. 按 `MinValidSequence` 找到最早的有效节点。
+2. 读取该节点 payload。
+3. 回填前先捕获目标范围当前源数据，追加带 `BACKFILL` 的 COW Record，再通过 Source Store 写入历史 payload。
+4. 成功后把该节点标为 Invalid，并刷新树摘要。
+5. 每个节点处理完成就释放外部 `HistoryMutex`，让新写有机会执行并 Punch 后续节点。
+
+回填时设置 `WritebackActive`，因此回填自身的 backfill COW 只写 Journal，不参与、不 Punch 当前 HistoryTree。树为空后释放 HistoryTree/StagingTree，清除目标时间和失败状态，回到 General。Cancel 不写源卷，只销毁临时树并回到 General。
+
+## 7. 启动自动发现与重启恢复
+
+驱动使用 Boot Driver Reinitialization 回调，在启动卷枚举完成后开始完整分类，而不是固定延时 30 秒。每个新启动卷先关闭 `AutoDiscoveryGate`；读写工作线程在 Gate 上等待，直到该卷被确认并处理。
+
+完整扫描会识别 Journal magic、挂载 v11 Journal、根据 `SourceVolumeGuid` 配对源卷并恢复保护。普通源卷或没有对应 Journal 的卷在分类完成后放行。
+
+若 Superblock 存在 Recovery Pending：
+
+1. 自动激活 Source/Journal 配对并执行 Recovery Begin。
+2. Begin 成功、历史视图一致后打开源卷 Gate。
+3. 自动逐节点 Commit；启动后的新写可与 Commit 交替并 Punch 重叠历史。
+4. Commit 成功后清除 Pending 标记并回到 General。
+5. Begin/Commit 失败时记录错误并保留 Pending，但打开 Gate，避免本次启动永久阻塞。
+
+## 8. 同步对象
+
+| 对象 | 保护范围 |
+|---|---|
+| `HistoryMutex` | 单个源卷的 COW、树构建、历史读取和单节点回填 |
+| `Journal.Lock` | Journal 运行时状态和磁盘元数据 |
+| `TreeLock` | PreviewTree、HistoryTree、StagingTree 及摘要字段 |
+| 捕获工作线程 | 在 PASSIVE_LEVEL 完成 before-image + Append + 原写转发 |
+| Recovery Read 线程 | 安全处理 Recovery 普通/Paging Read 和启动 Gate 等待 |
+| `AutoDiscoveryGateEvent` | 卷识别及自动 Recovery Begin 完成前阻塞启动 I/O |
+
+## 9. 控制接口
 
 | IOCTL | 用途 |
-|-------|------|
-| `IOCTL_Cdp_QUERY_PROTECT_STATUS` | 查询是否有卷已 CMD1 开启捕获（`CaptureEnabled`） |
-| `IOCTL_Cdp_SEND_COMMAND` | CMD1 配置捕获 / CMD2 停止 / CMD4 开卷 / CMD5 关卷 |
-| `IOCTL_Cdp_READ_SECTORS` | CMD3 按句柄读扇区 |
+|---|---|
+| `IOCTL_Cdp_SEND_COMMAND` | CMD1 配置/开启保护，CMD2 停止保护 |
+| `IOCTL_Cdp_QUERY_PROTECT_STATUS` | 查询是否存在受保护卷 |
 | `IOCTL_Cdp_BEGIN/READ/END_PREVIEW` | Preview 会话 |
-| `IOCTL_Cdp_QUERY_PHASE` | 查询 Phase |
-| `IOCTL_Cdp_QUERY_TIME_RANGE` | 查询 journal 最早/最新 COW 记录 WallClock |
-| `IOCTL_Cdp_QUERY_JOURNAL_USAGE` | 查询当前 record 负载已用/剩余空间与日志元数据占用 |
-| `IOCTL_Cdp_QUERY_JOURNAL_RECORDS` | 分页查询当前 record 元数据列表（不返回 payload） |
-| `IOCTL_Cdp_BEGIN_RECOVERY` | 准备 Recovery 历史视图并保持 Recovery Phase |
-| `IOCTL_Cdp_COMMIT_RECOVERY` | 同步回填已准备的历史视图，成功后回到 Normal |
-| `IOCTL_Cdp_CANCEL_RECOVERY` | 取消已准备的 Recovery，不回填 |
+| `IOCTL_Cdp_QUERY_PHASE` | 查询源卷 Phase、Journal GUID、Recovery 目标 |
+| `IOCTL_Cdp_QUERY_TIME_RANGE` | 查询 oldest/newest Record 时间 |
+| `IOCTL_Cdp_QUERY_JOURNAL_USAGE` | 查询容量、元数据、payload 已用/剩余、Record 数 |
+| `IOCTL_Cdp_QUERY_JOURNAL_RECORDS` | 分页读取 Record 元数据，不返回 payload |
+| `IOCTL_Cdp_BEGIN_RECOVERY` | 普通 Begin，或仅持久化 ON_REBOOT 意图 |
+| `IOCTL_Cdp_COMMIT_RECOVERY` | 同步逐节点回填 |
+| `IOCTL_Cdp_CANCEL_RECOVERY` | Cancel 或清除尚未执行的重启意图 |
+| `IOCTL_Cdp_AUTHENTICATE` | 在当前控制句柄上认证 |
+| `IOCTL_Cdp_QUERY_CREDENTIAL` | 查询共享凭据状态、Journal 数和 AuthEpoch |
+| `IOCTL_Cdp_CHANGE_PASSWORD` | 更新匹配当前共享凭据的已挂载 Journal；失败时尝试回滚 |
+| `IOCTL_Cdp_QUERY_VERSION` | 查询驱动、Build 和 Journal 版本 |
 
-CMD1 参数：`PartitionGuid1`（源卷）、`PartitionGuid2`（journal 分区）、`FormatJournal`（非 0 则 Format，否则 Mount）。
+Record 列表采用 `StartIndex + ExpectedGeneration` 分页。保留集合变化时 Generation 改变，调用方应从第一页重新枚举，避免拼接不同快照。
 
-## 关键同步
+## 10. 日志与限制
 
-- **`HistoryMutex`（每源卷）**：COW（读 before-image + Append + 转发原写）与 Preview/Recovery 构建、回填串行化，避免时间线撕裂。
-- **`Journal.Lock`**：journal 结构与磁盘元数据。
-- **Preview/Recovery `TreeLock`**：AVL 区间树与 Staging 合并。
-- **捕获工作线程**：写 IRP 入队，PASSIVE_LEVEL 下执行 COW + 同步转发。
+`Cdp_LOG` 在 Release/Debug 都保留；`Cdp_DBG` 只在 Debug 生效。因此高频 `[COW-TRACE]` 不会进入 Release，关键 `[RECOVERY]`、`[AUTO-CDP]`、错误日志仍可用于现场诊断。
 
-## 捕获启用
+主要限制：
 
-首次由控制设备 **CMD1** 格式化/开启 COW（源卷 GUID + journal 分区 GUID），**CMD2** 停止。重启后，驱动在 AddDevice 完成并延迟 30 秒后扫描首扇区 magic，避开 PnP START/Mount Manager 启动关键路径；随后自动挂载 v9 journal，并根据 Superblock 的 `SourceVolumeGuid` 打开源卷、绑定 Core 和重新使能捕获。
-
-## 已知限制
-
-1. Preview / Recovery 依赖 journal 中有足够历史；journal Format 后历史清空。
-2. 全局仅允许一个 Preview 会话。
-3. journal 空间不足时整体淘汰最旧 HeaderRegion，而不是逐条淘汰 record；一个区域内尚存的历史会一起失效。
-4. Recovery Begin 构建历史视图期间排队源卷应用层读写；扫描时间较长时会增加开始阶段的 I/O 延迟。
-5. Recovery Commit 对调用方同步；`HistoryMutex` 只按单个回填节点持有并在节点之间释放，新写可与 Commit 交替执行，但两者仍会竞争源卷和 journal I/O 带宽。
-6. Recovery 阶段的 Paging I/O 由工作线程合成历史视图；若 MDL 无法安全映射，则对应 I/O 返回失败，不会绕过历史视图读取 live source。
-
-## 未来规划
-
-- 捕获配置持久化
-- journal 容量告警与策略（保留窗口、优先级）
-- 性能剖析与写路径批处理优化
-- 评估非 NTFS 卷上的捕获可行性（当前捕获不依赖 `$Bitmap`，但 CdpConsole 卷枚举仍以固定盘为主）
+- 只支持 Journal v11，不迁移旧开发格式。
+- 全局只允许一个 Preview；Preview 与 Recovery 互斥。
+- 空间以 HeaderRegion 为粒度淘汰，可能同时失去同区多条历史。
+- Begin 会阻塞源卷 I/O；Commit 会持续占用源卷和 Journal 带宽。
+- Paging Read 无法安全映射 MDL 时失败，不允许绕过时间点视图。

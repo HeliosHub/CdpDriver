@@ -9,13 +9,16 @@
 #endif
 
 #define Cdp_JOURNAL_MAGIC            0x4C4E4A51UL /* 'QJNL' */
-#define Cdp_JOURNAL_VERSION          10UL
+#define Cdp_JOURNAL_VERSION          11UL
 #define Cdp_JOURNAL_MAX_RECORD_DATA  (2UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_REGION_SIZE (1UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_LINK_SIZE 32UL
 #define Cdp_JOURNAL_PAYLOAD_REGION_CAPACITY_DIVISOR 10ULL
 #define Cdp_JOURNAL_FLAG_RECOVERY_PENDING 0x00000001UL
 #define Cdp_JOURNAL_FLAG_CREDENTIAL_CONFIGURED 0x00000002UL
+#define Cdp_JOURNAL_RECORD_INDEX_MASK     0x0000FFFFUL
+#define Cdp_JOURNAL_RECORD_FLAGS_MASK     0xFFFF0000UL
+#define Cdp_JOURNAL_RECORD_FLAG_BACKFILL  0x80000000UL
 #define Cdp_CREDENTIAL_KDF_PBKDF2_SHA256 1UL
 #define Cdp_CREDENTIAL_SALT_BYTES 16UL
 #define Cdp_CREDENTIAL_VERIFIER_BYTES 32UL
@@ -30,7 +33,9 @@ typedef struct _Cdp_JOURNAL_RECORD_HEADER
 	UINT64 VolumeOffset;   // 8  source volume byte offset
 	UINT64 FileOffset;     // 8  payload offset inside CDP partition
 	ULONG DataLength;      // 4
-	ULONG Sequence;        // 4  zero-based index within this header region
+	// Low 16 bits: zero-based index within this header region.
+	// High 16 bits: Cdp_JOURNAL_RECORD_FLAG_*.
+	ULONG Sequence;
 } Cdp_JOURNAL_RECORD_HEADER, *PCdp_JOURNAL_RECORD_HEADER;
 
 C_ASSERT(sizeof(Cdp_JOURNAL_RECORD_HEADER) == 32);
@@ -56,7 +61,7 @@ typedef struct _Cdp_CREDENTIAL_DESCRIPTOR
 	UINT64 AuthEpoch;
 } Cdp_CREDENTIAL_DESCRIPTOR, *PCdp_CREDENTIAL_DESCRIPTOR;
 
-// On-disk layout (v10): one superblock, then alternating header/payload areas.
+// On-disk layout (v11): one superblock, then alternating header/payload areas.
 //   [Superblock]
 //   [HeaderRegion0 1MB][Payload0 ...]
 //   [HeaderRegion1 1MB][Payload1 ...]
@@ -81,7 +86,8 @@ typedef struct _Cdp_JOURNAL_SUPERBLOCK
 #pragma pack(pop)
 
 // Decoded runtime/query record. Unlike the on-disk header, Sequence is the
-// 64-bit global value: RegionLink.StartSequence + Header.Sequence.
+// 64-bit global value: RegionLink.StartSequence +
+// (Header.Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK).
 typedef struct _Cdp_JOURNAL_RECORD
 {
 	UINT64 WallClock100ns;
@@ -89,7 +95,7 @@ typedef struct _Cdp_JOURNAL_RECORD
 	UINT64 FileOffset;
 	UINT64 Sequence;
 	ULONG DataLength;
-	ULONG Reserved;
+	ULONG Flags; // Cdp_JOURNAL_RECORD_FLAG_* from the header high 16 bits
 } Cdp_JOURNAL_RECORD, *PCdp_JOURNAL_RECORD;
 
 C_ASSERT(sizeof(Cdp_JOURNAL_RECORD) == 40);
@@ -99,6 +105,8 @@ C_ASSERT(sizeof(Cdp_JOURNAL_RECORD) == 40);
 		sizeof(Cdp_JOURNAL_RECORD_HEADER))
 
 C_ASSERT(Cdp_JOURNAL_HEADERS_PER_REGION == 32767);
+C_ASSERT(Cdp_JOURNAL_HEADERS_PER_REGION <=
+	Cdp_JOURNAL_RECORD_INDEX_MASK + 1UL);
 
 typedef struct _Cdp_JOURNAL
 {
@@ -210,6 +218,14 @@ NTSTATUS CdpJournalAppend(
 	_In_ UINT64 VolumeOffset,
 	_In_ ULONG DataLength,
 	_In_reads_bytes_(DataLength) const VOID* BeforeImage,
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
+
+NTSTATUS CdpJournalAppendEx(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_In_reads_bytes_(DataLength) const VOID* BeforeImage,
+	_In_ ULONG RecordFlags,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
 
 NTSTATUS CdpJournalQueryTimeRange(

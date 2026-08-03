@@ -2694,6 +2694,7 @@ static NTSTATUS CdpCaptureBeforeImage(
 	PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
 	UINT64 offset = (UINT64)irpSp->Parameters.Write.ByteOffset.QuadPart;
 	ULONG remaining = irpSp->Parameters.Write.Length;
+	ULONG recordFlags = 0;
 	NTSTATUS status = STATUS_SUCCESS;
 	Cdp_JOURNAL_RECORD writtenRecord;
 	BOOLEAN seqLogged = FALSE;
@@ -2704,6 +2705,11 @@ static NTSTATUS CdpCaptureBeforeImage(
 		return STATUS_INVALID_PARAMETER;
 	if (!SourceExt->Core)
 		return STATUS_DEVICE_NOT_READY;
+	if (InterlockedCompareExchange(&SourceExt->Phase, 0, 0) ==
+		(LONG)Cdp_PHASE_RECOVERY)
+	{
+		recordFlags = Cdp_JOURNAL_RECORD_FLAG_BACKFILL;
+	}
 
 	Cdp_DBG("[COW-TRACE] capture begin irp=%p offset=%llu len=%lu\n",
 		Irp, offset, remaining);
@@ -2714,7 +2720,12 @@ static NTSTATUS CdpCaptureBeforeImage(
 		ULONG chunk = remaining > Cdp_JOURNAL_MAX_RECORD_DATA ?
 			Cdp_JOURNAL_MAX_RECORD_DATA : remaining;
 
-		status = CdpCoreCaptureAppend(SourceExt->Core, offset, chunk, &writtenRecord);
+		status = CdpCoreCaptureAppendEx(
+			SourceExt->Core,
+			offset,
+			chunk,
+			recordFlags,
+			&writtenRecord);
 		if (!NT_SUCCESS(status))
 		{
 			Cdp_LOG("[COW] core capture failed status=0x%08X offset=%llu len=%lu\n",

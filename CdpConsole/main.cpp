@@ -1008,7 +1008,7 @@ static BOOL DoListJournalRecords(HANDLE hDevice)
 			ConOutFmt(
 				L"Journal record list: %llu record(s), oldest first (metadata only)\n",
 				totalRecords);
-			ConOut(L"Index  WallClock100ns  VolumeOffset  JournalOffset  Length  Sequence\n");
+			ConOut(L"Index  WallClock100ns  VolumeOffset  JournalOffset  Length  Sequence  Flags\n");
 			firstPage = FALSE;
 		}
 		else if (reply->TotalRecords != totalRecords ||
@@ -1023,13 +1023,16 @@ static BOOL DoListJournalRecords(HANDLE hDevice)
 		for (i = 0; i < reply->RecordCount; ++i)
 		{
 			ConOutFmt(
-				L"%5llu  %llu  %llu  %llu  %lu  %llu\n",
+				L"%5llu  %llu  %llu  %llu  %lu  %llu  0x%08lX%s\n",
 				nextIndex + i,
 				records[i].WallClock100ns,
 				records[i].VolumeOffset,
 				records[i].FileOffset,
 				records[i].DataLength,
-				records[i].Sequence);
+				records[i].Sequence,
+				records[i].Flags,
+				(records[i].Flags & Cdp_RECORD_FLAG_BACKFILL) != 0 ?
+					L" (backfill)" : L"");
 		}
 
 		nextIndex += reply->RecordCount;

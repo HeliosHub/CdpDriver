@@ -1,119 +1,154 @@
 # CdpDriver
 
-Windows 卷过滤驱动：对受保护卷做 **写前镜像（COW）**，把被覆盖的旧数据写入独立的 **Journal/CDP 分区**，源卷始终保持最新数据。基于 journal 可做：
+CdpDriver 是一个 Windows 卷 Upper Filter 驱动。它对受保护卷执行写前镜像（Copy-on-Write，COW）：先把即将被覆盖的旧数据写入独立 Journal 卷，再把原写请求提交给源卷。因此源卷始终保存最新数据，Journal 保存可用于时间点预览和恢复的 before-image。
 
-- **时间点 Preview**（只读重建历史视图）
-- **Recovery**（读路径呈现指定时刻的数据）
+当前版本：**1.4.1**（Build `20260803.1`），Journal 磁盘格式：**v11**。
 
-配套：
+主要功能：
 
-- `CdpConsole` — 控制台工具（安装/注册驱动、配置捕获、扇区读写、Preview、查询 journal 时间范围）
+- 持续捕获受保护卷的覆盖写入
+- 按时间点只读 Preview
+- 普通 Recovery（Begin + Commit）
+- 将 Recovery 意图写入 Superblock，重启后自动 Begin + Commit
+- 查询 Journal 使用量、剩余负载空间和全部 Record 元数据
+- 全局保护密码、句柄级认证和密码更换
+- `VolHexdump` 按卷偏移导出原始数据
 
-> ## ⚠️ 数据安全警告
+> ## 数据安全警告
 >
-> 本项目是**挂在卷设备栈上的内核态过滤驱动**，开启捕获后会拦截写路径并写 journal 分区。请先阅读：
->
-> - **务必先在虚拟机或可随时重装的测试机上试用**，不要直接在装有重要数据的机器上首次部署
-> - **试用前请完整备份**；未签名内核驱动在未经测试的环境可能蓝屏
-> - **需要一块专用 journal 分区**（建议独立、足够大）；Format journal 会清空全部历史
-> - 本项目按 Apache License 2.0 以 **"按现状（AS-IS）"** 提供，不承担数据丢失或故障责任
+> 本项目直接工作在卷设备栈并修改专用 Journal 分区。请先在虚拟机或可重装测试机上验证，并完整备份重要数据。格式化 Journal 会清除其中全部历史。测试签名仅适用于测试环境，生产部署需要符合 Windows 要求的内核驱动签名。
 
-## 适用场景
+## 支持环境
 
-- 需要保留可回溯历史的系统盘 / 数据盘保护
-- 按时间点查看或恢复卷内容（Preview / Recovery）
-- 开发与联调：用 `CdpConsole` 验证 COW 与 Preview
+- Windows 10 / Windows 11 x64
+- Visual Studio 2022
+- Windows SDK / WDK 10.0.26100.0，或兼容版本
 
-仅在 Win10/11 上测试。本项目基于 WDK 从头构建，Apache License 2.0 开源。
+Windows 7/8.1 未验证，也不作为当前支持目标。
 
-## 项目状态
+## 构建
 
-当前实现：**COW Journal v9**（单 Superblock + 1MB 头区/负载区交替）+ Preview + Recovery 阶段机。Superblock 持久化源卷 GUID，驱动重启后会自动识别日志卷并恢复 CDP 绑定。
+打开 `CdpDriver.sln`，选择 `Release | x64` 后生成解决方案。主要产物位于：
 
-## 依赖
-
-**零第三方依赖，纯 WDK。** 驱动只链接 WDK 内核库（`ntoskrnl`、`hal` 等）。
-
-## 支持的平台
-
-- Windows 10/11：已测试
-- Windows 8.1/7：理论上兼容，未经测试
-
-## 编译环境
-
-- Microsoft Visual Studio 2022
-- Windows SDK / WDK 10.0.26100.0（或兼容版本）
-
-## 编译步骤
-
-1. 打开 `CdpDriver.sln`
-2. 选择 Release / x64
-3. 生成解决方案
-
-产物：
-
-- `x64\Release\CdpDriver.sys`
 - `x64\Release\CdpConsole.exe`
-- `x64\Release\driver\CdpDriver.sys` + `.inf`（驱动构建后自动复制，供 `i` 命令安装）
+- `x64\Release\VolHexdump.exe`
+- `x64\Release\CdpCore.Tests.exe`
+- `x64\Release\driver\CdpDriver.sys`
+- `x64\Release\driver\CdpDriver.inf`
+- `x64\Release\driver\cdpdriver.cat`
 
-## 部署与使用
+也可以从开发者命令行构建：
 
-1. 管理员终端：`bcdedit /set testsigning on`，重启  
-   > 当前未做生产签名，需测试模式。生产环境需 EV 内核驱动签名证书。
-2. 以管理员运行 `CdpConsole.exe`，执行 **`i`** 安装/注册驱动（INF + Volume UpperFilters）；必要时重启
-3. 准备**空闲专用分区**作为 journal（勿与源卷混用）
-4. 在 `CdpConsole` 中：
-    - `1` — 配置捕获（源卷 GUID + journal GUID；可选 Format）
-    - `2` — 停止捕获
-    - `4` / `3` / `5` — 打开卷句柄 / 按句柄读扇区 / 关闭句柄（单次读最大 2MB）
-    - `6` / `7` / `8` — Preview 开始 / 读（单次最大 2MB）/ 结束
-    - `9` — 查询 journal 最早/最新 COW 记录时间（需已 CMD1 配置捕获）
-    - `t` — 将本地时间 `年-月-日 时:分:秒` 转换为 Preview/Recovery 使用的 `WallClock100ns` 整数
-    - `e` — 按目标 FILETIME 准备 Recovery 历史视图，不回填
-    - `r` — 同步提交已准备的 Recovery，回填完成后自动回到 Normal
-    - `c` — 取消已准备的 Recovery，不回填
+```bat
+msbuild CdpDriver.sln /m /p:Configuration=Release /p:Platform=x64
+```
 
-**开启/停止 COW 捕获**：首次使用 `CdpConsole` 命令 `1`（CMD1）格式化并开启，命令 `2`（CMD2）停止。格式化后的 journal 会记录源卷 GUID；系统重启后驱动根据 journal magic 和该 GUID 自动重新启用 CDP。
+## 部署与基本使用
 
-详见 [架构设计](ARCHITECTURE.md)。
+1. 测试机开启测试签名并重启：`bcdedit /set testsigning on`。
+2. 以管理员身份运行 `CdpConsole.exe`。
+3. 使用 `i` 安装 INF、注册驱动并配置 Volume UpperFilters；按提示重启。
+4. 准备一块不与源卷混用的专用 Journal 分区。
+5. 使用 `1` 指定源卷 GUID 和 Journal 卷 GUID，选择格式化或挂载并开启保护。
 
-## FAQ
+格式化新 Journal 时会设置共享保护密码。密码不以明文写盘；之后的敏感操作需要先通过 `p` 完成认证。
 
-### Q1：和旧版“写重定向到空闲扇区”有何不同？
+## CdpConsole 命令
 
-旧方案改写写入目标扇区，靠重启丢弃映射还原。当前方案 **源卷写透传**，历史 before-image 进独立 journal，支持按时间 Preview/Recovery，且不依赖 `$Bitmap` / 扇区映射表。
+| 命令 | 功能 |
+|---|---|
+| `i` | 安装/注册驱动（INF + Volume UpperFilters） |
+| `1` | 配置并开启保护：源卷 GUID + 专用 Journal GUID |
+| `2` | 停止指定源卷的保护，并使其 Journal 不再被自动发现 |
+| `6` | 按源卷和时间点开始 Preview |
+| `7` | 按卷字节偏移读取 Preview 数据，单次最多 2 MiB |
+| `8` | 结束 Preview 会话 |
+| `9` | 查询最早/最新 Record 时间 |
+| `u` | 查询 Journal 容量、元数据空间、Record 负载已用/剩余空间 |
+| `l` | 列出全部现存 Record 元数据和 Flags，不读取或输出 payload |
+| `s` | 查询源卷保护状态、Phase 和 Journal GUID |
+| `e` | 准备 Recovery；可选择只持久化重启恢复意图 |
+| `r` | 同步提交已经准备好的 Recovery |
+| `c` | 取消 Recovery；也可清除尚未执行的重启恢复标记 |
+| `p` | 设置、验证或更换共享保护密码 |
+| `v` | 列出卷 |
+| `d` | 查询驱动版本、Build 和 Journal 版本 |
+| `t` | 将本地时间 `年-月-日 时:分:秒` 转成 `WallClock100ns` |
+| `h` | 帮助 |
+| `q` | 退出控制台，不停止保护 |
 
-### Q2：Journal 分区要多大？
+如果 Preview/Recovery 请求时间早于当前最早 Record，驱动会自动按 oldest 时间点处理；普通恢复、重启恢复和返回的有效目标时间使用同一规则。
 
-取决于写入量与希望保留的时间窗口。每次写都会追加 before-image；分区填满后驱动会推进最旧 header region 丢弃旧记录。生产前请按负载评估容量，并预留余量。
+`VolHexdump` 可直接把卷内指定区间导出到文件；offset/size 相对于分区起点，支持十进制和 `0x` 十六进制：
 
-### Q3：能否同时开多个 Preview？
+```bat
+VolHexdump <volume-guid> <offset> <size> <output-file>
+```
 
-**不能。** 全局同时只允许一个 Preview；Recovery 执行时也不能存在 Preview 会话。
+只传入 `<volume-guid>` 时进入交互模式。输出文件已存在时会被覆盖。
 
-### Q4：Recovery 如何完成？
+## Preview 与 Recovery
 
-先用 `e` / `IOCTL_Cdp_BEGIN_RECOVERY` 构建历史视图并进入 Recovery
-Phase，此时不回填且允许新写入；新写入覆盖的历史范围会失效并保留新数据。
-源卷 Online 后用 `r` / `IOCTL_Cdp_COMMIT_RECOVERY` 同步回填，成功后自动
-回到 Normal。也可用 `c` / `IOCTL_Cdp_CANCEL_RECOVERY` 放弃已准备的恢复。
+Preview 只构建历史视图，不修改源卷。读取时，历史树覆盖的部分取 Journal before-image，空缺部分取源卷当前数据；非扇区对齐请求会先扩展到对齐区间完成合成，再只返回调用方要求的字节。
+
+普通 Recovery 分为两个明确阶段：
+
+1. `e` / Begin：排队该源卷的应用层读写，扫描 Journal 并构建 HistoryTree；Begin 完成后恢复 I/O。
+2. `r` / Commit：按全局 Sequence 逐节点把 before-image 回填源卷；每个节点后释放同步锁，使新写能够在节点之间执行。
+
+Recovery Phase 中的读取由 HistoryTree 和源卷实时数据合成，包括 Paging I/O。新写仍先正常 COW；若与尚未回填的历史区间重叠，会从 HistoryTree 中 Punch 掉重叠部分，从而保留新写数据。Punch/拆分失败会使 Recovery 失败，不退回“整节点失效”的策略。
+
+从 Recovery Begin 开始到 Commit 完成，应用新写和恢复回填自身产生的 COW 都带 `BACKFILL (0x80000000)` 标志。恢复回填先把当前源数据作为 backfill before-image 追加到 Journal，再写源卷；由于 `WritebackActive`，该回填 COW 不进入或 Punch 当前 Recovery HistoryTree。后续 Preview/Recovery 扫描遇到 backfill Record 时，无视该 Record 已满足时间停止条件，仍将它插入树并继续向旧记录查找，最远只到当前 oldest。
+
+选择“重启恢复”时，`e` 只把恢复标记和目标时间写入 Journal Superblock，不立即构建历史树。下次启动时：
+
+1. 启动卷枚举完成前，各卷读写由自动发现 Gate 暂存。
+2. 驱动扫描并分类全部已启动卷，配对 Source 与 Journal。
+3. 发现 Recovery 标记后自动执行 Begin。
+4. Begin 成功后立即放行该源卷启动 I/O，再自动 Commit；新写按上述 Recovery 规则与回填交替执行。
+5. Commit 成功后清除标记并回到 General Phase；失败时保留标记用于诊断/重试，但会放行 I/O，避免系统永久阻塞。
+
+## Journal 空间与磁盘格式
+
+当前开发格式为 v11：一个 Superblock，随后是若干 `1 MiB HeaderRegion + PayloadRegion`。单条磁盘 Record Header 为 32 字节，HeaderRegion 末尾 32 字节是 RegionLink。
+
+- 单个 PayloadRegion 的跨度达到 Journal 容量的 `1/10` 时，即使 HeaderRegion 未写满也会切换新区域。
+- 空间不足时整区淘汰最旧 HeaderRegion 及其全部 payload，不逐条删除 Record。
+- 淘汰空间通过相邻 RegionLink 和最后一条 Record 的 `FileOffset + DataLength` 计算，不扫描整个 1 MiB HeaderRegion。
+- 普通 Append 持久化 payload 和 Record Header；只有切换 HeaderRegion、Recovery 标记、凭据、Format/Close 等元数据变化时才更新 Superblock，避免每次 Append 的写放大。
+- Record Header 的 `Sequence` 低16位是区域内索引，高16位是标志；当前定义最高位 `0x80000000` 为 `BACKFILL`。运行时全局序号为 `RegionLink.StartSequence + (Header.Sequence & 0xFFFF)`，使用64位表示。
+
+`CdpConsole u` 中的 metadata 包含 Superblock 占用扇区和所有活动 HeaderRegion。例如一个 1 MiB HeaderRegion 加一个 512 字节 Superblock 扇区为 `1,049,088` 字节；这不是把 1 MiB 换算错误。
+
+## TRIM 处理
+
+保护开启期间，驱动成功拦截并抑制 `DeviceDsmAction_Trim`，以免删除文件后物理扇区被清零/回收而绕过普通 COW。删除大量文件不会立即把所有被删数据复制到 Journal；对应簇以后被重新写入时，真实 `IRP_MJ_WRITE` 才按需捕获 before-image。停止保护后 TRIM 和普通写直接下发，不再进入 COW。
+
+## 保护密码与授权
+
+- Superblock 只保存 PBKDF2-SHA256 派生校验值、随机 Salt、迭代次数、CredentialId 和 AuthEpoch，不保存明文密码。
+- 默认 PBKDF2 迭代次数为 200,000。
+- 认证状态绑定到打开控制设备的文件句柄，不能被其他句柄复用。
+- 成功认证后的空闲有效期为 1 小时；通过敏感操作授权检查会续期。
+- 更换密码会更新所有使用当前共享凭据的已挂载 Journal，并递增认证代次；中途失败时驱动会尝试回滚已经更新的 Journal。
+- 连续 5 次认证失败会锁定认证入口 1 小时。
+- 遇到 `ERROR_ACCESS_DENIED (err=5)` 时应重新认证，并确认目标源卷绑定的 Journal 使用同一凭据。
+
+## 日志行为
+
+Release 构建仍保留关键生命周期、失败和恢复诊断日志。高频 `[COW-TRACE]`（包括 `write seen`、`write queued`、`write bypass`）使用 `Cdp_DBG`，只在 Debug 构建输出；Release 不输出这些跟踪。保护期间被抑制的 TRIM 使用 `[COW-TRIM]` 记录。
 
 ## 已知限制
 
-- 当前开发格式为 Journal v9，HeaderRegion 固定为 1MB；不提供旧开发格式的兼容或迁移
-- 单个 PayloadRegion 的跨度上限按日志卷容量的 1/10 控制；达到阈值会提前切换 HeaderRegion，因此 HeaderRegion 可能未写满
-- Preview 或 Recovery 请求时间早于当前 oldest record 时，自动按 oldest 时间点执行；普通 Recovery、重启 Recovery 和返回的有效时间保持一致
-- `CdpConsole c` 除了取消已进入 Recovery Phase 的恢复，也可在重启前取消仅持久化于 Superblock 的重启 Recovery 标记
-- 全局仅一个 Preview 会话
-- 可恢复时间窗口取决于 journal 容量；空间不足时会整体淘汰最旧 HeaderRegion，而不是逐条淘汰 record，因此保留粒度较粗
-- Recovery Begin 构建历史视图期间会排队该源卷的应用层读写；journal 较大、历史记录较多时，开始阶段可能产生可感知的 I/O 延迟
-- Recovery Commit 对发起命令的调用方是同步操作；回填锁按单个 history 节点获取和释放，新写可在节点之间进入并使重叠历史区间失效，但回填仍会占用源卷和 journal 的 I/O 带宽
-- Recovery 阶段的 Paging I/O 通过工作线程执行历史视图合成，不再直接透传 live source；该路径依赖可安全映射的 MDL，映射失败时对应 I/O 会失败
-
-## 版权与许可
-
-Apache License 2.0，版权归 xx。见 [LICENSE](LICENSE)、[NOTICE](NOTICE)。
+- 当前只兼容 Journal v11；升级后需要重新格式化旧 Journal。
+- 全局同时只允许一个 Preview 会话，Preview 与 Recovery 互斥。
+- 可恢复时间窗口取决于 Journal 容量；淘汰以 HeaderRegion 为粒度。
+- Recovery Begin 扫描期间会排队源卷应用层读写，历史较多时可能产生可感知延迟。
+- Recovery Commit 对调用者同步，并会占用源卷与 Journal I/O 带宽。
+- Recovery Paging I/O 依赖安全映射 MDL；映射失败时对应读取失败，不会绕过历史视图读取 live source。
 
 ## 相关文档
 
 - [架构设计](ARCHITECTURE.md)
+- [CdpCore 与单元测试](CdpCore/README.md)
+- [Apache License 2.0](LICENSE)
