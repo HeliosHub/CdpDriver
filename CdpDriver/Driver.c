@@ -3,6 +3,7 @@
 #include "..\CdpCore\include\cdp_core.h"
 
 PDRIVER_OBJECT g_DriverObject = NULL;
+Cdp_PERF_COUNTERS g_CdpPerfCounters = { 0 };
 
 static VOID CdpBootDriverReinitialize(
 	_In_ PDRIVER_OBJECT DriverObject,
@@ -115,6 +116,8 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 	KeInitializeSpinLock(&DeviceExtension->RecoveryReadQueueLock);
 	InitializeListHead(&DeviceExtension->RecoveryReadQueue);
 	KeInitializeEvent(&DeviceExtension->RecoveryReadEvent, NotificationEvent, FALSE);
+	KeInitializeEvent(&DeviceExtension->MergeThreadDoneEvent,
+		NotificationEvent, TRUE);
 	KeInitializeMutex(&DeviceExtension->HistoryMutex, 0);
 	ExInitializeRundownProtection(&DeviceExtension->AutoDiscoveryRundown);
 	InterlockedExchange(&DeviceExtension->AutoDiscoveryGateActive, 1);

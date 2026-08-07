@@ -54,6 +54,25 @@ NTSTATUS CdpCoreQueryJournalUsage(
 	_Out_ PUINT64 PayloadBytesFree,
 	_Out_ PUINT64 TotalRecords);
 
+NTSTATUS CdpCoreJournalUsageAtLeast(
+	_Inout_ PCdp_CORE Core,
+	_In_ ULONG Percent,
+	_Out_ PBOOLEAN AtLeast);
+
+// Materialize current-branch latest values referenced by the oldest complete
+// header region, remove those values from MetaTree, then delete the region.
+NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core);
+
+// Merge-thread lifetime gate used to make PreviewBegin race-free. Only one
+// merge owner may be active for a core at a time.
+NTSTATUS CdpCoreSetMergeActive(
+	_Inout_ PCdp_CORE Core,
+	_In_ BOOLEAN Active);
+
+// True once when compaction stopped Preview because it reached the region
+// containing the preview target record.
+BOOLEAN CdpCoreConsumePreviewStoppedByMerge(_Inout_ PCdp_CORE Core);
+
 NTSTATUS CdpCoreQueryRecordHeaders(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 StartIndex,
@@ -66,26 +85,12 @@ NTSTATUS CdpCoreQueryRecordHeaders(
 
 Cdp_CORE_PHASE CdpCoreGetPhase(_In_ PCdp_CORE Core);
 
-/* Full COW write (before-image + journal + source write). */
-NTSTATUS CdpCoreWrite(
+// Persist application bytes to the journal and publish them in MetaTree.
+NTSTATUS CdpCoreAppendAfterImage(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
-	_In_reads_bytes_(Length) const VOID* Data);
-
-/* Driver path: before-image + journal only; caller forwards original write IRP. */
-NTSTATUS CdpCoreCaptureAppend(
-	_Inout_ PCdp_CORE Core,
-	_In_ UINT64 Offset,
-	_In_ ULONG Length,
-	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
-
-/* Driver path with explicit on-disk Cdp_JOURNAL_RECORD_FLAG_* bits. */
-NTSTATUS CdpCoreCaptureAppendEx(
-	_Inout_ PCdp_CORE Core,
-	_In_ UINT64 Offset,
-	_In_ ULONG Length,
-	_In_ ULONG RecordFlags,
+	_In_reads_bytes_(Length) const VOID* AfterImage,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
 
 NTSTATUS CdpCoreRead(
@@ -94,31 +99,29 @@ NTSTATUS CdpCoreRead(
 	_In_ ULONG Length,
 	_Out_writes_bytes_(Length) PVOID Buffer);
 
+NTSTATUS CdpCorePreviewRead(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_Out_writes_bytes_(Length) PVOID Buffer);
+
 NTSTATUS CdpCorePreviewBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns);
 NTSTATUS CdpCorePreviewEnd(_Inout_ PCdp_CORE Core);
 
-/* Build the target-time history view and remain in Recovery phase. */
+/* Create a child branch at the target record, build and atomically publish
+ * its MetaTree, then return to General. No source-volume writeback occurs. */
 NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns);
 
-/* Write the prepared history back to the source and return to General. */
+/* Idempotent compatibility acknowledgement; RecoveryBegin already completed. */
 NTSTATUS CdpCoreRecoveryCommit(_Inout_ PCdp_CORE Core);
 
-// Apply at most one remaining history node.  The caller may release its
-// external serialization lock between calls so prepared-recovery writes can
-// punch the still-pending portion of the history tree.
+// Compatibility form of Commit. It always completes without source writeback.
 NTSTATUS CdpCoreRecoveryCommitStep(
 	_Inout_ PCdp_CORE Core,
 	_Out_ PBOOLEAN Complete);
 
-/* Discard a prepared history view without writing back. */
-NTSTATUS CdpCoreRecoveryCancel(_Inout_ PCdp_CORE Core);
-
 #ifdef Cdp_USERMODE
-typedef void (*Cdp_CORE_TEST_BUILD_HOOK)(_Inout_ struct _Cdp_CORE* Core);
-typedef void (*Cdp_CORE_TEST_WRITEBACK_HOOK)(_Inout_ struct _Cdp_CORE* Core);
-VOID CdpCoreTestSetPreviewBuildHook(_In_opt_ Cdp_CORE_TEST_BUILD_HOOK Hook);
-VOID CdpCoreTestSetRecoveryBuildHook(_In_opt_ Cdp_CORE_TEST_BUILD_HOOK Hook);
-VOID CdpCoreTestSetWritebackHook(_In_opt_ Cdp_CORE_TEST_WRITEBACK_HOOK Hook);
+VOID CdpCoreTestSetRecoveryBuildFailure(_In_ NTSTATUS Status);
 #endif
 
 #ifdef Cdp_USERMODE

@@ -1,54 +1,25 @@
-﻿#include "cdp_core.h"
+#include "cdp_core.h"
 #include "cdp_alloc.h"
 #include "CdpJournal.h"
 
 #ifndef Cdp_USERMODE
 #include "cdp_dev_store.h"
-#define Cdp_RECOVERY_ERR(fmt, ...) \
-	Cdp_LOG("[RECOVERY] " fmt, ##__VA_ARGS__)
-/*
- * Recovery writeback is intentionally traced in Release builds.  These
- * records contain only metadata (never payload bytes) and let field logs be
- * correlated with the record-header list returned by the console.
- */
 #define Cdp_RECOVERY_TRACE(fmt, ...) \
 	Cdp_LOG("[RECOVERY] " fmt, ##__VA_ARGS__)
-#if DBG
-#define Cdp_RECOVERY_DBG(fmt, ...) \
-	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
-		"CdpDriver: [RECOVERY] " fmt, ##__VA_ARGS__)
 #else
-#define Cdp_RECOVERY_DBG(fmt, ...) ((void)0)
-#endif
-#else
-#define Cdp_RECOVERY_ERR(fmt, ...) ((void)0)
 #define Cdp_RECOVERY_TRACE(fmt, ...) ((void)0)
-#define Cdp_RECOVERY_DBG(fmt, ...) ((void)0)
 #endif
 
 #ifdef Cdp_USERMODE
 #include <string.h>
 
-typedef void (*Cdp_CORE_TEST_BUILD_HOOK)(_Inout_ PCdp_CORE Core);
-typedef void (*Cdp_CORE_TEST_WRITEBACK_HOOK)(_Inout_ PCdp_CORE Core);
-static Cdp_CORE_TEST_BUILD_HOOK g_previewBuildHook;
-static Cdp_CORE_TEST_BUILD_HOOK g_recoveryBuildHook;
-static Cdp_CORE_TEST_WRITEBACK_HOOK g_writebackHook;
+static NTSTATUS g_recoveryBuildFailureStatus = STATUS_SUCCESS;
 
-VOID CdpCoreTestSetPreviewBuildHook(_In_opt_ Cdp_CORE_TEST_BUILD_HOOK Hook)
+VOID CdpCoreTestSetRecoveryBuildFailure(_In_ NTSTATUS Status)
 {
-	g_previewBuildHook = Hook;
+	g_recoveryBuildFailureStatus = Status;
 }
 
-VOID CdpCoreTestSetRecoveryBuildHook(_In_opt_ Cdp_CORE_TEST_BUILD_HOOK Hook)
-{
-	g_recoveryBuildHook = Hook;
-}
-
-VOID CdpCoreTestSetWritebackHook(_In_opt_ Cdp_CORE_TEST_WRITEBACK_HOOK Hook)
-{
-	g_writebackHook = Hook;
-}
 #endif
 
 struct _Cdp_CORE
@@ -61,14 +32,14 @@ struct _Cdp_CORE
 	LONG Phase;
 	UINT64 Time100ns;
 	Cdp_PREVIEW_TREE PreviewTree;
-	Cdp_PREVIEW_TREE HistoryTree;
-	Cdp_PREVIEW_TREE StagingTree;
+	Cdp_PREVIEW_TREE MetaTree;
 	Cdp_LOCK TreeLock;
+	BOOLEAN MetaTreeReady;
 	UINT64 TargetTime100ns;
-	UINT64 SnapshotMaxSequence;
+	UINT64 PreviewTargetSequence;
 	LONG Building;
-	LONG WritebackActive;
-	NTSTATUS RecoveryFailureStatus;
+	LONG MergeActive;
+	BOOLEAN PreviewStoppedByMerge;
 	GUID SourceGuid;
 };
 
@@ -84,25 +55,7 @@ static NTSTATUS CdpCoreSourceRead(
 	_In_ ULONG Length,
 	_Out_writes_bytes_(Length) PVOID Buffer)
 {
-	NTSTATUS status;
-
-	if (Core->Phase == Cdp_CORE_PHASE_RECOVERY)
-	{
-		Cdp_RECOVERY_DBG(
-			"source read begin offset=%llu len=%lu\n",
-			Offset,
-			Length);
-	}
-	status = Core->Source->Read(Core->Source, Offset, Length, Buffer);
-	if (Core->Phase == Cdp_CORE_PHASE_RECOVERY)
-	{
-		Cdp_RECOVERY_DBG(
-			"source read end offset=%llu len=%lu status=0x%08X\n",
-			Offset,
-			Length,
-			status);
-	}
-	return status;
+	return Core->Source->Read(Core->Source, Offset, Length, Buffer);
 }
 
 static NTSTATUS CdpCoreSourceWriteDirect(
@@ -111,25 +64,7 @@ static NTSTATUS CdpCoreSourceWriteDirect(
 	_In_ ULONG Length,
 	_In_reads_bytes_(Length) const VOID* Buffer)
 {
-	NTSTATUS status;
-
-	if (Core->WritebackActive)
-	{
-		Cdp_RECOVERY_DBG(
-			"source write begin offset=%llu len=%lu\n",
-			Offset,
-			Length);
-	}
-	status = Core->Source->Write(Core->Source, Offset, Length, Buffer);
-	if (Core->WritebackActive)
-	{
-		Cdp_RECOVERY_DBG(
-			"source write end offset=%llu len=%lu status=0x%08X\n",
-			Offset,
-			Length,
-			status);
-	}
-	return status;
+	return Core->Source->Write(Core->Source, Offset, Length, Buffer);
 }
 
 static VOID CdpCoreInitCommon(_Inout_ PCdp_CORE Core)
@@ -137,9 +72,30 @@ static VOID CdpCoreInitCommon(_Inout_ PCdp_CORE Core)
 	Core->Time100ns = 1;
 	Core->Phase = Cdp_CORE_PHASE_GENERAL;
 	CdpPreviewTreeInitialize(&Core->PreviewTree);
-	CdpPreviewTreeInitialize(&Core->HistoryTree);
-	CdpPreviewTreeInitialize(&Core->StagingTree);
+	CdpPreviewTreeInitialize(&Core->MetaTree);
 	Cdp_LOCK_INIT(&Core->TreeLock);
+}
+
+static NTSTATUS CdpCoreBuildMetaTree(_Inout_ PCdp_CORE Core)
+{
+	Cdp_PREVIEW_TREE newTree;
+	Cdp_PREVIEW_TREE oldTree;
+	NTSTATUS status;
+
+	if (!Core || !Core->Journal || !Core->Journal->Mounted)
+		return STATUS_DEVICE_NOT_READY;
+	Core->MetaTreeReady = FALSE;
+	status = CdpJournalBuildCurrentBranchTree(Core->Journal, &newTree);
+	if (!NT_SUCCESS(status))
+		return status;
+
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	oldTree = Core->MetaTree;
+	Core->MetaTree = newTree;
+	Core->MetaTreeReady = TRUE;
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	CdpPreviewTreeFree(&oldTree);
+	return STATUS_SUCCESS;
 }
 
 NTSTATUS CdpCoreCreate(
@@ -197,6 +153,18 @@ NTSTATUS CdpCoreBind(
 	core->OwnsJournal = FALSE;
 	core->SourceGuid = *SourceVolumeGuid;
 	CdpCoreInitCommon(core);
+	if (Journal->Mounted)
+	{
+		NTSTATUS status = CdpCoreBuildMetaTree(core);
+		if (!NT_SUCCESS(status))
+		{
+			CdpPreviewTreeFree(&core->MetaTree);
+			CdpPreviewTreeFree(&core->PreviewTree);
+			Cdp_LOCK_DELETE(&core->TreeLock);
+			Cdp_FREE(core);
+			return status;
+		}
+	}
 
 	(*OutCore) = core;
 	return STATUS_SUCCESS;
@@ -210,8 +178,7 @@ VOID CdpCoreDestroy(_Inout_opt_ PCdp_CORE Core)
 	if (Core->OwnsJournal)
 		CdpJournalClose(Core->Journal);
 	CdpPreviewTreeFree(&Core->PreviewTree);
-	CdpPreviewTreeFree(&Core->HistoryTree);
-	CdpPreviewTreeFree(&Core->StagingTree);
+	CdpPreviewTreeFree(&Core->MetaTree);
 	Cdp_LOCK_DELETE(&Core->TreeLock);
 #ifndef Cdp_USERMODE
 	if (Core->Source)
@@ -246,16 +213,33 @@ UINT64 CdpCoreTick(_Inout_ PCdp_CORE Core, _In_ UINT64 Delta100ns)
 
 NTSTATUS CdpCoreFormatJournal(_Inout_ PCdp_CORE Core)
 {
+	Cdp_PREVIEW_TREE oldTree;
+	NTSTATUS status;
+
 	if (!Core)
 		return STATUS_INVALID_PARAMETER;
-	return CdpJournalFormat(Core->Journal);
+	status = CdpJournalFormat(Core->Journal);
+	if (!NT_SUCCESS(status))
+		return status;
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	oldTree = Core->MetaTree;
+	CdpPreviewTreeInitialize(&Core->MetaTree);
+	Core->MetaTreeReady = TRUE;
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	CdpPreviewTreeFree(&oldTree);
+	return STATUS_SUCCESS;
 }
 
 NTSTATUS CdpCoreMountJournal(_Inout_ PCdp_CORE Core)
 {
+	NTSTATUS status;
 	if (!Core)
 		return STATUS_INVALID_PARAMETER;
-	return CdpJournalMount(Core->Journal);
+	Core->MetaTreeReady = FALSE;
+	status = CdpJournalMount(Core->Journal);
+	if (!NT_SUCCESS(status))
+		return status;
+	return CdpCoreBuildMetaTree(Core);
 }
 
 NTSTATUS CdpCoreQueryTimeRange(
@@ -290,6 +274,266 @@ NTSTATUS CdpCoreQueryJournalUsage(
 		TotalRecords);
 }
 
+NTSTATUS CdpCoreJournalUsageAtLeast(
+	_Inout_ PCdp_CORE Core,
+	_In_ ULONG Percent,
+	_Out_ PBOOLEAN AtLeast)
+{
+	UINT64 partitionBytes;
+	UINT64 metadataBytes;
+	UINT64 payloadBytesUsed;
+	UINT64 payloadBytesFree;
+	UINT64 totalRecords;
+	UINT64 usedBytes;
+	NTSTATUS status;
+
+	if (!Core || !AtLeast || Percent == 0 || Percent > 100)
+		return STATUS_INVALID_PARAMETER;
+	*AtLeast = FALSE;
+	status = CdpCoreQueryJournalUsage(
+		Core,
+		&partitionBytes,
+		&metadataBytes,
+		&payloadBytesUsed,
+		&payloadBytesFree,
+		&totalRecords);
+	UNREFERENCED_PARAMETER(payloadBytesFree);
+	UNREFERENCED_PARAMETER(totalRecords);
+	if (!NT_SUCCESS(status))
+		return status;
+	if (metadataBytes > MAXUINT64 - payloadBytesUsed)
+		return STATUS_INTEGER_OVERFLOW;
+	usedBytes = metadataBytes + payloadBytesUsed;
+	*AtLeast = usedBytes >=
+		(partitionBytes / 100) * Percent +
+		((partitionBytes % 100) * Percent + 99) / 100;
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS CdpCoreSetMergeActive(
+	_Inout_ PCdp_CORE Core,
+	_In_ BOOLEAN Active)
+{
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Core)
+		return STATUS_INVALID_PARAMETER;
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	if (Active)
+	{
+		if (Core->MergeActive)
+			status = STATUS_DEVICE_BUSY;
+		else
+			Core->MergeActive = 1;
+	}
+	else
+	{
+		Core->MergeActive = 0;
+	}
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	return status;
+}
+
+BOOLEAN CdpCoreConsumePreviewStoppedByMerge(_Inout_ PCdp_CORE Core)
+{
+	BOOLEAN stopped;
+
+	if (!Core)
+		return FALSE;
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	stopped = Core->PreviewStoppedByMerge;
+	Core->PreviewStoppedByMerge = FALSE;
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	return stopped;
+}
+
+static NTSTATUS CdpCoreMaterializeMetaNodes(
+	_Inout_ PCdp_CORE Core,
+	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
+	_In_ UINT64 FirstSequence,
+	_In_ UINT64 EndSequence)
+{
+	PVOID payload;
+	NTSTATUS status;
+
+	if (!Node)
+		return STATUS_SUCCESS;
+	status = CdpCoreMaterializeMetaNodes(
+		Core, Node->Left, FirstSequence, EndSequence);
+	if (!NT_SUCCESS(status))
+		return status;
+	if (!Node->Invalid && Node->Sequence >= FirstSequence &&
+		Node->Sequence < EndSequence)
+	{
+		payload = Cdp_ALLOC(Node->DataLength);
+		if (!payload)
+			return STATUS_INSUFFICIENT_RESOURCES;
+		status = CdpJournalReadPayload(
+			Core->Journal, Node->FileOffset, Node->DataLength, payload);
+		if (NT_SUCCESS(status))
+		{
+			status = CdpCoreSourceWriteDirect(
+				Core, Node->Start, Node->DataLength, payload);
+		}
+		Cdp_FREE(payload);
+		if (!NT_SUCCESS(status))
+			return status;
+	}
+	return CdpCoreMaterializeMetaNodes(
+		Core, Node->Right, FirstSequence, EndSequence);
+}
+
+static PCdp_PREVIEW_TREE_NODE CdpCoreFindMetaNodeBySequenceRange(
+	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
+	_In_ UINT64 FirstSequence,
+	_In_ UINT64 EndSequence)
+{
+	PCdp_PREVIEW_TREE_NODE found;
+
+	if (!Node)
+		return NULL;
+	found = CdpCoreFindMetaNodeBySequenceRange(
+		Node->Left, FirstSequence, EndSequence);
+	if (found)
+		return found;
+	if (!Node->Invalid && Node->Sequence >= FirstSequence &&
+		Node->Sequence < EndSequence)
+	{
+		return Node;
+	}
+	return CdpCoreFindMetaNodeBySequenceRange(
+		Node->Right, FirstSequence, EndSequence);
+}
+
+NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
+{
+	Cdp_PREVIEW_TREE regionTree;
+	UINT64 regionOffset;
+	UINT64 firstSequence;
+	UINT64 endSequence;
+	NTSTATUS status;
+	BOOLEAN regionTreeInitialized = FALSE;
+	BOOLEAN previewTargetDeleted = FALSE;
+
+	if (!Core)
+		return STATUS_INVALID_PARAMETER;
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	if (!Core->MetaTreeReady)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup;
+	}
+	status = CdpJournalGetOldestCompactableRegion(
+		Core->Journal, &regionOffset, &firstSequence, &endSequence);
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+
+	// Once reclamation reaches the record that anchors the requested preview
+	// time, that historical view can no longer be maintained from the retained
+	// journal. Stop it before any payload in the region is reclaimed.
+	if (Core->Phase == Cdp_CORE_PHASE_PREVIEW &&
+		Core->PreviewTargetSequence >= firstSequence &&
+		Core->PreviewTargetSequence < endSequence)
+	{
+		CdpPreviewTreeFree(&Core->PreviewTree);
+		CdpPreviewTreeInitialize(&Core->PreviewTree);
+		Core->Building = 0;
+		Core->PreviewTargetSequence = 0;
+		Core->Phase = Cdp_CORE_PHASE_GENERAL;
+		Core->PreviewStoppedByMerge = TRUE;
+	}
+
+	status = CdpJournalPruneUnreachableForCompaction(
+		Core->Journal,
+		firstSequence,
+		endSequence,
+		Core->Phase == Cdp_CORE_PHASE_PREVIEW ?
+			Core->PreviewTargetSequence : 0,
+		&previewTargetDeleted);
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+	if (previewTargetDeleted && Core->Phase == Cdp_CORE_PHASE_PREVIEW)
+	{
+		CdpPreviewTreeFree(&Core->PreviewTree);
+		CdpPreviewTreeInitialize(&Core->PreviewTree);
+		Core->Building = 0;
+		Core->PreviewTargetSequence = 0;
+		Core->Phase = Cdp_CORE_PHASE_GENERAL;
+		Core->PreviewStoppedByMerge = TRUE;
+	}
+
+	// Build the current-branch view local to the region being deleted. Newer
+	// regions deliberately do not suppress these values: the source becomes
+	// the complete base produced by this region, while newer MetaTree records
+	// continue to overlay it.
+	status = CdpJournalBuildCurrentBranchRegionTree(
+		Core->Journal, firstSequence, endSequence, &regionTree);
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+	regionTreeInitialized = TRUE;
+	status = CdpCoreMaterializeMetaNodes(
+		Core, regionTree.Root, firstSequence, endSequence);
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+
+	// Update only MetaTree coverage that still points into the deleted region.
+	// Intersections owned by newer regions remain intact and keep overriding
+	// the newly materialized source baseline.
+	for (;;)
+	{
+		PCdp_PREVIEW_TREE_NODE node =
+			CdpCoreFindMetaNodeBySequenceRange(
+				Core->MetaTree.Root, firstSequence, endSequence);
+		UINT64 start;
+		ULONG length;
+		if (!node)
+			break;
+		start = node->Start;
+		length = node->DataLength;
+		status = CdpPreviewTreePunchRange(
+			&Core->MetaTree, start, length);
+		if (!NT_SUCCESS(status))
+		{
+			Core->MetaTreeReady = FALSE;
+			goto cleanup;
+		}
+	}
+
+	// If Preview remains active, records reclaimed below its target boundary
+	// now live in the source baseline. Remove only PreviewTree fragments still
+	// pointing into this region; newer retained preview records stay overlaid.
+	if (Core->Phase == Cdp_CORE_PHASE_PREVIEW)
+	{
+		for (;;)
+		{
+			PCdp_PREVIEW_TREE_NODE node =
+				CdpCoreFindMetaNodeBySequenceRange(
+					Core->PreviewTree.Root, firstSequence, endSequence);
+			UINT64 start;
+			ULONG length;
+			if (!node)
+				break;
+			start = node->Start;
+			length = node->DataLength;
+			status = CdpPreviewTreePunchRange(
+				&Core->PreviewTree, start, length);
+			if (!NT_SUCCESS(status))
+				goto cleanup;
+		}
+	}
+
+	// The source now contains every live value referenced by this region.
+	// Only after that point is its header/payload span made reclaimable.
+	status = CdpJournalDeleteOldestRegion(
+		Core->Journal, regionOffset);
+
+cleanup:
+	if (regionTreeInitialized)
+		CdpPreviewTreeFree(&regionTree);
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	return status;
+}
+
 NTSTATUS CdpCoreQueryRecordHeaders(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 StartIndex,
@@ -320,183 +564,84 @@ Cdp_CORE_PHASE CdpCoreGetPhase(_In_ PCdp_CORE Core)
 	return (Cdp_CORE_PHASE)Core->Phase;
 }
 
-static NTSTATUS CdpCoreAfterAppend(
-	_Inout_ PCdp_CORE Core,
-	_In_ const Cdp_JOURNAL_RECORD* Record,
-	_In_ UINT64 Offset,
-	_In_ ULONG Length)
-{
-	NTSTATUS punchStatus = STATUS_SUCCESS;
-	if (Core->Phase == Cdp_CORE_PHASE_PREVIEW)
-	{
-		Cdp_LOCK_ACQUIRE(&Core->TreeLock);
-		if (Core->Building)
-		{
-			if (Record->Sequence >= Core->SnapshotMaxSequence)
-				(void)CdpPreviewTreeInsert(&Core->StagingTree, Record);
-		}
-		else
-		{
-			(void)CdpPreviewTreeInsert(&Core->PreviewTree, Record);
-		}
-		Cdp_LOCK_RELEASE(&Core->TreeLock);
-		return STATUS_SUCCESS;
-	}
-	else if (Core->Phase == Cdp_CORE_PHASE_RECOVERY && !Core->WritebackActive)
-	{
-		Cdp_LOCK_ACQUIRE(&Core->TreeLock);
-		if (Core->Building)
-		{
-			if (Record->Sequence >= Core->SnapshotMaxSequence)
-			{
-				Cdp_RECOVERY_TRACE(
-					"build-time concurrent record seq=%llu volumeOff=%llu len=%lu "
-					"journalOff=%llu -> staging\n",
-					Record->Sequence,
-					Offset,
-					Length,
-					Record->FileOffset);
-				(void)CdpPreviewTreeInsert(&Core->StagingTree, Record);
-			}
-		}
-		else
-		{
-			/* Do not overwrite a source range changed after recovery was prepared. */
-			Cdp_RECOVERY_TRACE(
-				"prepared-time concurrent record seq=%llu volumeOff=%llu len=%lu "
-				"journalOff=%llu -> punch history range\n",
-				Record->Sequence,
-				Offset,
-				Length,
-				Record->FileOffset);
-			punchStatus = CdpPreviewTreePunchRange(
-				&Core->HistoryTree,
-				Offset,
-				Length);
-			if (!NT_SUCCESS(punchStatus))
-			{
-				Cdp_RECOVERY_ERR(
-					"history punch failed seq=%llu volumeOff=%llu len=%lu status=0x%08X; "
-					"recovery is failed\n",
-					Record->Sequence,
-					Offset,
-					Length,
-					punchStatus);
-				Core->RecoveryFailureStatus = punchStatus;
-			}
-		}
-		Cdp_LOCK_RELEASE(&Core->TreeLock);
-		return punchStatus;
-	}
-	return STATUS_SUCCESS;
-}
-
-NTSTATUS CdpCoreCaptureAppend(
+NTSTATUS CdpCoreAppendAfterImage(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
+	_In_reads_bytes_(Length) const VOID* AfterImage,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord)
 {
-	ULONG recordFlags = 0;
-
-	if (Core && Core->Phase == Cdp_CORE_PHASE_RECOVERY)
-		recordFlags = Cdp_JOURNAL_RECORD_FLAG_BACKFILL;
-	return CdpCoreCaptureAppendEx(
-		Core, Offset, Length, recordFlags, WrittenRecord);
-}
-
-NTSTATUS CdpCoreCaptureAppendEx(
-	_Inout_ PCdp_CORE Core,
-	_In_ UINT64 Offset,
-	_In_ ULONG Length,
-	_In_ ULONG RecordFlags,
-	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord)
-{
-	PUCHAR before = NULL;
 	NTSTATUS status;
 	Cdp_JOURNAL_RECORD record;
-
-	if (!Core || Length == 0)
+#ifndef Cdp_USERMODE
+	LARGE_INTEGER appendStart;
+	LARGE_INTEGER treeWaitStart;
+	LARGE_INTEGER treeWaitEnd;
+	LARGE_INTEGER treeUpdateStart;
+	LARGE_INTEGER treeUpdateEnd;
+#endif
+	if (!Core || !AfterImage || Length == 0 ||
+		Length > Cdp_JOURNAL_MAX_RECORD_DATA)
+	{
 		return STATUS_INVALID_PARAMETER;
+	}
 	if (!Core->Journal->Mounted)
 		return STATUS_DEVICE_NOT_READY;
+	if (!Core->MetaTreeReady)
+		return STATUS_DEVICE_NOT_READY;
 
-	before = (PUCHAR)Cdp_ALLOC(Length);
-	if (!before)
-		return STATUS_INSUFFICIENT_RESOURCES;
-
-	status = CdpCoreSourceRead(Core, Offset, Length, before);
-	if (!NT_SUCCESS(status))
-		goto done;
-
-	if (Core->WritebackActive)
+#ifndef Cdp_USERMODE
+	appendStart = KeQueryPerformanceCounter(NULL);
+	treeWaitStart = appendStart;
+#endif
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+#ifndef Cdp_USERMODE
+	treeWaitEnd = KeQueryPerformanceCounter(NULL);
+	InterlockedAdd64(
+		&g_CdpPerfCounters.TreeLockWaitTicks,
+		treeWaitEnd.QuadPart - treeWaitStart.QuadPart);
+#endif
+	if (!Core->MetaTreeReady)
 	{
-		Cdp_RECOVERY_DBG(
-			"capture journal append begin offset=%llu len=%lu\n",
-			Offset,
-			Length);
+		Cdp_LOCK_RELEASE(&Core->TreeLock);
+		return STATUS_DEVICE_NOT_READY;
 	}
 	status = CdpJournalAppendEx(
 		Core->Journal,
 		Offset,
 		Length,
-		before,
-		RecordFlags,
+		AfterImage,
+		0,
 		&record);
-	if (!NT_SUCCESS(status))
+	if (NT_SUCCESS(status))
 	{
-		if (Core->WritebackActive)
-		{
-			Cdp_RECOVERY_DBG(
-				"capture journal append end offset=%llu len=%lu "
-				"status=0x%08X\n",
-				Offset,
-				Length,
-				status);
-		}
-		goto done;
+#ifndef Cdp_USERMODE
+		treeUpdateStart = KeQueryPerformanceCounter(NULL);
+#endif
+		status = CdpPreviewTreeOverlayLatest(&Core->MetaTree, &record);
+#ifndef Cdp_USERMODE
+		treeUpdateEnd = KeQueryPerformanceCounter(NULL);
+		InterlockedAdd64(
+			&g_CdpPerfCounters.TreeUpdateTicks,
+			treeUpdateEnd.QuadPart - treeUpdateStart.QuadPart);
+#endif
+		if (!NT_SUCCESS(status))
+			Core->MetaTreeReady = FALSE;
 	}
-	if (Core->WritebackActive)
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+#ifndef Cdp_USERMODE
+	InterlockedIncrement(&g_CdpPerfCounters.AppendCount);
+	InterlockedAdd64(
+		&g_CdpPerfCounters.AppendTicks,
+		KeQueryPerformanceCounter(NULL).QuadPart - appendStart.QuadPart);
+#endif
+	if (NT_SUCCESS(status))
 	{
-		Cdp_RECOVERY_DBG(
-			"capture journal append end offset=%llu len=%lu "
-			"seq=%llu journalOff=%llu status=0x%08X\n",
-			Offset,
-			Length,
-			record.Sequence,
-			record.FileOffset,
-			status);
+		Core->Time100ns += 1;
+		if (WrittenRecord)
+			*WrittenRecord = record;
 	}
-
-	status = CdpCoreAfterAppend(Core, &record, Offset, Length);
-	if (!NT_SUCCESS(status))
-		goto done;
-	Core->Time100ns += 1;
-	if (WrittenRecord)
-		*WrittenRecord = record;
-
-done:
-	Cdp_FREE(before);
 	return status;
-}
-
-NTSTATUS CdpCoreWrite(
-	_Inout_ PCdp_CORE Core,
-	_In_ UINT64 Offset,
-	_In_ ULONG Length,
-	_In_reads_bytes_(Length) const VOID* Data)
-{
-	NTSTATUS status;
-	Cdp_JOURNAL_RECORD record;
-
-	if (!Core || !Data || Length == 0)
-		return STATUS_INVALID_PARAMETER;
-
-	status = CdpCoreCaptureAppend(Core, Offset, Length, &record);
-	if (!NT_SUCCESS(status))
-		return status;
-
-	return CdpCoreSourceWriteDirect(Core, Offset, Length, Data);
 }
 
 static NTSTATUS CdpCoreSynthesizeRead(
@@ -519,13 +664,6 @@ static NTSTATUS CdpCoreSynthesizeRead(
 		goto done;
 	}
 
-	if (Core->Phase == Cdp_CORE_PHASE_RECOVERY)
-	{
-		Cdp_RECOVERY_DBG(
-			"synthesize tree begin offset=%llu len=%lu\n",
-			Offset,
-			Length);
-	}
 	status = CdpJournalApplyPreviewTree(
 		Core->Journal,
 		Tree,
@@ -535,16 +673,6 @@ static NTSTATUS CdpCoreSynthesizeRead(
 		Buffer,
 		coveredMask,
 		&coveredCount);
-	if (Core->Phase == Cdp_CORE_PHASE_RECOVERY)
-	{
-		Cdp_RECOVERY_DBG(
-			"synthesize tree end offset=%llu len=%lu covered=%lu "
-			"status=0x%08X\n",
-			Offset,
-			Length,
-			coveredCount,
-			status);
-	}
 	if (!NT_SUCCESS(status))
 		goto done;
 	if (coveredCount == Length)
@@ -611,70 +739,6 @@ done:
 /* During Preview/Recovery tree construction, staging headers describe writes
  * after the snapshot.  Their payloads are before-images, so staging is used
  * only as a coverage map: its bytes must come from live source. */
-static NTSTATUS CdpCoreSynthesizeReadWithStaging(
-	_Inout_ PCdp_CORE Core,
-	_In_ PCdp_PREVIEW_TREE PrimaryTree,
-	_In_ BOOLEAN StagingUsesLiveSource,
-	_In_ UINT64 Offset,
-	_In_ ULONG Length,
-	_Out_writes_bytes_(Length) PVOID Buffer)
-{
-	PUCHAR stagingMask = NULL;
-	ULONG stagingCovered = 0;
-	ULONG maskBytes = (Length + 7UL) / 8UL;
-	ULONG i;
-	NTSTATUS status;
-
-	status = CdpCoreSynthesizeRead(
-		Core, PrimaryTree, Offset, Length, Buffer);
-	if (!NT_SUCCESS(status) || !Core->Building)
-		return status;
-
-	stagingMask = (PUCHAR)Cdp_ALLOC0(maskBytes);
-	if (!stagingMask)
-		return STATUS_INSUFFICIENT_RESOURCES;
-	/* Preview staging holds before-images and therefore overlays the primary
-	 * tree directly.  Recovery staging protects new writes during prepare, so
-	 * its covered ranges must instead reflect the current live source. */
-	status = CdpJournalApplyPreviewTree(
-		Core->Journal,
-		&Core->StagingTree,
-		&Core->TreeLock,
-		Offset,
-		Length,
-		Buffer,
-		stagingMask,
-		&stagingCovered);
-	if (!NT_SUCCESS(status) || stagingCovered == 0 || !StagingUsesLiveSource)
-		goto done;
-
-	i = 0;
-	while (i < Length)
-	{
-		ULONG runStart;
-		while (i < Length &&
-			(stagingMask[i >> 3] & (UCHAR)(1U << (i & 7))) == 0)
-			++i;
-		if (i >= Length)
-			break;
-		runStart = i;
-		while (i < Length &&
-			(stagingMask[i >> 3] & (UCHAR)(1U << (i & 7))) != 0)
-			++i;
-		status = CdpCoreSourceRead(
-			Core,
-			Offset + runStart,
-			i - runStart,
-			(PUCHAR)Buffer + runStart);
-		if (!NT_SUCCESS(status))
-			break;
-	}
-
-done:
-	Cdp_FREE(stagingMask);
-	return status;
-}
-
 NTSTATUS CdpCoreRead(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,
@@ -683,18 +747,28 @@ NTSTATUS CdpCoreRead(
 {
 	if (!Core || !Buffer || Length == 0)
 		return STATUS_INVALID_PARAMETER;
-
 	if (Core->Phase == Cdp_CORE_PHASE_PREVIEW)
-	{
-		return CdpCoreSynthesizeReadWithStaging(
-			Core, &Core->PreviewTree, FALSE, Offset, Length, Buffer);
-	}
-	if (Core->Phase == Cdp_CORE_PHASE_RECOVERY)
-	{
-		return CdpCoreSynthesizeReadWithStaging(
-			Core, &Core->HistoryTree, TRUE, Offset, Length, Buffer);
-	}
-	return CdpCoreSourceRead(Core, Offset, Length, Buffer);
+		return CdpCoreSynthesizeRead(
+			Core, &Core->PreviewTree, Offset, Length, Buffer);
+	if (!Core->MetaTreeReady)
+		return STATUS_DEVICE_NOT_READY;
+
+	return CdpCoreSynthesizeRead(
+		Core, &Core->MetaTree, Offset, Length, Buffer);
+}
+
+NTSTATUS CdpCorePreviewRead(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_Out_writes_bytes_(Length) PVOID Buffer)
+{
+	if (!Core || !Buffer || Length == 0)
+		return STATUS_INVALID_PARAMETER;
+	if (Core->Phase != Cdp_CORE_PHASE_PREVIEW || Core->Building)
+		return STATUS_INVALID_DEVICE_STATE;
+	return CdpCoreSynthesizeRead(
+		Core, &Core->PreviewTree, Offset, Length, Buffer);
 }
 
 static NTSTATUS CdpCoreResolveTargetTime(
@@ -726,9 +800,10 @@ NTSTATUS CdpCorePreviewBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns
 {
 	NTSTATUS status;
 	UINT64 effectiveTargetTime100ns;
+	UINT64 targetRecordSequence = 0;
 
-	if (!Core || Core->Phase != Cdp_CORE_PHASE_GENERAL)
-		return STATUS_INVALID_DEVICE_STATE;
+	if (!Core)
+		return STATUS_INVALID_PARAMETER;
 	if (!Core->Journal->Mounted)
 		return STATUS_DEVICE_NOT_READY;
 	status = CdpCoreResolveTargetTime(
@@ -736,195 +811,100 @@ NTSTATUS CdpCorePreviewBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns
 	if (!NT_SUCCESS(status))
 		return status;
 
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	if (Core->Phase != Cdp_CORE_PHASE_GENERAL)
+	{
+		Cdp_LOCK_RELEASE(&Core->TreeLock);
+		return STATUS_INVALID_DEVICE_STATE;
+	}
+	if (Core->MergeActive)
+	{
+		Cdp_LOCK_RELEASE(&Core->TreeLock);
+		return STATUS_DEVICE_BUSY;
+	}
 	Core->Phase = Cdp_CORE_PHASE_PREVIEW;
 	Core->Building = 1;
+	Core->PreviewStoppedByMerge = FALSE;
 	Core->TargetTime100ns = effectiveTargetTime100ns;
-	Core->SnapshotMaxSequence = Core->Journal->NextSequence;
+	Core->PreviewTargetSequence = 0;
 	CdpPreviewTreeFree(&Core->PreviewTree);
-	CdpPreviewTreeFree(&Core->StagingTree);
 	CdpPreviewTreeInitialize(&Core->PreviewTree);
-	CdpPreviewTreeInitialize(&Core->StagingTree);
-
-#ifdef Cdp_USERMODE
-	if (g_previewBuildHook)
-		g_previewBuildHook(Core);
-#endif
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
 
 	status = CdpJournalBuildPreviewTree(
 		Core->Journal,
 		effectiveTargetTime100ns,
-		Core->SnapshotMaxSequence,
+		Core->Journal->NextSequence,
 		TRUE,
-		&Core->PreviewTree);
+		&Core->PreviewTree,
+		&targetRecordSequence);
 	if (!NT_SUCCESS(status) && status != STATUS_NOT_FOUND)
 	{
+		Cdp_LOCK_ACQUIRE(&Core->TreeLock);
 		Core->Building = 0;
 		Core->Phase = Cdp_CORE_PHASE_GENERAL;
+		Cdp_LOCK_RELEASE(&Core->TreeLock);
 		return status;
 	}
 	if (status == STATUS_NOT_FOUND)
 		status = STATUS_SUCCESS;
 
 	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
-	status = CdpPreviewTreeMergeFrom(&Core->PreviewTree, &Core->StagingTree);
+	Core->PreviewTargetSequence = targetRecordSequence;
 	Core->Building = 0;
 	Cdp_LOCK_RELEASE(&Core->TreeLock);
-	if (!NT_SUCCESS(status))
-	{
-		Core->Phase = Cdp_CORE_PHASE_GENERAL;
-		return status;
-	}
 
 	return STATUS_SUCCESS;
 }
 
 NTSTATUS CdpCorePreviewEnd(_Inout_ PCdp_CORE Core)
 {
-	if (!Core || Core->Phase != Cdp_CORE_PHASE_PREVIEW)
-		return STATUS_INVALID_DEVICE_STATE;
-	CdpPreviewTreeFree(&Core->PreviewTree);
-	CdpPreviewTreeFree(&Core->StagingTree);
-	CdpPreviewTreeInitialize(&Core->PreviewTree);
-	CdpPreviewTreeInitialize(&Core->StagingTree);
-	Core->Phase = Cdp_CORE_PHASE_GENERAL;
-	return STATUS_SUCCESS;
-}
-
-static PCdp_PREVIEW_TREE_NODE CdpCoreFindEarliestHistoryNode(
-	_In_opt_ PCdp_PREVIEW_TREE_NODE Node)
-{
-	UINT64 targetSequence;
-
-	if (!Node || Node->MinValidSequence == MAXUINT64)
-		return NULL;
-	targetSequence = Node->MinValidSequence;
-
-	while (Node)
+	if (!Core)
+		return STATUS_INVALID_PARAMETER;
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	if (Core->Phase != Cdp_CORE_PHASE_PREVIEW)
 	{
-		if (Node->Left &&
-			Node->Left->MinValidSequence == targetSequence)
-		{
-			Node = Node->Left;
-			continue;
-		}
-		if (!Node->Invalid && Node->Sequence == targetSequence)
-			return Node;
-		if (Node->Right &&
-			Node->Right->MinValidSequence == targetSequence)
-		{
-			Node = Node->Right;
-			continue;
-		}
-		break;
+		Cdp_LOCK_RELEASE(&Core->TreeLock);
+		return STATUS_INVALID_DEVICE_STATE;
 	}
-	return NULL;
+	CdpPreviewTreeFree(&Core->PreviewTree);
+	CdpPreviewTreeInitialize(&Core->PreviewTree);
+	Core->PreviewTargetSequence = 0;
+	Core->Phase = Cdp_CORE_PHASE_GENERAL;
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	return STATUS_SUCCESS;
 }
 
 NTSTATUS CdpCoreRecoveryCommitStep(
 	_Inout_ PCdp_CORE Core,
 	_Out_ PBOOLEAN Complete)
 {
-	PCdp_PREVIEW_TREE_NODE node;
-	PUCHAR payload = NULL;
-	ULONG writeOffset = 0;
-	ULONG writeRuns = 0;
-	NTSTATUS status = STATUS_SUCCESS;
-
-	if (!Core || !Complete || Core->Phase != Cdp_CORE_PHASE_RECOVERY ||
-		Core->Building)
-	{
+	if (!Core || !Complete)
+		return STATUS_INVALID_PARAMETER;
+	if (Core->Building || Core->Phase != Cdp_CORE_PHASE_GENERAL)
 		return STATUS_INVALID_DEVICE_STATE;
-	}
-	if (!NT_SUCCESS(Core->RecoveryFailureStatus))
-		return Core->RecoveryFailureStatus;
-
-	*Complete = FALSE;
-	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
-	node = CdpCoreFindEarliestHistoryNode(Core->HistoryTree.Root);
-	if (!node)
-	{
-		CdpPreviewTreeFree(&Core->HistoryTree);
-		CdpPreviewTreeFree(&Core->StagingTree);
-		CdpPreviewTreeInitialize(&Core->HistoryTree);
-		CdpPreviewTreeInitialize(&Core->StagingTree);
-		Core->TargetTime100ns = 0;
-		Core->SnapshotMaxSequence = 0;
-		Core->RecoveryFailureStatus = STATUS_SUCCESS;
-		Core->Phase = Cdp_CORE_PHASE_GENERAL;
-		Cdp_LOCK_RELEASE(&Core->TreeLock);
-		*Complete = TRUE;
-		Cdp_RECOVERY_TRACE("commit complete -> normal\n");
-		return STATUS_SUCCESS;
-	}
-	Cdp_LOCK_RELEASE(&Core->TreeLock);
-
-	payload = (PUCHAR)Cdp_ALLOC(node->DataLength);
-	if (!payload)
-		return STATUS_INSUFFICIENT_RESOURCES;
-	status = CdpJournalReadPayload(
-		Core->Journal, node->FileOffset, node->DataLength, payload);
-	if (!NT_SUCCESS(status))
-		goto done;
-
-	Core->WritebackActive = 1;
-	Cdp_RECOVERY_TRACE(
-		"commit step seq=%llu volumeOff=%llu len=%lu journalOff=%llu\n",
-		node->Sequence, node->Start, node->DataLength, node->FileOffset);
-	while (writeOffset < node->DataLength)
-	{
-		ULONG writeLength = node->DataLength - writeOffset;
-		if (writeLength > Cdp_JOURNAL_MAX_RECORD_DATA)
-			writeLength = Cdp_JOURNAL_MAX_RECORD_DATA;
-		/* Recovery writeback is itself protected by COW.  WritebackActive
-		 * prevents the resulting BACKFILL record from punching or entering
-		 * the in-flight HistoryTree. */
-		status = CdpCoreWrite(
-			Core,
-			node->Start + writeOffset,
-			writeLength,
-			payload + writeOffset);
-		Cdp_RECOVERY_TRACE(
-			"restore seq=%llu volumeOff=%llu len=%lu journalOff=%llu status=0x%08X\n",
-			node->Sequence,
-			node->Start + writeOffset,
-			writeLength,
-			node->FileOffset + writeOffset,
-			status);
-		if (!NT_SUCCESS(status))
-			break;
-		writeOffset += writeLength;
-		++writeRuns;
-	}
-	Core->WritebackActive = 0;
-	if (NT_SUCCESS(status))
-	{
-		Cdp_LOCK_ACQUIRE(&Core->TreeLock);
-		status = CdpPreviewTreeMarkInvalidByStart(
-			&Core->HistoryTree, node->Start);
-		if (!NT_SUCCESS(status))
-			Core->RecoveryFailureStatus = status;
-		Cdp_LOCK_RELEASE(&Core->TreeLock);
-		if (NT_SUCCESS(status))
-		{
-			Cdp_RECOVERY_TRACE(
-				"commit step complete seq=%llu runs=%lu bytes=%lu\n",
-				node->Sequence, writeRuns, node->DataLength);
-		}
-	}
-
-done:
-	Core->WritebackActive = 0;
-	Cdp_FREE(payload);
-	return status;
+	// After-image Recovery is complete when Begin publishes the replacement
+	// MetaTree. Commit remains as an idempotent compatibility operation and
+	// never writes data to the source volume.
+	*Complete = TRUE;
+	return STATUS_SUCCESS;
 }
 
 NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns)
 {
-	NTSTATUS status;
+	Cdp_PREVIEW_TREE newTree;
+	Cdp_PREVIEW_TREE oldTree;
+	LONG parentBranch = 0;
+	LONG newBranch = 0;
+	UINT64 inheritedSequence = 0;
 	UINT64 effectiveTargetTime100ns;
+	UINT64 previousTargetTime100ns = 0;
+	BOOLEAN branchCreated = FALSE;
+	BOOLEAN newTreeInitialized = FALSE;
+	NTSTATUS status;
 
-	if (!Core || Core->Phase != Cdp_CORE_PHASE_GENERAL)
-		return STATUS_INVALID_DEVICE_STATE;
+	if (!Core)
+		return STATUS_INVALID_PARAMETER;
 	if (!Core->Journal->Mounted)
 		return STATUS_DEVICE_NOT_READY;
 	status = CdpCoreResolveTargetTime(
@@ -932,123 +912,103 @@ NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100n
 	if (!NT_SUCCESS(status))
 		return status;
 
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	if (Core->Phase != Cdp_CORE_PHASE_GENERAL)
+	{
+		Cdp_LOCK_RELEASE(&Core->TreeLock);
+		return STATUS_INVALID_DEVICE_STATE;
+	}
+	if (Core->MergeActive)
+	{
+		Cdp_LOCK_RELEASE(&Core->TreeLock);
+		return STATUS_DEVICE_BUSY;
+	}
 	Core->Phase = Cdp_CORE_PHASE_RECOVERY;
 	Core->Building = 1;
-	Core->RecoveryFailureStatus = STATUS_SUCCESS;
+	previousTargetTime100ns = Core->TargetTime100ns;
 	Core->TargetTime100ns = effectiveTargetTime100ns;
-	Core->SnapshotMaxSequence = Core->Journal->NextSequence;
-	Cdp_RECOVERY_TRACE(
-		"begin target=%llu snapshotMaxSeq=%llu records=%llu range=[%llu,%llu]\n",
-		effectiveTargetTime100ns,
-		Core->SnapshotMaxSequence,
-		Core->Journal->TotalRecords,
-		Core->Journal->Oldest100ns,
-		Core->Journal->Newest100ns);
-	CdpPreviewTreeFree(&Core->HistoryTree);
-	CdpPreviewTreeFree(&Core->StagingTree);
-	CdpPreviewTreeInitialize(&Core->HistoryTree);
-	CdpPreviewTreeInitialize(&Core->StagingTree);
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
 
-#ifdef Cdp_USERMODE
-	if (g_recoveryBuildHook)
-		g_recoveryBuildHook(Core);
-#endif
-
-	status = CdpJournalBuildPreviewTree(
+	status = CdpJournalResolveTargetBranch(
 		Core->Journal,
 		effectiveTargetTime100ns,
-		Core->SnapshotMaxSequence,
-		TRUE,
-		&Core->HistoryTree);
-	if (!NT_SUCCESS(status) && status != STATUS_NOT_FOUND)
+		&parentBranch,
+		&inheritedSequence);
+	if (!NT_SUCCESS(status))
+		goto failure;
+	if (Core->Journal->HighestBranchNumber >= 0x7FFFFFFFL)
 	{
-		Core->Building = 0;
-		Core->Phase = Cdp_CORE_PHASE_GENERAL;
-		return status;
+		status = STATUS_INTEGER_OVERFLOW;
+		goto failure;
 	}
-	if (status == STATUS_NOT_FOUND)
-		status = STATUS_SUCCESS;
-	Cdp_RECOVERY_TRACE("tree build status=0x%08X nodes=%lu staging=%lu\n",
-		status,
-		Core->HistoryTree.NodeCount,
-		Core->StagingTree.NodeCount);
-
-	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
-	status = CdpPreviewTreePunchByStaging(&Core->HistoryTree, &Core->StagingTree);
-	Core->Building = 0;
-	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	newBranch = Core->Journal->HighestBranchNumber + 1;
+	status = CdpJournalAppendBranch(
+		Core->Journal,
+		newBranch,
+		parentBranch,
+		inheritedSequence);
 	if (!NT_SUCCESS(status))
 	{
-		Core->Phase = Cdp_CORE_PHASE_GENERAL;
-		return status;
+		branchCreated =
+			Core->Journal->CurrentBranchNumber == newBranch &&
+			Core->Journal->HighestBranchNumber == newBranch;
+		goto failure;
 	}
+	branchCreated = TRUE;
 
+#ifdef Cdp_USERMODE
+	if (!NT_SUCCESS(g_recoveryBuildFailureStatus))
+	{
+		status = g_recoveryBuildFailureStatus;
+		g_recoveryBuildFailureStatus = STATUS_SUCCESS;
+		goto failure;
+	}
+#endif
+	status = CdpJournalBuildCurrentBranchTree(Core->Journal, &newTree);
+	if (!NT_SUCCESS(status))
+		goto failure;
+	newTreeInitialized = TRUE;
+
+	// Publish only after the complete replacement tree is valid. The old tree
+	// remains available throughout target resolution, branch creation and scan.
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	oldTree = Core->MetaTree;
+	Core->MetaTree = newTree;
+	Core->MetaTreeReady = TRUE;
+	Core->Building = 0;
+	Core->Phase = Cdp_CORE_PHASE_GENERAL;
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	newTreeInitialized = FALSE;
+	CdpPreviewTreeFree(&oldTree);
 	Cdp_RECOVERY_TRACE(
-		"prepared target=%llu nodes=%lu; waiting for commit\n",
-		Core->TargetTime100ns,
-		Core->HistoryTree.NodeCount);
+		"branch switch complete target=%llu parent=%ld inherit=%llu new=%ld nodes=%lu\n",
+		effectiveTargetTime100ns,
+		parentBranch,
+		inheritedSequence,
+		newBranch,
+		Core->MetaTree.NodeCount);
 	return STATUS_SUCCESS;
+
+failure:
+	if (newTreeInitialized)
+		CdpPreviewTreeFree(&newTree);
+	if (branchCreated)
+	{
+		NTSTATUS rollbackStatus = CdpJournalRollbackLatestBranch(
+			Core->Journal, newBranch);
+		if (!NT_SUCCESS(rollbackStatus))
+			status = rollbackStatus;
+	}
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	Core->Building = 0;
+	Core->TargetTime100ns = previousTargetTime100ns;
+	Core->Phase = Cdp_CORE_PHASE_GENERAL;
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	return status;
 }
 
 NTSTATUS CdpCoreRecoveryCommit(_Inout_ PCdp_CORE Core)
 {
-	NTSTATUS status = STATUS_SUCCESS;
-	BOOLEAN complete = FALSE;
-
-	if (!Core || Core->Phase != Cdp_CORE_PHASE_RECOVERY || Core->Building)
-		return STATUS_INVALID_DEVICE_STATE;
-	if (!NT_SUCCESS(Core->RecoveryFailureStatus))
-	{
-		Cdp_RECOVERY_ERR("commit rejected: recovery previously failed status=0x%08X\n",
-			Core->RecoveryFailureStatus);
-		return Core->RecoveryFailureStatus;
-	}
-
-	Cdp_RECOVERY_TRACE(
-		"commit begin target=%llu nodes=%lu\n",
-		Core->TargetTime100ns,
-		Core->HistoryTree.NodeCount);
-#ifdef Cdp_USERMODE
-	if (g_writebackHook)
-	{
-		Core->WritebackActive = 1;
-		g_writebackHook(Core);
-		Core->WritebackActive = 0;
-	}
-#endif
-
-	while (!complete)
-	{
-		status = CdpCoreRecoveryCommitStep(Core, &complete);
-		if (!NT_SUCCESS(status))
-		{
-			Cdp_RECOVERY_TRACE(
-				"commit failed status=0x%08X; remaining in Recovery\n",
-				status);
-			return status;
-		}
-	}
-	return status;
-}
-
-NTSTATUS CdpCoreRecoveryCancel(_Inout_ PCdp_CORE Core)
-{
-	if (!Core || Core->Phase != Cdp_CORE_PHASE_RECOVERY || Core->Building)
-		return STATUS_INVALID_DEVICE_STATE;
-
-	Cdp_RECOVERY_DBG(
-		"cancel target=%llu nodes=%lu -> normal\n",
-		Core->TargetTime100ns,
-		Core->HistoryTree.NodeCount);
-	CdpPreviewTreeFree(&Core->HistoryTree);
-	CdpPreviewTreeFree(&Core->StagingTree);
-	CdpPreviewTreeInitialize(&Core->HistoryTree);
-	CdpPreviewTreeInitialize(&Core->StagingTree);
-	Core->TargetTime100ns = 0;
-	Core->SnapshotMaxSequence = 0;
-	Core->Building = 0;
-	Core->WritebackActive = 0;
-	Core->RecoveryFailureStatus = STATUS_SUCCESS;
-	Core->Phase = Cdp_CORE_PHASE_GENERAL;
-	return STATUS_SUCCESS;
+	BOOLEAN complete;
+	return CdpCoreRecoveryCommitStep(Core, &complete);
 }

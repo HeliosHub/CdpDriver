@@ -1031,8 +1031,8 @@ static BOOL DoListJournalRecords(HANDLE hDevice)
 				records[i].DataLength,
 				records[i].Sequence,
 				records[i].Flags,
-				(records[i].Flags & Cdp_RECORD_FLAG_BACKFILL) != 0 ?
-					L" (backfill)" : L"");
+				(records[i].Flags & Cdp_RECORD_FLAG_BRANCH) != 0 ?
+					L" (branch)" : L"");
 		}
 
 		nextIndex += reply->RecordCount;

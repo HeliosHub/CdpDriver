@@ -1,15 +1,15 @@
 # CdpDriver
 
-CdpDriver 是一个 Windows 卷 Upper Filter 驱动。它对受保护卷执行写前镜像（Copy-on-Write，COW）：先把即将被覆盖的旧数据写入独立 Journal 卷，再把原写请求提交给源卷。因此源卷始终保存最新数据，Journal 保存可用于时间点预览和恢复的 before-image。
+CdpDriver 是一个 Windows 卷 Upper Filter 驱动。当前开发版本采用 after-image：受保护卷的应用写持久化到独立 Journal 后直接完成，不再提交到源卷；读取由当前分支的日志数据和源卷基础数据合成。
 
-当前版本：**1.4.1**（Build `20260803.1`），Journal 磁盘格式：**v11**。
+当前版本：**1.4.1**（Build `20260805.1`），Journal 磁盘格式：**v12**。
 
 主要功能：
 
-- 持续捕获受保护卷的覆盖写入
+- 持续记录受保护卷的 after-image 写入
 - 按时间点只读 Preview
-- 普通 Recovery（Begin + Commit）
-- 将 Recovery 意图写入 Superblock，重启后自动 Begin + Commit
+- 基于分支切换的 Recovery
+- 将 Recovery 意图写入 Superblock，重启后自动切换分支
 - 查询 Journal 使用量、剩余负载空间和全部 Record 元数据
 - 全局保护密码、句柄级认证和密码更换
 - `VolHexdump` 按卷偏移导出原始数据
@@ -89,40 +89,37 @@ VolHexdump <volume-guid> <offset> <size> <output-file>
 
 ## Preview 与 Recovery
 
-Preview 只构建历史视图，不修改源卷。读取时，历史树覆盖的部分取 Journal before-image，空缺部分取源卷当前数据；非扇区对齐请求会先扩展到对齐区间完成合成，再只返回调用方要求的字节。
+Preview 按目标时间定位分支，递归包含父分支继承路径并构建 `PreviewTree`。读取命中的部分取 Journal after-image，空缺部分取源卷基础数据。
 
-普通 Recovery 分为两个明确阶段：
+Recovery Begin 会排队该源卷读写，根据目标时间确定父分支和继承点，追加一个新分支记录，再构建完整的新 `MetaTree`。构建成功后原子替换旧树并立即恢复 I/O；整个过程不向源卷回填数据。`r` / Commit 仅作为兼容确认命令，不执行磁盘写回。
 
-1. `e` / Begin：排队该源卷的应用层读写，扫描 Journal 并构建 HistoryTree；Begin 完成后恢复 I/O。
-2. `r` / Commit：按全局 Sequence 逐节点把 before-image 回填源卷；每个节点后释放同步锁，使新写能够在节点之间执行。
-
-Recovery Phase 中的读取由 HistoryTree 和源卷实时数据合成，包括 Paging I/O。新写仍先正常 COW；若与尚未回填的历史区间重叠，会从 HistoryTree 中 Punch 掉重叠部分，从而保留新写数据。Punch/拆分失败会使 Recovery 失败，不退回“整节点失效”的策略。
-
-从 Recovery Begin 开始到 Commit 完成，应用新写和恢复回填自身产生的 COW 都带 `BACKFILL (0x80000000)` 标志。恢复回填先把当前源数据作为 backfill before-image 追加到 Journal，再写源卷；由于 `WritebackActive`，该回填 COW 不进入或 Punch 当前 Recovery HistoryTree。后续 Preview/Recovery 扫描遇到 backfill Record 时，无视该 Record 已满足时间停止条件，仍将它插入树并继续向旧记录查找，最远只到当前 oldest。
+应用写逐条追加 payload 和 Record Header。日志写失败时对应应用写失败，不会绕过 Journal 写入源卷。
 
 选择“重启恢复”时，`e` 只把恢复标记和目标时间写入 Journal Superblock，不立即构建历史树。下次启动时：
 
 1. 启动卷枚举完成前，各卷读写由自动发现 Gate 暂存。
 2. 驱动扫描并分类全部已启动卷，配对 Source 与 Journal。
-3. 发现 Recovery 标记后自动执行 Begin。
-4. Begin 成功后立即放行该源卷启动 I/O，再自动 Commit；新写按上述 Recovery 规则与回填交替执行。
-5. Commit 成功后清除标记并回到 General Phase；失败时保留标记用于诊断/重试，但会放行 I/O，避免系统永久阻塞。
+3. 发现 Recovery 标记后自动执行分支切换式 Begin。
+4. Begin 成功并发布新 `MetaTree` 后放行源卷 I/O并清除标记。
+5. Begin 失败时保留原分支视图和标记用于诊断/重试，但会放行 I/O，避免系统永久阻塞。
 
 ## Journal 空间与磁盘格式
 
-当前开发格式为 v11：一个 Superblock，随后是若干 `1 MiB HeaderRegion + PayloadRegion`。单条磁盘 Record Header 为 32 字节，HeaderRegion 末尾 32 字节是 RegionLink。
+当前开发格式为 v12：一个 Superblock，随后是若干 `1 MiB HeaderRegion + PayloadRegion`。单条磁盘 Record Header 为 32 字节，HeaderRegion 末尾 32 字节是 RegionLink。
 
 - 单个 PayloadRegion 的跨度达到 Journal 容量的 `1/10` 时，即使 HeaderRegion 未写满也会切换新区域。
-- 空间不足时整区淘汰最旧 HeaderRegion 及其全部 payload，不逐条删除 Record。
+- 日志使用率达到90%时启动唯一合并线程。删除最旧 HeaderRegion 前，先把其中当前分支仍有效的最新值写入源卷；兄弟分支记录直接丢弃。
 - 淘汰空间通过相邻 RegionLink 和最后一条 Record 的 `FileOffset + DataLength` 计算，不扫描整个 1 MiB HeaderRegion。
 - 普通 Append 持久化 payload 和 Record Header；只有切换 HeaderRegion、Recovery 标记、凭据、Format/Close 等元数据变化时才更新 Superblock，避免每次 Append 的写放大。
-- Record Header 的 `Sequence` 低16位是区域内索引，高16位是标志；当前定义最高位 `0x80000000` 为 `BACKFILL`。运行时全局序号为 `RegionLink.StartSequence + (Header.Sequence & 0xFFFF)`，使用64位表示。
+- Record Header 的 `Sequence` 低16位是区域内索引，最高位 `0x80000000` 为 `BRANCH`。分支记录保存分支号、父分支号和继承 Record 序号；普通 Record 的全局序号为 `RegionLink.StartSequence + (Header.Sequence & 0xFFFF)`。
+- 创建新分支时无条件新建 HeaderRegion，分支 Record 固定写在新区域索引0；新区域继续使用全局 `NextSequence`，不会按分支重新编号。
+- 合并区域包含分支继承点时，会清理父分支无效后缀；只有继承点 Record 被丢弃的分支及其递归后代才立即删除。继承自仍有效/已回填 Record 的兄弟分支继续保留，直到合并到该分支自己的首个 HeaderRegion。跨区域删除使用内部 tombstone 保留已分配的 Sequence；查询和重挂载不会返回这些记录，后续新记录也不会复用其序号。
 
 `CdpConsole u` 中的 metadata 包含 Superblock 占用扇区和所有活动 HeaderRegion。例如一个 1 MiB HeaderRegion 加一个 512 字节 Superblock 扇区为 `1,049,088` 字节；这不是把 1 MiB 换算错误。
 
 ## TRIM 处理
 
-保护开启期间，驱动成功拦截并抑制 `DeviceDsmAction_Trim`，以免删除文件后物理扇区被清零/回收而绕过普通 COW。删除大量文件不会立即把所有被删数据复制到 Journal；对应簇以后被重新写入时，真实 `IRP_MJ_WRITE` 才按需捕获 before-image。停止保护后 TRIM 和普通写直接下发，不再进入 COW。
+保护开启期间，驱动拦截并抑制 `DeviceDsmAction_Trim`，避免底层回收破坏源卷基础数据。停止保护后 TRIM 和普通写直接下发。
 
 ## 保护密码与授权
 
@@ -140,12 +137,12 @@ Release 构建仍保留关键生命周期、失败和恢复诊断日志。高频
 
 ## 已知限制
 
-- 当前只兼容 Journal v11；升级后需要重新格式化旧 Journal。
+- 当前只兼容 Journal v12；开发阶段不兼容旧 Journal，需要重新格式化。
 - 全局同时只允许一个 Preview 会话，Preview 与 Recovery 互斥。
 - 可恢复时间窗口取决于 Journal 容量；淘汰以 HeaderRegion 为粒度。
 - Recovery Begin 扫描期间会排队源卷应用层读写，历史较多时可能产生可感知延迟。
-- Recovery Commit 对调用者同步，并会占用源卷与 Journal I/O 带宽。
-- Recovery Paging I/O 依赖安全映射 MDL；映射失败时对应读取失败，不会绕过历史视图读取 live source。
+- 当前写入不做批量合并，每个应用写独立追加 Journal。
+- Paging I/O 依赖安全映射 MDL；映射失败时对应请求失败，不会绕过当前分支视图。
 
 ## 相关文档
 

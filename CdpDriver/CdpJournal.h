@@ -9,7 +9,7 @@
 #endif
 
 #define Cdp_JOURNAL_MAGIC            0x4C4E4A51UL /* 'QJNL' */
-#define Cdp_JOURNAL_VERSION          11UL
+#define Cdp_JOURNAL_VERSION          12UL
 #define Cdp_JOURNAL_MAX_RECORD_DATA  (2UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_REGION_SIZE (1UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_LINK_SIZE 32UL
@@ -18,7 +18,11 @@
 #define Cdp_JOURNAL_FLAG_CREDENTIAL_CONFIGURED 0x00000002UL
 #define Cdp_JOURNAL_RECORD_INDEX_MASK     0x0000FFFFUL
 #define Cdp_JOURNAL_RECORD_FLAGS_MASK     0xFFFF0000UL
-#define Cdp_JOURNAL_RECORD_FLAG_BACKFILL  0x80000000UL
+// Highest Sequence bit selects the branch-record interpretation.
+#define Cdp_JOURNAL_RECORD_FLAG_BRANCH    0x80000000UL
+// Internal persistent tombstone. The slot keeps its global Sequence reserved
+// but is absent from runtime trees, time ranges and record queries.
+#define Cdp_JOURNAL_RECORD_FLAG_DELETED   0x40000000UL
 #define Cdp_CREDENTIAL_KDF_PBKDF2_SHA256 1UL
 #define Cdp_CREDENTIAL_SALT_BYTES 16UL
 #define Cdp_CREDENTIAL_VERIFIER_BYTES 32UL
@@ -39,6 +43,24 @@ typedef struct _Cdp_JOURNAL_RECORD_HEADER
 } Cdp_JOURNAL_RECORD_HEADER, *PCdp_JOURNAL_RECORD_HEADER;
 
 C_ASSERT(sizeof(Cdp_JOURNAL_RECORD_HEADER) == 32);
+
+// On-disk interpretation of Cdp_JOURNAL_RECORD_HEADER when Sequence has
+// Cdp_JOURNAL_RECORD_FLAG_BRANCH. It occupies exactly the same 32 bytes:
+// BranchNumber/ParentBranchNumber overlay VolumeOffset,
+// InheritedRecordSequence overlays FileOffset, and Reserved overlays
+// DataLength. Branch records have no payload.
+typedef struct _Cdp_JOURNAL_BRANCH_RECORD_HEADER
+{
+	UINT64 WallClock100ns;
+	LONG BranchNumber;
+	LONG ParentBranchNumber;
+	UINT64 InheritedRecordSequence;
+	ULONG Reserved;
+	ULONG Sequence;
+} Cdp_JOURNAL_BRANCH_RECORD_HEADER, *PCdp_JOURNAL_BRANCH_RECORD_HEADER;
+
+C_ASSERT(sizeof(Cdp_JOURNAL_BRANCH_RECORD_HEADER) ==
+	sizeof(Cdp_JOURNAL_RECORD_HEADER));
 
 // Last 32 bytes of each 1MB header region.
 typedef struct _Cdp_HEADER_REGION_LINK
@@ -61,7 +83,7 @@ typedef struct _Cdp_CREDENTIAL_DESCRIPTOR
 	UINT64 AuthEpoch;
 } Cdp_CREDENTIAL_DESCRIPTOR, *PCdp_CREDENTIAL_DESCRIPTOR;
 
-// On-disk layout (v11): one superblock, then alternating header/payload areas.
+// On-disk layout (v12): one superblock, then alternating header/payload areas.
 //   [Superblock]
 //   [HeaderRegion0 1MB][Payload0 ...]
 //   [HeaderRegion1 1MB][Payload1 ...]
@@ -80,6 +102,8 @@ typedef struct _Cdp_JOURNAL_SUPERBLOCK
 	UINT64 RecoveryTargetTime100ns;
 	ULONG RecoveryCrc32c;
 	Cdp_CREDENTIAL_DESCRIPTOR Credential;
+	LONG CurrentBranchNumber;
+	LONG HighestBranchNumber;
 	ULONG MetadataCrc32c;
 } Cdp_JOURNAL_SUPERBLOCK, *PCdp_JOURNAL_SUPERBLOCK;
 
@@ -108,6 +132,43 @@ C_ASSERT(Cdp_JOURNAL_HEADERS_PER_REGION == 32767);
 C_ASSERT(Cdp_JOURNAL_HEADERS_PER_REGION <=
 	Cdp_JOURNAL_RECORD_INDEX_MASK + 1UL);
 
+typedef struct _Cdp_BRANCH_RECORD_INFO
+{
+	UINT64 Sequence;
+	UINT64 WallClock100ns;
+	UINT64 HeaderRegionOffset;
+	ULONG HeaderIndex;
+} Cdp_BRANCH_RECORD_INFO, *PCdp_BRANCH_RECORD_INFO;
+
+// Runtime-only branch topology. Parent/FirstChild/NextSibling form the
+// ancestry tree; Previous/Next preserve branch creation order for target-time
+// lookup without allocating a per-record index.
+typedef struct _Cdp_BRANCH_INFO_NODE
+{
+	LONG BranchNumber;
+	LONG ParentBranchNumber;
+	UINT64 InheritedRecordSequence;
+	Cdp_BRANCH_RECORD_INFO StartRecord;
+	Cdp_BRANCH_RECORD_INFO EndRecord;
+	BOOLEAN Latest;
+	BOOLEAN SyntheticStart;
+	BOOLEAN PrunePending; // transient mark used only while compaction holds Lock
+	struct _Cdp_BRANCH_INFO_NODE* Parent;
+	struct _Cdp_BRANCH_INFO_NODE* FirstChild;
+	struct _Cdp_BRANCH_INFO_NODE* NextSibling;
+	struct _Cdp_BRANCH_INFO_NODE* Previous;
+	struct _Cdp_BRANCH_INFO_NODE* Next;
+} Cdp_BRANCH_INFO_NODE, *PCdp_BRANCH_INFO_NODE;
+
+typedef struct _Cdp_BRANCH_INFO_TREE
+{
+	PCdp_BRANCH_INFO_NODE Root;
+	PCdp_BRANCH_INFO_NODE First;
+	PCdp_BRANCH_INFO_NODE Last;
+	PCdp_BRANCH_INFO_NODE Latest;
+	ULONG Count;
+} Cdp_BRANCH_INFO_TREE, *PCdp_BRANCH_INFO_TREE;
+
 typedef struct _Cdp_JOURNAL
 {
 	BOOLEAN Mounted;
@@ -129,12 +190,23 @@ typedef struct _Cdp_JOURNAL
 	// users; retained across Preview/Recovery builds and freed by Close.
 	PVOID HeaderScanAllocationBase;
 	PUCHAR HeaderScanBuffer;
+	// One-sector write-through cache for 32-byte record headers. Header
+	// append is sequential, so retaining the current sector avoids a disk
+	// read and an allocation for every record while preserving the existing
+	// per-record sector write + flush durability boundary.
+	PVOID HeaderWriteAllocationBase;
+	PUCHAR HeaderWriteBuffer;
+	UINT64 HeaderWriteSectorOffset;
+	BOOLEAN HeaderWriteCacheValid;
 	UINT64 NextSequence;
 	UINT64 TotalRecords;
 	UINT64 PayloadBytesUsed;
 	UINT64 RecordGeneration;
 	UINT64 Oldest100ns;
 	UINT64 Newest100ns;
+	LONG CurrentBranchNumber;
+	LONG HighestBranchNumber;
+	Cdp_BRANCH_INFO_TREE BranchTree;
 	BOOLEAN RecoveryPending;
 	BOOLEAN SuperblockDirty;
 	UINT64 RecoveryTargetTime100ns;
@@ -196,6 +268,32 @@ NTSTATUS CdpJournalFormat(_Inout_ PCdp_JOURNAL Journal);
 
 NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal);
 
+// Ensure a newly formatted/empty after-image journal starts with branch 1.
+// The branch marker is durable before this function returns.
+NTSTATUS CdpJournalEnsureInitialBranch(_Inout_ PCdp_JOURNAL Journal);
+
+// Append a branch marker. BranchNumber must be the next monotonically
+// increasing number. Parent 0 means no parent and requires inherit sequence 0.
+NTSTATUS CdpJournalAppendBranch(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ LONG BranchNumber,
+	_In_ LONG ParentBranchNumber,
+	_In_ UINT64 InheritedRecordSequence);
+
+// Resolve the branch active at TargetTime and its last included record. The
+// returned sequence is suitable as a new child branch inheritance point.
+NTSTATUS CdpJournalResolveTargetBranch(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 TargetTime100ns,
+	_Out_ PLONG BranchNumber,
+	_Out_ PUINT64 InheritedRecordSequence);
+
+// Undo the newest empty branch marker. Used only when Recovery created a
+// branch but failed before publishing its replacement MetaTree.
+NTSTATUS CdpJournalRollbackLatestBranch(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ LONG BranchNumber);
+
 NTSTATUS CdpJournalSetRecoveryIntent(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 TargetTime100ns);
@@ -217,14 +315,14 @@ NTSTATUS CdpJournalAppend(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 VolumeOffset,
 	_In_ ULONG DataLength,
-	_In_reads_bytes_(DataLength) const VOID* BeforeImage,
+	_In_reads_bytes_(DataLength) const VOID* AfterImage,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
 
 NTSTATUS CdpJournalAppendEx(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 VolumeOffset,
 	_In_ ULONG DataLength,
-	_In_reads_bytes_(DataLength) const VOID* BeforeImage,
+	_In_reads_bytes_(DataLength) const VOID* AfterImage,
 	_In_ ULONG RecordFlags,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
 
@@ -244,6 +342,31 @@ NTSTATUS CdpJournalQueryUsage(
 	_Out_ PUINT64 PayloadBytesFree,
 	_Out_ PUINT64 TotalRecords);
 
+// Return the global sequence range owned by the oldest complete header
+// region. The active/newest region is never returned for compaction.
+NTSTATUS CdpJournalGetOldestCompactableRegion(
+	_Inout_ PCdp_JOURNAL Journal,
+	_Out_ PUINT64 RegionOffset,
+	_Out_ PUINT64 FirstSequence,
+	_Out_ PUINT64 EndSequence);
+
+// Delete the expected oldest complete region after its live current-branch
+// values have been materialized to the source volume.
+NTSTATUS CdpJournalDeleteOldestRegion(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 ExpectedRegionOffset);
+
+// If the compacted range contains a branch inheritance point, tombstone all
+// records and branch markers unreachable from the current branch. Otherwise
+// this is a no-op. PreviewTargetDeleted reports whether the active preview
+// anchor was removed by the reachability cleanup.
+NTSTATUS CdpJournalPruneUnreachableForCompaction(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 FirstSequence,
+	_In_ UINT64 EndSequence,
+	_In_ UINT64 PreviewTargetSequence,
+	_Out_opt_ PBOOLEAN PreviewTargetDeleted);
+
 // Read retained records in chronological order. Records contain only
 // record metadata; callers never receive journal payload data.  The caller
 // can page with StartIndex and must echo Generation after the first page to
@@ -258,12 +381,28 @@ NTSTATUS CdpJournalQueryRecordHeaders(
 	_Out_ PUINT64 Generation,
 	_Out_ PULONG ReturnedCount);
 
+// Build the latest-value interval map for Journal->CurrentBranchNumber.
+// Headers are scanned once from newest to oldest. Existing (newer) tree
+// coverage wins; branch markers restrict the scan to the current ancestry.
+NTSTATUS CdpJournalBuildCurrentBranchTree(
+	_Inout_ PCdp_JOURNAL Journal,
+	_Out_ PCdp_PREVIEW_TREE Tree);
+
+// Build only the current-branch records in [FirstSequence, EndSequence),
+// keeping the newest value per byte within that sequence range itself.
+NTSTATUS CdpJournalBuildCurrentBranchRegionTree(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 FirstSequence,
+	_In_ UINT64 EndSequence,
+	_Out_ PCdp_PREVIEW_TREE Tree);
+
 NTSTATUS CdpJournalBuildPreviewTree(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 TargetTime100ns,
 	_In_ UINT64 MaxSequence,
 	_In_ BOOLEAN IncludeTargetTime,
-	_Out_ PCdp_PREVIEW_TREE Tree);
+	_Out_ PCdp_PREVIEW_TREE Tree,
+	_Out_opt_ PUINT64 TargetRecordSequence);
 
 NTSTATUS CdpJournalApplyPreviewTree(
 	_Inout_ PCdp_JOURNAL Journal,
@@ -291,11 +430,11 @@ NTSTATUS CdpPreviewTreeInsert(
 	_Inout_ PCdp_PREVIEW_TREE Tree,
 	_In_ const Cdp_JOURNAL_RECORD* Record);
 
-// Mark the node identified by its (unique) volume start invalid and refresh
-// the subtree sequence summaries used by stepped Recovery commit.
-NTSTATUS CdpPreviewTreeMarkInvalidByStart(
+// Replace existing overlapping coverage with a newly appended after-image.
+// Caller serializes access to Tree.
+NTSTATUS CdpPreviewTreeOverlayLatest(
 	_Inout_ PCdp_PREVIEW_TREE Tree,
-	_In_ UINT64 VolumeOffset);
+	_In_ const Cdp_JOURNAL_RECORD* Record);
 
 // Remove only the intersecting byte range from the history tree.  Remaining
 // left/right fragments keep their original journal payload offsets.
@@ -303,15 +442,5 @@ NTSTATUS CdpPreviewTreePunchRange(
 	_Inout_ PCdp_PREVIEW_TREE Tree,
 	_In_ UINT64 VolumeOffset,
 	_In_ ULONG DataLength);
-
-NTSTATUS CdpPreviewTreeMergeFrom(
-	_Inout_ PCdp_PREVIEW_TREE Dest,
-	_Inout_ PCdp_PREVIEW_TREE Source);
-
-// Recovery build finish: Staging holds concurrent new-write ranges;
-// remove only their overlapping bytes from HistoryTree, then free Staging.
-NTSTATUS CdpPreviewTreePunchByStaging(
-	_Inout_ PCdp_PREVIEW_TREE HistoryTree,
-	_Inout_ PCdp_PREVIEW_TREE StagingTree);
 
 VOID CdpJournalClose(_Inout_ PCdp_JOURNAL Journal);

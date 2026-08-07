@@ -18,8 +18,14 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.4.1"
-#define Cdp_DRIVER_BUILD_STRING   "20260803.1"
+#define Cdp_DRIVER_VERSION_STRING "1.4.7"
+#define Cdp_DRIVER_BUILD_STRING   "20260806.6"
+
+#define Cdp_COW_BATCH_MAX_ITEMS 16UL
+#define Cdp_COW_BATCH_MAX_BYTES (16UL * 1024UL * 1024UL)
+#define Cdp_PERF_TIMING_ENABLED 1
+#define Cdp_PERF_TEST_DISABLE_MERGE 1
+#define Cdp_PERF_TEST_COMPLETE_WRITE_BEFORE_JOURNAL_IO 1
 
 // Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.
 // Cdp_DBG: Debug builds only — verbose I/O and path tracing.
@@ -41,6 +47,29 @@
 #endif
 
 extern PDRIVER_OBJECT g_DriverObject;
+
+typedef struct _Cdp_PERF_COUNTERS
+{
+	volatile LONGLONG TreeLockWaitTicks;
+	volatile LONGLONG JournalLockWaitTicks;
+	volatile LONGLONG PayloadWriteTicks;
+	volatile LONGLONG RawBuildTicks;
+	volatile LONGLONG RawCallTicks;
+	volatile LONGLONG RawWaitTicks;
+	volatile LONGLONG TreeUpdateTicks;
+	volatile LONGLONG AppendTicks;
+	volatile LONG RawPendingCount;
+	volatile LONG RawWriteCount;
+	volatile LONG ZeroCopyCount;
+	volatile LONG CopyFallbackCount;
+	volatile LONGLONG CopyFallbackBytes;
+	volatile LONG AppendCount;
+	volatile LONGLONG MdlMapTicks;
+	volatile LONGLONG MergeCheckTicks;
+	volatile LONG MergeCheckCount;
+} Cdp_PERF_COUNTERS, *PCdp_PERF_COUNTERS;
+
+extern Cdp_PERF_COUNTERS g_CdpPerfCounters;
 
 static __forceinline NTSTATUS CdpCompleteIrp(
 	_In_ PIRP Irp,
@@ -172,16 +201,33 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	KEVENT RecoveryReadEvent;
 	HANDLE RecoveryReadThreadHandle;
 	volatile LONG RecoveryReadStopping;
+	HANDLE MergeThreadHandle;
+	volatile LONG MergeThreadRunning;
+	volatile LONG MergeThreadStopping;
+	KEVENT MergeThreadDoneEvent;
 	KMUTEX HistoryMutex;
 	PCdp_CORE Core;
 	// Journal VolumeHandleList entry used while CaptureEnabled is set.
 	UINT64 JournalHandleId;
+	UINT64 PerfWindowStartTicks;
+	UINT64 PerfQueueWaitTicks;
+	UINT64 PerfHistoryLockWaitTicks;
+	UINT64 PerfWorkerTicks;
+	UINT64 PerfBytes;
+	ULONG PerfIrpCount;
+	volatile LONG CaptureQueueDepth;
+	volatile LONG PerfMaxQueueDepth;
 } Cdp_DEVICE_EXTENSION, *PCdp_DEVICE_EXTENSION;
 
 typedef struct _Cdp_CAPTURE_ITEM
 {
 	LIST_ENTRY Entry;
 	PIRP Irp;
+	UINT64 EnqueueTicks;
+	PVOID WriteCopy;
+	UINT64 WriteOffset;
+	ULONG WriteLength;
+	BOOLEAN EarlyCompleted;
 } Cdp_CAPTURE_ITEM, *PCdp_CAPTURE_ITEM;
 
 typedef struct _Cdp_RECOVERY_READ_ITEM

@@ -8,6 +8,10 @@
 #endif
 
 #define Cdp_CRC32C_POLY 0x82F63B78UL
+// Temporary CrystalDiskMark isolation build. Ordinary after-image appends
+// publish their runtime MetaTree entries but deliberately omit the on-disk
+// record header and append flush. The resulting writes are not remountable.
+#define Cdp_PERF_TEST_SKIP_RECORD_HEADER_AND_FLUSH 1
 #ifndef Cdp_USERMODE
 #if DBG
 #define Cdp_JOURNAL_DIAG(fmt, ...) \
@@ -21,6 +25,19 @@
 
 static ULONG g_CdpCrc32cTable[256];
 static volatile LONG g_CdpCrc32cReady;
+
+static NTSTATUS CdpJournalAppendBranchLocked(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ LONG BranchNumber,
+	_In_ LONG ParentBranchNumber,
+	_In_ UINT64 InheritedRecordSequence);
+
+static NTSTATUS CdpJournalRebuildRuntimeLocked(
+	_Inout_ PCdp_JOURNAL Journal);
+
+static PCdp_BRANCH_INFO_NODE CdpBranchTreeFindBySequence(
+	_In_ PCdp_BRANCH_INFO_TREE BranchTree,
+	_In_ UINT64 Sequence);
 
 static VOID CdpStallBrief(VOID)
 {
@@ -106,6 +123,345 @@ static PVOID CdpAllocateAligned(
 		return NULL;
 	address = ((ULONG_PTR)*AllocationBase + alignment - 1) & ~(alignment - 1);
 	return (PVOID)address;
+}
+
+static BOOLEAN CdpJournalBufferMeetsIoAlignment(
+	_In_ PCdp_JOURNAL Journal,
+	_In_ const VOID* Buffer)
+{
+	SIZE_T alignment = Journal->SectorSize;
+
+#ifndef Cdp_USERMODE
+	if (Journal->TargetDevice)
+	{
+		SIZE_T deviceAlignment =
+			(SIZE_T)Journal->TargetDevice->AlignmentRequirement + 1;
+		if (deviceAlignment > alignment)
+			alignment = deviceAlignment;
+	}
+#endif
+	return ((ULONG_PTR)Buffer % alignment) == 0;
+}
+
+static UINT64 CdpJournalQueryWallClock100ns(_In_ PCdp_JOURNAL Journal)
+{
+	if (Journal->QueryTime100ns)
+		return Journal->QueryTime100ns(Journal->QueryTimeContext);
+#ifdef Cdp_USERMODE
+	{
+		FILETIME utcFt;
+		FILETIME localFt;
+		ULARGE_INTEGER u;
+		GetSystemTimeAsFileTime(&utcFt);
+		if (!FileTimeToLocalFileTime(&utcFt, &localFt))
+			localFt = utcFt;
+		u.LowPart = localFt.dwLowDateTime;
+		u.HighPart = localFt.dwHighDateTime;
+		return u.QuadPart;
+	}
+#else
+	{
+		LARGE_INTEGER systemTime;
+		LARGE_INTEGER localTime;
+		KeQuerySystemTime(&systemTime);
+		ExSystemTimeToLocalTime(&systemTime, &localTime);
+		return (UINT64)localTime.QuadPart;
+	}
+#endif
+}
+
+static BOOLEAN CdpJournalHeaderIsBranch(
+	_In_ const Cdp_JOURNAL_RECORD_HEADER* Header)
+{
+	return (Header->Sequence & Cdp_JOURNAL_RECORD_FLAG_BRANCH) != 0;
+}
+
+static BOOLEAN CdpJournalHeaderIsDeleted(
+	_In_ const Cdp_JOURNAL_RECORD_HEADER* Header)
+{
+	return (Header->Sequence & Cdp_JOURNAL_RECORD_FLAG_DELETED) != 0;
+}
+
+static VOID CdpBranchTreeFree(_Inout_ PCdp_BRANCH_INFO_TREE Tree)
+{
+	PCdp_BRANCH_INFO_NODE node;
+	PCdp_BRANCH_INFO_NODE next;
+
+	if (!Tree)
+		return;
+	node = Tree->First;
+	while (node)
+	{
+		next = node->Next;
+		cdpfree(node);
+		node = next;
+	}
+	RtlZeroMemory(Tree, sizeof(*Tree));
+}
+
+static PCdp_BRANCH_INFO_NODE CdpBranchTreeFind(
+	_In_ PCdp_BRANCH_INFO_TREE Tree,
+	_In_ LONG BranchNumber)
+{
+	PCdp_BRANCH_INFO_NODE node;
+
+	if (!Tree || BranchNumber <= 0)
+		return NULL;
+	for (node = Tree->Last; node; node = node->Previous)
+	{
+		if (node->BranchNumber == BranchNumber)
+			return node;
+	}
+	return NULL;
+}
+
+static BOOLEAN CdpBranchTreeLatestPathLimit(
+	_In_ PCdp_BRANCH_INFO_TREE Tree,
+	_In_ PCdp_BRANCH_INFO_NODE Candidate,
+	_Out_opt_ PUINT64 AllowedSequence)
+{
+	PCdp_BRANCH_INFO_NODE branch;
+	UINT64 limit = MAXUINT64;
+
+	if (!Tree || !Tree->Latest || !Candidate)
+		return FALSE;
+	for (branch = Tree->Latest; branch; branch = branch->Parent)
+	{
+		if (branch == Candidate)
+		{
+			if (AllowedSequence)
+				*AllowedSequence = limit;
+			return TRUE;
+		}
+		limit = branch->InheritedRecordSequence;
+	}
+	return FALSE;
+}
+
+static VOID CdpBranchTreeMarkPruneSubtree(
+	_Inout_opt_ PCdp_BRANCH_INFO_NODE Branch)
+{
+	PCdp_BRANCH_INFO_NODE child;
+
+	if (!Branch || Branch->PrunePending)
+		return;
+	Branch->PrunePending = TRUE;
+	for (child = Branch->FirstChild; child; child = child->NextSibling)
+		CdpBranchTreeMarkPruneSubtree(child);
+}
+
+static BOOLEAN CdpBranchTreeSequenceDiscardedByCompaction(
+	_In_ PCdp_BRANCH_INFO_TREE Tree,
+	_In_ UINT64 Sequence,
+	_In_ UINT64 FirstSequence,
+	_In_ UINT64 EndSequence,
+	_In_ BOOLEAN PruneAncestorSuffix)
+{
+	PCdp_BRANCH_INFO_NODE owner;
+	UINT64 allowedSequence;
+	BOOLEAN onLatestPath;
+
+	owner = CdpBranchTreeFindBySequence(Tree, Sequence);
+	if (!owner || owner->PrunePending)
+		return owner != NULL;
+	onLatestPath = CdpBranchTreeLatestPathLimit(
+		Tree, owner, &allowedSequence);
+	if (Sequence >= FirstSequence && Sequence < EndSequence)
+		return !onLatestPath || Sequence > allowedSequence;
+	return PruneAncestorSuffix && onLatestPath &&
+		Sequence > allowedSequence;
+}
+
+static VOID CdpBranchRecordInfoSet(
+	_Out_ PCdp_BRANCH_RECORD_INFO Info,
+	_In_ UINT64 Sequence,
+	_In_ UINT64 WallClock100ns,
+	_In_ UINT64 RegionOffset,
+	_In_ ULONG HeaderIndex)
+{
+	Info->Sequence = Sequence;
+	Info->WallClock100ns = WallClock100ns;
+	Info->HeaderRegionOffset = RegionOffset;
+	Info->HeaderIndex = HeaderIndex;
+}
+
+static NTSTATUS CdpBranchTreeAttachNode(
+	_Inout_ PCdp_BRANCH_INFO_TREE Tree,
+	_Inout_ PCdp_BRANCH_INFO_NODE Node)
+{
+	PCdp_BRANCH_INFO_NODE parent;
+
+	if (!Tree || !Node || Node->BranchNumber <= 0 ||
+		CdpBranchTreeFind(Tree, Node->BranchNumber))
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+	parent = CdpBranchTreeFind(Tree, Node->ParentBranchNumber);
+	Node->Parent = parent;
+	if (parent)
+	{
+		Node->NextSibling = parent->FirstChild;
+		parent->FirstChild = Node;
+	}
+	else if (!Tree->Root)
+	{
+		Tree->Root = Node;
+	}
+
+	Node->Previous = Tree->Last;
+	if (Tree->Last)
+		Tree->Last->Next = Node;
+	else
+		Tree->First = Node;
+	Tree->Last = Node;
+	Tree->Latest = Node;
+	Tree->Count++;
+	return STATUS_SUCCESS;
+}
+
+static PCdp_BRANCH_INFO_NODE CdpBranchTreeAllocateNode(
+	_In_ LONG BranchNumber,
+	_In_ LONG ParentBranchNumber,
+	_In_ UINT64 InheritedRecordSequence,
+	_In_ UINT64 Sequence,
+	_In_ UINT64 WallClock100ns,
+	_In_ UINT64 RegionOffset,
+	_In_ ULONG HeaderIndex,
+	_In_ BOOLEAN SyntheticStart)
+{
+	PCdp_BRANCH_INFO_NODE node =
+		(PCdp_BRANCH_INFO_NODE)cdpalloc(sizeof(*node));
+
+	if (!node)
+		return NULL;
+	RtlZeroMemory(node, sizeof(*node));
+	node->BranchNumber = BranchNumber;
+	node->ParentBranchNumber = ParentBranchNumber;
+	node->InheritedRecordSequence = InheritedRecordSequence;
+	node->Latest = TRUE;
+	node->SyntheticStart = SyntheticStart;
+	CdpBranchRecordInfoSet(
+		&node->StartRecord,
+		Sequence,
+		WallClock100ns,
+		RegionOffset,
+		HeaderIndex);
+	node->EndRecord = node->StartRecord;
+	return node;
+}
+
+static VOID CdpBranchTreeAdvanceLatest(
+	_Inout_ PCdp_BRANCH_INFO_TREE Tree,
+	_In_ UINT64 Sequence,
+	_In_ UINT64 WallClock100ns,
+	_In_ UINT64 RegionOffset,
+	_In_ ULONG HeaderIndex)
+{
+	if (!Tree || !Tree->Latest)
+		return;
+	CdpBranchRecordInfoSet(
+		&Tree->Latest->EndRecord,
+		Sequence,
+		WallClock100ns,
+		RegionOffset,
+		HeaderIndex);
+}
+
+// Rebase the already-built runtime tree after the oldest region is reclaimed.
+// This performs no allocation: branches wholly before the new oldest record
+// are freed, a branch crossing the boundary gets a synthetic retained start,
+// and ancestry links are reconstructed from the surviving creation list.
+static VOID CdpBranchTreePruneBefore(
+	_Inout_ PCdp_BRANCH_INFO_TREE Tree,
+	_In_ const Cdp_BRANCH_RECORD_INFO* NewOldest)
+{
+	PCdp_BRANCH_INFO_NODE node;
+	PCdp_BRANCH_INFO_NODE next;
+	ULONG count;
+
+	if (!Tree || !NewOldest)
+		return;
+	node = Tree->First;
+	count = Tree->Count;
+	while (node && node->EndRecord.Sequence < NewOldest->Sequence)
+	{
+		next = node->Next;
+		cdpfree(node);
+		node = next;
+		if (count)
+			count--;
+	}
+	Tree->First = node;
+	Tree->Count = count;
+	if (!node)
+	{
+		RtlZeroMemory(Tree, sizeof(*Tree));
+		return;
+	}
+	node->Previous = NULL;
+	if (node->StartRecord.Sequence < NewOldest->Sequence)
+	{
+		node->StartRecord = *NewOldest;
+		node->SyntheticStart = TRUE;
+	}
+
+	Tree->Root = NULL;
+	Tree->Last = NULL;
+	Tree->Latest = NULL;
+	for (node = Tree->First; node; node = node->Next)
+	{
+		PCdp_BRANCH_INFO_NODE parent;
+		node->Parent = NULL;
+		node->FirstChild = NULL;
+		node->NextSibling = NULL;
+		node->Latest = FALSE;
+		Tree->Last = node;
+		parent = CdpBranchTreeFind(Tree, node->ParentBranchNumber);
+		if (parent && parent != node)
+		{
+			node->Parent = parent;
+			node->NextSibling = parent->FirstChild;
+			parent->FirstChild = node;
+		}
+		else if (!Tree->Root)
+		{
+			Tree->Root = node;
+		}
+	}
+	Tree->Latest = Tree->Last;
+	Tree->Latest->Latest = TRUE;
+}
+
+static VOID CdpBranchTreeRemoveLatest(
+	_Inout_ PCdp_BRANCH_INFO_TREE Tree)
+{
+	PCdp_BRANCH_INFO_NODE node;
+	PCdp_BRANCH_INFO_NODE* link;
+
+	if (!Tree || !Tree->Latest)
+		return;
+	node = Tree->Latest;
+	if (node->Parent)
+	{
+		link = &node->Parent->FirstChild;
+		while (*link && *link != node)
+			link = &(*link)->NextSibling;
+		if (*link == node)
+			*link = node->NextSibling;
+	}
+	if (node->Previous)
+		node->Previous->Next = NULL;
+	else
+		Tree->First = NULL;
+	Tree->Last = node->Previous;
+	Tree->Latest = Tree->Last;
+	if (Tree->Latest)
+		Tree->Latest->Latest = TRUE;
+	if (Tree->Root == node)
+		Tree->Root = Tree->First;
+	if (Tree->Count)
+		Tree->Count--;
+	cdpfree(node);
 }
 
 // Caller holds Journal->Lock. A journal has at most one header scan in
@@ -195,8 +551,7 @@ static NTSTATUS CdpJournalDecodeRecord(
 		(Header->Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) : 0;
 	recordFlags = Header ?
 		(Header->Sequence & Cdp_JOURNAL_RECORD_FLAGS_MASK) : 0;
-	if (!Link || !Header || !Record ||
-		(recordFlags & ~Cdp_JOURNAL_RECORD_FLAG_BACKFILL) != 0 ||
+	if (!Link || !Header || !Record || recordFlags != 0 ||
 		Link->StartSequence > MAXUINT64 - localSequence)
 	{
 		return STATUS_INTEGER_OVERFLOW;
@@ -209,6 +564,25 @@ static NTSTATUS CdpJournalDecodeRecord(
 	Record->DataLength = Header->DataLength;
 	Record->Flags = recordFlags;
 	return STATUS_SUCCESS;
+}
+
+// Caller holds Journal->Lock. Any write that overlaps the cached header
+// sector makes its in-memory copy stale. CdpJournalWriteHeaderAt restores
+// validity after its own write-through succeeds.
+static VOID CdpJournalInvalidateHeaderWriteCacheRangeLocked(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length)
+{
+	UINT64 writeEnd;
+	UINT64 cacheEnd;
+
+	if (!Journal->HeaderWriteCacheValid || Length == 0)
+		return;
+	writeEnd = Offset + Length;
+	cacheEnd = Journal->HeaderWriteSectorOffset + Journal->SectorSize;
+	if (Offset < cacheEnd && Journal->HeaderWriteSectorOffset < writeEnd)
+		Journal->HeaderWriteCacheValid = FALSE;
 }
 
 static NTSTATUS CdpJournalRawIo(
@@ -227,6 +601,14 @@ static NTSTATUS CdpJournalRawIo(
 		Length > Journal->PartitionSize - Offset)
 	{
 		return STATUS_INVALID_PARAMETER;
+	}
+	if (MajorFunction == IRP_MJ_WRITE)
+	{
+		CdpJournalInvalidateHeaderWriteCacheRangeLocked(
+			Journal, Offset, Length);
+#ifndef Cdp_USERMODE
+		InterlockedIncrement(&g_CdpPerfCounters.RawWriteCount);
+#endif
 	}
 
 	if (Journal->Store)
@@ -299,6 +681,12 @@ static NTSTATUS CdpJournalRawIo(
 		IO_STATUS_BLOCK iosb;
 		LARGE_INTEGER byteOffset;
 		PIRP irp;
+		LARGE_INTEGER buildStart;
+		LARGE_INTEGER buildEnd;
+		LARGE_INTEGER callStart;
+		LARGE_INTEGER callEnd;
+		LARGE_INTEGER waitStart;
+		LARGE_INTEGER waitEnd;
 
 		if (!Journal->TargetDevice)
 			return STATUS_DEVICE_NOT_READY;
@@ -306,6 +694,7 @@ static NTSTATUS CdpJournalRawIo(
 	byteOffset.QuadPart = (LONGLONG)Offset;
 	KeInitializeEvent(&event, NotificationEvent, FALSE);
 	RtlZeroMemory(&iosb, sizeof(iosb));
+	buildStart = KeQueryPerformanceCounter(NULL);
 	irp = IoBuildSynchronousFsdRequest(
 		MajorFunction,
 		Journal->TargetDevice,
@@ -314,6 +703,13 @@ static NTSTATUS CdpJournalRawIo(
 		&byteOffset,
 		&event,
 		&iosb);
+	buildEnd = KeQueryPerformanceCounter(NULL);
+	if (MajorFunction == IRP_MJ_WRITE)
+	{
+		InterlockedAdd64(
+			&g_CdpPerfCounters.RawBuildTicks,
+			buildEnd.QuadPart - buildStart.QuadPart);
+	}
 	if (!irp)
 		return STATUS_INSUFFICIENT_RESOURCES;
 
@@ -324,7 +720,15 @@ static NTSTATUS CdpJournalRawIo(
 		Offset,
 		Length,
 		irp);
+	callStart = KeQueryPerformanceCounter(NULL);
 	status = IoCallDriver(Journal->TargetDevice, irp);
+	callEnd = KeQueryPerformanceCounter(NULL);
+	if (MajorFunction == IRP_MJ_WRITE)
+	{
+		InterlockedAdd64(
+			&g_CdpPerfCounters.RawCallTicks,
+			callEnd.QuadPart - callStart.QuadPart);
+	}
 	Cdp_DBG("[JOURNAL-RAW] IoCallDriver returned irp=%p "
 		"status=0x%08X iosb=0x%08X bytes=%Iu\n",
 		irp,
@@ -333,9 +737,19 @@ static NTSTATUS CdpJournalRawIo(
 		iosb.Information);
 	if (status == STATUS_PENDING)
 	{
+		if (MajorFunction == IRP_MJ_WRITE)
+			InterlockedIncrement(&g_CdpPerfCounters.RawPendingCount);
 		Cdp_DBG("[JOURNAL-RAW] wait begin irp=%p\n",
 			irp);
+		waitStart = KeQueryPerformanceCounter(NULL);
 		KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+		waitEnd = KeQueryPerformanceCounter(NULL);
+		if (MajorFunction == IRP_MJ_WRITE)
+		{
+			InterlockedAdd64(
+				&g_CdpPerfCounters.RawWaitTicks,
+				waitEnd.QuadPart - waitStart.QuadPart);
+		}
 		status = iosb.Status;
 		Cdp_DBG("[JOURNAL-RAW] wait end irp=%p "
 			"status=0x%08X bytes=%Iu\n",
@@ -484,6 +898,8 @@ static NTSTATUS CdpJournalWriteSuperblockLocked(_Inout_ PCdp_JOURNAL Journal)
 	superblock->RecoveryTargetTime100ns = Journal->RecoveryTargetTime100ns;
 	if (Journal->CredentialConfigured)
 		superblock->Credential = Journal->Credential;
+	superblock->CurrentBranchNumber = Journal->CurrentBranchNumber;
+	superblock->HighestBranchNumber = Journal->HighestBranchNumber;
 	superblock->Crc32c = CdpCrc32c(
 		0,
 		superblock,
@@ -548,6 +964,11 @@ static BOOLEAN CdpJournalSuperblockValid(
 		(Superblock->Credential.KdfAlgorithm != Cdp_CREDENTIAL_KDF_PBKDF2_SHA256 ||
 		 Superblock->Credential.KdfIterations == 0 ||
 		 Superblock->Credential.AuthEpoch == 0))
+	{
+		return FALSE;
+	}
+	if (Superblock->CurrentBranchNumber <= 0 ||
+		Superblock->HighestBranchNumber < Superblock->CurrentBranchNumber)
 	{
 		return FALSE;
 	}
@@ -821,19 +1242,71 @@ static NTSTATUS CdpJournalWriteHeaderAt(
 	_In_ ULONG Index,
 	_In_ const Cdp_JOURNAL_RECORD_HEADER* Header)
 {
+	UINT64 headerOffset;
+	UINT64 sectorOffset;
+	ULONG sectorByteOffset;
+	NTSTATUS status;
+
 	if (Index >= Cdp_JOURNAL_HEADERS_PER_REGION)
 		return STATUS_INVALID_PARAMETER;
-	return CdpJournalRawWriteSub(
+
+	headerOffset = RegionOff +
+		(UINT64)Index * sizeof(Cdp_JOURNAL_RECORD_HEADER);
+	sectorOffset = CdpAlignDown64(headerOffset, Journal->SectorSize);
+	sectorByteOffset = (ULONG)(headerOffset - sectorOffset);
+	if (sectorByteOffset + sizeof(*Header) > Journal->SectorSize)
+		return STATUS_DISK_CORRUPT_ERROR;
+
+	if (!Journal->HeaderWriteBuffer)
+	{
+		Journal->HeaderWriteBuffer = (PUCHAR)CdpAllocateAligned(
+			Journal,
+			Journal->SectorSize,
+			&Journal->HeaderWriteAllocationBase);
+		if (!Journal->HeaderWriteBuffer)
+			return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	if (!Journal->HeaderWriteCacheValid ||
+		Journal->HeaderWriteSectorOffset != sectorOffset)
+	{
+		Journal->HeaderWriteCacheValid = FALSE;
+		status = CdpJournalRawIo(
+			Journal,
+			IRP_MJ_READ,
+			sectorOffset,
+			Journal->SectorSize,
+			Journal->HeaderWriteBuffer);
+		if (!NT_SUCCESS(status))
+			return status;
+		Journal->HeaderWriteSectorOffset = sectorOffset;
+		Journal->HeaderWriteCacheValid = TRUE;
+	}
+
+	RtlCopyMemory(
+		Journal->HeaderWriteBuffer + sectorByteOffset,
+		Header,
+		sizeof(*Header));
+	status = CdpJournalRawIo(
 		Journal,
-		RegionOff + (UINT64)Index * sizeof(Cdp_JOURNAL_RECORD_HEADER),
-		sizeof(*Header),
-		Header);
+		IRP_MJ_WRITE,
+		sectorOffset,
+		Journal->SectorSize,
+		Journal->HeaderWriteBuffer);
+	if (NT_SUCCESS(status))
+	{
+		Journal->HeaderWriteSectorOffset = sectorOffset;
+		Journal->HeaderWriteCacheValid = TRUE;
+	}
+	return status;
 }
 
 static NTSTATUS CdpJournalRefreshOldestTimeLocked(_Inout_ PCdp_JOURNAL Journal)
 {
-	Cdp_JOURNAL_RECORD_HEADER header;
-	NTSTATUS status;
+	UINT64 regionOff;
+	ULONG startIndex;
+	ULONG guard = 0;
+	NTSTATUS status = STATUS_SUCCESS;
 
 	if (CdpJournalIsEmptyLocked(Journal))
 	{
@@ -842,15 +1315,41 @@ static NTSTATUS CdpJournalRefreshOldestTimeLocked(_Inout_ PCdp_JOURNAL Journal)
 		return STATUS_SUCCESS;
 	}
 
-	status = CdpJournalReadHeaderAt(
-		Journal,
-		Journal->OldestHeaderRegionOff,
-		Journal->OldestHeaderIndex,
-		&header);
-	if (!NT_SUCCESS(status))
-	return status;
-	Journal->Oldest100ns = header.WallClock100ns;
-	return STATUS_SUCCESS;
+	regionOff = Journal->OldestHeaderRegionOff;
+	startIndex = Journal->OldestHeaderIndex;
+	for (;;)
+	{
+		Cdp_HEADER_REGION_LINK link;
+		ULONG limit;
+		ULONG index;
+		BOOLEAN isLast = regionOff == Journal->LastHeaderRegionOff;
+
+		status = CdpJournalReadRegionLink(Journal, regionOff, &link);
+		if (!NT_SUCCESS(status) || !CdpJournalRegionLinkValid(Journal, &link))
+			return STATUS_DISK_CORRUPT_ERROR;
+		status = CdpJournalGetRegionHeaderLimitLocked(
+			Journal, regionOff, &link, &limit, NULL);
+		if (!NT_SUCCESS(status))
+			return status;
+		for (index = startIndex; index < limit; ++index)
+		{
+			Cdp_JOURNAL_RECORD_HEADER header;
+			status = CdpJournalReadHeaderAt(
+				Journal, regionOff, index, &header);
+			if (!NT_SUCCESS(status))
+				return status;
+			if (!CdpJournalHeaderIsDeleted(&header))
+			{
+				Journal->Oldest100ns = header.WallClock100ns;
+				return STATUS_SUCCESS;
+			}
+		}
+		if (isLast || link.NextRegionOff == regionOff || ++guard > 100000UL)
+			break;
+		regionOff = link.NextRegionOff;
+		startIndex = 0;
+	}
+	return STATUS_DISK_CORRUPT_ERROR;
 }
 
 // Contiguous free bytes from PayloadRegionOff without wrapping and without
@@ -880,10 +1379,13 @@ static NTSTATUS CdpJournalDropOldestRegionLocked(
 {
 	Cdp_HEADER_REGION_LINK link;
 	Cdp_HEADER_REGION_LINK nextLink;
+	Cdp_JOURNAL_RECORD_HEADER newOldestHeader;
+	Cdp_BRANCH_RECORD_INFO newOldestInfo;
 	UINT64 regionOff;
 	UINT64 reclaimedBytes = 0;
 	UINT64 reclaimedRecords = 0;
 	ULONG limit;
+	ULONG index;
 	NTSTATUS status;
 
 	if (CdpJournalIsEmptyLocked(Journal))
@@ -903,10 +1405,20 @@ static NTSTATUS CdpJournalDropOldestRegionLocked(
 		return status;
 	if (Journal->OldestHeaderIndex >= limit)
 		return STATUS_DISK_CORRUPT_ERROR;
+	for (index = Journal->OldestHeaderIndex; index < limit; ++index)
+	{
+		Cdp_JOURNAL_RECORD_HEADER header;
+		status = CdpJournalReadHeaderAt(Journal, regionOff, index, &header);
+		if (!NT_SUCCESS(status))
+			return status;
+		if ((header.Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) != index)
+			return STATUS_DISK_CORRUPT_ERROR;
+		if (!CdpJournalHeaderIsDeleted(&header))
+			reclaimedRecords++;
+	}
 
 	if (regionOff == Journal->LastHeaderRegionOff)
 	{
-		reclaimedRecords = limit - Journal->OldestHeaderIndex;
 		reclaimedBytes = Journal->PayloadBytesUsed;
 		if (reclaimedRecords != Journal->TotalRecords)
 			return STATUS_DISK_CORRUPT_ERROR;
@@ -923,8 +1435,8 @@ static NTSTATUS CdpJournalDropOldestRegionLocked(
 		firstSequence = link.StartSequence + Journal->OldestHeaderIndex;
 		if (nextLink.StartSequence <= firstSequence)
 			return STATUS_DISK_CORRUPT_ERROR;
-		reclaimedRecords = nextLink.StartSequence - firstSequence;
-		if (reclaimedRecords != limit - Journal->OldestHeaderIndex)
+		if (nextLink.StartSequence - firstSequence !=
+			limit - Journal->OldestHeaderIndex)
 			return STATUS_DISK_CORRUPT_ERROR;
 		status = CdpJournalRingDistance(
 			Journal,
@@ -970,6 +1482,16 @@ static NTSTATUS CdpJournalDropOldestRegionLocked(
 
 	// Persist the logical deletion: Mount walking backwards from the newest
 	// region must stop at the new oldest region, not rediscover stale headers.
+	status = CdpJournalReadHeaderAt(
+		Journal, link.NextRegionOff, 0, &newOldestHeader);
+	if (!NT_SUCCESS(status))
+		return status;
+	CdpBranchRecordInfoSet(
+		&newOldestInfo,
+		nextLink.StartSequence,
+		newOldestHeader.WallClock100ns,
+		link.NextRegionOff,
+		0);
 	nextLink.PrevRegionOff = link.NextRegionOff;
 	status = CdpJournalWriteRegionLink(
 		Journal,
@@ -980,6 +1502,7 @@ static NTSTATUS CdpJournalDropOldestRegionLocked(
 
 	Journal->OldestHeaderRegionOff = link.NextRegionOff;
 	Journal->OldestHeaderIndex = 0;
+	CdpBranchTreePruneBefore(&Journal->BranchTree, &newOldestInfo);
 	return CdpJournalRefreshOldestTimeLocked(Journal);
 }
 
@@ -989,19 +1512,22 @@ static NTSTATUS CdpJournalEnsureContiguousLocked(
 {
 	UINT64 usableStart = CdpJournalUsableStart(Journal);
 	UINT64 usableEnd = CdpJournalUsableEnd(Journal);
-	ULONG guard = 0;
 
 	if (BytesNeeded > usableEnd - usableStart)
 		return STATUS_INSUFFICIENT_RESOURCES;
 
 	for (;;)
 	{
-		NTSTATUS status;
-
 		// Payload hits the end: wrap write cursor; do NOT open a new header.
 		if (Journal->PayloadRegionOff + BytesNeeded > usableEnd)
 		{
 			UINT64 skipped = usableEnd - Journal->PayloadRegionOff;
+			UINT64 wrapFree = CdpJournalIsEmptyLocked(Journal) ?
+				usableEnd - usableStart :
+				(Journal->OldestHeaderRegionOff > usableStart ?
+					Journal->OldestHeaderRegionOff - usableStart : 0);
+			if (wrapFree < BytesNeeded)
+				return STATUS_DISK_FULL;
 			if (Journal->PayloadBytesUsed > MAXUINT64 - skipped)
 				return STATUS_INTEGER_OVERFLOW;
 			Journal->PayloadBytesUsed += skipped;
@@ -1011,11 +1537,9 @@ static NTSTATUS CdpJournalEnsureContiguousLocked(
 		if (CdpJournalContiguousFreeLocked(Journal) >= BytesNeeded)
 			return STATUS_SUCCESS;
 
-		status = CdpJournalDropOldestRegionLocked(Journal);
-		if (!NT_SUCCESS(status))
-			return status;
-		if (++guard > 1000000UL)
-			return STATUS_DISK_CORRUPT_ERROR;
+		// The merge thread must materialize live values before reclaiming a
+		// complete region. Never discard after-image data from the append path.
+		return STATUS_DISK_FULL;
 	}
 }
 
@@ -1065,7 +1589,6 @@ static NTSTATUS CdpJournalAllocateHeaderRegionLocked(
 	Cdp_HEADER_REGION_LINK oldLink;
 	Cdp_HEADER_REGION_LINK newLink;
 	NTSTATUS status;
-	ULONG guard = 0;
 
 	candidate = CdpAlignUp64(Journal->PayloadRegionOff, Journal->SectorSize);
 	if (candidate + Cdp_JOURNAL_HEADER_REGION_SIZE > usableEnd)
@@ -1097,11 +1620,7 @@ static NTSTATUS CdpJournalAllocateHeaderRegionLocked(
 			}
 		}
 
-		status = CdpJournalDropOldestRegionLocked(Journal);
-		if (!NT_SUCCESS(status))
-			return status;
-		if (++guard > 1000000UL)
-			return STATUS_DISK_CORRUPT_ERROR;
+		return STATUS_DISK_FULL;
 	}
 
 	if (candidate + Cdp_JOURNAL_HEADER_REGION_SIZE > usableEnd)
@@ -1145,6 +1664,53 @@ static NTSTATUS CdpJournalAllocateHeaderRegionLocked(
 	return STATUS_SUCCESS;
 }
 
+// Undo a just-allocated newest region before any record has been published.
+// The abandoned bytes remain reusable at the restored payload cursor.
+static NTSTATUS CdpJournalDiscardEmptyNewestRegionLocked(
+	_Inout_ PCdp_JOURNAL Journal)
+{
+	Cdp_HEADER_REGION_LINK currentLink;
+	Cdp_HEADER_REGION_LINK previousLink;
+	PCdp_BRANCH_INFO_NODE latest;
+	UINT64 discardedRegion;
+	NTSTATUS status;
+
+	if (!Journal || Journal->CurrentHeaderCount != 0)
+		return STATUS_INVALID_DEVICE_STATE;
+	latest = Journal->BranchTree.Latest;
+	if (!latest)
+		return STATUS_INVALID_DEVICE_STATE;
+	discardedRegion = Journal->LastHeaderRegionOff;
+	status = CdpJournalReadRegionLink(Journal, discardedRegion, &currentLink);
+	if (!NT_SUCCESS(status) ||
+		!CdpJournalRegionLinkValid(Journal, &currentLink) ||
+		currentLink.PrevRegionOff == discardedRegion)
+	{
+		return STATUS_DISK_CORRUPT_ERROR;
+	}
+	status = CdpJournalReadRegionLink(
+		Journal, currentLink.PrevRegionOff, &previousLink);
+	if (!NT_SUCCESS(status) ||
+		!CdpJournalRegionLinkValid(Journal, &previousLink) ||
+		previousLink.NextRegionOff != discardedRegion ||
+		latest->EndRecord.HeaderRegionOffset != currentLink.PrevRegionOff)
+	{
+		return STATUS_DISK_CORRUPT_ERROR;
+	}
+	previousLink.NextRegionOff = currentLink.PrevRegionOff;
+	status = CdpJournalWriteRegionLink(
+		Journal, currentLink.PrevRegionOff, &previousLink);
+	if (!NT_SUCCESS(status))
+		return status;
+
+	Journal->LastHeaderRegionOff = currentLink.PrevRegionOff;
+	Journal->CurrentHeaderRegionStartSequence = previousLink.StartSequence;
+	Journal->CurrentHeaderCount = latest->EndRecord.HeaderIndex + 1;
+	Journal->PayloadRegionOff = discardedRegion;
+	Journal->SuperblockDirty = TRUE;
+	return STATUS_SUCCESS;
+}
+
 static NTSTATUS CdpJournalRebuildRuntimeLocked(_Inout_ PCdp_JOURNAL Journal)
 {
 	UINT64 regionOff;
@@ -1153,6 +1719,12 @@ static NTSTATUS CdpJournalRebuildRuntimeLocked(_Inout_ PCdp_JOURNAL Journal)
 	Cdp_HEADER_REGION_LINK link;
 	UINT64 expectedSequence = 0;
 	BOOLEAN haveExpectedSequence = FALSE;
+	BOOLEAN havePrefixRecords = FALSE;
+	Cdp_BRANCH_RECORD_INFO prefixStart = { 0 };
+	Cdp_BRANCH_RECORD_INFO prefixEnd = { 0 };
+	LONG persistedCurrentBranch = Journal->CurrentBranchNumber;
+	LONG persistedHighestBranch = Journal->HighestBranchNumber;
+	LONG discoveredHighestBranch = 0;
 	NTSTATUS status = STATUS_SUCCESS;
 	PUCHAR region = NULL;
 
@@ -1162,6 +1734,9 @@ static NTSTATUS CdpJournalRebuildRuntimeLocked(_Inout_ PCdp_JOURNAL Journal)
 	Journal->NextSequence = 1;
 	Journal->Oldest100ns = 0;
 	Journal->Newest100ns = 0;
+	Journal->CurrentBranchNumber = 0;
+	Journal->HighestBranchNumber = 0;
+	CdpBranchTreeFree(&Journal->BranchTree);
 	Journal->OldestHeaderIndex = 0;
 	Journal->PayloadRegionOff =
 		Journal->LastHeaderRegionOff + Cdp_JOURNAL_HEADER_REGION_SIZE;
@@ -1238,6 +1813,10 @@ static NTSTATUS CdpJournalRebuildRuntimeLocked(_Inout_ PCdp_JOURNAL Journal)
 		for (index = 0; index < limit; ++index)
 		{
 			Cdp_JOURNAL_RECORD_HEADER header;
+			BOOLEAN isBranch;
+			BOOLEAN isDeleted;
+			ULONG recordFlags;
+			UINT64 globalSequence;
 
 			RtlCopyMemory(
 				&header,
@@ -1254,47 +1833,177 @@ static NTSTATUS CdpJournalRebuildRuntimeLocked(_Inout_ PCdp_JOURNAL Journal)
 				Journal->CurrentHeaderCount = index;
 				break;
 			}
-			if (header.DataLength == 0 ||
-				(header.Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) != index ||
-				(header.Sequence & Cdp_JOURNAL_RECORD_FLAGS_MASK &
-					~Cdp_JOURNAL_RECORD_FLAG_BACKFILL) != 0 ||
-				header.DataLength > Cdp_JOURNAL_MAX_RECORD_DATA ||
-				header.FileOffset < CdpJournalUsableStart(Journal) ||
-				header.FileOffset > CdpJournalUsableEnd(Journal) ||
-				header.DataLength >
-					CdpJournalUsableEnd(Journal) - header.FileOffset ||
-				header.VolumeOffset > MAXUINT64 - header.DataLength)
+			isBranch = CdpJournalHeaderIsBranch(&header);
+			isDeleted = CdpJournalHeaderIsDeleted(&header);
+			recordFlags = header.Sequence & Cdp_JOURNAL_RECORD_FLAGS_MASK;
+			if ((header.Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) != index ||
+				(recordFlags & ~(Cdp_JOURNAL_RECORD_FLAG_BRANCH |
+					Cdp_JOURNAL_RECORD_FLAG_DELETED)) != 0 ||
+				(isBranch && isDeleted) ||
+				(isDeleted && header.DataLength != 0) ||
+				(isBranch &&
+					(recordFlags != Cdp_JOURNAL_RECORD_FLAG_BRANCH ||
+					header.DataLength != 0)) ||
+				(!isBranch && !isDeleted &&
+					(header.DataLength == 0 ||
+					header.DataLength > Cdp_JOURNAL_MAX_RECORD_DATA ||
+					header.FileOffset < CdpJournalUsableStart(Journal) ||
+					header.FileOffset > CdpJournalUsableEnd(Journal) ||
+					header.DataLength >
+						CdpJournalUsableEnd(Journal) - header.FileOffset ||
+					header.VolumeOffset > MAXUINT64 - header.DataLength)))
 			{
 				status = STATUS_DISK_CORRUPT_ERROR;
 				goto cleanup;
 			}
-
-			Journal->TotalRecords++;
-			if (link.StartSequence > MAXUINT64 - index ||
-				link.StartSequence + index == MAXUINT64)
+			if (link.StartSequence > MAXUINT64 - index)
 			{
 				status = STATUS_INTEGER_OVERFLOW;
 				goto cleanup;
 			}
-			expectedSequence = link.StartSequence + index + 1;
+			globalSequence = link.StartSequence + index;
+			if (isDeleted)
+			{
+				// Tombstones reserve their global Sequence but have no logical
+				// record, payload or branch-tree membership.
+			}
+			else if (isBranch)
+			{
+				Cdp_JOURNAL_BRANCH_RECORD_HEADER branchHeader;
+				PCdp_BRANCH_INFO_NODE branchNode;
+				RtlCopyMemory(&branchHeader, &header, sizeof(branchHeader));
+				if (branchHeader.Reserved != 0 ||
+					branchHeader.BranchNumber <= 0 ||
+					branchHeader.ParentBranchNumber < 0 ||
+					branchHeader.ParentBranchNumber >= branchHeader.BranchNumber ||
+					(branchHeader.ParentBranchNumber == 0 &&
+						branchHeader.InheritedRecordSequence != 0) ||
+					(branchHeader.ParentBranchNumber != 0 &&
+						(branchHeader.InheritedRecordSequence == 0 ||
+						 link.StartSequence > MAXUINT64 - index ||
+						 branchHeader.InheritedRecordSequence >=
+							link.StartSequence + index)) ||
+					branchHeader.BranchNumber <= discoveredHighestBranch)
+				{
+					status = STATUS_DISK_CORRUPT_ERROR;
+					goto cleanup;
+				}
+
+				if (havePrefixRecords && !Journal->BranchTree.First)
+				{
+					PCdp_BRANCH_INFO_NODE prefixNode;
+					if (branchHeader.BranchNumber <= 1)
+					{
+						status = STATUS_DISK_CORRUPT_ERROR;
+						goto cleanup;
+					}
+					prefixNode = CdpBranchTreeAllocateNode(
+						branchHeader.BranchNumber - 1,
+						0,
+						0,
+						prefixStart.Sequence,
+						prefixStart.WallClock100ns,
+						prefixStart.HeaderRegionOffset,
+						prefixStart.HeaderIndex,
+						TRUE);
+					if (!prefixNode)
+					{
+						status = STATUS_INSUFFICIENT_RESOURCES;
+						goto cleanup;
+					}
+					prefixNode->EndRecord = prefixEnd;
+					prefixNode->Latest = FALSE;
+					status = CdpBranchTreeAttachNode(
+						&Journal->BranchTree, prefixNode);
+					if (!NT_SUCCESS(status))
+					{
+						cdpfree(prefixNode);
+						goto cleanup;
+					}
+					discoveredHighestBranch = prefixNode->BranchNumber;
+				}
+
+				if (Journal->BranchTree.Latest)
+					Journal->BranchTree.Latest->Latest = FALSE;
+				branchNode = CdpBranchTreeAllocateNode(
+					branchHeader.BranchNumber,
+					branchHeader.ParentBranchNumber,
+					branchHeader.InheritedRecordSequence,
+					globalSequence,
+					branchHeader.WallClock100ns,
+					regionOff,
+					index,
+					FALSE);
+				if (!branchNode)
+				{
+					status = STATUS_INSUFFICIENT_RESOURCES;
+					goto cleanup;
+				}
+				status = CdpBranchTreeAttachNode(
+					&Journal->BranchTree, branchNode);
+				if (!NT_SUCCESS(status))
+				{
+					cdpfree(branchNode);
+					goto cleanup;
+				}
+				discoveredHighestBranch = branchHeader.BranchNumber;
+			}
+			else
+			{
+				if (Journal->BranchTree.Latest)
+				{
+					CdpBranchTreeAdvanceLatest(
+						&Journal->BranchTree,
+						globalSequence,
+						header.WallClock100ns,
+						regionOff,
+						index);
+				}
+				else
+				{
+					Cdp_BRANCH_RECORD_INFO info;
+					CdpBranchRecordInfoSet(
+						&info,
+						globalSequence,
+						header.WallClock100ns,
+						regionOff,
+						index);
+					if (!havePrefixRecords)
+						prefixStart = info;
+					prefixEnd = info;
+					havePrefixRecords = TRUE;
+				}
+			}
+
+			if (!isDeleted)
+				Journal->TotalRecords++;
+			if (globalSequence == MAXUINT64)
+			{
+				status = STATUS_INTEGER_OVERFLOW;
+				goto cleanup;
+			}
+			expectedSequence = globalSequence + 1;
 			haveExpectedSequence = TRUE;
 			if (isLast)
 				Journal->NextSequence = expectedSequence;
 
-			if (Journal->Oldest100ns == 0 ||
-				header.WallClock100ns < Journal->Oldest100ns)
+			if (!isDeleted && (Journal->Oldest100ns == 0 ||
+				header.WallClock100ns < Journal->Oldest100ns))
 			{
 				Journal->Oldest100ns = header.WallClock100ns;
 			}
-			if (header.WallClock100ns > Journal->Newest100ns)
+			if (!isDeleted && header.WallClock100ns > Journal->Newest100ns)
 				Journal->Newest100ns = header.WallClock100ns;
 
 			if (isLast)
 			{
 				Journal->CurrentHeaderCount = index + 1;
-				Journal->PayloadRegionOff = CdpAlignUp64(
-					header.FileOffset + header.DataLength,
-					Journal->SectorSize);
+				if (!isBranch)
+				{
+					Journal->PayloadRegionOff = CdpAlignUp64(
+						header.FileOffset + header.DataLength,
+						Journal->SectorSize);
+				}
 			}
 		}
 
@@ -1331,7 +2040,50 @@ static NTSTATUS CdpJournalRebuildRuntimeLocked(_Inout_ PCdp_JOURNAL Journal)
 			break;
 	}
 
+	if (!Journal->BranchTree.First && havePrefixRecords)
+	{
+		PCdp_BRANCH_INFO_NODE prefixNode;
+		if (persistedCurrentBranch <= 0)
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup;
+		}
+		prefixNode = CdpBranchTreeAllocateNode(
+			persistedCurrentBranch,
+			0,
+			0,
+			prefixStart.Sequence,
+			prefixStart.WallClock100ns,
+			prefixStart.HeaderRegionOffset,
+			prefixStart.HeaderIndex,
+			TRUE);
+		if (!prefixNode)
+		{
+			status = STATUS_INSUFFICIENT_RESOURCES;
+			goto cleanup;
+		}
+		prefixNode->EndRecord = prefixEnd;
+		status = CdpBranchTreeAttachNode(&Journal->BranchTree, prefixNode);
+		if (!NT_SUCCESS(status))
+		{
+			cdpfree(prefixNode);
+			goto cleanup;
+		}
+		discoveredHighestBranch = persistedCurrentBranch;
+	}
+
+	if (discoveredHighestBranch > persistedHighestBranch ||
+		persistedCurrentBranch <= 0 || persistedHighestBranch <= 0)
+	{
+		status = STATUS_DISK_CORRUPT_ERROR;
+		goto cleanup;
+	}
+	Journal->CurrentBranchNumber = persistedCurrentBranch;
+	Journal->HighestBranchNumber = persistedHighestBranch;
+
 cleanup:
+	if (!NT_SUCCESS(status))
+		CdpBranchTreeFree(&Journal->BranchTree);
 	return status;
 }
 
@@ -1430,13 +2182,20 @@ NTSTATUS CdpJournalFormat(_Inout_ PCdp_JOURNAL Journal)
 	Journal->RecordGeneration = 1;
 	Journal->Oldest100ns = 0;
 	Journal->Newest100ns = 0;
+	Journal->CurrentBranchNumber = 0;
+	Journal->HighestBranchNumber = 0;
 
 	Journal->SuperblockDirty = TRUE;
 	status = CdpJournalWriteSuperblockLocked(Journal);
 	if (NT_SUCCESS(status))
 		status = CdpJournalFlush(Journal);
 	if (NT_SUCCESS(status))
+	{
 		Journal->Mounted = TRUE;
+		status = CdpJournalAppendBranchLocked(Journal, 1, 0, 0);
+		if (!NT_SUCCESS(status))
+			Journal->Mounted = FALSE;
+	}
 
 cleanup:
 	Cdp_LOCK_RELEASE(&Journal->Lock);
@@ -1449,6 +2208,8 @@ NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal)
 	PUCHAR sector;
 	PCdp_JOURNAL_SUPERBLOCK superblock;
 	UINT64 minSize;
+	LONG persistedCurrentBranch;
+	LONG persistedHighestBranch;
 	NTSTATUS status;
 
 	minSize = (UINT64)Journal->SectorSize +
@@ -1486,6 +2247,10 @@ NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal)
 	}
 
 	Journal->LastHeaderRegionOff = superblock->LastHeaderRegionOff;
+	persistedCurrentBranch = superblock->CurrentBranchNumber;
+	persistedHighestBranch = superblock->HighestBranchNumber;
+	Journal->CurrentBranchNumber = persistedCurrentBranch;
+	Journal->HighestBranchNumber = persistedHighestBranch;
 	Journal->SourceVolumeGuid = superblock->SourceVolumeGuid;
 	Journal->RecoveryPending =
 		(superblock->Flags & Cdp_JOURNAL_FLAG_RECOVERY_PENDING) != 0;
@@ -1502,6 +2267,12 @@ NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal)
 	status = CdpJournalRebuildRuntimeLocked(Journal);
 	if (!NT_SUCCESS(status))
 		goto cleanup;
+	if (Journal->CurrentBranchNumber != persistedCurrentBranch ||
+		Journal->HighestBranchNumber != persistedHighestBranch)
+	{
+		status = STATUS_DISK_CORRUPT_ERROR;
+		goto cleanup;
+	}
 
 	Journal->RecordGeneration = 1;
 	Journal->Mounted = TRUE;
@@ -1520,6 +2291,287 @@ cleanup:
 		cdpfree(allocationBase);
 	if (!NT_SUCCESS(status))
 		Journal->Mounted = FALSE;
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
+static NTSTATUS CdpJournalAppendBranchLocked(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ LONG BranchNumber,
+	_In_ LONG ParentBranchNumber,
+	_In_ UINT64 InheritedRecordSequence)
+{
+	Cdp_JOURNAL_BRANCH_RECORD_HEADER branchHeader;
+	PCdp_BRANCH_INFO_NODE branchNode = NULL;
+	UINT64 writeSequence;
+	UINT64 writeTime;
+	BOOLEAN newRegionAllocated = FALSE;
+	NTSTATUS status;
+
+	if (!Journal->Mounted)
+		return STATUS_DEVICE_NOT_READY;
+	if (BranchNumber <= 0 || BranchNumber != Journal->HighestBranchNumber + 1 ||
+		ParentBranchNumber < 0 ||
+		ParentBranchNumber > Journal->HighestBranchNumber ||
+		(ParentBranchNumber == 0 && InheritedRecordSequence != 0) ||
+		(ParentBranchNumber != 0 &&
+			(InheritedRecordSequence == 0 ||
+			 InheritedRecordSequence >= Journal->NextSequence)))
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+
+	// Branch boundaries are also header-region boundaries. Branch 1 uses the
+	// fresh region created by Format; every later branch starts at header[0]
+	// of a newly allocated region even when the previous region has free slots.
+	if (Journal->TotalRecords != 0)
+	{
+		UINT64 newRegion = 0;
+		status = CdpJournalAllocateHeaderRegionLocked(Journal, &newRegion);
+		if (!NT_SUCCESS(status))
+			return status;
+		newRegionAllocated = TRUE;
+	}
+	if (Journal->CurrentHeaderCount != 0)
+	{
+		if (newRegionAllocated)
+			(void)CdpJournalDiscardEmptyNewestRegionLocked(Journal);
+		return STATUS_DISK_CORRUPT_ERROR;
+	}
+	if (Journal->NextSequence == MAXUINT64 ||
+		Journal->CurrentHeaderRegionStartSequence >
+			MAXUINT64 - Journal->CurrentHeaderCount ||
+		Journal->CurrentHeaderRegionStartSequence +
+			Journal->CurrentHeaderCount != Journal->NextSequence)
+	{
+		if (newRegionAllocated)
+			(void)CdpJournalDiscardEmptyNewestRegionLocked(Journal);
+		return STATUS_INTEGER_OVERFLOW;
+	}
+
+	writeSequence = Journal->NextSequence;
+	writeTime = CdpJournalQueryWallClock100ns(Journal);
+	if (Journal->Newest100ns != 0 && writeTime <= Journal->Newest100ns)
+	{
+		if (Journal->Newest100ns == MAXUINT64)
+		{
+			if (newRegionAllocated)
+				(void)CdpJournalDiscardEmptyNewestRegionLocked(Journal);
+			return STATUS_INTEGER_OVERFLOW;
+		}
+		writeTime = Journal->Newest100ns + 1;
+	}
+	branchNode = CdpBranchTreeAllocateNode(
+		BranchNumber,
+		ParentBranchNumber,
+		InheritedRecordSequence,
+		writeSequence,
+		writeTime,
+		Journal->LastHeaderRegionOff,
+		Journal->CurrentHeaderCount,
+		FALSE);
+	if (!branchNode)
+	{
+		if (newRegionAllocated)
+			(void)CdpJournalDiscardEmptyNewestRegionLocked(Journal);
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+	RtlZeroMemory(&branchHeader, sizeof(branchHeader));
+	branchHeader.WallClock100ns = writeTime;
+	branchHeader.BranchNumber = BranchNumber;
+	branchHeader.ParentBranchNumber = ParentBranchNumber;
+	branchHeader.InheritedRecordSequence = InheritedRecordSequence;
+	branchHeader.Reserved = 0;
+	branchHeader.Sequence = Journal->CurrentHeaderCount |
+		Cdp_JOURNAL_RECORD_FLAG_BRANCH;
+
+	status = CdpJournalWriteHeaderAt(
+		Journal,
+		Journal->LastHeaderRegionOff,
+		Journal->CurrentHeaderCount,
+		(PCdp_JOURNAL_RECORD_HEADER)&branchHeader);
+	if (!NT_SUCCESS(status))
+	{
+		NTSTATUS discardStatus = STATUS_SUCCESS;
+		cdpfree(branchNode);
+		if (newRegionAllocated)
+			discardStatus = CdpJournalDiscardEmptyNewestRegionLocked(Journal);
+		return NT_SUCCESS(discardStatus) ? status : discardStatus;
+	}
+
+	if (Journal->BranchTree.Latest)
+		Journal->BranchTree.Latest->Latest = FALSE;
+	status = CdpBranchTreeAttachNode(&Journal->BranchTree, branchNode);
+	if (!NT_SUCCESS(status))
+	{
+		cdpfree(branchNode);
+		return status;
+	}
+
+	Journal->CurrentHeaderCount++;
+	Journal->NextSequence = writeSequence + 1;
+	Journal->TotalRecords++;
+	Journal->CurrentBranchNumber = BranchNumber;
+	Journal->HighestBranchNumber = BranchNumber;
+	Journal->SuperblockDirty = TRUE;
+	CdpJournalAdvanceRecordGenerationLocked(Journal);
+	Journal->Newest100ns = writeTime;
+	if (Journal->TotalRecords == 1)
+	{
+		Journal->OldestHeaderRegionOff = Journal->LastHeaderRegionOff;
+		Journal->OldestHeaderIndex = Journal->CurrentHeaderCount - 1;
+		Journal->Oldest100ns = writeTime;
+	}
+
+	if (Journal->SuperblockDirty)
+	{
+		status = CdpJournalFlush(Journal);
+		if (NT_SUCCESS(status))
+			status = CdpJournalWriteSuperblockLocked(Journal);
+		if (NT_SUCCESS(status))
+			status = CdpJournalFlush(Journal);
+	}
+	else
+	{
+		status = CdpJournalFlush(Journal);
+	}
+	return status;
+}
+
+NTSTATUS CdpJournalAppendBranch(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ LONG BranchNumber,
+	_In_ LONG ParentBranchNumber,
+	_In_ UINT64 InheritedRecordSequence)
+{
+	NTSTATUS status;
+	if (!Journal)
+		return STATUS_INVALID_PARAMETER;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	status = CdpJournalAppendBranchLocked(
+		Journal,
+		BranchNumber,
+		ParentBranchNumber,
+		InheritedRecordSequence);
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
+NTSTATUS CdpJournalRollbackLatestBranch(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ LONG BranchNumber)
+{
+	Cdp_JOURNAL_RECORD_HEADER header;
+	Cdp_HEADER_REGION_LINK currentLink;
+	Cdp_HEADER_REGION_LINK previousLink;
+	PCdp_BRANCH_INFO_NODE latest;
+	PCdp_BRANCH_INFO_NODE previousNode;
+	UINT64 rolledBackRegion;
+	LONG previousBranch;
+	NTSTATUS status;
+
+	if (!Journal || BranchNumber <= 0)
+		return STATUS_INVALID_PARAMETER;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	latest = Journal->BranchTree.Latest;
+	if (!Journal->Mounted)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup;
+	}
+	if (!latest || latest->BranchNumber != BranchNumber ||
+		Journal->CurrentBranchNumber != BranchNumber ||
+		Journal->HighestBranchNumber != BranchNumber ||
+		Journal->CurrentHeaderCount != 1 || Journal->NextSequence <= 1 ||
+		latest->StartRecord.Sequence != Journal->NextSequence - 1 ||
+		latest->EndRecord.Sequence != latest->StartRecord.Sequence ||
+		latest->StartRecord.HeaderIndex != 0 || !latest->Previous)
+	{
+		status = STATUS_INVALID_DEVICE_STATE;
+		goto cleanup;
+	}
+	status = CdpJournalReadHeaderAt(
+		Journal,
+		Journal->LastHeaderRegionOff,
+		0,
+		&header);
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+	if (!CdpJournalHeaderIsBranch(&header) ||
+		(header.Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) != 0)
+	{
+		status = STATUS_DISK_CORRUPT_ERROR;
+		goto cleanup;
+	}
+	rolledBackRegion = Journal->LastHeaderRegionOff;
+	status = CdpJournalReadRegionLink(Journal, rolledBackRegion, &currentLink);
+	if (!NT_SUCCESS(status) ||
+		!CdpJournalRegionLinkValid(Journal, &currentLink) ||
+		currentLink.PrevRegionOff == rolledBackRegion)
+	{
+		status = STATUS_DISK_CORRUPT_ERROR;
+		goto cleanup;
+	}
+	status = CdpJournalReadRegionLink(
+		Journal, currentLink.PrevRegionOff, &previousLink);
+	if (!NT_SUCCESS(status) ||
+		!CdpJournalRegionLinkValid(Journal, &previousLink) ||
+		previousLink.NextRegionOff != rolledBackRegion)
+	{
+		status = STATUS_DISK_CORRUPT_ERROR;
+		goto cleanup;
+	}
+	previousNode = latest->Previous;
+	if (previousNode->EndRecord.HeaderRegionOffset != currentLink.PrevRegionOff)
+	{
+		status = STATUS_DISK_CORRUPT_ERROR;
+		goto cleanup;
+	}
+	previousBranch = previousNode->BranchNumber;
+	previousLink.NextRegionOff = currentLink.PrevRegionOff;
+	status = CdpJournalWriteRegionLink(
+		Journal, currentLink.PrevRegionOff, &previousLink);
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+
+	Journal->LastHeaderRegionOff = currentLink.PrevRegionOff;
+	Journal->CurrentHeaderRegionStartSequence = previousLink.StartSequence;
+	Journal->CurrentHeaderCount = previousNode->EndRecord.HeaderIndex + 1;
+	Journal->PayloadRegionOff = rolledBackRegion;
+	Journal->NextSequence--;
+	Journal->TotalRecords--;
+	Journal->CurrentBranchNumber = previousBranch;
+	Journal->HighestBranchNumber = previousBranch;
+	CdpBranchTreeRemoveLatest(&Journal->BranchTree);
+	Journal->Newest100ns = Journal->BranchTree.Latest ?
+		Journal->BranchTree.Latest->EndRecord.WallClock100ns : 0;
+	Journal->SuperblockDirty = TRUE;
+	CdpJournalAdvanceRecordGenerationLocked(Journal);
+	status = CdpJournalFlush(Journal);
+	if (NT_SUCCESS(status))
+		status = CdpJournalWriteSuperblockLocked(Journal);
+	if (NT_SUCCESS(status))
+		status = CdpJournalFlush(Journal);
+
+cleanup:
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
+NTSTATUS CdpJournalEnsureInitialBranch(_Inout_ PCdp_JOURNAL Journal)
+{
+	NTSTATUS status;
+	if (!Journal)
+		return STATUS_INVALID_PARAMETER;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted)
+		status = STATUS_DEVICE_NOT_READY;
+	else if (Journal->CurrentBranchNumber != 0)
+		status = STATUS_SUCCESS;
+	else if (Journal->HighestBranchNumber != 0 || Journal->TotalRecords != 0)
+		status = STATUS_DISK_CORRUPT_ERROR;
+	else
+		status = CdpJournalAppendBranchLocked(Journal, 1, 0, 0);
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	return status;
 }
@@ -1654,7 +2706,6 @@ NTSTATUS CdpJournalInvalidate(_Inout_ PCdp_JOURNAL Journal)
 		Cdp_LOG("[JOURNAL] invalidated superblock\n");
 #endif
 	}
-
 cleanup:
 	if (allocationBase)
 		cdpfree(allocationBase);
@@ -1666,14 +2717,14 @@ NTSTATUS CdpJournalAppend(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 VolumeOffset,
 	_In_ ULONG DataLength,
-	_In_reads_bytes_(DataLength) const VOID* BeforeImage,
+	_In_reads_bytes_(DataLength) const VOID* AfterImage,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord)
 {
 	return CdpJournalAppendEx(
 		Journal,
 		VolumeOffset,
 		DataLength,
-		BeforeImage,
+		AfterImage,
 		0,
 		WrittenRecord);
 }
@@ -1682,7 +2733,7 @@ NTSTATUS CdpJournalAppendEx(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 VolumeOffset,
 	_In_ ULONG DataLength,
-	_In_reads_bytes_(DataLength) const VOID* BeforeImage,
+	_In_reads_bytes_(DataLength) const VOID* AfterImage,
 	_In_ ULONG RecordFlags,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord)
 {
@@ -1696,18 +2747,37 @@ NTSTATUS CdpJournalAppendEx(
 	UINT64 writeTime;
 	BOOLEAN rotateHeaderRegion;
 	NTSTATUS status = STATUS_SUCCESS;
+#ifndef Cdp_USERMODE
+	LARGE_INTEGER journalLockStart;
+	LARGE_INTEGER journalLockEnd;
+	LARGE_INTEGER payloadWriteStart;
+	LARGE_INTEGER payloadWriteEnd;
+#endif
 
-	if (!Journal->Mounted || !BeforeImage ||
-		(RecordFlags & ~Cdp_JOURNAL_RECORD_FLAG_BACKFILL) != 0 ||
+	if (!Journal->Mounted || !AfterImage || RecordFlags != 0 ||
 		DataLength == 0 || DataLength > Cdp_JOURNAL_MAX_RECORD_DATA)
 	{
 		return STATUS_INVALID_PARAMETER;
 	}
 
+#ifndef Cdp_USERMODE
+	journalLockStart = KeQueryPerformanceCounter(NULL);
+#endif
 	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+#ifndef Cdp_USERMODE
+	journalLockEnd = KeQueryPerformanceCounter(NULL);
+	InterlockedAdd64(
+		&g_CdpPerfCounters.JournalLockWaitTicks,
+		journalLockEnd.QuadPart - journalLockStart.QuadPart);
+#endif
 	if (!Journal->Mounted)
 	{
 		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup;
+	}
+	if (Journal->CurrentBranchNumber <= 0)
+	{
+		status = STATUS_INVALID_DEVICE_STATE;
 		goto cleanup;
 	}
 
@@ -1750,23 +2820,53 @@ NTSTATUS CdpJournalAppendEx(
 		goto cleanup;
 
 	payloadOff = Journal->PayloadRegionOff;
-	payloadBuffer = (PUCHAR)CdpAllocateAligned(Journal,
-		(SIZE_T)alignedSize,
-		&allocationBase);
-	if (!payloadBuffer)
+	// The queued write IRP remains alive and its MDL remains locked until this
+	// synchronous journal write completes. Reuse that mapping when it already
+	// satisfies the journal device's transfer alignment. Only the partial-
+	// sector/address-misaligned path needs a temporary buffer and zero padding.
+	if (alignedSize == DataLength &&
+		CdpJournalBufferMeetsIoAlignment(Journal, AfterImage))
 	{
-		status = STATUS_INSUFFICIENT_RESOURCES;
-		goto cleanup;
+		payloadBuffer = (PUCHAR)AfterImage;
+#ifndef Cdp_USERMODE
+		InterlockedIncrement(&g_CdpPerfCounters.ZeroCopyCount);
+#endif
 	}
-	RtlZeroMemory(payloadBuffer, (SIZE_T)alignedSize);
-	RtlCopyMemory(payloadBuffer, BeforeImage, DataLength);
+	else
+	{
+#ifndef Cdp_USERMODE
+		InterlockedIncrement(&g_CdpPerfCounters.CopyFallbackCount);
+		InterlockedAdd64(
+			&g_CdpPerfCounters.CopyFallbackBytes,
+			(LONGLONG)alignedSize);
+#endif
+		payloadBuffer = (PUCHAR)CdpAllocateAligned(Journal,
+			(SIZE_T)alignedSize,
+			&allocationBase);
+		if (!payloadBuffer)
+		{
+			status = STATUS_INSUFFICIENT_RESOURCES;
+			goto cleanup;
+		}
+		RtlZeroMemory(payloadBuffer, (SIZE_T)alignedSize);
+		RtlCopyMemory(payloadBuffer, AfterImage, DataLength);
+	}
 
+#ifndef Cdp_USERMODE
+	payloadWriteStart = KeQueryPerformanceCounter(NULL);
+#endif
 	status = CdpJournalRawIo(
 		Journal,
 		IRP_MJ_WRITE,
 		payloadOff,
 		(ULONG)alignedSize,
 		payloadBuffer);
+#ifndef Cdp_USERMODE
+	payloadWriteEnd = KeQueryPerformanceCounter(NULL);
+	InterlockedAdd64(
+		&g_CdpPerfCounters.PayloadWriteTicks,
+		payloadWriteEnd.QuadPart - payloadWriteStart.QuadPart);
+#endif
 	if (!NT_SUCCESS(status))
 		goto cleanup;
 
@@ -1797,6 +2897,15 @@ NTSTATUS CdpJournalAppendEx(
 		}
 #endif
 	}
+	if (Journal->Newest100ns != 0 && writeTime <= Journal->Newest100ns)
+	{
+		if (Journal->Newest100ns == MAXUINT64)
+		{
+			status = STATUS_INTEGER_OVERFLOW;
+			goto cleanup;
+		}
+		writeTime = Journal->Newest100ns + 1;
+	}
 
 	RtlZeroMemory(&header, sizeof(header));
 	header.WallClock100ns = writeTime;
@@ -1805,6 +2914,7 @@ NTSTATUS CdpJournalAppendEx(
 	header.DataLength = DataLength;
 	header.Sequence = Journal->CurrentHeaderCount | RecordFlags;
 
+#if !Cdp_PERF_TEST_SKIP_RECORD_HEADER_AND_FLUSH
 	status = CdpJournalWriteHeaderAt(
 		Journal,
 		Journal->LastHeaderRegionOff,
@@ -1812,6 +2922,13 @@ NTSTATUS CdpJournalAppendEx(
 		&header);
 	if (!NT_SUCCESS(status))
 		goto cleanup;
+#endif
+	CdpBranchTreeAdvanceLatest(
+		&Journal->BranchTree,
+		writeSeq,
+		writeTime,
+		Journal->LastHeaderRegionOff,
+		Journal->CurrentHeaderCount);
 
 	Journal->CurrentHeaderCount++;
 	Journal->PayloadRegionOff = payloadOff + alignedSize;
@@ -1844,6 +2961,7 @@ NTSTATUS CdpJournalAppendEx(
 		*WrittenRecord = record;
 	}
 
+#if !Cdp_PERF_TEST_SKIP_RECORD_HEADER_AND_FLUSH
 	if (Journal->SuperblockDirty)
 	{
 		// Make the new region, link, payload and record header durable before
@@ -1858,6 +2976,7 @@ NTSTATUS CdpJournalAppendEx(
 	{
 		status = CdpJournalFlush(Journal);
 	}
+#endif
 
 cleanup:
 	if (allocationBase)
@@ -1957,7 +3076,6 @@ NTSTATUS CdpJournalQueryUsage(
 		status = STATUS_DEVICE_NOT_READY;
 		goto cleanup;
 	}
-
 	status = CdpJournalCountActiveHeaderRegionsLocked(
 		Journal,
 		&headerRegionCount);
@@ -1992,6 +3110,312 @@ cleanup:
 	return status;
 }
 
+NTSTATUS CdpJournalGetOldestCompactableRegion(
+	_Inout_ PCdp_JOURNAL Journal,
+	_Out_ PUINT64 RegionOffset,
+	_Out_ PUINT64 FirstSequence,
+	_Out_ PUINT64 EndSequence)
+{
+	Cdp_HEADER_REGION_LINK link;
+	Cdp_HEADER_REGION_LINK nextLink;
+	ULONG limit;
+	NTSTATUS status;
+
+	if (!Journal || !RegionOffset || !FirstSequence || !EndSequence)
+		return STATUS_INVALID_PARAMETER;
+	*RegionOffset = 0;
+	*FirstSequence = 0;
+	*EndSequence = 0;
+
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup;
+	}
+	if (Journal->OldestHeaderRegionOff == Journal->LastHeaderRegionOff)
+	{
+		status = STATUS_NOT_FOUND;
+		goto cleanup;
+	}
+	status = CdpJournalReadRegionLink(
+		Journal, Journal->OldestHeaderRegionOff, &link);
+	if (!NT_SUCCESS(status) || !CdpJournalRegionLinkValid(Journal, &link))
+	{
+		status = STATUS_DISK_CORRUPT_ERROR;
+		goto cleanup;
+	}
+	status = CdpJournalGetRegionHeaderLimitLocked(
+		Journal,
+		Journal->OldestHeaderRegionOff,
+		&link,
+		&limit,
+		&nextLink);
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+	if (Journal->OldestHeaderIndex >= limit ||
+		link.StartSequence > MAXUINT64 - Journal->OldestHeaderIndex ||
+		nextLink.StartSequence <=
+			link.StartSequence + Journal->OldestHeaderIndex)
+	{
+		status = STATUS_DISK_CORRUPT_ERROR;
+		goto cleanup;
+	}
+	*RegionOffset = Journal->OldestHeaderRegionOff;
+	*FirstSequence = link.StartSequence + Journal->OldestHeaderIndex;
+	*EndSequence = nextLink.StartSequence;
+	status = STATUS_SUCCESS;
+
+cleanup:
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
+NTSTATUS CdpJournalDeleteOldestRegion(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 ExpectedRegionOffset)
+{
+	NTSTATUS status;
+
+	if (!Journal)
+		return STATUS_INVALID_PARAMETER;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted)
+		status = STATUS_DEVICE_NOT_READY;
+	else if (Journal->OldestHeaderRegionOff != ExpectedRegionOffset)
+		status = STATUS_RETRY;
+	else if (Journal->OldestHeaderRegionOff == Journal->LastHeaderRegionOff)
+		status = STATUS_NOT_FOUND;
+	else
+	{
+		status = CdpJournalDropOldestRegionLocked(Journal);
+		if (NT_SUCCESS(status))
+			status = CdpJournalFlush(Journal);
+	}
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
+NTSTATUS CdpJournalPruneUnreachableForCompaction(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 FirstSequence,
+	_In_ UINT64 EndSequence,
+	_In_ UINT64 PreviewTargetSequence,
+	_Out_opt_ PBOOLEAN PreviewTargetDeleted)
+{
+	PCdp_BRANCH_INFO_NODE branch;
+	PUCHAR region = NULL;
+	UINT64 regionOff;
+	ULONG guard = 0;
+	BOOLEAN containsInheritancePoint = FALSE;
+	BOOLEAN haveBranchToPrune = FALSE;
+	BOOLEAN changed = FALSE;
+	BOOLEAN previewDeleted = FALSE;
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Journal || FirstSequence >= EndSequence)
+		return STATUS_INVALID_PARAMETER;
+	if (PreviewTargetDeleted)
+		*PreviewTargetDeleted = FALSE;
+
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted || !Journal->BranchTree.Latest)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup;
+	}
+	for (branch = Journal->BranchTree.First; branch; branch = branch->Next)
+	{
+		branch->PrunePending = FALSE;
+		if (branch->ParentBranchNumber != 0 &&
+			branch->InheritedRecordSequence >= FirstSequence &&
+			branch->InheritedRecordSequence < EndSequence)
+		{
+			containsInheritancePoint = TRUE;
+		}
+	}
+
+	// Reaching the first region of a non-current branch discards that branch
+	// itself. Its descendants depend on it and are pruned recursively. Merely
+	// being a sibling of the latest branch is not enough to delete it early.
+	for (branch = Journal->BranchTree.First; branch; branch = branch->Next)
+	{
+		if (!branch->SyntheticStart &&
+			branch->StartRecord.Sequence >= FirstSequence &&
+			branch->StartRecord.Sequence < EndSequence &&
+			!CdpBranchTreeLatestPathLimit(
+				&Journal->BranchTree, branch, NULL))
+		{
+			CdpBranchTreeMarkPruneSubtree(branch);
+			haveBranchToPrune = TRUE;
+		}
+	}
+
+	// A branch is invalid only when its inherited ordinary record is being
+	// discarded (or an ancestor branch was already invalidated). A sibling
+	// inheriting from a retained/materialized record remains valid.
+	if (containsInheritancePoint || haveBranchToPrune)
+	{
+		BOOLEAN marked;
+		do
+		{
+			marked = FALSE;
+			for (branch = Journal->BranchTree.First;
+				branch;
+				branch = branch->Next)
+			{
+				if (branch->PrunePending ||
+					branch->ParentBranchNumber == 0)
+				{
+					continue;
+				}
+				if ((branch->Parent && branch->Parent->PrunePending) ||
+					CdpBranchTreeSequenceDiscardedByCompaction(
+						&Journal->BranchTree,
+						branch->InheritedRecordSequence,
+						FirstSequence,
+						EndSequence,
+						containsInheritancePoint))
+				{
+					CdpBranchTreeMarkPruneSubtree(branch);
+					haveBranchToPrune = TRUE;
+					marked = TRUE;
+				}
+			}
+		} while (marked);
+	}
+	if (!containsInheritancePoint && !haveBranchToPrune)
+		goto cleanup;
+
+	status = CdpJournalGetHeaderScanBufferLocked(Journal, &region);
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+	regionOff = Journal->OldestHeaderRegionOff;
+	for (;;)
+	{
+		Cdp_HEADER_REGION_LINK link;
+		ULONG limit;
+		ULONG startIndex;
+		ULONG index;
+		BOOLEAN isLast;
+
+		if (++guard > 100000UL)
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			break;
+		}
+		status = CdpJournalReadHeaderRegion(Journal, regionOff, region);
+		if (!NT_SUCCESS(status))
+			break;
+		RtlCopyMemory(
+			&link,
+			region + Cdp_JOURNAL_HEADER_REGION_SIZE -
+				Cdp_JOURNAL_HEADER_LINK_SIZE,
+			sizeof(link));
+		if (!CdpJournalRegionLinkValid(Journal, &link))
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			break;
+		}
+		isLast = regionOff == Journal->LastHeaderRegionOff;
+		status = CdpJournalGetRegionHeaderLimitLocked(
+			Journal, regionOff, &link, &limit, NULL);
+		if (!NT_SUCCESS(status))
+			break;
+		startIndex = regionOff == Journal->OldestHeaderRegionOff ?
+			Journal->OldestHeaderIndex : 0;
+
+		for (index = startIndex; index < limit; ++index)
+		{
+			Cdp_JOURNAL_RECORD_HEADER header;
+			Cdp_JOURNAL_RECORD_HEADER tombstone;
+			PCdp_BRANCH_INFO_NODE recordBranch;
+			UINT64 globalSequence;
+			BOOLEAN deleteRecord = FALSE;
+
+			RtlCopyMemory(
+				&header,
+				region + index * sizeof(header),
+				sizeof(header));
+			if ((header.Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) != index ||
+				link.StartSequence > MAXUINT64 - index)
+			{
+				status = STATUS_DISK_CORRUPT_ERROR;
+				break;
+			}
+			if (CdpJournalHeaderIsDeleted(&header))
+				continue;
+			globalSequence = link.StartSequence + index;
+			if (CdpJournalHeaderIsBranch(&header))
+			{
+				Cdp_JOURNAL_BRANCH_RECORD_HEADER branchHeader;
+				RtlCopyMemory(&branchHeader, &header, sizeof(branchHeader));
+				recordBranch = CdpBranchTreeFind(
+					&Journal->BranchTree, branchHeader.BranchNumber);
+				deleteRecord = recordBranch && recordBranch->PrunePending;
+			}
+			else
+			{
+				UINT64 allowedSequence = MAXUINT64;
+				BOOLEAN onLatestPath;
+				recordBranch = CdpBranchTreeFindBySequence(
+					&Journal->BranchTree, globalSequence);
+				onLatestPath = CdpBranchTreeLatestPathLimit(
+					&Journal->BranchTree,
+					recordBranch,
+					&allowedSequence);
+				deleteRecord = recordBranch &&
+					(recordBranch->PrunePending ||
+					 (containsInheritancePoint && onLatestPath &&
+					  globalSequence > allowedSequence));
+			}
+			if (!deleteRecord)
+				continue;
+
+			RtlZeroMemory(&tombstone, sizeof(tombstone));
+			tombstone.Sequence = index | Cdp_JOURNAL_RECORD_FLAG_DELETED;
+			status = CdpJournalWriteHeaderAt(
+				Journal, regionOff, index, &tombstone);
+			if (!NT_SUCCESS(status))
+				break;
+			changed = TRUE;
+			if (globalSequence == PreviewTargetSequence)
+				previewDeleted = TRUE;
+		}
+		if (!NT_SUCCESS(status) || isLast)
+			break;
+		if (link.NextRegionOff == regionOff)
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			break;
+		}
+		regionOff = link.NextRegionOff;
+	}
+
+	if (changed)
+	{
+		NTSTATUS rebuildStatus;
+		NTSTATUS flushStatus = CdpJournalFlush(Journal);
+		CdpJournalAdvanceRecordGenerationLocked(Journal);
+		rebuildStatus = CdpJournalRebuildRuntimeLocked(Journal);
+		if (NT_SUCCESS(status) && !NT_SUCCESS(flushStatus))
+			status = flushStatus;
+		if (NT_SUCCESS(status) && !NT_SUCCESS(rebuildStatus))
+			status = rebuildStatus;
+	}
+
+cleanup:
+	if (!changed)
+	{
+		for (branch = Journal->BranchTree.First; branch; branch = branch->Next)
+			branch->PrunePending = FALSE;
+	}
+	if (PreviewTargetDeleted)
+		*PreviewTargetDeleted = previewDeleted;
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
 NTSTATUS CdpJournalQueryRecordHeaders(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 StartIndex,
@@ -2002,15 +3426,10 @@ NTSTATUS CdpJournalQueryRecordHeaders(
 	_Out_ PUINT64 Generation,
 	_Out_ PULONG ReturnedCount)
 {
-	UINT64 remaining;
+	UINT64 skip;
 	UINT64 regionOff;
-	ULONG headerIndex;
-	ULONG limit;
 	ULONG returned = 0;
-	ULONG wanted;
 	ULONG guard = 0;
-	Cdp_HEADER_REGION_LINK link;
-	Cdp_HEADER_REGION_LINK nextLink;
 	NTSTATUS status;
 
 	if (!Journal || !TotalRecords || !Generation || !ReturnedCount ||
@@ -2018,7 +3437,6 @@ NTSTATUS CdpJournalQueryRecordHeaders(
 	{
 		return STATUS_INVALID_PARAMETER;
 	}
-
 	*TotalRecords = 0;
 	*Generation = 0;
 	*ReturnedCount = 0;
@@ -2029,7 +3447,6 @@ NTSTATUS CdpJournalQueryRecordHeaders(
 		status = STATUS_DEVICE_NOT_READY;
 		goto cleanup;
 	}
-
 	*TotalRecords = Journal->TotalRecords;
 	*Generation = Journal->RecordGeneration;
 	if (ExpectedGeneration != 0 &&
@@ -2049,109 +3466,117 @@ NTSTATUS CdpJournalQueryRecordHeaders(
 		goto cleanup;
 	}
 
-	remaining = Journal->TotalRecords - StartIndex;
-	wanted = remaining < RecordCapacity ? (ULONG)remaining : RecordCapacity;
+	skip = StartIndex;
 	regionOff = Journal->OldestHeaderRegionOff;
-	headerIndex = Journal->OldestHeaderIndex;
-	remaining = StartIndex;
-	status = CdpJournalReadRegionLink(Journal, regionOff, &link);
-	if (!NT_SUCCESS(status) || !CdpJournalRegionLinkValid(Journal, &link))
+	for (;;)
 	{
-		status = STATUS_DISK_CORRUPT_ERROR;
-		goto cleanup;
-	}
-	status = CdpJournalGetRegionHeaderLimitLocked(
-		Journal, regionOff, &link, &limit, &nextLink);
-	if (!NT_SUCCESS(status))
-		goto cleanup;
+		Cdp_HEADER_REGION_LINK link;
+		ULONG limit;
+		ULONG index;
+		ULONG startIndex;
+		BOOLEAN isLast;
 
-	while (remaining != 0)
-	{
-		ULONG available;
-		if (headerIndex >= limit)
+		if (++guard > 100000UL)
 		{
 			status = STATUS_DISK_CORRUPT_ERROR;
 			goto cleanup;
 		}
-		available = limit - headerIndex;
-		if (remaining < available)
+		status = CdpJournalReadRegionLink(Journal, regionOff, &link);
+		if (!NT_SUCCESS(status) || !CdpJournalRegionLinkValid(Journal, &link))
 		{
-			headerIndex += (ULONG)remaining;
-			remaining = 0;
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup;
+		}
+		status = CdpJournalGetRegionHeaderLimitLocked(
+			Journal, regionOff, &link, &limit, NULL);
+		if (!NT_SUCCESS(status))
+			goto cleanup;
+		isLast = regionOff == Journal->LastHeaderRegionOff;
+		startIndex = regionOff == Journal->OldestHeaderRegionOff ?
+			Journal->OldestHeaderIndex : 0;
+
+		for (index = startIndex; index < limit; ++index)
+		{
+			Cdp_JOURNAL_RECORD_HEADER header;
+			Cdp_JOURNAL_RECORD record;
+
+			status = CdpJournalReadHeaderAt(
+				Journal, regionOff, index, &header);
+			if (!NT_SUCCESS(status))
+				goto cleanup;
+			if ((header.Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) != index)
+			{
+				status = STATUS_DISK_CORRUPT_ERROR;
+				goto cleanup;
+			}
+			if (CdpJournalHeaderIsDeleted(&header))
+			{
+				if ((header.Sequence & Cdp_JOURNAL_RECORD_FLAGS_MASK) !=
+					Cdp_JOURNAL_RECORD_FLAG_DELETED || header.DataLength != 0)
+				{
+					status = STATUS_DISK_CORRUPT_ERROR;
+					goto cleanup;
+				}
+				continue;
+			}
+			if (skip != 0)
+			{
+				skip--;
+				continue;
+			}
+			if (CdpJournalHeaderIsBranch(&header))
+			{
+				Cdp_JOURNAL_BRANCH_RECORD_HEADER branch;
+				RtlCopyMemory(&branch, &header, sizeof(branch));
+				if ((header.Sequence & Cdp_JOURNAL_RECORD_FLAGS_MASK) !=
+						Cdp_JOURNAL_RECORD_FLAG_BRANCH ||
+					branch.Reserved != 0 || branch.BranchNumber <= 0 ||
+					branch.ParentBranchNumber < 0 ||
+					link.StartSequence > MAXUINT64 - index)
+				{
+					status = STATUS_DISK_CORRUPT_ERROR;
+					goto cleanup;
+				}
+				RtlZeroMemory(&record, sizeof(record));
+				record.WallClock100ns = branch.WallClock100ns;
+				record.Sequence = link.StartSequence + index;
+				record.Flags = Cdp_JOURNAL_RECORD_FLAG_BRANCH;
+			}
+			else
+			{
+				if (header.DataLength == 0 ||
+					(header.Sequence & Cdp_JOURNAL_RECORD_FLAGS_MASK) != 0 ||
+					header.DataLength > Cdp_JOURNAL_MAX_RECORD_DATA)
+				{
+					status = STATUS_DISK_CORRUPT_ERROR;
+					goto cleanup;
+				}
+				status = CdpJournalDecodeRecord(&link, &header, &record);
+				if (!NT_SUCCESS(status))
+					goto cleanup;
+			}
+			Records[returned++] = record;
+			if (returned == RecordCapacity)
+			{
+				*ReturnedCount = returned;
+				status = STATUS_SUCCESS;
+				goto cleanup;
+			}
+		}
+		if (isLast)
 			break;
-		}
-
-		remaining -= available;
-		if (regionOff == Journal->LastHeaderRegionOff)
-		{
-			status = STATUS_DISK_CORRUPT_ERROR;
-			goto cleanup;
-		}
-		if (link.NextRegionOff == regionOff || ++guard > 100000UL)
+		if (link.NextRegionOff == regionOff)
 		{
 			status = STATUS_DISK_CORRUPT_ERROR;
 			goto cleanup;
 		}
 		regionOff = link.NextRegionOff;
-		link = nextLink;
-		headerIndex = 0;
-		status = CdpJournalGetRegionHeaderLimitLocked(
-			Journal, regionOff, &link, &limit, &nextLink);
-		if (!NT_SUCCESS(status))
-			goto cleanup;
 	}
-
-	while (returned < wanted)
+	if (skip != 0 || returned == 0)
 	{
-		Cdp_JOURNAL_RECORD_HEADER header;
-		Cdp_JOURNAL_RECORD record;
-
-		if (headerIndex >= limit)
-		{
-			if (regionOff == Journal->LastHeaderRegionOff)
-			{
-				status = STATUS_DISK_CORRUPT_ERROR;
-				goto cleanup;
-			}
-			if (link.NextRegionOff == regionOff || ++guard > 100000UL)
-			{
-				status = STATUS_DISK_CORRUPT_ERROR;
-				goto cleanup;
-			}
-			regionOff = link.NextRegionOff;
-			link = nextLink;
-			headerIndex = 0;
-			status = CdpJournalGetRegionHeaderLimitLocked(
-				Journal, regionOff, &link, &limit, &nextLink);
-			if (!NT_SUCCESS(status))
-				goto cleanup;
-			continue;
-		}
-
-		status = CdpJournalReadHeaderAt(
-			Journal,
-			regionOff,
-			headerIndex,
-			&header);
-		if (!NT_SUCCESS(status))
-			goto cleanup;
-		if (header.DataLength == 0 ||
-			(header.Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) != headerIndex ||
-			(header.Sequence & Cdp_JOURNAL_RECORD_FLAGS_MASK &
-				~Cdp_JOURNAL_RECORD_FLAG_BACKFILL) != 0 ||
-			header.DataLength > Cdp_JOURNAL_MAX_RECORD_DATA)
-		{
-			status = STATUS_DISK_CORRUPT_ERROR;
-			goto cleanup;
-		}
-
-		status = CdpJournalDecodeRecord(&link, &header, &record);
-		if (!NT_SUCCESS(status))
-			goto cleanup;
-		Records[returned++] = record;
-		headerIndex++;
+		status = STATUS_DISK_CORRUPT_ERROR;
+		goto cleanup;
 	}
-
 	*ReturnedCount = returned;
 	status = STATUS_SUCCESS;
 
@@ -2159,7 +3584,6 @@ cleanup:
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	return status;
 }
-
 VOID CdpPreviewTreeInitialize(_Out_ PCdp_PREVIEW_TREE Tree)
 {
 	RtlZeroMemory(Tree, sizeof(*Tree));
@@ -2500,6 +3924,26 @@ static NTSTATUS CdpPreviewTreeOverlayEarlier(
 	return CdpPreviewTreeInsertRaw(Tree, Record);
 }
 
+NTSTATUS CdpPreviewTreeOverlayLatest(
+	_Inout_ PCdp_PREVIEW_TREE Tree,
+	_In_ const Cdp_JOURNAL_RECORD* Record)
+{
+	NTSTATUS status;
+	UINT64 end;
+
+	if (!Tree || !Record || Record->DataLength == 0 ||
+		Record->VolumeOffset > MAXUINT64 - Record->DataLength)
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+	end = Record->VolumeOffset + Record->DataLength;
+	status = CdpPreviewTreeRemoveRangeInPlace(
+		Tree, Record->VolumeOffset, end);
+	if (!NT_SUCCESS(status))
+		return status;
+	return CdpPreviewTreeInsertRaw(Tree, Record);
+}
+
 static ULONG CdpBitmapByteCount(_In_ ULONG BitCount)
 {
 	return (BitCount + 7UL) / 8UL;
@@ -2591,129 +4035,6 @@ NTSTATUS CdpPreviewTreeInsert(
 		cursor = overlapEnd < end ? overlapEnd : end;
 	}
 	return status;
-}
-
-static NTSTATUS CdpPreviewTreeMergeNode(
-	_Inout_ PCdp_PREVIEW_TREE Dest,
-	_In_opt_ PCdp_PREVIEW_TREE_NODE Node)
-{
-	Cdp_JOURNAL_RECORD record;
-	NTSTATUS status;
-
-	if (!Node)
-		return STATUS_SUCCESS;
-
-	status = CdpPreviewTreeMergeNode(Dest, Node->Left);
-	if (!NT_SUCCESS(status))
-		return status;
-
-	RtlZeroMemory(&record, sizeof(record));
-	record.WallClock100ns = Node->WallClock100ns;
-	record.VolumeOffset = Node->Start;
-	record.FileOffset = Node->FileOffset;
-	record.DataLength = Node->DataLength;
-	record.Sequence = Node->Sequence;
-	status = CdpPreviewTreeInsert(Dest, &record);
-	if (!NT_SUCCESS(status))
-		return status;
-
-	return CdpPreviewTreeMergeNode(Dest, Node->Right);
-}
-
-NTSTATUS CdpPreviewTreeMergeFrom(
-	_Inout_ PCdp_PREVIEW_TREE Dest,
-	_Inout_ PCdp_PREVIEW_TREE Source)
-{
-	NTSTATUS status;
-
-	if (!Dest || !Source)
-		return STATUS_INVALID_PARAMETER;
-	if (!Source->Root)
-		return STATUS_SUCCESS;
-
-	status = CdpPreviewTreeMergeNode(Dest, Source->Root);
-	CdpPreviewTreeFree(Source);
-	return status;
-}
-
-static NTSTATUS CdpPreviewTreePunchByNode(
-	_Inout_ PCdp_PREVIEW_TREE HistoryTree,
-	_In_opt_ PCdp_PREVIEW_TREE_NODE Node)
-{
-	NTSTATUS status;
-
-	if (!Node)
-		return STATUS_SUCCESS;
-
-	status = CdpPreviewTreePunchByNode(HistoryTree, Node->Left);
-	if (!NT_SUCCESS(status))
-		return status;
-	status = CdpPreviewTreePunchRange(
-		HistoryTree,
-		Node->Start,
-		Node->DataLength);
-	if (!NT_SUCCESS(status))
-		return status;
-	return CdpPreviewTreePunchByNode(HistoryTree, Node->Right);
-}
-
-NTSTATUS CdpPreviewTreePunchByStaging(
-	_Inout_ PCdp_PREVIEW_TREE HistoryTree,
-	_Inout_ PCdp_PREVIEW_TREE StagingTree)
-{
-	NTSTATUS status;
-
-	if (!HistoryTree || !StagingTree)
-		return STATUS_INVALID_PARAMETER;
-
-	if (StagingTree->Root)
-		status = CdpPreviewTreePunchByNode(HistoryTree, StagingTree->Root);
-	else
-		status = STATUS_SUCCESS;
-
-	CdpPreviewTreeFree(StagingTree);
-	return status;
-}
-
-static PCdp_PREVIEW_TREE_NODE CdpPreviewTreeMarkInvalidNodeByStart(
-	_Inout_opt_ PCdp_PREVIEW_TREE_NODE Node,
-	_In_ UINT64 VolumeOffset,
-	_Out_ PBOOLEAN Found)
-{
-	if (!Node)
-		return NULL;
-
-	if (VolumeOffset < Node->Start)
-	{
-		Node->Left = CdpPreviewTreeMarkInvalidNodeByStart(
-			Node->Left, VolumeOffset, Found);
-	}
-	else if (VolumeOffset > Node->Start)
-	{
-		Node->Right = CdpPreviewTreeMarkInvalidNodeByStart(
-			Node->Right, VolumeOffset, Found);
-	}
-	else
-	{
-		Node->Invalid = TRUE;
-		*Found = TRUE;
-	}
-
-	CdpPreviewTreeNodeUpdate(Node);
-	return Node;
-}
-
-NTSTATUS CdpPreviewTreeMarkInvalidByStart(
-	_Inout_ PCdp_PREVIEW_TREE Tree,
-	_In_ UINT64 VolumeOffset)
-{
-	BOOLEAN found = FALSE;
-
-	if (!Tree)
-		return STATUS_INVALID_PARAMETER;
-	Tree->Root = CdpPreviewTreeMarkInvalidNodeByStart(
-		Tree->Root, VolumeOffset, &found);
-	return found ? STATUS_SUCCESS : STATUS_NOT_FOUND;
 }
 
 typedef struct _Cdp_PREVIEW_HIT
@@ -2811,57 +4132,45 @@ NTSTATUS CdpPreviewTreePunchRange(
 	return CdpPreviewTreeRemoveRangeInPlace(Tree, VolumeOffset, cutEnd);
 }
 
-NTSTATUS CdpJournalBuildPreviewTree(
+static NTSTATUS CdpJournalBuildCurrentBranchTreeInternal(
 	_Inout_ PCdp_JOURNAL Journal,
-	_In_ UINT64 TargetTime100ns,
-	_In_ UINT64 MaxSequence,
-	_In_ BOOLEAN IncludeTargetTime,
+	_In_ BOOLEAN RestrictSequenceRange,
+	_In_ UINT64 FirstSequence,
+	_In_ UINT64 EndSequence,
 	_Out_ PCdp_PREVIEW_TREE Tree)
 {
 	NTSTATUS status = STATUS_SUCCESS;
 	UINT64 regionOff;
 	UINT64 regionEndSequence;
+	UINT64 allowedSequence = MAXUINT64;
+	LONG expectedBranch;
 	ULONG guardRegions = 0;
-	BOOLEAN stop = FALSE;
 	PUCHAR region = NULL;
+	BOOLEAN ancestryComplete = FALSE;
 
-	if (!Tree)
+	if (!Journal || !Tree ||
+		(RestrictSequenceRange && FirstSequence >= EndSequence))
 		return STATUS_INVALID_PARAMETER;
-
 	CdpPreviewTreeInitialize(Tree);
 
 	Cdp_LOCK_ACQUIRE(&Journal->Lock);
-	if (!Journal->Mounted)
+	if (!Journal->Mounted || Journal->CurrentBranchNumber <= 0)
 	{
 		status = STATUS_DEVICE_NOT_READY;
 		goto cleanup_locked;
 	}
-	if (CdpJournalIsEmptyLocked(Journal) ||
-		(IncludeTargetTime ?
-			TargetTime100ns > Journal->Newest100ns :
-			TargetTime100ns >= Journal->Newest100ns))
-	{
-		status = STATUS_SUCCESS;
-		goto cleanup_locked;
-	}
-	if (TargetTime100ns < Journal->Oldest100ns)
-		TargetTime100ns = Journal->Oldest100ns;
-
+	expectedBranch = Journal->CurrentBranchNumber;
 	status = CdpJournalGetHeaderScanBufferLocked(Journal, &region);
 	if (!NT_SUCCESS(status))
-	{
 		goto cleanup_locked;
-	}
 
-	// Single pass, newest-to-oldest.  Each header is immediately overlaid into
-	// the tree; the earlier before-image replaces only overlapping bytes from
-	// newer records.  No record-header array and no second region read.
 	regionOff = Journal->LastHeaderRegionOff;
 	regionEndSequence = Journal->NextSequence;
 	for (;;)
 	{
 		Cdp_HEADER_REGION_LINK link;
 		ULONG limit;
+		ULONG startIndex;
 		LONG index;
 		BOOLEAN isLast;
 		BOOLEAN isOldest;
@@ -2871,7 +4180,410 @@ NTSTATUS CdpJournalBuildPreviewTree(
 			status = STATUS_DISK_CORRUPT_ERROR;
 			goto cleanup_locked;
 		}
+		status = CdpJournalReadHeaderRegion(Journal, regionOff, region);
+		if (!NT_SUCCESS(status))
+			goto cleanup_locked;
+		RtlCopyMemory(
+			&link,
+			region + Cdp_JOURNAL_HEADER_REGION_SIZE -
+				Cdp_JOURNAL_HEADER_LINK_SIZE,
+			sizeof(link));
+		if (!CdpJournalRegionLinkValid(Journal, &link) ||
+			regionEndSequence <= link.StartSequence ||
+			regionEndSequence - link.StartSequence >
+				Cdp_JOURNAL_HEADERS_PER_REGION)
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup_locked;
+		}
 
+		isLast = regionOff == Journal->LastHeaderRegionOff;
+		isOldest = regionOff == Journal->OldestHeaderRegionOff;
+		limit = (ULONG)(regionEndSequence - link.StartSequence);
+		startIndex = isOldest ? Journal->OldestHeaderIndex : 0;
+		if ((isLast && limit != Journal->CurrentHeaderCount) ||
+			startIndex >= limit)
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup_locked;
+		}
+
+		for (index = (LONG)limit - 1; index >= (LONG)startIndex; --index)
+		{
+			Cdp_JOURNAL_RECORD_HEADER header;
+			UINT64 globalSequence;
+
+			if (link.StartSequence > MAXUINT64 - (ULONG)index)
+			{
+				status = STATUS_INTEGER_OVERFLOW;
+				goto cleanup_locked;
+			}
+			globalSequence = link.StartSequence + (ULONG)index;
+			RtlCopyMemory(
+				&header,
+				region + (ULONG)index * sizeof(header),
+				sizeof(header));
+			if ((header.Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) !=
+				(ULONG)index)
+			{
+				status = STATUS_DISK_CORRUPT_ERROR;
+				goto cleanup_locked;
+			}
+			if (CdpJournalHeaderIsDeleted(&header))
+			{
+				if ((header.Sequence & Cdp_JOURNAL_RECORD_FLAGS_MASK) !=
+					Cdp_JOURNAL_RECORD_FLAG_DELETED || header.DataLength != 0)
+				{
+					status = STATUS_DISK_CORRUPT_ERROR;
+					goto cleanup_locked;
+				}
+				continue;
+			}
+
+			if (CdpJournalHeaderIsBranch(&header))
+			{
+				Cdp_JOURNAL_BRANCH_RECORD_HEADER branch;
+				RtlCopyMemory(&branch, &header, sizeof(branch));
+				if ((header.Sequence & Cdp_JOURNAL_RECORD_FLAGS_MASK) !=
+					Cdp_JOURNAL_RECORD_FLAG_BRANCH ||
+					branch.Reserved != 0 || branch.BranchNumber <= 0 ||
+					branch.ParentBranchNumber < 0 ||
+					branch.ParentBranchNumber >= branch.BranchNumber)
+				{
+					status = STATUS_DISK_CORRUPT_ERROR;
+					goto cleanup_locked;
+				}
+				if (branch.BranchNumber != expectedBranch ||
+					globalSequence > allowedSequence)
+				{
+					continue;
+				}
+				if (branch.ParentBranchNumber == 0)
+				{
+					if (branch.InheritedRecordSequence != 0)
+					{
+						status = STATUS_DISK_CORRUPT_ERROR;
+						goto cleanup_locked;
+					}
+					ancestryComplete = TRUE;
+					break;
+				}
+				if (branch.InheritedRecordSequence == 0 ||
+					branch.InheritedRecordSequence >= globalSequence)
+				{
+					status = STATUS_DISK_CORRUPT_ERROR;
+					goto cleanup_locked;
+				}
+				expectedBranch = branch.ParentBranchNumber;
+				allowedSequence = branch.InheritedRecordSequence;
+				continue;
+			}
+
+			if ((header.Sequence & Cdp_JOURNAL_RECORD_FLAGS_MASK) != 0 ||
+				header.DataLength == 0 ||
+				header.DataLength > Cdp_JOURNAL_MAX_RECORD_DATA ||
+				header.VolumeOffset > MAXUINT64 - header.DataLength ||
+				header.FileOffset < CdpJournalUsableStart(Journal) ||
+				header.FileOffset > CdpJournalUsableEnd(Journal) ||
+				header.DataLength >
+					CdpJournalUsableEnd(Journal) - header.FileOffset)
+			{
+				status = STATUS_DISK_CORRUPT_ERROR;
+				goto cleanup_locked;
+			}
+			if (globalSequence <= allowedSequence &&
+				(!RestrictSequenceRange ||
+					(globalSequence >= FirstSequence &&
+					 globalSequence < EndSequence)))
+			{
+				Cdp_JOURNAL_RECORD record;
+				status = CdpJournalDecodeRecord(&link, &header, &record);
+				if (!NT_SUCCESS(status))
+					goto cleanup_locked;
+				status = CdpPreviewTreeInsert(Tree, &record);
+				if (!NT_SUCCESS(status))
+					goto cleanup_locked;
+			}
+		}
+
+		if (ancestryComplete)
+			break;
+		if (isOldest)
+		{
+			// Compaction materializes everything before the retained oldest
+			// region into the source volume, so a reclaimed branch marker is
+			// represented by this implicit source-backed ancestry base.
+			ancestryComplete = TRUE;
+			break;
+		}
+		if (link.PrevRegionOff == regionOff)
+			break;
+		regionEndSequence = link.StartSequence;
+		regionOff = link.PrevRegionOff;
+	}
+
+	if (!ancestryComplete)
+		status = STATUS_DISK_CORRUPT_ERROR;
+
+cleanup_locked:
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	if (!NT_SUCCESS(status))
+		CdpPreviewTreeFree(Tree);
+	return status;
+}
+
+NTSTATUS CdpJournalBuildCurrentBranchTree(
+	_Inout_ PCdp_JOURNAL Journal,
+	_Out_ PCdp_PREVIEW_TREE Tree)
+{
+	return CdpJournalBuildCurrentBranchTreeInternal(
+		Journal, FALSE, 0, 0, Tree);
+}
+
+NTSTATUS CdpJournalBuildCurrentBranchRegionTree(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 FirstSequence,
+	_In_ UINT64 EndSequence,
+	_Out_ PCdp_PREVIEW_TREE Tree)
+{
+	return CdpJournalBuildCurrentBranchTreeInternal(
+		Journal, TRUE, FirstSequence, EndSequence, Tree);
+}
+
+static PCdp_BRANCH_INFO_NODE CdpBranchTreeFindBySequence(
+	_In_ PCdp_BRANCH_INFO_TREE BranchTree,
+	_In_ UINT64 Sequence)
+{
+	PCdp_BRANCH_INFO_NODE branch;
+	for (branch = BranchTree->Last; branch; branch = branch->Previous)
+	{
+		if (Sequence >= branch->StartRecord.Sequence &&
+			Sequence <= branch->EndRecord.Sequence)
+		{
+			return branch;
+		}
+	}
+	return NULL;
+}
+
+static PCdp_BRANCH_INFO_NODE CdpBranchTreeFindTargetTime(
+	_In_ PCdp_BRANCH_INFO_TREE BranchTree,
+	_In_ UINT64 TargetTime100ns)
+{
+	PCdp_BRANCH_INFO_NODE branch;
+	PCdp_BRANCH_INFO_NODE target = BranchTree->First;
+	for (branch = BranchTree->First; branch; branch = branch->Next)
+	{
+		if (branch->StartRecord.WallClock100ns > TargetTime100ns)
+			break;
+		target = branch;
+	}
+	return target;
+}
+
+static BOOLEAN CdpBranchRecordBelongsToPreview(
+	_In_ PCdp_BRANCH_INFO_TREE BranchTree,
+	_In_ PCdp_BRANCH_INFO_NODE TargetBranch,
+	_In_ PCdp_BRANCH_INFO_NODE RecordBranch,
+	_In_ UINT64 RecordSequence,
+	_In_ UINT64 RecordTime100ns,
+	_In_ UINT64 TargetTime100ns,
+	_In_ BOOLEAN IncludeTargetTime)
+{
+	PCdp_BRANCH_INFO_NODE branch = TargetBranch;
+	UINT64 allowedSequence = MAXUINT64;
+
+	while (branch)
+	{
+		if (branch == RecordBranch)
+		{
+			if (RecordSequence > allowedSequence)
+				return FALSE;
+			if (branch == TargetBranch)
+			{
+				return IncludeTargetTime ?
+					RecordTime100ns <= TargetTime100ns :
+					RecordTime100ns < TargetTime100ns;
+			}
+			return TRUE;
+		}
+		allowedSequence = branch->InheritedRecordSequence;
+		branch = branch->Parent ? branch->Parent :
+			CdpBranchTreeFind(BranchTree, branch->ParentBranchNumber);
+	}
+	return FALSE;
+}
+
+NTSTATUS CdpJournalResolveTargetBranch(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 TargetTime100ns,
+	_Out_ PLONG BranchNumber,
+	_Out_ PUINT64 InheritedRecordSequence)
+{
+	PCdp_BRANCH_INFO_NODE targetBranch;
+	PUCHAR region = NULL;
+	UINT64 regionOff;
+	ULONG guardRegions = 0;
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Journal || !BranchNumber || !InheritedRecordSequence)
+		return STATUS_INVALID_PARAMETER;
+	*BranchNumber = 0;
+	*InheritedRecordSequence = 0;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted || !Journal->BranchTree.First)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup;
+	}
+	if (TargetTime100ns < Journal->Oldest100ns)
+		TargetTime100ns = Journal->Oldest100ns;
+	targetBranch = CdpBranchTreeFindTargetTime(
+		&Journal->BranchTree, TargetTime100ns);
+	if (!targetBranch)
+	{
+		status = STATUS_NOT_FOUND;
+		goto cleanup;
+	}
+	*BranchNumber = targetBranch->BranchNumber;
+	*InheritedRecordSequence = targetBranch->StartRecord.Sequence;
+	status = CdpJournalGetHeaderScanBufferLocked(Journal, &region);
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+
+	regionOff = Journal->OldestHeaderRegionOff;
+	for (;;)
+	{
+		Cdp_HEADER_REGION_LINK link;
+		ULONG limit;
+		ULONG startIndex;
+		ULONG index;
+		BOOLEAN isLast;
+
+		if (++guardRegions > 100000UL)
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup;
+		}
+		status = CdpJournalReadHeaderRegion(Journal, regionOff, region);
+		if (!NT_SUCCESS(status))
+			goto cleanup;
+		RtlCopyMemory(
+			&link,
+			region + Cdp_JOURNAL_HEADER_REGION_SIZE -
+				Cdp_JOURNAL_HEADER_LINK_SIZE,
+			sizeof(link));
+		if (!CdpJournalRegionLinkValid(Journal, &link))
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup;
+		}
+		isLast = regionOff == Journal->LastHeaderRegionOff;
+		status = CdpJournalGetRegionHeaderLimitLocked(
+			Journal, regionOff, &link, &limit, NULL);
+		if (!NT_SUCCESS(status))
+			goto cleanup;
+		startIndex = regionOff == Journal->OldestHeaderRegionOff ?
+			Journal->OldestHeaderIndex : 0;
+		for (index = startIndex; index < limit; ++index)
+		{
+			Cdp_JOURNAL_RECORD_HEADER header;
+			Cdp_JOURNAL_RECORD record;
+			PCdp_BRANCH_INFO_NODE recordBranch;
+
+			RtlCopyMemory(
+				&header, region + index * sizeof(header), sizeof(header));
+			if ((header.Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) != index)
+			{
+				status = STATUS_DISK_CORRUPT_ERROR;
+				goto cleanup;
+			}
+			if (CdpJournalHeaderIsDeleted(&header))
+				continue;
+			if (CdpJournalHeaderIsBranch(&header))
+				continue;
+			status = CdpJournalDecodeRecord(&link, &header, &record);
+			if (!NT_SUCCESS(status))
+				goto cleanup;
+			recordBranch = CdpBranchTreeFindBySequence(
+				&Journal->BranchTree, record.Sequence);
+			if (recordBranch == targetBranch &&
+				record.WallClock100ns <= TargetTime100ns)
+			{
+				*InheritedRecordSequence = record.Sequence;
+			}
+		}
+		if (isLast)
+			break;
+		regionOff = link.NextRegionOff;
+	}
+
+cleanup:
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
+NTSTATUS CdpJournalBuildPreviewTree(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 TargetTime100ns,
+	_In_ UINT64 MaxSequence,
+	_In_ BOOLEAN IncludeTargetTime,
+	_Out_ PCdp_PREVIEW_TREE Tree,
+	_Out_opt_ PUINT64 TargetRecordSequence)
+{
+	NTSTATUS status = STATUS_SUCCESS;
+	PCdp_BRANCH_INFO_NODE targetBranch;
+	UINT64 regionOff;
+	ULONG guardRegions = 0;
+	PUCHAR region = NULL;
+
+	if (!Journal || !Tree || MaxSequence == 0)
+		return STATUS_INVALID_PARAMETER;
+	CdpPreviewTreeInitialize(Tree);
+	if (TargetRecordSequence)
+		*TargetRecordSequence = 0;
+
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup_locked;
+	}
+	if (CdpJournalIsEmptyLocked(Journal) || !Journal->BranchTree.First)
+		goto cleanup_locked;
+	if (TargetTime100ns < Journal->Oldest100ns)
+		TargetTime100ns = Journal->Oldest100ns;
+	targetBranch = CdpBranchTreeFindTargetTime(
+		&Journal->BranchTree, TargetTime100ns);
+	if (!targetBranch)
+	{
+		status = STATUS_NOT_FOUND;
+		goto cleanup_locked;
+	}
+	if (TargetRecordSequence)
+		*TargetRecordSequence = targetBranch->StartRecord.Sequence;
+
+	status = CdpJournalGetHeaderScanBufferLocked(Journal, &region);
+	if (!NT_SUCCESS(status))
+		goto cleanup_locked;
+
+	// One chronological pass.  Branch membership comes from the runtime
+	// branch tree; only the selected branch and its recursive ancestry enter
+	// the preview map, with later after-images replacing earlier coverage.
+	regionOff = Journal->OldestHeaderRegionOff;
+	for (;;)
+	{
+		Cdp_HEADER_REGION_LINK link;
+		ULONG limit;
+		ULONG startIndex;
+		ULONG index;
+		BOOLEAN isLast;
+
+		if (++guardRegions > 100000UL)
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup_locked;
+		}
 		status = CdpJournalReadHeaderRegion(Journal, regionOff, region);
 		if (!NT_SUCCESS(status))
 			goto cleanup_locked;
@@ -2885,83 +4597,76 @@ NTSTATUS CdpJournalBuildPreviewTree(
 			status = STATUS_DISK_CORRUPT_ERROR;
 			goto cleanup_locked;
 		}
-		if (regionEndSequence <= link.StartSequence ||
-			regionEndSequence - link.StartSequence >
-				Cdp_JOURNAL_HEADERS_PER_REGION)
-		{
-			status = STATUS_DISK_CORRUPT_ERROR;
+		isLast = regionOff == Journal->LastHeaderRegionOff;
+		status = CdpJournalGetRegionHeaderLimitLocked(
+			Journal, regionOff, &link, &limit, NULL);
+		if (!NT_SUCCESS(status))
 			goto cleanup_locked;
-		}
+		startIndex = regionOff == Journal->OldestHeaderRegionOff ?
+			Journal->OldestHeaderIndex : 0;
 
-		isLast = (regionOff == Journal->LastHeaderRegionOff);
-		isOldest = (regionOff == Journal->OldestHeaderRegionOff);
-		limit = (ULONG)(regionEndSequence - link.StartSequence);
-		if (isLast && limit != Journal->CurrentHeaderCount)
-		{
-			status = STATUS_DISK_CORRUPT_ERROR;
-			goto cleanup_locked;
-		}
-
-		for (index = (LONG)limit - 1; index >= 0; --index)
+		for (index = startIndex; index < limit; ++index)
 		{
 			Cdp_JOURNAL_RECORD_HEADER header;
 			Cdp_JOURNAL_RECORD record;
-			ULONG startIndex = isOldest ? Journal->OldestHeaderIndex : 0;
-
-			if ((ULONG)index < startIndex)
-				break;
+			PCdp_BRANCH_INFO_NODE recordBranch;
 
 			RtlCopyMemory(
 				&header,
-				region + (ULONG)index *
-					sizeof(Cdp_JOURNAL_RECORD_HEADER),
+				region + index * sizeof(header),
 				sizeof(header));
-
-			if (header.DataLength == 0 ||
-				header.DataLength > Cdp_JOURNAL_MAX_RECORD_DATA ||
-				header.VolumeOffset > MAXUINT64 - header.DataLength ||
-				(header.Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) !=
-					(ULONG)index ||
-				(header.Sequence & Cdp_JOURNAL_RECORD_FLAGS_MASK &
-					~Cdp_JOURNAL_RECORD_FLAG_BACKFILL) != 0)
+			if ((header.Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) != index)
 			{
+				status = STATUS_DISK_CORRUPT_ERROR;
+				goto cleanup_locked;
+			}
+			if (CdpJournalHeaderIsDeleted(&header))
 				continue;
+			if (CdpJournalHeaderIsBranch(&header))
+				continue;
+			if ((header.Sequence & Cdp_JOURNAL_RECORD_FLAGS_MASK) != 0 ||
+				header.DataLength == 0 ||
+				header.DataLength > Cdp_JOURNAL_MAX_RECORD_DATA ||
+				header.VolumeOffset > MAXUINT64 - header.DataLength)
+			{
+				status = STATUS_DISK_CORRUPT_ERROR;
+				goto cleanup_locked;
 			}
 			status = CdpJournalDecodeRecord(&link, &header, &record);
 			if (!NT_SUCCESS(status))
 				goto cleanup_locked;
-
 			if (record.Sequence >= MaxSequence)
 				continue;
-
-			/* Backfill records are replay-protection COWs created while a
-			 * Recovery is active.  During target-time discovery they always
-			 * enter the tree and never satisfy the time stop condition. */
-			if ((record.Flags & Cdp_JOURNAL_RECORD_FLAG_BACKFILL) == 0 &&
-				(IncludeTargetTime ?
-					header.WallClock100ns < TargetTime100ns :
-					header.WallClock100ns <= TargetTime100ns))
+			recordBranch = CdpBranchTreeFindBySequence(
+				&Journal->BranchTree, record.Sequence);
+			if (!recordBranch ||
+				!CdpBranchRecordBelongsToPreview(
+					&Journal->BranchTree,
+					targetBranch,
+					recordBranch,
+					record.Sequence,
+					record.WallClock100ns,
+					TargetTime100ns,
+					IncludeTargetTime))
 			{
-				stop = TRUE;
-				break;
+				continue;
 			}
-
-			status = CdpPreviewTreeOverlayEarlier(Tree, &record);
+			status = CdpPreviewTreeOverlayLatest(Tree, &record);
 			if (!NT_SUCCESS(status))
 				goto cleanup_locked;
+			if (TargetRecordSequence && recordBranch == targetBranch)
+				*TargetRecordSequence = record.Sequence;
 		}
 
-		if (stop)
+		if (isLast)
 			break;
-		if (isOldest)
-			break;
-		if (link.PrevRegionOff == regionOff)
-			break;
-		regionEndSequence = link.StartSequence;
-		regionOff = link.PrevRegionOff;
+		if (link.NextRegionOff == regionOff)
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup_locked;
+		}
+		regionOff = link.NextRegionOff;
 	}
-
-	status = STATUS_SUCCESS;
 
 cleanup_locked:
 	Cdp_LOCK_RELEASE(&Journal->Lock);
@@ -3213,6 +4918,12 @@ VOID CdpJournalClose(_Inout_ PCdp_JOURNAL Journal)
 		cdpfree(Journal->HeaderScanAllocationBase);
 	Journal->HeaderScanAllocationBase = NULL;
 	Journal->HeaderScanBuffer = NULL;
+	if (Journal->HeaderWriteAllocationBase)
+		cdpfree(Journal->HeaderWriteAllocationBase);
+	Journal->HeaderWriteAllocationBase = NULL;
+	Journal->HeaderWriteBuffer = NULL;
+	Journal->HeaderWriteCacheValid = FALSE;
+	CdpBranchTreeFree(&Journal->BranchTree);
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	Cdp_LOCK_DELETE(&Journal->Lock);
 }

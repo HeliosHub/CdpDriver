@@ -123,6 +123,9 @@ typedef struct _TEST_FAIL_STORE
 	ULONG MaxWriteLength;
 	ULONG OversizeWriteCount;
 	ULONG LargestSuccessfulWrite;
+	UINT64 WatchedWriteOffset;
+	const VOID* WatchedWriteBuffer;
+	ULONG WatchedWriteLength;
 } TEST_FAIL_STORE, *PTEST_FAIL_STORE;
 
 static NTSTATUS TestFailStoreRead(
@@ -172,6 +175,11 @@ static NTSTATUS TestFailStoreWrite(
 	NTSTATUS status;
 
 	++fail->WriteCallCount;
+	if (Offset == fail->WatchedWriteOffset)
+	{
+		fail->WatchedWriteBuffer = Buffer;
+		fail->WatchedWriteLength = Length;
+	}
 	if (Offset == 0 && Length == Store->SectorSize)
 	{
 		++fail->SuperblockWriteCount;
@@ -221,6 +229,9 @@ static VOID TestFailStoreInstall(_Inout_ PCdp_STORE Store, _Out_ PTEST_FAIL_STOR
 	Fail->MaxWriteLength = 0;
 	Fail->OversizeWriteCount = 0;
 	Fail->LargestSuccessfulWrite = 0;
+	Fail->WatchedWriteOffset = ~(UINT64)0;
+	Fail->WatchedWriteBuffer = NULL;
+	Fail->WatchedWriteLength = 0;
 	Store->Context = Fail;
 	Store->Read = TestFailStoreRead;
 	Store->Write = TestFailStoreWrite;
@@ -252,16 +263,6 @@ static VOID TestCtxDestroy(_Inout_ PTEST_CTX Ctx)
 	}
 }
 
-static NTSTATUS TestRecoveryOneShot(
-	_Inout_ PCdp_CORE Core,
-	_In_ UINT64 TargetTime100ns)
-{
-	NTSTATUS status = CdpCoreRecoveryBegin(Core, TargetTime100ns);
-	if (!NT_SUCCESS(status))
-		return status;
-	return CdpCoreRecoveryCommit(Core);
-}
-
 static int RunCase(const char* title, int (*fn)(void))
 {
 	int failed;
@@ -274,3122 +275,1376 @@ static int RunCase(const char* title, int (*fn)(void))
 	return failed;
 }
 
-/* --- existing end-to-end --- */
-
-static int TestCowPreviewRecovery(void)
+static int TestAfterImageInitialBranchRecord(void)
 {
 	TEST_CTX ctx;
-	UCHAR a[512];
-	UCHAR b[512];
-	UCHAR c[512];
-	UCHAR out[512];
-	UINT64 t0, t1, t2;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 1000)),
-		"setup core");
-
-	FillPattern(a, sizeof(a), 0x10);
-	FillPattern(b, sizeof(b), 0x20);
-	FillPattern(c, sizeof(c), 0x30);
-
-	st = ctx.Source->Write(ctx.Source, 0, sizeof(a), a);
-	Expect(NT_SUCCESS(st), "seed source with A");
-
-	t0 = CdpCoreGetTime100ns(ctx.Core);
-	st = CdpCoreWrite(ctx.Core, 0, sizeof(b), b);
-	Expect(NT_SUCCESS(st), "COW write B over A");
-	t1 = CdpCoreGetTime100ns(ctx.Core);
-
-	st = CdpCoreWrite(ctx.Core, 0, sizeof(c), c);
-	Expect(NT_SUCCESS(st), "COW write C over B");
-	t2 = CdpCoreGetTime100ns(ctx.Core);
-	Expect(t2 > t1 && t1 > t0, "time advances on COW");
-
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, c, sizeof(c)) == 0,
-		"Normal read sees C (live)");
-
-	st = CdpCorePreviewBegin(ctx.Core, t0);
-	Expect(NT_SUCCESS(st), "PreviewBegin at t0");
-	Expect(CdpCoreGetPhase(ctx.Core) == Cdp_CORE_PHASE_PREVIEW, "phase Preview");
-	Expect(CdpCoreGetTargetTime100ns(ctx.Core) == t0, "target time saved");
-
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, a, sizeof(a)) == 0,
-		"Preview at t0 includes t0 record and sees A");
-
-	st = CdpCorePreviewEnd(ctx.Core);
-	Expect(NT_SUCCESS(st), "PreviewEnd");
-	Expect(CdpCoreGetPhase(ctx.Core) == Cdp_CORE_PHASE_GENERAL, "phase General");
-
-	st = TestRecoveryOneShot(ctx.Core, t0);
-	Expect(NT_SUCCESS(st), "RecoveryBegin at t0");
-	Expect(CdpCoreGetPhase(ctx.Core) == Cdp_CORE_PHASE_GENERAL,
-		"one-shot Recovery returns to General");
-
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, a, sizeof(a)) == 0,
-		"Recovery at t0 includes t0 record and reads A");
-
-	Expect(memcmp(CdpMemStoreData(ctx.Source), a, sizeof(a)) == 0,
-		"Recovery at t0 physically writes back t0 before-image A");
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-static int TestRecoveryInvalidate(void)
-{
-	TEST_CTX ctx;
-	UCHAR a[512];
-	UCHAR b[512];
-	UCHAR n[512];
-	UCHAR out[512];
-	UINT64 t1;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 5000)), "setup");
-
-	FillPattern(a, sizeof(a), 0x41);
-	FillPattern(b, sizeof(b), 0x42);
-	FillPattern(n, sizeof(n), 0x4E);
-	ctx.Source->Write(ctx.Source, 0, sizeof(a), a);
-	CdpCoreWrite(ctx.Core, 0, sizeof(b), b);
-	t1 = CdpCoreGetTime100ns(ctx.Core);
-
-	st = TestRecoveryOneShot(ctx.Core, t1 - 1);
-	Expect(NT_SUCCESS(st), "RecoveryBegin before B");
-
-	st = CdpCoreWrite(ctx.Core, 0, sizeof(n), n);
-	Expect(NT_SUCCESS(st), "write after one-shot recovery");
-
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, n, sizeof(n)) == 0,
-		"read after Recovery sees new write");
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- driver-style capture append (journal only, no source write) --- */
-
-static int TestCaptureAppendPath(void)
-{
-	TEST_CTX ctx;
-	UCHAR seed[512];
-	UCHAR data[512];
-	UCHAR out[512];
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 2000)), "setup");
-
-	FillPattern(seed, sizeof(seed), 0x01);
-	FillPattern(data, sizeof(data), 0x55);
-	ctx.Source->Write(ctx.Source, 0, sizeof(seed), seed);
-
-	st = CdpCoreCaptureAppend(ctx.Core, 0, sizeof(data), NULL);
-	Expect(NT_SUCCESS(st), "CaptureAppend journals before-image");
-
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, seed, sizeof(seed)) == 0,
-		"Normal read still sees pre-append live data");
-
-	st = ctx.Source->Write(ctx.Source, 0, sizeof(data), data);
-	Expect(NT_SUCCESS(st), "caller applies write separately");
-
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, data, sizeof(data)) == 0,
-		"live data updated after caller write");
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- mixed journal + live gap fill in Preview --- */
-
-static int TestMixedReadPartialCoverage(void)
-{
-	TEST_CTX ctx;
-	UCHAR whole[1024];
-	UCHAR half[512];
-	UCHAR out[1024];
-	UINT64 tAfterHalf;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 3000)), "setup");
-
-	FillPattern(whole, sizeof(whole), 0xAA);
-	FillPattern(half, sizeof(half), 0xBB);
-	ctx.Source->Write(ctx.Source, 0, sizeof(whole), whole);
-
-	tAfterHalf = CdpCoreGetTime100ns(ctx.Core);
-	st = CdpCoreWrite(ctx.Core, 0, sizeof(half), half);
-	Expect(NT_SUCCESS(st), "COW first half only");
-
-	st = CdpCorePreviewBegin(ctx.Core, tAfterHalf);
-	Expect(NT_SUCCESS(st), "PreviewBegin");
-
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st), "Preview mixed read ok");
-	Expect(memcmp(out, whole, sizeof(half)) == 0,
-		"covered prefix uses target-time record before-image (A)");
-	Expect(memcmp(out + sizeof(half), whole + sizeof(half),
-			sizeof(whole) - sizeof(half)) == 0,
-		"uncovered suffix from live (A)");
-
-	CdpCorePreviewEnd(ctx.Core);
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- multi-offset + overlapping dedup (earliest sequence wins) --- */
-
-static int TestMultiOffsetAndDedup(void)
-{
-	TEST_CTX ctx;
-	UCHAR seed0[512];
-	UCHAR seed1[512];
-	UCHAR cow0[512];
-	UCHAR cow1[512];
-	UCHAR out[512];
-	UINT64 tAfterFirstCow;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 4000)), "setup");
-
-	FillPattern(seed0, sizeof(seed0), 0xA0);
-	FillPattern(seed1, sizeof(seed1), 0xA1);
-	FillPattern(cow0, sizeof(cow0), 0xB0);
-	FillPattern(cow1, sizeof(cow1), 0xB1);
-	ctx.Source->Write(ctx.Source, 0, sizeof(seed0), seed0);
-	ctx.Source->Write(ctx.Source, 512, sizeof(seed1), seed1);
-
-	CdpCoreWrite(ctx.Core, 0, sizeof(cow0), cow0);
-	tAfterFirstCow = CdpCoreGetTime100ns(ctx.Core);
-	CdpCoreWrite(ctx.Core, 512, sizeof(cow1), cow1);
-
-	/* Target = first record WallClock (tAfterFirstCow - 1): Oldest <= T < Newest */
-	st = CdpCorePreviewBegin(ctx.Core, tAfterFirstCow - 1);
-	Expect(NT_SUCCESS(st), "PreviewBegin after two COWs at first record time");
-
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, seed0, sizeof(seed0)) == 0,
-		"offset 0 includes oldest target-time COW record");
-
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 512, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, seed1, sizeof(seed1)) == 0,
-		"offset 512 preview sees before-image of second COW (seed1)");
-
-	CdpCorePreviewEnd(ctx.Core);
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- query time range + mount persistence --- */
-
-static int TestQueryTimeRangeAndMount(void)
-{
-	TEST_CTX ctx;
-	PCdp_CORE core2 = NULL;
-	UINT64 oldest = 0;
-	UINT64 newest = 0;
-	UINT64 ticked;
-	UCHAR buf[512];
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 6000)), "setup");
-
-	FillPattern(buf, sizeof(buf), 0x71);
-	ctx.Source->Write(ctx.Source, 0, sizeof(buf), buf);
-	CdpCoreWrite(ctx.Core, 0, sizeof(buf), buf);
-
-	st = CdpCoreQueryTimeRange(ctx.Core, &oldest, &newest);
-	Expect(NT_SUCCESS(st), "QueryTimeRange after COW");
-	Expect(oldest <= newest, "oldest <= newest");
-	Expect(newest >= 6000, "newest reflects writes");
-
-	ticked = CdpCoreTick(ctx.Core, 42);
-	Expect(ticked == CdpCoreGetTime100ns(ctx.Core), "CdpCoreTick");
-
-	CdpCoreDestroy(ctx.Core);
-	ctx.Core = NULL;
-
-	st = CdpCoreCreate(ctx.Source, ctx.Journal, &core2);
-	Expect(NT_SUCCESS(st), "recreate core on same stores");
-	st = CdpCoreMountJournal(core2);
-	Expect(NT_SUCCESS(st), "MountJournal on formatted partition");
-
-	st = CdpCoreQueryTimeRange(core2, &oldest, &newest);
-	Expect(NT_SUCCESS(st), "QueryTimeRange after mount");
-	Expect(newest >= oldest, "newest >= oldest after mount");
-	Expect(oldest >= 6000, "oldest time persisted across mount");
-
-	CdpCoreDestroy(core2);
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- invalid parameters and phase guards --- */
-
-static int TestErrorsAndPhaseGuards(void)
-{
-	TEST_CTX ctx;
-	UCHAR buf[512];
-	PCdp_CORE bogus = NULL;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 7000)), "setup");
-
-	Expect(CdpCoreCreate(NULL, ctx.Journal, &bogus) ==
-			STATUS_INVALID_PARAMETER,
-		"Create rejects null source");
-	Expect(CdpCoreRead(NULL, 0, sizeof(buf), buf) ==
-			STATUS_INVALID_PARAMETER,
-		"Read rejects null core");
-	Expect(CdpCoreWrite(ctx.Core, 0, 0, buf) ==
-			STATUS_INVALID_PARAMETER,
-		"Write rejects zero length");
-	Expect(CdpCoreCaptureAppend(ctx.Core, 0, 0, NULL) ==
-			STATUS_INVALID_PARAMETER,
-		"CaptureAppend rejects zero length");
-
-	st = CdpCorePreviewBegin(ctx.Core, 7000);
-	Expect(NT_SUCCESS(st), "PreviewBegin ok");
-	Expect(CdpCorePreviewBegin(ctx.Core, 7000) ==
-			STATUS_INVALID_DEVICE_STATE,
-		"PreviewBegin rejected while already Preview");
-	Expect(TestRecoveryOneShot(ctx.Core, 7000) ==
-			STATUS_INVALID_DEVICE_STATE,
-		"RecoveryBegin rejected while Preview");
-
-	CdpCorePreviewEnd(ctx.Core);
-
-	st = TestRecoveryOneShot(ctx.Core, 7000);
-	Expect(NT_SUCCESS(st), "RecoveryBegin ok");
-	Expect(CdpCoreGetPhase(ctx.Core) == Cdp_CORE_PHASE_GENERAL,
-		"Recovery completes in General phase");
-	Expect(NT_SUCCESS(CdpCorePreviewBegin(ctx.Core, 7000)),
-		"PreviewBegin allowed after one-shot Recovery");
-	Expect(NT_SUCCESS(CdpCorePreviewEnd(ctx.Core)),
-		"PreviewEnd succeeds after one-shot Recovery");
-	Expect(NT_SUCCESS(TestRecoveryOneShot(ctx.Core, 7000)),
-		"another one-shot Recovery is allowed");
-
-	Expect(CdpCorePreviewEnd(ctx.Core) == STATUS_INVALID_DEVICE_STATE,
-		"PreviewEnd rejected while General");
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- preview write after session established (PreviewTree live update) --- */
-
-static int TestPreviewWriteDuringSession(void)
-{
-	TEST_CTX ctx;
-	UCHAR a[512];
-	UCHAR b[512];
-	UCHAR c[512];
-	UCHAR seedExtra[512];
-	UCHAR extra[512];
-	UCHAR out[512];
-	UINT64 tAfterB;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 8000)), "setup");
-
-	FillPattern(a, sizeof(a), 0xA0);
-	FillPattern(b, sizeof(b), 0xB0);
-	FillPattern(c, sizeof(c), 0xC0);
-	FillPattern(seedExtra, sizeof(seedExtra), 0x11);
-	FillPattern(extra, sizeof(extra), 0xE0);
-	ctx.Source->Write(ctx.Source, 0, sizeof(a), a);
-	ctx.Source->Write(ctx.Source, 1024, sizeof(seedExtra), seedExtra);
-
-	CdpCoreWrite(ctx.Core, 0, sizeof(b), b);
-	tAfterB = CdpCoreGetTime100ns(ctx.Core);
-	CdpCoreWrite(ctx.Core, 0, sizeof(c), c);
-
-	st = CdpCorePreviewBegin(ctx.Core, tAfterB);
-	Expect(NT_SUCCESS(st), "PreviewBegin at C record time");
-
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, b, sizeof(b)) == 0,
-		"Preview read returns before-image B (from C's journal record)");
-
-	st = CdpCoreWrite(ctx.Core, 1024, sizeof(extra), extra);
-	Expect(NT_SUCCESS(st), "COW during Preview at offset 1024");
-
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 1024, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, seedExtra, sizeof(seedExtra)) == 0,
-		"Preview read at 1024 returns before-image (not post-write live)");
-
-	CdpCorePreviewEnd(ctx.Core);
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- preview at seed-only (no COW yet) --- */
-
-static int TestPreviewBeforeAnyCow(void)
-{
-	TEST_CTX ctx;
-	UCHAR seed[512];
-	UCHAR out[512];
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 9000)), "setup");
-
-	FillPattern(seed, sizeof(seed), 0xE0);
-	ctx.Source->Write(ctx.Source, 0, sizeof(seed), seed);
-
-	st = CdpCorePreviewBegin(ctx.Core, 9500);
-	Expect(NT_SUCCESS(st), "PreviewBegin with empty journal tree");
-
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, seed, sizeof(seed)) == 0,
-		"Preview with no history falls back to live seed");
-
-	CdpCorePreviewEnd(ctx.Core);
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- staging during Preview build (Merge into tree) --- */
-
-static UCHAR g_stagingBuf[512];
-
-static VOID PreviewBuildHook_InsertStaging(_Inout_ PCdp_CORE Core)
-{
-	FillPattern(g_stagingBuf, sizeof(g_stagingBuf), 0x51);
-	(void)CdpCoreWrite(Core, 256, sizeof(g_stagingBuf), g_stagingBuf);
-}
-
-static int TestPreviewStagingMerge(void)
-{
-	TEST_CTX ctx;
-	UCHAR base[512];
-	UCHAR early[512];
-	UCHAR beforeStaging[512];
-	UCHAR out[512];
-	UINT64 t0;
-	NTSTATUS st;
-
-	CdpCoreTestSetPreviewBuildHook(NULL);
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 10000)), "setup");
-
-	FillPattern(base, sizeof(base), 0xF0);
-	FillPattern(early, sizeof(early), 0xF1);
-	ctx.Source->Write(ctx.Source, 0, sizeof(base), base);
-
-	CdpCoreWrite(ctx.Core, 0, sizeof(early), early);
-	t0 = CdpCoreGetTime100ns(ctx.Core);
-	FillPattern(beforeStaging, sizeof(beforeStaging), 0xF2);
-	ctx.Source->Write(ctx.Source, 256, sizeof(beforeStaging), beforeStaging);
-
-	CdpCoreTestSetPreviewBuildHook(PreviewBuildHook_InsertStaging);
-	st = CdpCorePreviewBegin(ctx.Core, t0);
-	CdpCoreTestSetPreviewBuildHook(NULL);
-	Expect(NT_SUCCESS(st), "PreviewBegin with staging hook");
-
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 256, sizeof(out), out);
-	Expect(NT_SUCCESS(st) &&
-			memcmp(out, beforeStaging, sizeof(beforeStaging)) == 0,
-		"Preview staging merge serves before-image at offset 256");
-
-	CdpCorePreviewEnd(ctx.Core);
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- staging during Recovery build (Punch History, not merge) --- */
-
-static UCHAR g_punchBuf[512];
-
-static VOID RecoveryBuildHook_StagingPunch(_Inout_ PCdp_CORE Core)
-{
-	FillPattern(g_punchBuf, sizeof(g_punchBuf), 0x50);
-	(void)CdpCoreWrite(Core, 0, sizeof(g_punchBuf), g_punchBuf);
-}
-
-static int TestRecoveryStagingPunch(void)
-{
-	TEST_CTX ctx;
-	UCHAR a[512];
-	UCHAR b[512];
-	UCHAR c[512];
-	UCHAR out[512];
-	UINT64 t0, t1;
-	NTSTATUS st;
-
-	CdpCoreTestSetRecoveryBuildHook(NULL);
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 11000)), "setup");
-
-	FillPattern(a, sizeof(a), 0x01);
-	FillPattern(b, sizeof(b), 0x02);
-	FillPattern(c, sizeof(c), 0x03);
-	ctx.Source->Write(ctx.Source, 0, sizeof(a), a);
-
-	t0 = CdpCoreGetTime100ns(ctx.Core);
-	CdpCoreWrite(ctx.Core, 0, sizeof(b), b);
-	t1 = CdpCoreGetTime100ns(ctx.Core);
-	CdpCoreWrite(ctx.Core, 0, sizeof(c), c);
-
-	/* Recover to t1: history should be B, staging during build punches B */
-	CdpCoreTestSetRecoveryBuildHook(RecoveryBuildHook_StagingPunch);
-	st = TestRecoveryOneShot(ctx.Core, t1);
-	CdpCoreTestSetRecoveryBuildHook(NULL);
-	Expect(NT_SUCCESS(st), "RecoveryBegin with staging punch hook");
-
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, g_punchBuf, sizeof(g_punchBuf)) == 0,
-		"Recovery read after punch sees staging/live (not punched-back B)");
-
-	/* Source should have writeback of A only (B was punched), plus staging write */
-	Expect(memcmp(CdpMemStoreData(ctx.Source), g_punchBuf, sizeof(g_punchBuf)) == 0,
-		"source reflects post-punch writeback path");
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- recovery writeback: earliest sequence wins on overlap --- */
-
-static int TestRecoveryWritebackOverlap(void)
-{
-	TEST_CTX ctx;
-	UCHAR a[512];
-	UCHAR bFull[512];
-	UCHAR bTail[256];
-	UCHAR out[512];
-	UINT64 tAfterFull;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 12000)), "setup");
-
-	FillPattern(a, sizeof(a), 0xA5);
-	FillPattern(bFull, sizeof(bFull), 0xB5);
-	FillPattern(bTail, sizeof(bTail), 0xBE);
-	ctx.Source->Write(ctx.Source, 0, sizeof(a), a);
-
-	CdpCoreWrite(ctx.Core, 0, sizeof(bFull), bFull);
-	tAfterFull = CdpCoreGetTime100ns(ctx.Core);
-	CdpCoreWrite(ctx.Core, 256, sizeof(bTail), bTail);
-
-	st = TestRecoveryOneShot(ctx.Core, tAfterFull);
-	Expect(NT_SUCCESS(st), "RecoveryBegin to full B time");
-
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, bFull, sizeof(bFull)) == 0,
-		"Recovery read full block");
-	Expect(memcmp(CdpMemStoreData(ctx.Source), bFull, sizeof(bFull)) == 0,
-		"writeback restores full B (earlier seq on overlap)");
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- unmounted journal operations fail --- */
-
-static int TestUnmountedJournal(void)
-{
-	TEST_CTX ctx;
-	UCHAR buf[512];
-	PCdp_CORE bare = NULL;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 13000)), "setup");
-	CdpCoreDestroy(ctx.Core);
-	ctx.Core = NULL;
-
-	Expect(NT_SUCCESS(CdpCoreCreate(ctx.Source, ctx.Journal, &bare)),
-		"create without format/mount");
-	Expect(CdpCoreCaptureAppend(bare, 0, sizeof(buf), NULL) ==
-			STATUS_DEVICE_NOT_READY,
-		"CaptureAppend fails when journal not mounted");
-	Expect(CdpCorePreviewBegin(bare, 13000) == STATUS_DEVICE_NOT_READY,
-		"PreviewBegin fails when journal not mounted");
-	Expect(TestRecoveryOneShot(bare, 13000) == STATUS_DEVICE_NOT_READY,
-		"RecoveryBegin fails when journal not mounted");
-
-	CdpCoreDestroy(bare);
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- journal ring: drop oldest when payload ring is full --- */
-
-static NTSTATUS TestAppendJournalRecord(
-	_Inout_ PTEST_CTX Ctx,
-	_In_ UINT64 Time100ns,
-	_In_ UINT64 Offset,
-	_In_reads_bytes_(Length) PUCHAR Data,
-	_In_ ULONG Length)
-{
-	NTSTATUS st;
-
-	/* Match driver/COW order: journal before-image, then live write. */
-	CdpCoreSetTime100ns(Ctx->Core, Time100ns);
-	st = CdpCoreCaptureAppend(Ctx->Core, Offset, Length, NULL);
-	if (!NT_SUCCESS(st))
-		return st;
-	return Ctx->Source->Write(Ctx->Source, Offset, Length, Data);
-}
-
-static int TestJournalDropOldest(void)
-{
-	TEST_CTX ctx;
-	UCHAR buf[512];
-	UCHAR out[512];
-	UCHAR expectLive[512];
-	UCHAR expectSnapshot[512];
-	UINT64 oldest = 0;
-	UINT64 newest = 0;
-	UINT64 firstTime = 20000;
-	ULONG i;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, SMALL_JNL_SIZE, firstTime)),
-		"setup small journal");
-
-	for (i = 0; i < 2600; ++i)
-	{
-		FillPattern(buf, sizeof(buf), (UCHAR)(i & 0xFF));
-		st = TestAppendJournalRecord(
-			&ctx,
-			firstTime + i,
-			0,
-			buf,
-			sizeof(buf));
-		Expect(NT_SUCCESS(st), "append under ring pressure");
-		if (!NT_SUCCESS(st))
-			break;
-	}
-
-	st = CdpCoreQueryTimeRange(ctx.Core, &oldest, &newest);
-	Expect(NT_SUCCESS(st), "QueryTimeRange after fill");
-	Expect(oldest > firstTime + 100,
-		"oldest record evicted (ring dropped early entries)");
-	Expect(newest >= firstTime + 2599, "newest retains latest write");
-
-	/* A request before the retained range is clamped to the oldest record. */
-	st = CdpCorePreviewBegin(ctx.Core, firstTime + 50);
-	Expect(NT_SUCCESS(st),
-		"preview before oldest succeeds at oldest fallback");
-	Expect(CdpCoreGetTargetTime100ns(ctx.Core) == oldest,
-		"preview target is clamped to oldest retained time");
-	FillPattern(
-		expectLive,
-		sizeof(expectLive),
-		(UCHAR)((oldest - firstTime - 1) & 0xFF));
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, expectLive, sizeof(out)) == 0,
-		"preview before oldest reconstructs the oldest retained view");
-	CdpCorePreviewEnd(ctx.Core);
-
-	st = CdpCorePreviewBegin(ctx.Core, newest);
-	Expect(NT_SUCCESS(st), "preview near newest still works");
-	FillPattern(expectSnapshot, sizeof(expectSnapshot), (UCHAR)(2598 & 0xFF));
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, expectSnapshot, sizeof(out)) == 0,
-		"preview near newest reconstructs offset 0 before latest write");
-	CdpCorePreviewEnd(ctx.Core);
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- payload hits partition tail, wraps, continues after drop-oldest --- */
-
-static int TestJournalPayloadTailWrap(void)
-{
-	TEST_CTX ctx;
-	TEST_FAIL_STORE journalReads;
-	UCHAR buf[512];
-	UINT64 oldestBefore = 0;
-	UINT64 newestBefore = 0;
-	UINT64 oldestAfter = 0;
-	UINT64 newestAfter = 0;
-	UINT64 partitionBytes = 0;
-	UINT64 metadataBytes = 0;
-	UINT64 payloadBytesUsed = 0;
-	UINT64 payloadBytesFree = 0;
-	UINT64 totalRecords = 0;
-	UINT64 previousRecords = 0;
-	UINT64 firstTime = 30000;
-	ULONG i;
-	BOOLEAN regionDropped = FALSE;
-	NTSTATUS st;
-	ULONG tailFillRecords;
-
-	/* First payload region space ~= journal - fixed header region - metadata. */
-	tailFillRecords = (ULONG)((SMALL_JNL_SIZE -
-		Cdp_JOURNAL_HEADER_REGION_SIZE - 4096ULL) / 512ULL);
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, SMALL_JNL_SIZE, firstTime)),
-		"setup small journal");
-
-	for (i = 0; i < tailFillRecords; ++i)
-	{
-		FillPattern(buf, sizeof(buf), (UCHAR)(0x80 + (i & 0x7F)));
-		st = TestAppendJournalRecord(
-			&ctx,
-			firstTime + i,
-			0,
-			buf,
-			sizeof(buf));
-		Expect(NT_SUCCESS(st), "fill toward partition tail");
-	}
-
-	st = CdpCoreQueryTimeRange(ctx.Core, &oldestBefore, &newestBefore);
-	Expect(NT_SUCCESS(st), "QueryTimeRange before tail wrap");
-	TestFailStoreInstall(ctx.Journal, &journalReads);
-	journalReads.MaxReadLength = SECTOR;
-
-	/* Next append must wrap payload cursor off the end and still succeed. */
-	FillPattern(buf, sizeof(buf), 0xEE);
-	st = TestAppendJournalRecord(
-		&ctx,
-		firstTime + tailFillRecords,
-		0,
-		buf,
-		sizeof(buf));
-	Expect(NT_SUCCESS(st), "append after tail wrap");
-	st = CdpCoreQueryJournalUsage(
-		ctx.Core,
-		&partitionBytes,
-		&metadataBytes,
-		&payloadBytesUsed,
-		&payloadBytesFree,
-		&totalRecords);
-	Expect(NT_SUCCESS(st), "query usage while approaching tail pressure");
-	previousRecords = totalRecords;
-
-	st = TestAppendJournalRecord(
-		&ctx,
-		firstTime + tailFillRecords + 1,
-		512,
-		buf,
-		sizeof(buf));
-	Expect(NT_SUCCESS(st), "append continues after wrap (drop-oldest if needed)");
-	st = CdpCoreQueryJournalUsage(
-		ctx.Core,
-		&partitionBytes,
-		&metadataBytes,
-		&payloadBytesUsed,
-		&payloadBytesFree,
-		&totalRecords);
-	Expect(NT_SUCCESS(st), "query usage after wrapped append");
-	if (NT_SUCCESS(st) && totalRecords < previousRecords)
-	{
-		regionDropped = TRUE;
-		Expect(totalRecords == 1,
-			"tail pressure drops the complete oldest header region");
-	}
-	previousRecords = totalRecords;
-
-	for (i = 0; i < 32 && !regionDropped; ++i)
-	{
-		st = TestAppendJournalRecord(
-			&ctx,
-			firstTime + tailFillRecords + 2 + i,
-			512,
-			buf,
-			sizeof(buf));
-		Expect(NT_SUCCESS(st), "append until whole-region reclamation");
-		st = CdpCoreQueryJournalUsage(
-			ctx.Core,
-			&partitionBytes,
-			&metadataBytes,
-			&payloadBytesUsed,
-			&payloadBytesFree,
-			&totalRecords);
-		Expect(NT_SUCCESS(st), "query usage during whole-region reclamation");
-		if (NT_SUCCESS(st) && totalRecords < previousRecords)
-		{
-			regionDropped = TRUE;
-			Expect(totalRecords == 1,
-				"tail pressure drops the complete oldest header region");
-		}
-		previousRecords = totalRecords;
-	}
-	Expect(regionDropped,
-		"tail pressure eventually triggers whole-region reclamation");
-
-	st = TestAppendJournalRecord(
-		&ctx,
-		firstTime + tailFillRecords + 40,
-		1024,
-		buf,
-		sizeof(buf));
-	Expect(NT_SUCCESS(st), "append after whole-region reclamation");
-	st = CdpCoreQueryJournalUsage(
-		ctx.Core,
-		&partitionBytes,
-		&metadataBytes,
-		&payloadBytesUsed,
-		&payloadBytesFree,
-		&totalRecords);
-	Expect(NT_SUCCESS(st) && totalRecords == 2,
-		"new records accumulate after whole-region reclamation");
-	Expect(journalReads.OversizeReadCount == 0 &&
-		journalReads.LargestSuccessfulRead <= SECTOR,
-		"whole-region reclamation does not read the 1MB header region");
-
-	st = CdpCoreQueryTimeRange(ctx.Core, &oldestAfter, &newestAfter);
-	Expect(NT_SUCCESS(st), "QueryTimeRange after tail wrap");
-	Expect(newestAfter >= newestBefore, "newest advances after tail wrap");
-	Expect(oldestAfter >= oldestBefore,
-		"oldest time non-decreasing across tail wrap");
-	if (oldestBefore > firstTime)
-	{
-		Expect(oldestAfter > oldestBefore,
-			"tail wrap triggered additional eviction");
-	}
-
-	TestFailStoreRemove(ctx.Journal, &journalReads);
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- tiny journal: large record + remount after ring pressure --- */
-
-static int TestJournalTinyPartitionLargeRecord(void)
-{
-	TEST_CTX ctx;
-	UCHAR smallBuf[512];
-	UCHAR largeBuf[8192];
-	UCHAR outBuf[8192];
-	UINT64 oldest = 0;
-	UINT64 newest = 0;
-	UINT64 firstTime = 40000;
-	UINT64 partitionBytes = 0;
-	UINT64 metadataBytes = 0;
-	UINT64 payloadUsedBeforeMount = 0;
-	UINT64 payloadFreeBeforeMount = 0;
-	UINT64 totalBeforeMount = 0;
-	UINT64 payloadUsedAfterMount = 0;
-	UINT64 payloadFreeAfterMount = 0;
-	UINT64 totalAfterMount = 0;
-	ULONG i;
-	NTSTATUS st;
-	PCdp_CORE remounted = NULL;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, TINY_JNL_SIZE, firstTime)),
-		"setup tiny journal");
-
-	FillPattern(largeBuf, sizeof(largeBuf), 0xD0);
-	st = TestAppendJournalRecord(&ctx, firstTime, 0, largeBuf, sizeof(largeBuf));
-	Expect(NT_SUCCESS(st), "large append on tiny journal");
-
-	for (i = 0; i < 24; ++i)
-	{
-		FillPattern(smallBuf, sizeof(smallBuf), (UCHAR)(0xA0 + i));
-		st = TestAppendJournalRecord(
-			&ctx,
-			firstTime + 1 + i,
-			512,
-			smallBuf,
-			sizeof(smallBuf));
-		Expect(NT_SUCCESS(st), "small appends force tail wrap on tiny volume");
-	}
-
-	st = CdpCoreQueryTimeRange(ctx.Core, &oldest, &newest);
-	Expect(NT_SUCCESS(st), "QueryTimeRange on tiny journal");
-	Expect(oldest > firstTime, "tiny journal evicted oldest large record");
-
-	/* Overwrite live offset 0 so preview cannot mask eviction via live data. */
-	FillPattern(smallBuf, sizeof(smallBuf), 0xFF);
-	st = ctx.Source->Write(ctx.Source, 0, sizeof(smallBuf), smallBuf);
-	Expect(NT_SUCCESS(st), "overwrite live offset 0 after eviction");
-
-	st = CdpCorePreviewBegin(ctx.Core, firstTime);
-	Expect(NT_SUCCESS(st),
-		"preview before evicted oldest on tiny journal (empty tree)");
-	memset(outBuf, 0, sizeof(outBuf));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(smallBuf), outBuf);
-	Expect(NT_SUCCESS(st) && memcmp(outBuf, smallBuf, sizeof(smallBuf)) == 0,
-		"evicted large record not reconstructable from journal");
-	CdpCorePreviewEnd(ctx.Core);
-
-	st = CdpCorePreviewBegin(ctx.Core, newest);
-	Expect(NT_SUCCESS(st), "preview newest on tiny journal");
-	memset(outBuf, 0, sizeof(outBuf));
-	st = CdpCoreRead(ctx.Core, 512, sizeof(smallBuf), outBuf);
-	Expect(NT_SUCCESS(st), "read recent offset after tiny journal churn");
-	FillPattern(smallBuf, sizeof(smallBuf), (UCHAR)(0xA0 + 22));
-	Expect(memcmp(outBuf, smallBuf, sizeof(smallBuf)) == 0,
-		"preview near newest shows before-image of recent 512 write");
-	CdpCorePreviewEnd(ctx.Core);
-	st = CdpCoreQueryJournalUsage(
-		ctx.Core,
-		&partitionBytes,
-		&metadataBytes,
-		&payloadUsedBeforeMount,
-		&payloadFreeBeforeMount,
-		&totalBeforeMount);
-	Expect(NT_SUCCESS(st), "query occupied span before churn remount");
-
-	CdpCoreDestroy(ctx.Core);
-	ctx.Core = NULL;
-	st = CdpCoreCreate(ctx.Source, ctx.Journal, &remounted);
-	Expect(NT_SUCCESS(st), "recreate core");
-	st = CdpCoreMountJournal(remounted);
-	Expect(NT_SUCCESS(st), "remount after ring churn");
-	st = CdpCoreQueryTimeRange(remounted, &oldest, &newest);
-	Expect(NT_SUCCESS(st) && newest > oldest,
-		"journal metadata survives remount after wrap/evict");
-	st = CdpCoreQueryJournalUsage(
-		remounted,
-		&partitionBytes,
-		&metadataBytes,
-		&payloadUsedAfterMount,
-		&payloadFreeAfterMount,
-		&totalAfterMount);
-	Expect(NT_SUCCESS(st) &&
-		payloadUsedAfterMount == payloadUsedBeforeMount &&
-		payloadFreeAfterMount == payloadFreeBeforeMount &&
-		totalAfterMount == totalBeforeMount,
-		"remount rebuilds identical occupied ring-span accounting");
-
-	CdpCoreDestroy(remounted);
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- empty journal QueryTimeRange --- */
-
-static int TestQueryTimeRangeEmptyJournal(void)
-{
-	TEST_CTX ctx;
-	UINT64 oldest = 0;
-	UINT64 newest = 0;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 14000)), "setup");
-	st = CdpCoreQueryTimeRange(ctx.Core, &oldest, &newest);
-	Expect(st == STATUS_NOT_FOUND, "QueryTimeRange on empty journal");
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- Recovery time boundaries (before oldest / at or after newest) --- */
-
-static int TestRecoveryTimeBoundaries(void)
-{
-	TEST_CTX ctx;
-	UCHAR a[512];
-	UCHAR b[512];
-	UCHAR c[512];
-	UINT64 oldest = 0;
-	UINT64 newest = 0;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 15000)), "setup");
-
-	FillPattern(a, sizeof(a), 0x31);
-	FillPattern(b, sizeof(b), 0x32);
-	FillPattern(c, sizeof(c), 0x33);
-	ctx.Source->Write(ctx.Source, 0, sizeof(a), a);
-	CdpCoreWrite(ctx.Core, 0, sizeof(b), b);
-	CdpCoreWrite(ctx.Core, 0, sizeof(c), c);
-
-	st = CdpCoreQueryTimeRange(ctx.Core, &oldest, &newest);
-	Expect(NT_SUCCESS(st), "QueryTimeRange after COWs");
-	st = CdpCoreRecoveryBegin(ctx.Core, oldest - 1);
-	Expect(NT_SUCCESS(st), "RecoveryBegin before oldest succeeds at oldest fallback");
-	Expect(CdpCoreGetTargetTime100ns(ctx.Core) == oldest,
-		"Recovery target is clamped to oldest retained time");
-	if (NT_SUCCESS(st))
-		st = CdpCoreRecoveryCommit(ctx.Core);
-	Expect(NT_SUCCESS(st), "Recovery before oldest commits oldest retained view");
-	Expect(memcmp(CdpMemStoreData(ctx.Source), a, sizeof(a)) == 0,
-		"Recovery before oldest restores oldest record before-image");
-
-	st = TestRecoveryOneShot(ctx.Core, oldest);
-	Expect(NT_SUCCESS(st), "RecoveryBegin at oldest includes oldest record");
-	Expect(memcmp(CdpMemStoreData(ctx.Source), a, sizeof(a)) == 0,
-		"Recovery at oldest restores oldest record before-image");
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- Preview target at/after newest falls back to live --- */
-
-static int TestPreviewTargetAtOrAfterNewest(void)
-{
-	TEST_CTX ctx;
-	UCHAR a[512];
-	UCHAR b[512];
-	UCHAR c[512];
-	UCHAR out[512];
-	UINT64 oldest = 0;
-	UINT64 newest = 0;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 16000)), "setup");
-
-	FillPattern(a, sizeof(a), 0x41);
-	FillPattern(b, sizeof(b), 0x42);
-	FillPattern(c, sizeof(c), 0x43);
-	ctx.Source->Write(ctx.Source, 0, sizeof(a), a);
-	CdpCoreWrite(ctx.Core, 0, sizeof(b), b);
-	CdpCoreWrite(ctx.Core, 0, sizeof(c), c);
-
-	st = CdpCoreQueryTimeRange(ctx.Core, &oldest, &newest);
-	Expect(NT_SUCCESS(st), "QueryTimeRange newest");
-
-	st = CdpCorePreviewBegin(ctx.Core, newest);
-	Expect(NT_SUCCESS(st), "PreviewBegin at newest");
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, b, sizeof(b)) == 0,
-		"Preview at newest includes newest record and reads B");
-	CdpCorePreviewEnd(ctx.Core);
-
-	st = CdpCorePreviewBegin(ctx.Core, newest + 500);
-	Expect(NT_SUCCESS(st), "PreviewBegin after newest");
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, c, sizeof(c)) == 0,
-		"Preview after newest reads live C");
-	CdpCorePreviewEnd(ctx.Core);
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- append rejects record larger than journal maximum --- */
-
-static int TestJournalAppendTooLarge(void)
-{
-	TEST_CTX ctx;
-	PUCHAR big = NULL;
-	ULONG overSize = Cdp_JOURNAL_MAX_RECORD_DATA + SECTOR;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(
-			TestCtxCreate(
-				&ctx,
-				(2ULL * 1024 * 1024) + SECTOR,
-				JNL_SIZE,
-				17000)),
-		"setup large source");
-	big = (PUCHAR)malloc(overSize);
-	Expect(big != NULL, "allocate oversize buffer");
-	if (!big)
-	{
-		TestCtxDestroy(&ctx);
-		return g_caseFailed;
-	}
-	memset(big, 0xAB, overSize);
-
-	st = CdpCoreCaptureAppend(ctx.Core, 0, overSize, NULL);
-	Expect(st == STATUS_INVALID_PARAMETER,
-		"CaptureAppend rejects length above journal maximum");
-
-	st = CdpCoreWrite(ctx.Core, 0, overSize, big);
-	Expect(st == STATUS_INVALID_PARAMETER,
-		"Write rejects length above journal maximum");
-
-	free(big);
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- mount unformatted journal partition --- */
-
-static int TestMountUnformattedJournal(void)
-{
-	PCdp_STORE source = NULL;
-	PCdp_STORE journal = NULL;
-	PCdp_CORE core = NULL;
-	NTSTATUS st;
-
-	st = CdpMemStoreCreate(SRC_SIZE, SECTOR, &source);
-	Expect(NT_SUCCESS(st), "create source");
-	st = CdpMemStoreCreate(JNL_SIZE, SECTOR, &journal);
-	Expect(NT_SUCCESS(st), "create journal store");
-	st = CdpCoreCreate(source, journal, &core);
-	Expect(NT_SUCCESS(st), "create core");
-	st = CdpCoreMountJournal(core);
-	Expect(st == STATUS_DISK_CORRUPT_ERROR,
-		"Mount rejects unformatted journal partition");
-
-	CdpCoreDestroy(core);
-	CdpMemStoreDestroy(journal);
-	CdpMemStoreDestroy(source);
-	return g_caseFailed;
-}
-
-/* --- WritebackActive during Recovery writeback --- */
-
-static int g_writebackHookInvoked;
-
-static VOID RecoveryWritebackHook(_Inout_ PCdp_CORE Core)
-{
-	UCHAR scratch[512];
-
-	(void)Core;
-	g_writebackHookInvoked = 1;
-	/* Concurrent COW during writeback must not rely on Invalid (WritebackActive). */
-	FillPattern(scratch, sizeof(scratch), 0x99);
-	(void)CdpCoreWrite(Core, 1024, sizeof(scratch), scratch);
-}
-
-static int TestRecoveryWritebackActive(void)
-{
-	TEST_CTX ctx;
-	UCHAR a[512];
-	UCHAR bFull[512];
-	UCHAR bTail[256];
-	UCHAR scratchLive[512];
-	UINT64 tAfterFull;
-	NTSTATUS st;
-
-	CdpCoreTestSetWritebackHook(NULL);
-	g_writebackHookInvoked = 0;
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 18000)), "setup");
-
-	FillPattern(a, sizeof(a), 0xA5);
-	FillPattern(bFull, sizeof(bFull), 0xB5);
-	FillPattern(bTail, sizeof(bTail), 0xBE);
-	ctx.Source->Write(ctx.Source, 0, sizeof(a), a);
-
-	CdpCoreWrite(ctx.Core, 0, sizeof(bFull), bFull);
-	tAfterFull = CdpCoreGetTime100ns(ctx.Core);
-	CdpCoreWrite(ctx.Core, 256, sizeof(bTail), bTail);
-
-	CdpCoreTestSetWritebackHook(RecoveryWritebackHook);
-	st = TestRecoveryOneShot(ctx.Core, tAfterFull);
-	CdpCoreTestSetWritebackHook(NULL);
-	Expect(NT_SUCCESS(st), "RecoveryBegin with writeback hook");
-	Expect(g_writebackHookInvoked != 0, "writeback hook invoked during RecoveryBegin");
-	Expect(memcmp(CdpMemStoreData(ctx.Source), bFull, sizeof(bFull)) == 0,
-		"writeback completes despite concurrent COW during writeback");
-	FillPattern(scratchLive, sizeof(scratchLive), 0x99);
-	Expect(memcmp((PUCHAR)CdpMemStoreData(ctx.Source) + 1024,
-			scratchLive,
-			sizeof(scratchLive)) == 0,
-		"concurrent COW during writeback applied to live source");
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- format rejects partition smaller than minimum layout --- */
-
-static int TestQueryTimeRangeWallClocks(void)
-{
-	TEST_CTX ctx;
-	UCHAR a[512];
-	UCHAR b[512];
-	UINT64 tFirst = 50000;
-	UINT64 tSecond = 50001;
-	UINT64 oldest = 0;
-	UINT64 newest = 0;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, tFirst)), "setup");
-
-	FillPattern(a, sizeof(a), 0x51);
-	FillPattern(b, sizeof(b), 0x52);
-	ctx.Source->Write(ctx.Source, 0, sizeof(a), a);
-
-	st = TestAppendJournalRecord(&ctx, tFirst, 0, a, sizeof(a));
-	Expect(NT_SUCCESS(st), "first journal record");
-	st = TestAppendJournalRecord(&ctx, tSecond, 512, b, sizeof(b));
-	Expect(NT_SUCCESS(st), "second journal record");
-
-	st = CdpCoreQueryTimeRange(ctx.Core, &oldest, &newest);
-	Expect(NT_SUCCESS(st), "QueryTimeRange after two records");
-	Expect(oldest == tFirst, "oldest matches first record WallClock");
-	Expect(newest == tSecond, "newest matches last record WallClock");
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-static int TestJournalUsageAndRecordHeaders(void)
-{
-	TEST_CTX ctx;
-	UCHAR a[512];
-	UCHAR b[512];
-	Cdp_JOURNAL_RECORD headers[2];
-	UINT64 partitionBytes = 0;
-	UINT64 metadataBytes = 0;
-	UINT64 payloadBytesUsed = 0;
-	UINT64 payloadBytesFree = 0;
-	UINT64 totalRecords = 0;
-	UINT64 generation = 0;
-	ULONG returned = 0;
-	UINT64 tFirst = 50500;
-	UINT64 tSecond = 50501;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, tFirst)),
-		"setup journal usage/list test");
-	FillPattern(a, sizeof(a), 0x61);
-	FillPattern(b, sizeof(b), 0x62);
-	st = TestAppendJournalRecord(&ctx, tFirst, 0, a, sizeof(a));
-	Expect(NT_SUCCESS(st), "append first record for usage/list");
-	st = TestAppendJournalRecord(&ctx, tSecond, 4096, b, sizeof(b));
-	Expect(NT_SUCCESS(st), "append second record for usage/list");
-
-	st = CdpCoreQueryJournalUsage(
-		ctx.Core,
-		&partitionBytes,
-		&metadataBytes,
-		&payloadBytesUsed,
-		&payloadBytesFree,
-		&totalRecords);
-	Expect(NT_SUCCESS(st), "QueryJournalUsage after two records");
-	Expect(partitionBytes == JNL_SIZE, "journal usage reports partition bytes");
-	Expect(metadataBytes == SECTOR + Cdp_JOURNAL_HEADER_REGION_SIZE,
-		"journal usage reserves superblock and active header region");
-	Expect(payloadBytesUsed == 2 * SECTOR,
-		"journal usage reports sector-aligned record payload bytes");
-	Expect(payloadBytesFree ==
-		JNL_SIZE - metadataBytes - payloadBytesUsed,
-		"journal usage reports remaining record payload bytes");
-	Expect(totalRecords == 2, "journal usage reports surviving record count");
-
-	st = CdpCoreQueryRecordHeaders(
-		ctx.Core,
-		0,
-		0,
-		headers,
-		_countof(headers),
-		&totalRecords,
-		&generation,
-		&returned);
-	Expect(NT_SUCCESS(st), "query all record headers");
-	Expect(totalRecords == 2 && returned == 2,
-		"record header query returns both surviving records");
-	Expect(generation != 0, "record header query returns a generation");
-	Expect(headers[0].WallClock100ns == tFirst &&
-		headers[0].VolumeOffset == 0 &&
-		headers[0].DataLength == sizeof(a),
-		"first record header metadata is returned without payload");
-	Expect(headers[1].WallClock100ns == tSecond &&
-		headers[1].VolumeOffset == 4096 &&
-		headers[1].DataLength == sizeof(b),
-		"second record header metadata is returned without payload");
-
-	st = CdpCoreQueryRecordHeaders(
-		ctx.Core,
-		1,
-		generation,
-		headers,
-		1,
-		&totalRecords,
-		&generation,
-		&returned);
-	Expect(NT_SUCCESS(st), "query record header page after first record");
-	Expect(returned == 1 && headers[0].WallClock100ns == tSecond,
-		"record header paging is oldest-first");
-
-	st = TestAppendJournalRecord(&ctx, tSecond + 1, 8192, a, sizeof(a));
-	Expect(NT_SUCCESS(st), "append record to advance list generation");
-	st = CdpCoreQueryRecordHeaders(
-		ctx.Core,
-		1,
-		generation,
-		headers,
-		1,
-		&totalRecords,
-		&generation,
-		&returned);
-	Expect(st == STATUS_RETRY,
-		"record header query detects a changed journal between pages");
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-static int TestRecordSequenceFlagsAndRemount(void)
-{
-	TEST_CTX ctx;
-	Cdp_JOURNAL_RECORD records[2];
 	PCdp_JOURNAL_SUPERBLOCK superblock;
-	PCdp_JOURNAL_RECORD_HEADER diskHeaders;
-	Cdp_JOURNAL remounted;
-	GUID sourceGuid = { 0 };
-	UCHAR a[512];
-	UCHAR b[512];
-	UINT64 total = 0;
-	UINT64 generation = 0;
-	ULONG returned = 0;
-	NTSTATUS status;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 50600)),
-		"setup sequence flag test");
-	FillPattern(a, sizeof(a), 0x63);
-	FillPattern(b, sizeof(b), 0x64);
-	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
-		"seed source for flagged append");
-	status = CdpCoreCaptureAppend(ctx.Core, 0, sizeof(a), NULL);
-	Expect(NT_SUCCESS(status), "append ordinary record");
-	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(b), b)),
-		"apply ordinary live write");
-	status = CdpCoreCaptureAppendEx(ctx.Core, 0, sizeof(b),
-		Cdp_JOURNAL_RECORD_FLAG_BACKFILL, NULL);
-	Expect(NT_SUCCESS(status), "append backfill record");
-
-	status = CdpCoreQueryRecordHeaders(ctx.Core, 0, 0, records,
-		RTL_NUMBER_OF(records), &total, &generation, &returned);
-	Expect(NT_SUCCESS(status) && total == 2 && returned == 2,
-		"query ordinary and backfill records");
-	Expect(records[0].Sequence == 1 && records[0].Flags == 0 &&
-		records[1].Sequence == 2 &&
-		records[1].Flags == Cdp_JOURNAL_RECORD_FLAG_BACKFILL,
-		"decoded records separate global sequence from flags");
-
-	superblock = (PCdp_JOURNAL_SUPERBLOCK)CdpMemStoreData(ctx.Journal);
-	diskHeaders = (PCdp_JOURNAL_RECORD_HEADER)(
-		(PUCHAR)CdpMemStoreData(ctx.Journal) + superblock->LastHeaderRegionOff);
-	Expect(diskHeaders[0].Sequence == 0 &&
-		diskHeaders[1].Sequence ==
-			(Cdp_JOURNAL_RECORD_FLAG_BACKFILL | 1UL),
-		"disk header stores low-16 index and high-16 backfill flag");
-
-	CdpCoreDestroy(ctx.Core);
-	ctx.Core = NULL;
-	CdpJournalInitializeWithStore(
-		&remounted, ctx.Journal, &sourceGuid, NULL, NULL);
-	status = CdpJournalMount(&remounted);
-	Expect(NT_SUCCESS(status), "remount journal containing flagged header");
-	if (NT_SUCCESS(status))
-	{
-		returned = 0;
-		status = CdpJournalQueryRecordHeaders(&remounted, 0, 0, records,
-			RTL_NUMBER_OF(records), &total, &generation, &returned);
-		Expect(NT_SUCCESS(status) && returned == 2 &&
-			records[1].Sequence == 2 &&
-			records[1].Flags == Cdp_JOURNAL_RECORD_FLAG_BACKFILL,
-			"remount preserves backfill flag and global sequence");
-	}
-	CdpJournalClose(&remounted);
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-static int TestBackfillTargetScanContinuesPastTimeStop(void)
-{
-	TEST_CTX ctx;
-	UCHAR initial[1024];
-	UCHAR live[1024];
-	UCHAR out[1024];
-	NTSTATUS status;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 50700)),
-		"setup backfill target scan test");
-	FillPattern(initial, sizeof(initial), 0x65);
-	FillPattern(live, sizeof(live), 0x75);
-	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0,
-		sizeof(initial), initial)), "seed two target-scan ranges");
-
-	CdpCoreSetTime100ns(ctx.Core, 100);
-	status = CdpCoreCaptureAppend(ctx.Core, 0, 512, NULL);
-	Expect(NT_SUCCESS(status), "append normal record newer than target");
-	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, 512, live)),
-		"apply normal live write");
-
-	CdpCoreSetTime100ns(ctx.Core, 50);
-	status = CdpCoreCaptureAppendEx(ctx.Core, 512, 512,
-		Cdp_JOURNAL_RECORD_FLAG_BACKFILL, NULL);
-	Expect(NT_SUCCESS(status), "append backfill record satisfying time stop");
-	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 512, 512, live + 512)),
-		"apply backfill live write");
-	/* The artificial backfill timestamp is intentionally older than the
-	 * preceding physical record. Remount rebuilds the true min/max range just
-	 * as a reboot would, while preserving physical record order. */
-	CdpCoreDestroy(ctx.Core);
-	ctx.Core = NULL;
-	status = CdpCoreCreate(ctx.Source, ctx.Journal, &ctx.Core);
-	Expect(NT_SUCCESS(status), "recreate core for backfill target scan");
-	if (NT_SUCCESS(status))
-	{
-		status = CdpCoreMountJournal(ctx.Core);
-		Expect(NT_SUCCESS(status), "remount out-of-order backfill timestamps");
-	}
-	if (!NT_SUCCESS(status))
-	{
-		TestCtxDestroy(&ctx);
-		return g_caseFailed;
-	}
-
-	status = CdpCorePreviewBegin(ctx.Core, 75);
-	Expect(NT_SUCCESS(status), "preview scans through backfill time stop");
-	status = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(status) &&
-		memcmp(out, initial, sizeof(initial)) == 0,
-		"preview inserts backfill and preceding normal record");
-	Expect(NT_SUCCESS(CdpCorePreviewEnd(ctx.Core)),
-		"end backfill preview");
-
-	status = CdpCoreRecoveryBegin(ctx.Core, 75);
-	Expect(NT_SUCCESS(status), "recovery scans through backfill time stop");
-	status = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(status) &&
-		memcmp(out, initial, sizeof(initial)) == 0,
-		"recovery inserts backfill and preceding normal record");
-	Expect(NT_SUCCESS(CdpCoreRecoveryCancel(ctx.Core)),
-		"cancel backfill scan recovery");
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-static int TestRecoveryCowRecordsAreBackfill(void)
-{
-	TEST_CTX ctx;
-	UCHAR original[512];
-	UCHAR changed[512];
-	UCHAR concurrent[512];
-	Cdp_JOURNAL_RECORD records[4];
-	UINT64 target;
-	UINT64 total = 0;
-	UINT64 generation = 0;
-	ULONG returned = 0;
-	BOOLEAN complete = FALSE;
-	NTSTATUS status;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 50800)),
-		"setup recovery backfill COW test");
-	FillPattern(original, sizeof(original), 0x66);
-	FillPattern(changed, sizeof(changed), 0x76);
-	FillPattern(concurrent, sizeof(concurrent), 0x86);
-	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0,
-		sizeof(original), original)), "seed recovery source");
-	target = CdpCoreGetTime100ns(ctx.Core);
-	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 0,
-		sizeof(changed), changed)), "create ordinary recovery history");
-	Expect(NT_SUCCESS(CdpCoreRecoveryBegin(ctx.Core, target)),
-		"prepare recovery before flagged COWs");
-	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 512,
-		sizeof(concurrent), concurrent)),
-		"normal write during recovery appends backfill COW");
-	while (!complete)
-	{
-		status = CdpCoreRecoveryCommitStep(ctx.Core, &complete);
-		if (!NT_SUCCESS(status))
-			break;
-	}
-	Expect(NT_SUCCESS(status) && complete,
-		"recovery writeback completes through COW");
-	Expect(memcmp(CdpMemStoreData(ctx.Source), original,
-		sizeof(original)) == 0 &&
-		memcmp((PUCHAR)CdpMemStoreData(ctx.Source) + 512,
-			concurrent, sizeof(concurrent)) == 0,
-		"writeback restores history and preserves concurrent range");
-
-	status = CdpCoreQueryRecordHeaders(ctx.Core, 0, 0, records,
-		RTL_NUMBER_OF(records), &total, &generation, &returned);
-	Expect(NT_SUCCESS(status) && total == 3 && returned == 3,
-		"ordinary, concurrent, and writeback COW records are retained");
-	Expect(records[0].Flags == 0 &&
-		records[1].Flags == Cdp_JOURNAL_RECORD_FLAG_BACKFILL &&
-		records[2].Flags == Cdp_JOURNAL_RECORD_FLAG_BACKFILL,
-		"all Recovery-phase COWs, including writeback, are backfill");
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-static int TestRecoveryCommitCoalescedLargePayload(void)
-{
-	const ULONG transferSize = 4UL * 1024UL * 1024UL;
-	const UINT64 journalSize = 12ULL * 1024ULL * 1024ULL;
-	TEST_CTX ctx;
-	PUCHAR before = NULL;
-	PUCHAR after = NULL;
-	UINT64 targetTime = 61000;
-	ULONG offset;
-	NTSTATUS st;
+	PCdp_JOURNAL_BRANCH_RECORD_HEADER branch;
+	PUCHAR journalBytes;
 
 	Expect(NT_SUCCESS(TestCtxCreate(
-		&ctx,
-		transferSize,
-		journalSize,
-		targetTime)),
-		"setup large coalesced recovery test");
-	before = (PUCHAR)malloc(transferSize);
-	after = (PUCHAR)malloc(transferSize);
-	Expect(before != NULL && after != NULL,
-		"allocate large coalesced recovery buffers");
-	if (!before || !after)
-		goto cleanup;
-
-	FillPattern(before, transferSize, 0x23);
-	FillPattern(after, transferSize, 0xA7);
-	st = ctx.Source->Write(ctx.Source, 0, transferSize, before);
-	Expect(NT_SUCCESS(st), "seed large source before-image");
-	for (offset = 0; offset < transferSize;
-		offset += Cdp_JOURNAL_MAX_RECORD_DATA)
-	{
-		st = TestAppendJournalRecord(
-			&ctx,
-			targetTime + offset / Cdp_JOURNAL_MAX_RECORD_DATA,
-			offset,
-			after + offset,
-			Cdp_JOURNAL_MAX_RECORD_DATA);
-		Expect(NT_SUCCESS(st), "write adjacent maximum-size journal record");
-		if (!NT_SUCCESS(st))
-			goto cleanup;
-	}
-	st = CdpCoreRecoveryBegin(ctx.Core, targetTime);
-	Expect(NT_SUCCESS(st), "prepare recovery with coalesced adjacent records");
-	st = CdpCoreRecoveryCommit(ctx.Core);
-	Expect(NT_SUCCESS(st), "commit reads coalesced payload in chunks");
-	Expect(memcmp(CdpMemStoreData(ctx.Source), before, transferSize) == 0,
-		"coalesced recovery restores the complete large before-image");
-
-cleanup:
-	free(after);
-	free(before);
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* The driver commits through RecoveryCommitStep, not the legacy all-at-once
- * helper.  Exercise two 4MB coalesced nodes and punch the second one after
- * the first step, then compare the prepared read view with physical bytes. */
-static int TestRecoveryCommitStepCoalescedLargePayload(void)
-{
-	const ULONG nodeBytes = 4UL * 1024UL * 1024UL;
-	const ULONG totalBytes = 8UL * 1024UL * 1024UL;
-	const UINT64 journalSize = 24ULL * 1024ULL * 1024ULL;
-	TEST_CTX ctx;
-	PUCHAR before = NULL;
-	PUCHAR firstAfter = NULL;
-	PUCHAR secondAfter = NULL;
-	PUCHAR expected = NULL;
-	PUCHAR readView = NULL;
-	UCHAR liveWrite[512];
-	Cdp_JOURNAL_RECORD header;
-	UINT64 targetTime = 61500;
-	ULONG offset;
-	UINT64 totalBeforeCommit = 0;
-	UINT64 totalAfterCommit = 0;
-	UINT64 generation;
-	ULONG returned;
-	BOOLEAN complete = FALSE;
-	NTSTATUS status = STATUS_SUCCESS;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, totalBytes, journalSize, targetTime)),
-		"setup step coalesced recovery test");
-	before = (PUCHAR)malloc(totalBytes);
-	firstAfter = (PUCHAR)malloc(nodeBytes);
-	secondAfter = (PUCHAR)malloc(nodeBytes);
-	expected = (PUCHAR)malloc(totalBytes);
-	readView = (PUCHAR)malloc(totalBytes);
-	Expect(before && firstAfter && secondAfter && expected && readView,
-		"allocate step coalesced recovery buffers");
-	if (!before || !firstAfter || !secondAfter || !expected || !readView)
-		goto cleanup;
-
-	FillPattern(before, totalBytes, 0x25);
-	FillPattern(firstAfter, nodeBytes, 0xA5);
-	FillPattern(secondAfter, nodeBytes, 0xB5);
-	FillPattern(liveWrite, sizeof(liveWrite), 0xC5);
-	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, totalBytes, before)),
-		"seed two large before-image nodes");
-	for (offset = 0; offset < nodeBytes;
-		offset += Cdp_JOURNAL_MAX_RECORD_DATA)
-	{
-		status = TestAppendJournalRecord(&ctx,
-			targetTime + offset / Cdp_JOURNAL_MAX_RECORD_DATA,
-			offset, firstAfter + offset, Cdp_JOURNAL_MAX_RECORD_DATA);
-		Expect(NT_SUCCESS(status), "append first coalesced node");
-		if (!NT_SUCCESS(status))
-			goto cleanup;
-	}
-	for (offset = 0; offset < nodeBytes;
-		offset += Cdp_JOURNAL_MAX_RECORD_DATA)
-	{
-		status = TestAppendJournalRecord(&ctx,
-			targetTime + 10 + offset / Cdp_JOURNAL_MAX_RECORD_DATA,
-			nodeBytes + offset, secondAfter + offset,
-			Cdp_JOURNAL_MAX_RECORD_DATA);
-		Expect(NT_SUCCESS(status), "append second coalesced node");
-		if (!NT_SUCCESS(status))
-			goto cleanup;
-	}
-
-	status = CdpCoreRecoveryBegin(ctx.Core, targetTime);
-	Expect(NT_SUCCESS(status), "prepare step coalesced recovery");
-	status = CdpCoreQueryRecordHeaders(ctx.Core, 0, 0, &header, 1,
-		&totalBeforeCommit, &generation, &returned);
-	Expect(NT_SUCCESS(status), "query journal count before replay COW commit");
-	status = CdpCoreRecoveryCommitStep(ctx.Core, &complete);
-	Expect(NT_SUCCESS(status) && !complete,
-		"first commit step restores only first coalesced node");
-	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, nodeBytes + 512,
-		sizeof(liveWrite), liveWrite)),
-		"new write punches middle of pending coalesced node");
-
-	RtlCopyMemory(expected, before, totalBytes);
-	RtlCopyMemory(expected + nodeBytes + 512, liveWrite, sizeof(liveWrite));
-	status = CdpCoreRead(ctx.Core, 0, totalBytes, readView);
-	Expect(NT_SUCCESS(status) && memcmp(readView, expected, totalBytes) == 0,
-		"prepared coalesced read equals expected final physical image");
-	while (!complete && NT_SUCCESS(status))
-		status = CdpCoreRecoveryCommitStep(ctx.Core, &complete);
-	Expect(NT_SUCCESS(status) && complete,
-		"step commit completes coalesced nodes after punch");
-	Expect(memcmp(CdpMemStoreData(ctx.Source), expected, totalBytes) == 0,
-		"step commit physical image equals prepared read view");
-	status = CdpCoreQueryRecordHeaders(ctx.Core, 0, 0, &header, 1,
-		&totalAfterCommit, &generation, &returned);
-	Expect(NT_SUCCESS(status) && totalAfterCommit > totalBeforeCommit,
-		"replay COW appends before-images without changing recovery view");
-
-cleanup:
-	free(readView);
-	free(expected);
-	free(secondAfter);
-	free(firstAfter);
-	free(before);
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-static int TestQueryTimeRangeAfterEviction(void)
-{
-	TEST_CTX ctx;
-	UCHAR buf[512];
-	UINT64 oldest = 0;
-	UINT64 newest = 0;
-	UINT64 firstTime = 51000;
-	ULONG i;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, SMALL_JNL_SIZE, firstTime)),
-		"setup small journal");
-
-	for (i = 0; i < 2600; ++i)
-	{
-		FillPattern(buf, sizeof(buf), (UCHAR)(i & 0xFF));
-		st = TestAppendJournalRecord(
-			&ctx,
-			firstTime + i,
-			0,
-			buf,
-			sizeof(buf));
-		Expect(NT_SUCCESS(st), "append under ring pressure");
-		if (!NT_SUCCESS(st))
-			break;
-	}
-
-	st = CdpCoreQueryTimeRange(ctx.Core, &oldest, &newest);
-	Expect(NT_SUCCESS(st), "QueryTimeRange after eviction");
-	Expect(oldest > firstTime, "oldest advanced after drop-oldest");
-	Expect(newest == firstTime + 2599, "newest retains latest record time");
-	Expect(newest > oldest, "newest > oldest after eviction");
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-static int TestQueryTimeRangeGuards(void)
-{
-	TEST_CTX ctx;
-	PCdp_CORE bare = NULL;
-	UINT64 oldest = 0;
-	UINT64 newest = 0;
-
-	Expect(CdpCoreQueryTimeRange(NULL, &oldest, &newest) ==
-			STATUS_INVALID_PARAMETER,
-		"QueryTimeRange rejects null core");
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 52000)), "setup");
-	Expect(CdpCoreQueryTimeRange(ctx.Core, NULL, &newest) ==
-			STATUS_INVALID_PARAMETER,
-		"QueryTimeRange rejects null oldest");
-	Expect(CdpCoreQueryTimeRange(ctx.Core, &oldest, NULL) ==
-			STATUS_INVALID_PARAMETER,
-		"QueryTimeRange rejects null newest");
-	TestCtxDestroy(&ctx);
-
-	Expect(NT_SUCCESS(CdpMemStoreCreate(SRC_SIZE, SECTOR, &ctx.Source)),
-		"create source for unmounted core");
-	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &ctx.Journal)),
-		"create journal store");
-	Expect(NT_SUCCESS(CdpCoreCreate(ctx.Source, ctx.Journal, &bare)),
-		"create core without mount");
-	Expect(CdpCoreQueryTimeRange(bare, &oldest, &newest) ==
-			STATUS_DEVICE_NOT_READY,
-		"QueryTimeRange fails when journal not mounted");
-	CdpCoreDestroy(bare);
-	CdpMemStoreDestroy(ctx.Journal);
-	CdpMemStoreDestroy(ctx.Source);
-
-	return g_caseFailed;
-}
-
-static int TestJournalAppendMaxSize(void)
-{
-	TEST_CTX ctx;
-	PUCHAR maxBuf = NULL;
-	ULONG maxSize = Cdp_JOURNAL_MAX_RECORD_DATA;
-	ULONG i;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(
-			TestCtxCreate(&ctx, maxSize, JNL_SIZE, 53000)),
-		"setup source sized for max record");
-	maxBuf = (PUCHAR)malloc(maxSize);
-	Expect(maxBuf != NULL, "allocate max-size buffer");
-	if (!maxBuf)
-	{
-		TestCtxDestroy(&ctx);
+		&ctx, SRC_SIZE, JNL_SIZE, 90000)),
+		"setup after-image initial branch test");
+	if (!ctx.Journal)
 		return g_caseFailed;
-	}
-	for (i = 0; i < maxSize; ++i)
-		maxBuf[i] = (UCHAR)(0xC0 + (i & 0x3F));
 
-	st = CdpCoreCaptureAppend(ctx.Core, 0, maxSize, NULL);
-	Expect(NT_SUCCESS(st), "CaptureAppend accepts max record size");
+	journalBytes = (PUCHAR)CdpMemStoreData(ctx.Journal);
+	superblock = (PCdp_JOURNAL_SUPERBLOCK)journalBytes;
+	branch = (PCdp_JOURNAL_BRANCH_RECORD_HEADER)(
+		journalBytes + superblock->LastHeaderRegionOff);
+	Expect((branch->Sequence & Cdp_JOURNAL_RECORD_FLAG_BRANCH) != 0 &&
+		(branch->Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) == 0,
+		"first header is branch marker at local index zero");
+	Expect(branch->BranchNumber == 1 &&
+		branch->ParentBranchNumber == 0 &&
+		branch->InheritedRecordSequence == 0 &&
+		branch->Reserved == 0,
+		"initial branch record stores branch 1 with no parent");
 
-	st = ctx.Source->Write(ctx.Source, 0, maxSize, maxBuf);
-	Expect(NT_SUCCESS(st), "live write after max append");
-
-	free(maxBuf);
 	TestCtxDestroy(&ctx);
 	return g_caseFailed;
 }
 
-static int TestCaptureAppendSourceBounds(void)
+static int TestAfterImageAppendDoesNotTouchSource(void)
 {
 	TEST_CTX ctx;
-	UCHAR buf[512];
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 54000)), "setup");
-
-	FillPattern(buf, sizeof(buf), 0x77);
-	st = CdpCoreCaptureAppend(ctx.Core, SRC_SIZE, sizeof(buf), NULL);
-	Expect(st == STATUS_INVALID_PARAMETER,
-		"CaptureAppend rejects read past source end");
-
-	st = CdpCoreCaptureAppend(ctx.Core, SRC_SIZE - 256, 512, NULL);
-	Expect(st == STATUS_INVALID_PARAMETER,
-		"CaptureAppend rejects partial overlap past source end");
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-static int TestJournalFormatTooSmall(void)
-{
-	PCdp_STORE source = NULL;
-	PCdp_STORE journal = NULL;
-	PCdp_CORE core = NULL;
-	NTSTATUS st;
-
-	st = CdpMemStoreCreate(SRC_SIZE, SECTOR, &source);
-	Expect(NT_SUCCESS(st), "create source");
-	st = CdpMemStoreCreate(1024ULL * 1024, SECTOR, &journal);
-	Expect(NT_SUCCESS(st), "create undersized journal store");
-	st = CdpCoreCreate(source, journal, &core);
-	Expect(NT_SUCCESS(st), "create core");
-	st = CdpCoreFormatJournal(core);
-	Expect(st == STATUS_INVALID_PARAMETER,
-		"format rejects partition below journal minimum");
-
-	CdpCoreDestroy(core);
-	CdpMemStoreDestroy(journal);
-	CdpMemStoreDestroy(source);
-	return g_caseFailed;
-}
-
-/* --- header-region format write-size fallback and cache --- */
-
-static int TestJournalFormatWriteChunkFallback(void)
-{
-	PCdp_STORE source = NULL;
-	PCdp_STORE journal = NULL;
-	PCdp_CORE core = NULL;
-	TEST_FAIL_STORE limited;
-	NTSTATUS st;
-
-	st = CdpMemStoreCreate(SRC_SIZE, SECTOR, &source);
-	Expect(NT_SUCCESS(st), "create source for format write fallback");
-	st = CdpMemStoreCreate(JNL_SIZE, SECTOR, &journal);
-	Expect(NT_SUCCESS(st), "create journal for format write fallback");
-	st = CdpCoreCreate(source, journal, &core);
-	Expect(NT_SUCCESS(st), "create core for format write fallback");
-	if (!NT_SUCCESS(st))
-		goto cleanup;
-
-	TestFailStoreInstall(journal, &limited);
-	limited.MaxWriteLength = 64UL * 1024UL;
-
-	st = CdpCoreFormatJournal(core);
-	Expect(NT_SUCCESS(st), "format falls back to supported write size");
-	Expect(limited.OversizeWriteCount == 4,
-		"format probes 1MB down to 64KB");
-	Expect(limited.LargestSuccessfulWrite == 64UL * 1024UL,
-		"format selects 64KB as largest successful write");
-
-	limited.OversizeWriteCount = 0;
-	limited.LargestSuccessfulWrite = 0;
-	st = CdpCoreFormatJournal(core);
-	Expect(NT_SUCCESS(st), "second format reuses cached write size");
-	Expect(limited.OversizeWriteCount == 0,
-		"second format does not retry oversized writes");
-	Expect(limited.LargestSuccessfulWrite == 64UL * 1024UL,
-		"second format continues with cached 64KB writes");
-
-	CdpCoreDestroy(core);
-	core = NULL;
-	TestFailStoreRemove(journal, &limited);
-
-cleanup:
-	if (core)
-		CdpCoreDestroy(core);
-	CdpMemStoreDestroy(journal);
-	CdpMemStoreDestroy(source);
-	return g_caseFailed;
-}
-
-/* --- 4 KiB-sector journal end to end --- */
-
-static int TestFourKiBSectorCowPreviewRecovery(void)
-{
-	TEST_CTX ctx;
-	UCHAR a[4096];
-	UCHAR b[4096];
-	UCHAR c[4096];
-	UCHAR out[4096];
-	UINT64 t0;
-	UINT64 tAfterB;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreateWithSector(
-		&ctx, 128ULL * 1024, 8ULL * 1024 * 1024, 26000, 4096)),
-		"setup 4KiB-sector core");
-	FillPattern(a, sizeof(a), 0x11);
-	FillPattern(b, sizeof(b), 0x22);
-	FillPattern(c, sizeof(c), 0x33);
-	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
-		"seed 4KiB source");
-	t0 = CdpCoreGetTime100ns(ctx.Core);
-	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 0, sizeof(b), b)),
-		"4KiB COW write B");
-	tAfterB = CdpCoreGetTime100ns(ctx.Core);
-	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 0, sizeof(c), c)),
-		"4KiB COW write C");
-
-	Expect(NT_SUCCESS(CdpCorePreviewBegin(ctx.Core, t0)),
-		"4KiB PreviewBegin");
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, a, sizeof(a)) == 0,
-		"4KiB Preview includes target-time record and returns A");
-	Expect(NT_SUCCESS(CdpCorePreviewEnd(ctx.Core)), "4KiB PreviewEnd");
-
-	Expect(NT_SUCCESS(TestRecoveryOneShot(ctx.Core, tAfterB)),
-		"4KiB RecoveryBegin");
-	Expect(memcmp(CdpMemStoreData(ctx.Source), b, sizeof(b)) == 0,
-		"4KiB Recovery writes back B");
-	Expect(CdpCoreGetPhase(ctx.Core) == Cdp_CORE_PHASE_GENERAL,
-		"4KiB Recovery returns to General");
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* --- single superblock, source GUID, and payload-head rebuild --- */
-
-static int TestSingleSuperblockMetadata(void)
-{
-	PCdp_STORE store = NULL;
-	Cdp_JOURNAL journal;
-	Cdp_JOURNAL remounted;
-	GUID sourceGuid = {
-		0x12345678, 0x1234, 0x5678,
-		{ 0x90, 0xAB, 0xCD, 0xEF, 1, 2, 3, 4 }
-	};
-	GUID zeroGuid = { 0 };
-	Cdp_JOURNAL_RECORD lastHeader;
-	Cdp_PREVIEW_TREE scanTree;
-	PUCHAR cachedScanBuffer;
+	TEST_FAIL_STORE sourceTrace;
+	Cdp_JOURNAL_RECORD written;
+	PCdp_JOURNAL_SUPERBLOCK superblock;
+	PCdp_JOURNAL_RECORD_HEADER header;
+	UCHAR sourceBefore[512];
+	UCHAR afterImage[512];
 	PUCHAR journalBytes;
-	UCHAR payload[513];
-	UINT64 expectedPayloadHead;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &store)),
-		"create single-superblock store");
-	if (!store)
-		return g_caseFailed;
-	journalBytes = (PUCHAR)CdpMemStoreData(store);
-	CdpJournalInitializeWithStore(
-		&journal, store, &sourceGuid, NULL, NULL);
-	Expect(NT_SUCCESS(CdpJournalFormat(&journal)),
-		"format single-superblock journal");
-
-	FillPattern(payload, sizeof(payload), 0x71);
-	Expect(NT_SUCCESS(CdpJournalAppend(
-		&journal, 0, sizeof(payload), payload, &lastHeader)),
-		"append record before payload-head rebuild");
-	expectedPayloadHead = lastHeader.FileOffset + sizeof(payload);
-	expectedPayloadHead =
-		(expectedPayloadHead + SECTOR - 1) / SECTOR * SECTOR;
-	CdpJournalClose(&journal);
-
-	CdpJournalInitializeWithStore(
-		&remounted, store, &zeroGuid, NULL, NULL);
-	st = CdpJournalMount(&remounted);
-	Expect(NT_SUCCESS(st), "mount single-superblock journal");
-	Expect(RtlCompareMemory(
-		&remounted.SourceVolumeGuid,
-		&sourceGuid,
-		sizeof(GUID)) == sizeof(GUID),
-		"superblock persists source volume GUID");
-	Expect(remounted.PayloadRegionOff == expectedPayloadHead,
-		"mount derives payload head from latest record fileoffset+length");
-	cachedScanBuffer = remounted.HeaderScanBuffer;
-	Expect(cachedScanBuffer != NULL,
-		"mount retains aligned header scan buffer");
-	st = CdpJournalBuildPreviewTree(
-		&remounted,
-		lastHeader.WallClock100ns,
-		remounted.NextSequence,
-		TRUE,
-		&scanTree);
-	Expect(NT_SUCCESS(st), "preview build reuses mounted header scan buffer");
-	Expect(remounted.HeaderScanBuffer == cachedScanBuffer,
-		"preview build keeps the same header scan allocation");
-	CdpPreviewTreeFree(&scanTree);
-	Expect(NT_SUCCESS(CdpJournalSetRecoveryIntent(&remounted, 123456789ULL)),
-		"persist reboot recovery intent");
-	CdpJournalClose(&remounted);
-	Expect(remounted.HeaderScanBuffer == NULL &&
-		remounted.HeaderScanAllocationBase == NULL,
-		"journal close releases cached header scan buffer");
-
-	CdpJournalInitializeWithStore(
-		&remounted, store, &zeroGuid, NULL, NULL);
-	Expect(NT_SUCCESS(CdpJournalMount(&remounted)),
-		"remount journal with reboot recovery intent");
-	Expect(remounted.RecoveryPending &&
-		remounted.RecoveryTargetTime100ns == 123456789ULL,
-		"superblock persists reboot recovery target");
-	Expect(NT_SUCCESS(CdpJournalClearRecoveryIntent(&remounted)),
-		"clear reboot recovery intent");
-	CdpJournalClose(&remounted);
-
-	CdpJournalInitializeWithStore(
-		&remounted, store, &zeroGuid, NULL, NULL);
-	Expect(NT_SUCCESS(CdpJournalMount(&remounted)),
-		"remount journal after clearing reboot recovery intent");
-	Expect(!remounted.RecoveryPending &&
-		remounted.RecoveryTargetTime100ns == 0,
-		"cleared reboot recovery intent stays cleared");
-	CdpJournalClose(&remounted);
-
-	journalBytes[0] ^= 0xFF;
-	CdpJournalInitializeWithStore(
-		&remounted, store, &zeroGuid, NULL, NULL);
-	st = CdpJournalMount(&remounted);
-	Expect(st == STATUS_DISK_CORRUPT_ERROR,
-		"invalid primary superblock has no backup fallback");
-	CdpJournalClose(&remounted);
-	CdpMemStoreDestroy(store);
-	return g_caseFailed;
-}
-
-static int TestJournalGlobalSequenceCrossesUlong(void)
-{
-	PCdp_STORE store = NULL;
-	Cdp_JOURNAL journal;
-	Cdp_JOURNAL remounted;
-	Cdp_PREVIEW_TREE tree;
-	Cdp_HEADER_REGION_LINK* link;
-	Cdp_JOURNAL_RECORD_HEADER* diskHeaders;
-	Cdp_JOURNAL_RECORD records[3];
-	GUID sourceGuid = {
-		0x9A29D38E, 0x2468, 0x1357,
-		{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 }
-	};
-	GUID zeroGuid = { 0 };
-	UCHAR payload[512];
-	PUCHAR bytes;
-	UINT64 total = 0;
-	UINT64 generation = 0;
-	ULONG returned = 0;
-	ULONG i;
 	NTSTATUS status;
 
-	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &store)),
-		"create journal for 64-bit sequence rollover test");
-	if (!store)
-		return g_caseFailed;
-	CdpJournalInitializeWithStore(
-		&journal, store, &sourceGuid, NULL, NULL);
-	Expect(NT_SUCCESS(CdpJournalFormat(&journal)),
-		"format journal for 64-bit sequence rollover test");
+	Expect(NT_SUCCESS(TestCtxCreate(
+		&ctx, SRC_SIZE, JNL_SIZE, 91000)),
+		"setup single after-image append test");
+	FillPattern(sourceBefore, sizeof(sourceBefore), 0x21);
+	FillPattern(afterImage, sizeof(afterImage), 0xA4);
+	Expect(NT_SUCCESS(ctx.Source->Write(
+		ctx.Source, 4096, sizeof(sourceBefore), sourceBefore)),
+		"seed source before after-image append");
 
-	bytes = (PUCHAR)CdpMemStoreData(store);
-	diskHeaders = (Cdp_JOURNAL_RECORD_HEADER*)(bytes + SECTOR);
-	link = (Cdp_HEADER_REGION_LINK*)(
-		bytes + SECTOR + Cdp_JOURNAL_HEADER_REGION_SIZE -
-		Cdp_JOURNAL_HEADER_LINK_SIZE);
-	link->StartSequence = 0xFFFFFFFEULL;
-	link->Reserved = 0;
-	journal.CurrentHeaderRegionStartSequence = link->StartSequence;
-	journal.NextSequence = link->StartSequence;
-	journal.QueryTime100ns = TestPointerTime100ns;
+	TestFailStoreInstall(ctx.Source, &sourceTrace);
+	status = CdpCoreAppendAfterImage(
+		ctx.Core, 4096, sizeof(afterImage), afterImage, &written);
+	Expect(NT_SUCCESS(status), "append one after-image record");
+	Expect(sourceTrace.ReadCallCount == 0 &&
+		sourceTrace.WriteCallCount == 0,
+		"after-image append performs no source read or source write");
+	TestFailStoreRemove(ctx.Source, &sourceTrace);
 
-	FillPattern(payload, sizeof(payload), 0x39);
-	for (i = 0; i < RTL_NUMBER_OF(records); ++i)
-	{
-		journal.QueryTimeContext = (PVOID)(ULONG_PTR)(90000 + i);
-		status = CdpJournalAppend(
-			&journal,
-			(UINT64)i * 4096,
-			sizeof(payload),
-			payload,
-			&records[i]);
-		Expect(NT_SUCCESS(status),
-			"append across 32-bit global sequence boundary");
-	}
-	Expect(link->Reserved == 0,
-		"header-region Reserved remains zero");
-	Expect(diskHeaders[0].Sequence == 0 &&
-		diskHeaders[1].Sequence == 1 &&
-		diskHeaders[2].Sequence == 2,
-		"on-disk record Sequence remains region-local");
-	Expect(records[0].Sequence == 0xFFFFFFFEULL &&
-		records[1].Sequence == 0xFFFFFFFFULL &&
-		records[2].Sequence == 0x100000000ULL,
-		"append returns monotonically increasing 64-bit global Sequence");
+	Expect(memcmp(
+		(PUCHAR)CdpMemStoreData(ctx.Source) + 4096,
+		sourceBefore,
+		sizeof(sourceBefore)) == 0,
+		"source bytes remain unchanged after journal append");
+	journalBytes = (PUCHAR)CdpMemStoreData(ctx.Journal);
+	superblock = (PCdp_JOURNAL_SUPERBLOCK)journalBytes;
+	header = (PCdp_JOURNAL_RECORD_HEADER)(
+		journalBytes + superblock->LastHeaderRegionOff +
+		sizeof(Cdp_JOURNAL_RECORD_HEADER));
+	Expect((header->Sequence & Cdp_JOURNAL_RECORD_FLAG_BRANCH) == 0 &&
+		(header->Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) == 1 &&
+		header->VolumeOffset == 4096 &&
+		header->DataLength == sizeof(afterImage),
+		"normal record follows initial branch marker");
+	Expect(written.Sequence == 2 &&
+		written.FileOffset == header->FileOffset &&
+		memcmp(journalBytes + header->FileOffset,
+			afterImage, sizeof(afterImage)) == 0,
+		"record payload contains the application after-image");
 
-	RtlZeroMemory(records, sizeof(records));
-	status = CdpJournalQueryRecordHeaders(
-		&journal, 0, 0, records, RTL_NUMBER_OF(records),
-		&total, &generation, &returned);
-	Expect(NT_SUCCESS(status) && total == 3 && returned == 3,
-		"query records across 32-bit global sequence boundary");
-	Expect(records[0].Sequence == 0xFFFFFFFEULL &&
-		records[1].Sequence == 0xFFFFFFFFULL &&
-		records[2].Sequence == 0x100000000ULL,
-		"query decodes region-local Sequence to global UINT64");
-
-	status = CdpJournalBuildPreviewTree(
-		&journal, 90000, 0x100000000ULL, TRUE, &tree);
-	Expect(NT_SUCCESS(status) && tree.NodeCount == 2,
-		"preview max-sequence filtering remains 64-bit at rollover");
-	CdpPreviewTreeFree(&tree);
-	CdpJournalClose(&journal);
-
-	CdpJournalInitializeWithStore(
-		&remounted, store, &zeroGuid, NULL, NULL);
-	status = CdpJournalMount(&remounted);
-	Expect(NT_SUCCESS(status),
-		"remount journal containing crossed 32-bit sequence boundary");
-	Expect(remounted.NextSequence == 0x100000001ULL,
-		"remount rebuilds the next global UINT64 Sequence");
-	CdpJournalClose(&remounted);
-
-	link->Reserved = 1;
-	CdpJournalInitializeWithStore(
-		&remounted, store, &zeroGuid, NULL, NULL);
-	status = CdpJournalMount(&remounted);
-	Expect(status == STATUS_DISK_CORRUPT_ERROR,
-		"mount rejects a nonzero header-region Reserved field");
-	CdpJournalClose(&remounted);
-	link->Reserved = 0;
-	CdpMemStoreDestroy(store);
+	TestCtxDestroy(&ctx);
 	return g_caseFailed;
 }
 
-/* Stop-CDP must clear superblock magic so a later mount (auto-discovery) fails. */
-static int TestJournalInvalidateRejectsRemount(void)
+static int TestAfterImageJournalFailureDoesNotBypassSource(void)
 {
-	PCdp_STORE store = NULL;
-	Cdp_JOURNAL journal;
-	Cdp_JOURNAL remounted;
-	GUID sourceGuid = {
-		0xF0E833C9, 0x0000, 0x0000,
-		{ 0x00, 0x00, 0x10, 0x80, 0x02, 0x00, 0x00, 0x00 }
-	};
-	GUID zeroGuid = { 0 };
-	Cdp_JOURNAL_RECORD header;
-	PUCHAR journalBytes;
-	UCHAR payload[512];
-	NTSTATUS st;
+	TEST_CTX ctx;
+	TEST_FAIL_STORE sourceTrace;
+	TEST_FAIL_STORE journalFail;
+	UCHAR sourceBefore[512];
+	UCHAR afterImage[512];
+	NTSTATUS status;
 
-	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &store)),
-		"create journal store for invalidate test");
-	if (!store)
-		return g_caseFailed;
-	journalBytes = (PUCHAR)CdpMemStoreData(store);
+	Expect(NT_SUCCESS(TestCtxCreate(
+		&ctx, SRC_SIZE, JNL_SIZE, 92000)),
+		"setup after-image failure test");
+	FillPattern(sourceBefore, sizeof(sourceBefore), 0x32);
+	FillPattern(afterImage, sizeof(afterImage), 0xB5);
+	Expect(NT_SUCCESS(ctx.Source->Write(
+		ctx.Source, 8192, sizeof(sourceBefore), sourceBefore)),
+		"seed source before failed journal append");
 
-	CdpJournalInitializeWithStore(
-		&journal, store, &sourceGuid, NULL, NULL);
-	Expect(NT_SUCCESS(CdpJournalFormat(&journal)), "format journal");
-	FillPattern(payload, sizeof(payload), 0xA5);
-	Expect(NT_SUCCESS(CdpJournalAppend(
-		&journal, 0, sizeof(payload), payload, &header)),
-		"append before stop");
-	CdpJournalClose(&journal);
+	TestFailStoreInstall(ctx.Source, &sourceTrace);
+	TestFailStoreInstall(ctx.Journal, &journalFail);
+	journalFail.FailNextWrites = 1;
+	status = CdpCoreAppendAfterImage(
+		ctx.Core, 8192, sizeof(afterImage), afterImage, NULL);
+	Expect(status == STATUS_IO_DEVICE_ERROR,
+		"after-image append reports journal write failure");
+	Expect(sourceTrace.ReadCallCount == 0 &&
+		sourceTrace.WriteCallCount == 0,
+		"journal failure does not fall back to the source volume");
+	TestFailStoreRemove(ctx.Journal, &journalFail);
+	TestFailStoreRemove(ctx.Source, &sourceTrace);
+	Expect(memcmp(
+		(PUCHAR)CdpMemStoreData(ctx.Source) + 8192,
+		sourceBefore,
+		sizeof(sourceBefore)) == 0,
+		"source bytes remain unchanged after journal failure");
 
-	CdpJournalInitializeWithStore(
-		&remounted, store, &zeroGuid, NULL, NULL);
-	Expect(NT_SUCCESS(CdpJournalMount(&remounted)),
-		"close alone still leaves a remountable journal");
-	Expect(*(ULONG*)journalBytes == Cdp_JOURNAL_MAGIC,
-		"close preserves superblock magic (auto-CDP would find it)");
-
-	Expect(NT_SUCCESS(CdpJournalInvalidate(&remounted)),
-		"invalidate clears on-disk magic like stop CDP");
-	Expect(*(ULONG*)journalBytes != Cdp_JOURNAL_MAGIC,
-		"superblock magic cleared after invalidate");
-	Expect(remounted.Mounted == FALSE, "invalidate marks journal unmounted");
-	CdpJournalClose(&remounted);
-
-	CdpJournalInitializeWithStore(
-		&remounted, store, &zeroGuid, NULL, NULL);
-	st = CdpJournalMount(&remounted);
-	Expect(st == STATUS_DISK_CORRUPT_ERROR,
-		"mount rejects invalidated journal (no auto remount)");
-	Expect(*(ULONG*)journalBytes != Cdp_JOURNAL_MAGIC,
-		"close after invalidate does not rewrite magic");
-	CdpJournalClose(&remounted);
-
-	CdpMemStoreDestroy(store);
+	TestCtxDestroy(&ctx);
 	return g_caseFailed;
 }
 
-static int TestAppendWritesSuperblockOnlyForNewRegion(void)
+static int TestAfterImagePayloadZeroCopyAndFallback(void)
 {
 	PCdp_STORE store = NULL;
 	Cdp_JOURNAL journal;
 	TEST_FAIL_STORE trace;
-	GUID sourceGuid = {
-		0xA7372451, 0x1000, 0x2000,
-		{ 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xA0 }
-	};
-	Cdp_JOURNAL_RECORD header;
-	UCHAR payload[512];
+	GUID sourceGuid = { 0 };
+	PUCHAR alignedInput = NULL;
+	PUCHAR journalBytes;
+	UINT64 payloadOffset;
+	ULONG i;
+	NTSTATUS status;
 
 	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &store)),
-		"create journal for superblock append test");
+		"create journal for payload zero-copy test");
 	if (!store)
 		return g_caseFailed;
-	CdpJournalInitializeWithStore(
-		&journal, store, &sourceGuid, NULL, NULL);
-	Expect(NT_SUCCESS(CdpJournalFormat(&journal)),
-		"format journal for superblock append test");
-	FillPattern(payload, sizeof(payload), 0x6A);
-	TestFailStoreInstall(store, &trace);
-
-	Expect(NT_SUCCESS(CdpJournalAppend(
-		&journal, 0, sizeof(payload), payload, &header)),
-		"ordinary append succeeds without superblock rewrite");
-	Expect(trace.SuperblockWriteCount == 0,
-		"ordinary append does not write superblock sector");
-
-	// Force the next append through the real new-region allocation path
-	// without filling every record slot merely to exhaust the current region.
-	journal.CurrentHeaderCount = Cdp_JOURNAL_HEADERS_PER_REGION;
-	trace.FailNextSuperblockWrites = 1;
-	Expect(CdpJournalAppend(
-		&journal, 512, sizeof(payload), payload, &header) ==
-		STATUS_IO_DEVICE_ERROR,
-		"new-region append reports superblock persistence failure");
-	Expect(trace.SuperblockWriteCount == 1 && journal.SuperblockDirty,
-		"failed new-region superblock remains dirty for retry");
-	Expect(NT_SUCCESS(CdpJournalAppend(
-		&journal, 1024, sizeof(payload), payload, &header)),
-		"next append retries dirty new-region superblock");
-	Expect(trace.SuperblockWriteCount == 2 && !journal.SuperblockDirty,
-		"successful retry clears dirty superblock");
-	Expect(NT_SUCCESS(CdpJournalAppend(
-		&journal, 1536, sizeof(payload), payload, &header)),
-		"ordinary append after superblock retry succeeds");
-	Expect(trace.SuperblockWriteCount == 2,
-		"later ordinary append does not rewrite superblock");
-
-	TestFailStoreRemove(store, &trace);
-	CdpJournalClose(&journal);
-	CdpMemStoreDestroy(store);
-	return g_caseFailed;
-}
-
-/* --- journal append failure must not update the live source --- */
-
-static int TestJournalWriteFailureDoesNotWriteSource(void)
-{
-	TEST_CTX ctx;
-	TEST_FAIL_STORE fail;
-	UCHAR a[512];
-	UCHAR b[512];
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 28000)),
-		"setup journal write failure test");
-	FillPattern(a, sizeof(a), 0x81);
-	FillPattern(b, sizeof(b), 0x82);
-	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
-		"seed source before failed COW write");
-
-	TestFailStoreInstall(ctx.Journal, &fail);
-	fail.FailNextWrites = 1;
-	st = CdpCoreWrite(ctx.Core, 0, sizeof(b), b);
-	Expect(st == STATUS_IO_DEVICE_ERROR, "COW reports journal write failure");
-	Expect(memcmp(CdpMemStoreData(ctx.Source), a, sizeof(a)) == 0,
-		"failed journal append leaves live source unchanged");
-	TestFailStoreRemove(ctx.Journal, &fail);
-
-	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 0, sizeof(b), b)),
-		"COW succeeds after fault removal");
-	Expect(memcmp(CdpMemStoreData(ctx.Source), b, sizeof(b)) == 0,
-		"live source updates after successful journal append");
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-static int TestPreparedRecoveryCommitCancel(void)
-{
-	TEST_CTX ctx;
-	UCHAR a[512];
-	UCHAR b[512];
-	UCHAR c[512];
-	UCHAR n[512];
-	UCHAR x[512];
-	UCHAR y[512];
-	UCHAR out[512];
-	UINT64 t0;
-	UINT64 tx;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 29000)),
-		"setup prepared recovery test");
-	FillPattern(a, sizeof(a), 0x10);
-	FillPattern(b, sizeof(b), 0x20);
-	FillPattern(c, sizeof(c), 0x30);
-	FillPattern(n, sizeof(n), 0x40);
-	FillPattern(x, sizeof(x), 0x50);
-	FillPattern(y, sizeof(y), 0x60);
-
-	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
-		"seed prepared recovery source A");
-	t0 = CdpCoreGetTime100ns(ctx.Core);
-	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 0, sizeof(b), b)),
-		"COW write B before prepare");
-	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 0, sizeof(c), c)),
-		"COW write C before prepare");
-
-	st = CdpCoreRecoveryBegin(ctx.Core, t0);
-	Expect(NT_SUCCESS(st), "prepare recovery without writeback");
-	Expect(CdpCoreGetPhase(ctx.Core) == Cdp_CORE_PHASE_RECOVERY,
-		"prepare remains in Recovery phase");
-	Expect(memcmp(CdpMemStoreData(ctx.Source), c, sizeof(c)) == 0,
-		"prepare leaves physical source unchanged");
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, a, sizeof(a)) == 0,
-		"prepared read serves target-time history");
-
-	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 0, sizeof(n), n)),
-		"new write is allowed while recovery is prepared");
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, n, sizeof(n)) == 0,
-		"new prepared-phase write wins over history");
-	Expect(NT_SUCCESS(CdpCoreRecoveryCommit(ctx.Core)),
-		"commit prepared recovery");
-	Expect(CdpCoreGetPhase(ctx.Core) == Cdp_CORE_PHASE_GENERAL,
-		"commit returns to General");
-	Expect(memcmp(CdpMemStoreData(ctx.Source), n, sizeof(n)) == 0,
-		"commit preserves prepared-phase new write");
-
-	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 512, sizeof(x), x)),
-		"seed cancel range X");
-	tx = CdpCoreGetTime100ns(ctx.Core);
-	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 512, sizeof(y), y)),
-		"COW write Y before cancel test");
-	Expect(NT_SUCCESS(CdpCoreRecoveryBegin(ctx.Core, tx)),
-		"prepare recovery for cancel");
-	memset(out, 0, sizeof(out));
-	Expect(NT_SUCCESS(CdpCoreRead(ctx.Core, 512, sizeof(out), out)) &&
-			memcmp(out, x, sizeof(x)) == 0,
-		"prepared cancel view serves X");
-	Expect(NT_SUCCESS(CdpCoreRecoveryCancel(ctx.Core)),
-		"cancel prepared recovery");
-	Expect(CdpCoreGetPhase(ctx.Core) == Cdp_CORE_PHASE_GENERAL,
-		"cancel returns to General");
-	Expect(memcmp((PUCHAR)CdpMemStoreData(ctx.Source) + 512, y, sizeof(y)) == 0,
-		"cancel performs no physical writeback");
-	Expect(CdpCoreRecoveryCommit(ctx.Core) == STATUS_INVALID_DEVICE_STATE,
-		"commit requires prepared Recovery phase");
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* A prepared-phase write may overlap only part of one history node.  The
- * overlap must remain live, while the node's untouched bytes still roll back. */
-static int TestPreparedRecoveryPartialConcurrentWrite(void)
-{
-	TEST_CTX ctx;
-	UCHAR a[1536];
-	UCHAR b[1536];
-	UCHAR n[512];
-	UCHAR expected[1536];
-	UCHAR out[1536];
-	UINT64 t0;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 29500)),
-		"setup prepared partial-overlap recovery test");
-	FillPattern(a, sizeof(a), 0x71);
-	FillPattern(b, sizeof(b), 0x72);
-	FillPattern(n, sizeof(n), 0x73);
-	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
-		"seed partial-overlap source A");
-	t0 = CdpCoreGetTime100ns(ctx.Core);
-	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 0, sizeof(b), b)),
-		"COW write full history node B");
-	Expect(NT_SUCCESS(CdpCoreRecoveryBegin(ctx.Core, t0)),
-		"prepare partial-overlap recovery");
-
-	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 512, sizeof(n), n)),
-		"write only the middle sector while recovery is prepared");
-	RtlCopyMemory(expected, a, sizeof(expected));
-	RtlCopyMemory(expected + 512, n, sizeof(n));
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, expected, sizeof(out)) == 0,
-		"prepared view keeps history on both sides of concurrent middle write");
-
-	Expect(NT_SUCCESS(CdpCoreRecoveryCommit(ctx.Core)),
-		"commit partial-overlap recovery");
-	Expect(memcmp(CdpMemStoreData(ctx.Source), expected, sizeof(expected)) == 0,
-		"commit restores untouched history bytes and preserves concurrent middle write");
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* Commit is intentionally stepped one history node at a time.  A write that
- * arrives between two steps must punch only the still-pending node. */
-static int TestRecoveryCommitInterleavesNewWrite(void)
-{
-	TEST_CTX ctx;
-	UCHAR a[512];
-	UCHAR b[512];
-	UCHAR c[512];
-	UCHAR n[512];
-	BOOLEAN complete = FALSE;
-	UINT64 t0;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 29750)),
-		"setup commit-step interleave test");
-	FillPattern(a, sizeof(a), 0x81);
-	FillPattern(b, sizeof(b), 0x82);
-	FillPattern(c, sizeof(c), 0x83);
-	FillPattern(n, sizeof(n), 0x84);
-	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
-		"seed first commit-step range");
-	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 512, sizeof(a), a)),
-		"seed second commit-step range");
-	t0 = CdpCoreGetTime100ns(ctx.Core);
-	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 0, sizeof(b), b)),
-		"write first history node");
-	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 512, sizeof(c), c)),
-		"write second history node");
-	Expect(NT_SUCCESS(CdpCoreRecoveryBegin(ctx.Core, t0)),
-		"prepare commit-step recovery");
-
-	st = CdpCoreRecoveryCommitStep(ctx.Core, &complete);
-	Expect(NT_SUCCESS(st) && !complete,
-		"first commit step restores exactly one node");
-	Expect(memcmp(CdpMemStoreData(ctx.Source), a, sizeof(a)) == 0,
-		"first node restored before interleaved write");
-	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 512, sizeof(n), n)),
-		"new write interleaves before second commit step");
-	st = CdpCoreRecoveryCommitStep(ctx.Core, &complete);
-	Expect(NT_SUCCESS(st) && complete,
-		"second step completes after pending node is punched");
-	Expect(memcmp((PUCHAR)CdpMemStoreData(ctx.Source) + 512, n, sizeof(n)) == 0,
-		"interleaved new write is not overwritten by later commit step");
-
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-/* These are the five possible relationships between a new write and one
- * history range [512, 2048): no overlap, full overlap, left/right edge
- * overlap, and an overlap that splits the history node in two. */
-typedef struct _TEST_OVERLAP_CASE
-{
-	const char* Name;
-	ULONG Offset;
-	ULONG Length;
-} TEST_OVERLAP_CASE;
-
-static const TEST_OVERLAP_CASE g_overlapCases[] =
-{
-	{ "no overlap", 0, 512 },
-	{ "full overlap", 512, 1536 },
-	{ "left edge overlap", 0, 1024 },
-	{ "right edge overlap", 1536, 1024 },
-	{ "middle split overlap", 1024, 512 }
-};
-
-static ULONG g_buildOverlapOffset;
-static ULONG g_buildOverlapLength;
-static UCHAR g_buildOverlapData[1536];
-
-static VOID PreviewBuildHook_OverlapWrite(_Inout_ PCdp_CORE Core)
-{
-	(void)CdpCoreWrite(
-		Core,
-		g_buildOverlapOffset,
-		g_buildOverlapLength,
-		g_buildOverlapData);
-}
-
-static VOID RecoveryBuildHook_OverlapWrite(_Inout_ PCdp_CORE Core)
-{
-	(void)CdpCoreWrite(
-		Core,
-		g_buildOverlapOffset,
-		g_buildOverlapLength,
-		g_buildOverlapData);
-}
-
-static VOID TestSetExpectedRange(
-	_Inout_updates_bytes_(2560) PUCHAR Expected,
-	_In_ ULONG Offset,
-	_In_ ULONG Length,
-	_In_reads_bytes_(Length) const UCHAR* Data)
-{
-	RtlCopyMemory(Expected + Offset, Data, Length);
-}
-
-/* New writes while Recovery is already prepared must both change the read
- * view and punch only their overlap before each remaining commit step. */
-static int TestPreparedRecoveryOverlapMatrix(void)
-{
-	ULONG index;
-
-	for (index = 0; index < RTL_NUMBER_OF(g_overlapCases); ++index)
-	{
-		const TEST_OVERLAP_CASE* overlap = &g_overlapCases[index];
-		TEST_CTX ctx;
-		UCHAR a[2560];
-		UCHAR b[1536];
-		UCHAR n[1536];
-		UCHAR expected[2560];
-		UCHAR out[2560];
-		UINT64 target;
-		BOOLEAN complete = FALSE;
-		NTSTATUS status;
-
-		Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE,
-			30000 + index * 100)), overlap->Name);
-		FillPattern(a, sizeof(a), (UCHAR)(0xA0 + index));
-		FillPattern(b, sizeof(b), (UCHAR)(0xB0 + index));
-		FillPattern(n, sizeof(n), (UCHAR)(0xC0 + index));
-		Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
-			overlap->Name);
-		target = CdpCoreGetTime100ns(ctx.Core);
-		Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 512, sizeof(b), b)),
-			overlap->Name);
-		Expect(NT_SUCCESS(CdpCoreRecoveryBegin(ctx.Core, target)),
-			overlap->Name);
-
-		Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, overlap->Offset,
-			overlap->Length, n)), overlap->Name);
-		RtlCopyMemory(expected, a, sizeof(expected));
-		TestSetExpectedRange(expected, overlap->Offset, overlap->Length, n);
-		status = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-		Expect(NT_SUCCESS(status) && memcmp(out, expected, sizeof(out)) == 0,
-			overlap->Name);
-
-		while (!complete && NT_SUCCESS(status))
-			status = CdpCoreRecoveryCommitStep(ctx.Core, &complete);
-		Expect(NT_SUCCESS(status) && complete, overlap->Name);
-		Expect(memcmp(CdpMemStoreData(ctx.Source), expected, sizeof(expected)) == 0,
-			overlap->Name);
-		TestCtxDestroy(&ctx);
-	}
-	return g_caseFailed;
-}
-
-/* Preview keeps its target-time bytes even when a new write overlaps an
- * existing preview node; its before-image is merged after the main tree. */
-static int TestPreviewOverlapMatrix(void)
-{
-	ULONG index;
-
-	for (index = 0; index < RTL_NUMBER_OF(g_overlapCases); ++index)
-	{
-		const TEST_OVERLAP_CASE* overlap = &g_overlapCases[index];
-		TEST_CTX ctx;
-		UCHAR a[2560];
-		UCHAR b[1536];
-		UCHAR n[1536];
-		UCHAR liveExpected[2560];
-		UCHAR out[2560];
-		UINT64 target;
-		NTSTATUS status;
-
-		Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE,
-			31000 + index * 100)), overlap->Name);
-		FillPattern(a, sizeof(a), (UCHAR)(0xD0 + index));
-		FillPattern(b, sizeof(b), (UCHAR)(0xE0 + index));
-		FillPattern(n, sizeof(n), (UCHAR)(0xF0 + index));
-		Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
-			overlap->Name);
-		target = CdpCoreGetTime100ns(ctx.Core);
-		Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 512, sizeof(b), b)),
-			overlap->Name);
-		Expect(NT_SUCCESS(CdpCorePreviewBegin(ctx.Core, target)), overlap->Name);
-		Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, overlap->Offset,
-			overlap->Length, n)), overlap->Name);
-		status = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-		Expect(NT_SUCCESS(status) && memcmp(out, a, sizeof(out)) == 0,
-			overlap->Name);
-		Expect(NT_SUCCESS(CdpCorePreviewEnd(ctx.Core)), overlap->Name);
-
-		RtlCopyMemory(liveExpected, a, sizeof(liveExpected));
-		RtlCopyMemory(liveExpected + 512, b, sizeof(b));
-		TestSetExpectedRange(liveExpected, overlap->Offset, overlap->Length, n);
-		Expect(memcmp(CdpMemStoreData(ctx.Source), liveExpected,
-			sizeof(liveExpected)) == 0, overlap->Name);
-		TestCtxDestroy(&ctx);
-	}
-	return g_caseFailed;
-}
-
-/* Commit releases the external mutex between steps.  Exercise every overlap
- * form against a still-pending node after the first node was written back. */
-static int TestRecoveryCommitInterleaveOverlapMatrix(void)
-{
-	static const TEST_OVERLAP_CASE commitCases[] =
-	{
-		{ "commit no overlap", 0, 512 },
-		{ "commit full overlap", 1536, 1536 },
-		{ "commit left edge overlap", 1024, 1024 },
-		{ "commit right edge overlap", 2560, 1024 },
-		{ "commit middle split overlap", 2048, 512 }
-	};
-	ULONG index;
-
-	for (index = 0; index < RTL_NUMBER_OF(commitCases); ++index)
-	{
-		const TEST_OVERLAP_CASE* overlap = &commitCases[index];
-		TEST_CTX ctx;
-		UCHAR a[4096];
-		UCHAR first[512];
-		UCHAR pending[1536];
-		UCHAR n[1536];
-		UCHAR expected[4096];
-		UCHAR out[4096];
-		UINT64 target;
-		BOOLEAN complete = FALSE;
-		NTSTATUS status;
-
-		Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE,
-			33000 + index * 100)), overlap->Name);
-		FillPattern(a, sizeof(a), (UCHAR)(0x21 + index));
-		FillPattern(first, sizeof(first), (UCHAR)(0x31 + index));
-		FillPattern(pending, sizeof(pending), (UCHAR)(0x41 + index));
-		FillPattern(n, sizeof(n), (UCHAR)(0x51 + index));
-		Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
-			overlap->Name);
-		target = CdpCoreGetTime100ns(ctx.Core);
-		Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 512, sizeof(first), first)),
-			overlap->Name);
-		Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 1536, sizeof(pending), pending)),
-			overlap->Name);
-		Expect(NT_SUCCESS(CdpCoreRecoveryBegin(ctx.Core, target)),
-			overlap->Name);
-
-		status = CdpCoreRecoveryCommitStep(ctx.Core, &complete);
-		Expect(NT_SUCCESS(status) && !complete, overlap->Name);
-		Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, overlap->Offset,
-			overlap->Length, n)), overlap->Name);
-		RtlCopyMemory(expected, a, sizeof(expected));
-		TestSetExpectedRange(expected, overlap->Offset, overlap->Length, n);
-		status = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-		Expect(NT_SUCCESS(status) && memcmp(out, expected, sizeof(out)) == 0,
-			overlap->Name);
-
-		while (!complete && NT_SUCCESS(status))
-			status = CdpCoreRecoveryCommitStep(ctx.Core, &complete);
-		Expect(NT_SUCCESS(status) && complete, overlap->Name);
-		Expect(memcmp(CdpMemStoreData(ctx.Source), expected, sizeof(expected)) == 0,
-			overlap->Name);
-		TestCtxDestroy(&ctx);
-	}
-	return g_caseFailed;
-}
-
-/* The same overlap matrix is exercised for writes captured while each tree
- * is being built (the staging-tree path), including the resulting read view
- * and Recovery's subsequent physical commit. */
-static int TestBuildStagingOverlapMatrix(void)
-{
-	ULONG index;
-
-	for (index = 0; index < RTL_NUMBER_OF(g_overlapCases); ++index)
-	{
-		const TEST_OVERLAP_CASE* overlap = &g_overlapCases[index];
-		TEST_CTX ctx;
-		UCHAR a[2560];
-		UCHAR b[1536];
-		UCHAR expected[2560];
-		UCHAR out[2560];
-		UINT64 target;
-		BOOLEAN complete = FALSE;
-		NTSTATUS status;
-
-		FillPattern(a, sizeof(a), (UCHAR)(0x51 + index));
-		FillPattern(b, sizeof(b), (UCHAR)(0x61 + index));
-		FillPattern(g_buildOverlapData, sizeof(g_buildOverlapData),
-			(UCHAR)(0x71 + index));
-		g_buildOverlapOffset = overlap->Offset;
-		g_buildOverlapLength = overlap->Length;
-
-		Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE,
-			32000 + index * 100)), overlap->Name);
-		Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
-			overlap->Name);
-		target = CdpCoreGetTime100ns(ctx.Core);
-		Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 512, sizeof(b), b)),
-			overlap->Name);
-
-		CdpCoreTestSetPreviewBuildHook(PreviewBuildHook_OverlapWrite);
-		status = CdpCorePreviewBegin(ctx.Core, target);
-		CdpCoreTestSetPreviewBuildHook(NULL);
-		Expect(NT_SUCCESS(status), overlap->Name);
-		status = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-		Expect(NT_SUCCESS(status) && memcmp(out, a, sizeof(out)) == 0,
-			overlap->Name);
-		Expect(NT_SUCCESS(CdpCorePreviewEnd(ctx.Core)), overlap->Name);
-
-		CdpCoreTestSetRecoveryBuildHook(RecoveryBuildHook_OverlapWrite);
-		status = CdpCoreRecoveryBegin(ctx.Core, target);
-		CdpCoreTestSetRecoveryBuildHook(NULL);
-		Expect(NT_SUCCESS(status), overlap->Name);
-		RtlCopyMemory(expected, a, sizeof(expected));
-		TestSetExpectedRange(expected, overlap->Offset,
-			overlap->Length, g_buildOverlapData);
-		status = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-		Expect(NT_SUCCESS(status) && memcmp(out, expected, sizeof(out)) == 0,
-			overlap->Name);
-		while (!complete && NT_SUCCESS(status))
-			status = CdpCoreRecoveryCommitStep(ctx.Core, &complete);
-		Expect(NT_SUCCESS(status) && complete, overlap->Name);
-		Expect(memcmp(CdpMemStoreData(ctx.Source), expected, sizeof(expected)) == 0,
-			overlap->Name);
-		TestCtxDestroy(&ctx);
-	}
-	return g_caseFailed;
-}
-
-static int TestFullyCoveredRecoveryReadSkipsSource(void)
-{
-	TEST_CTX ctx;
-	TEST_FAIL_STORE sourceFail;
-	UCHAR a[512];
-	UCHAR b[512];
-	UCHAR out[512];
-	UINT64 t0;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 30000)),
-		"setup fully covered recovery read");
-	FillPattern(a, sizeof(a), 0x91);
-	FillPattern(b, sizeof(b), 0x92);
-	Expect(NT_SUCCESS(ctx.Source->Write(ctx.Source, 0, sizeof(a), a)),
-		"seed fully covered source A");
-	t0 = CdpCoreGetTime100ns(ctx.Core);
-	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 0, sizeof(b), b)),
-		"journal full-block before-image A");
-	Expect(NT_SUCCESS(CdpCoreRecoveryBegin(ctx.Core, t0)),
-		"prepare fully covered recovery");
-
-	TestFailStoreInstall(ctx.Source, &sourceFail);
-	sourceFail.FailNextReads = 1;
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, a, sizeof(a)) == 0,
-		"fully covered recovery read uses journal only");
-	Expect(sourceFail.ReadCallCount == 0 && sourceFail.FailNextReads == 1,
-		"fully covered recovery read skips live source");
-	TestFailStoreRemove(ctx.Source, &sourceFail);
-
-	Expect(NT_SUCCESS(CdpCoreRecoveryCancel(ctx.Core)),
-		"cancel fully covered recovery");
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-static int TestHeaderRegionReadUsesDiscoveredChunk(void)
-{
-	PCdp_STORE source = NULL;
-	PCdp_STORE journal = NULL;
-	PCdp_CORE core = NULL;
-	TEST_FAIL_STORE limited;
-	UCHAR a[512];
-	UCHAR b[512];
-	UINT64 targetTime = 31000;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(CdpMemStoreCreate(SRC_SIZE, SECTOR, &source)),
-		"create source for header read chunk test");
-	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &journal)),
-		"create journal for header read chunk test");
-	Expect(NT_SUCCESS(CdpCoreCreate(source, journal, &core)),
-		"create core for header read chunk test");
-	if (!source || !journal || !core)
-		goto cleanup;
-
-	TestFailStoreInstall(journal, &limited);
-	limited.MaxWriteLength = 64UL * 1024UL;
-	CdpCoreSetTime100ns(core, targetTime);
-	Expect(NT_SUCCESS(CdpCoreFormatJournal(core)),
-		"format discovers 64KB header-region I/O chunk");
-
-	FillPattern(a, sizeof(a), 0x31);
-	FillPattern(b, sizeof(b), 0x32);
-	Expect(NT_SUCCESS(source->Write(source, 0, sizeof(a), a)),
-		"seed header read chunk source");
-	Expect(NT_SUCCESS(CdpCoreWrite(core, 0, sizeof(b), b)),
-		"append record for header read chunk scan");
-
-	limited.ReadCallCount = 0;
-	limited.MaxReadLength = 64UL * 1024UL;
-	limited.OversizeReadCount = 0;
-	limited.LargestSuccessfulRead = 0;
-	limited.TotalReadBytes = 0;
-	st = CdpCoreRecoveryBegin(core, targetTime);
-	Expect(NT_SUCCESS(st), "recovery tree builds with cached read chunk");
-	Expect(limited.OversizeReadCount == 0 &&
-		limited.LargestSuccessfulRead == 64UL * 1024UL,
-		"header scan reuses discovered 64KB transfer size");
-	Expect(limited.ReadCallCount == 16 &&
-		limited.TotalReadBytes == Cdp_JOURNAL_HEADER_REGION_SIZE,
-		"header scan reads one 1MB region in 64KB blocks");
-	if (NT_SUCCESS(st))
-		Expect(NT_SUCCESS(CdpCoreRecoveryCancel(core)),
-			"cancel header read chunk recovery");
-
-	TestFailStoreRemove(journal, &limited);
-
-cleanup:
-	CdpCoreDestroy(core);
-	CdpMemStoreDestroy(journal);
-	CdpMemStoreDestroy(source);
-	return g_caseFailed;
-}
-
-static int TestPartialCoverageReadsOnlyLiveGap(void)
-{
-	TEST_CTX ctx;
-	TEST_FAIL_STORE sourceReads;
-	UCHAR original[1536];
-	UCHAR changed[512];
-	UCHAR out[1536];
-	UINT64 targetTime;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 32000)),
-		"setup live-gap read test");
-	FillPattern(original, sizeof(original), 0x41);
-	FillPattern(changed, sizeof(changed), 0x42);
-	Expect(NT_SUCCESS(ctx.Source->Write(
-		ctx.Source, 0, sizeof(original), original)),
-		"seed three-sector source");
-	targetTime = CdpCoreGetTime100ns(ctx.Core);
-	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 0, sizeof(changed), changed)),
-		"journal first covered sector");
-	Expect(NT_SUCCESS(CdpCoreWrite(ctx.Core, 1024, sizeof(changed), changed)),
-		"journal third covered sector");
-	Expect(NT_SUCCESS(CdpCoreRecoveryBegin(ctx.Core, targetTime)),
-		"prepare history with one live gap");
-
-	TestFailStoreInstall(ctx.Source, &sourceReads);
-	memset(out, 0, sizeof(out));
-	st = CdpCoreRead(ctx.Core, 0, sizeof(out), out);
-	Expect(NT_SUCCESS(st) && memcmp(out, original, sizeof(out)) == 0,
-		"mixed recovery read synthesizes journal and live bytes");
-	Expect(sourceReads.ReadCallCount == 1 &&
-		sourceReads.TotalReadBytes == 512 &&
-		sourceReads.LastReadOffset == 512 &&
-		sourceReads.LastReadLength == 512,
-		"partial coverage reads only the uncovered source interval");
-	TestFailStoreRemove(ctx.Source, &sourceReads);
-
-	Expect(NT_SUCCESS(CdpCoreRecoveryCancel(ctx.Core)),
-		"cancel live-gap recovery");
-	TestCtxDestroy(&ctx);
-	return g_caseFailed;
-}
-
-static int TestHeaderRegionReadFallbackOnMount(void)
-{
-	PCdp_STORE source = NULL;
-	PCdp_STORE journal = NULL;
-	PCdp_CORE core = NULL;
-	TEST_FAIL_STORE limited;
-	UCHAR a[512];
-	UCHAR b[512];
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(CdpMemStoreCreate(SRC_SIZE, SECTOR, &source)),
-		"create source for header read fallback");
-	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &journal)),
-		"create journal for header read fallback");
-	Expect(NT_SUCCESS(CdpCoreCreate(source, journal, &core)),
-		"create core for header read fallback");
-	if (!source || !journal || !core)
-		goto cleanup;
-
-	CdpCoreSetTime100ns(core, 33000);
-	Expect(NT_SUCCESS(CdpCoreFormatJournal(core)),
-		"format journal before remount fallback");
-	FillPattern(a, sizeof(a), 0x51);
-	FillPattern(b, sizeof(b), 0x52);
-	Expect(NT_SUCCESS(source->Write(source, 0, sizeof(a), a)),
-		"seed remount fallback source");
-	Expect(NT_SUCCESS(CdpCoreWrite(core, 0, sizeof(b), b)),
-		"append record before remount fallback");
-	CdpCoreDestroy(core);
-	core = NULL;
-
-	Expect(NT_SUCCESS(CdpCoreCreate(source, journal, &core)),
-		"recreate core with unknown header read chunk");
-	if (!core)
-		goto cleanup;
-	TestFailStoreInstall(journal, &limited);
-	limited.MaxReadLength = 64UL * 1024UL;
-	st = CdpCoreMountJournal(core);
-	Expect(NT_SUCCESS(st), "mount halves header reads down to supported size");
-	Expect(limited.OversizeReadCount == 4 &&
-		limited.LargestSuccessfulRead == 64UL * 1024UL,
-		"header read probes 1MB to 64KB by halving");
-	Expect(limited.ReadLength32Count == 0,
-		"mount and runtime rebuild never issue 32-byte reads");
-	TestFailStoreRemove(journal, &limited);
-
-cleanup:
-	CdpCoreDestroy(core);
-	CdpMemStoreDestroy(journal);
-	CdpMemStoreDestroy(source);
-	return g_caseFailed;
-}
-
-static int TestPreviewTreeMinValidSequenceSummary(void)
-{
-	Cdp_PREVIEW_TREE tree;
-	Cdp_JOURNAL_RECORD header;
-
-	CdpPreviewTreeInitialize(&tree);
-	RtlZeroMemory(&header, sizeof(header));
-	header.VolumeOffset = 4096;
-	header.FileOffset = 4096;
-	header.DataLength = 512;
-	header.Sequence = 30;
-	Expect(NT_SUCCESS(CdpPreviewTreeInsert(&tree, &header)),
-		"insert later sequence for subtree-min test");
-	header.VolumeOffset = 0;
-	header.FileOffset = 0;
-	header.DataLength = 512;
-	header.Sequence = 10;
-	Expect(NT_SUCCESS(CdpPreviewTreeInsert(&tree, &header)),
-		"insert earliest sequence for subtree-min test");
-	header.VolumeOffset = 512;
-	header.FileOffset = 512;
-	header.DataLength = 1536;
-	header.Sequence = 20;
-	Expect(NT_SUCCESS(CdpPreviewTreeInsert(&tree, &header)),
-		"insert splittable sequence for subtree-min test");
-	Expect(tree.Root && tree.Root->MinValidSequence == 10,
-		"subtree summary selects earliest valid sequence");
-
-	Expect(NT_SUCCESS(CdpPreviewTreeMarkInvalidByStart(&tree, 0)),
-		"invalidate earliest node by start");
-	Expect(tree.Root && tree.Root->MinValidSequence == 20,
-		"subtree summary advances after commit invalidation");
-	Expect(NT_SUCCESS(CdpPreviewTreePunchRange(&tree, 1024, 512)),
-		"split pending node around concurrent write");
-	Expect(tree.Root && tree.Root->MinValidSequence == 20,
-		"subtree summary survives AVL split and reinsertion");
-	Expect(NT_SUCCESS(CdpPreviewTreeMarkInvalidByStart(&tree, 512)),
-		"invalidate left split fragment");
-	Expect(tree.Root && tree.Root->MinValidSequence == 20,
-		"right split fragment remains the earliest node");
-	Expect(NT_SUCCESS(CdpPreviewTreeMarkInvalidByStart(&tree, 1536)),
-		"invalidate right split fragment");
-	Expect(tree.Root && tree.Root->MinValidSequence == 30,
-		"subtree summary advances past both split fragments");
-	Expect(NT_SUCCESS(CdpPreviewTreeMarkInvalidByStart(&tree, 4096)),
-		"invalidate final valid node");
-	Expect(tree.Root && tree.Root->MinValidSequence == MAXUINT64,
-		"subtree summary reports no remaining valid node");
-
-	CdpPreviewTreeFree(&tree);
-	return g_caseFailed;
-}
-
-static VOID TestCollectTreeNodes(
-	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
-	_Out_writes_(Capacity) PCdp_PREVIEW_TREE_NODE* Nodes,
-	_Inout_ PULONG Count,
-	_In_ ULONG Capacity)
-{
-	if (!Node || *Count >= Capacity)
-		return;
-	TestCollectTreeNodes(Node->Left, Nodes, Count, Capacity);
-	if (*Count < Capacity)
-		Nodes[(*Count)++] = Node;
-	TestCollectTreeNodes(Node->Right, Nodes, Count, Capacity);
-}
-
-static int TestPreviewTreeGapInsert(void)
-{
-	Cdp_PREVIEW_TREE tree;
-	Cdp_JOURNAL_RECORD header;
-	PCdp_PREVIEW_TREE_NODE nodes[8];
-	ULONG count = 0;
-	static const UINT64 expectedStart[] = { 0, 512, 1024, 1536, 2048 };
-	static const UINT64 expectedEnd[] = { 512, 1024, 1536, 2048, 2560 };
-	static const UINT64 expectedSequence[] = { 30, 10, 30, 20, 30 };
-	static const UINT64 expectedFileOffset[] =
-		{ 10000, 20000, 11024, 30000, 12048 };
-	ULONG i;
-
-	CdpPreviewTreeInitialize(&tree);
-	RtlZeroMemory(&header, sizeof(header));
-	header.VolumeOffset = 512;
-	header.FileOffset = 20000;
-	header.DataLength = 512;
-	header.Sequence = 10;
-	Expect(NT_SUCCESS(CdpPreviewTreeInsert(&tree, &header)),
-		"insert first existing range for gap test");
-	header.VolumeOffset = 1536;
-	header.FileOffset = 30000;
-	header.Sequence = 20;
-	Expect(NT_SUCCESS(CdpPreviewTreeInsert(&tree, &header)),
-		"insert second existing range for gap test");
-	header.VolumeOffset = 0;
-	header.FileOffset = 10000;
-	header.DataLength = 2560;
-	header.Sequence = 30;
-	Expect(NT_SUCCESS(CdpPreviewTreeInsert(&tree, &header)),
-		"insert spanning range through multiple tree holes");
-
-	TestCollectTreeNodes(tree.Root, nodes, &count, RTL_NUMBER_OF(nodes));
-	Expect(count == RTL_NUMBER_OF(expectedStart) && tree.NodeCount == count,
-		"gap insert creates only uncovered fragments");
-	for (i = 0; i < count && i < RTL_NUMBER_OF(expectedStart); ++i)
-	{
-		Expect(nodes[i]->Start == expectedStart[i] &&
-			nodes[i]->End == expectedEnd[i] &&
-			nodes[i]->Sequence == expectedSequence[i] &&
-			nodes[i]->FileOffset == expectedFileOffset[i],
-			"gap insert preserves interval priority and payload offsets");
-	}
-	CdpPreviewTreeFree(&tree);
-	return g_caseFailed;
-}
-
-static int TestPayloadThresholdRotatesPartialHeaderRegion(void)
-{
-	const UINT64 journalSize = 8ULL * 1024ULL * 1024ULL;
-	const ULONG payloadSize = 512UL * 1024UL;
-	PCdp_STORE store = NULL;
-	Cdp_JOURNAL journal;
-	Cdp_JOURNAL remounted;
-	Cdp_JOURNAL_RECORD written;
-	Cdp_JOURNAL_RECORD records[2];
-	Cdp_PREVIEW_TREE tree;
-	GUID sourceGuid = { 0 };
-	PUCHAR payload = NULL;
-	UINT64 firstRegion;
-	UINT64 total = 0;
-	UINT64 generation = 0;
-	UINT64 partitionBytes = 0;
-	UINT64 metadataBytes = 0;
-	UINT64 payloadUsed = 0;
-	UINT64 payloadFree = 0;
-	ULONG returned = 0;
-	NTSTATUS st;
-
-	Expect(NT_SUCCESS(CdpMemStoreCreate(journalSize, SECTOR, &store)),
-		"create journal for payload threshold rotation");
-	if (!store)
-		return g_caseFailed;
-	payload = (PUCHAR)malloc(payloadSize);
-	Expect(payload != NULL, "allocate threshold test payload");
-	if (!payload)
+	alignedInput = (PUCHAR)_aligned_malloc(1024, SECTOR);
+	Expect(alignedInput != NULL,
+		"allocate sector-aligned application buffer");
+	if (!alignedInput)
 	{
 		CdpMemStoreDestroy(store);
 		return g_caseFailed;
 	}
-	FillPattern(payload, payloadSize, 0x51);
+	FillPattern(alignedInput, 1024, 0x6D);
+	CdpJournalInitializeWithStore(
+		&journal, store, &sourceGuid, TestPointerTime100ns,
+		(PVOID)(ULONG_PTR)92400);
+	Expect(NT_SUCCESS(CdpJournalFormat(&journal)),
+		"format journal for payload zero-copy test");
+
+	TestFailStoreInstall(store, &trace);
+	payloadOffset = journal.PayloadRegionOff;
+	trace.WatchedWriteOffset = payloadOffset;
+	status = CdpJournalAppend(
+		&journal, 0, SECTOR, alignedInput, NULL);
+	Expect(NT_SUCCESS(status), "append aligned after-image payload");
+	Expect(trace.WatchedWriteBuffer == alignedInput &&
+		trace.WatchedWriteLength == SECTOR,
+		"aligned payload is written directly without a copy buffer");
+
+	payloadOffset = journal.PayloadRegionOff;
+	trace.WatchedWriteOffset = payloadOffset;
+	trace.WatchedWriteBuffer = NULL;
+	trace.WatchedWriteLength = 0;
+	status = CdpJournalAppend(
+		&journal, SECTOR, SECTOR + 1, alignedInput, NULL);
+	Expect(NT_SUCCESS(status), "append partial-sector after-image payload");
+	Expect(trace.WatchedWriteBuffer != NULL &&
+		trace.WatchedWriteBuffer != alignedInput &&
+		trace.WatchedWriteLength == 2 * SECTOR,
+		"partial-sector payload uses the aligned fallback buffer");
+	TestFailStoreRemove(store, &trace);
+	journalBytes = (PUCHAR)CdpMemStoreData(store);
+	Expect(memcmp(journalBytes + payloadOffset,
+		alignedInput, SECTOR + 1) == 0,
+		"fallback payload preserves all valid input bytes");
+	for (i = SECTOR + 1; i < 2 * SECTOR; ++i)
+	{
+		if (journalBytes[payloadOffset + i] != 0)
+			break;
+	}
+	Expect(i == 2 * SECTOR,
+		"fallback payload zero-fills the final partial sector");
+
+	CdpJournalClose(&journal);
+	_aligned_free(alignedInput);
+	CdpMemStoreDestroy(store);
+	return g_caseFailed;
+}
+
+static int TestRecordHeaderWriteReusesSectorCache(void)
+{
+	PCdp_STORE store = NULL;
+	Cdp_JOURNAL formatted;
+	Cdp_JOURNAL mounted;
+	TEST_FAIL_STORE trace;
+	GUID sourceGuid = { 0 };
+	UCHAR payload[512];
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &store)),
+		"create journal for record-header cache test");
+	if (!store)
+		return g_caseFailed;
+	CdpJournalInitializeWithStore(
+		&formatted, store, &sourceGuid, TestPointerTime100ns,
+		(PVOID)(ULONG_PTR)92500);
+	Expect(NT_SUCCESS(CdpJournalFormat(&formatted)),
+		"format journal for record-header cache test");
+	CdpJournalClose(&formatted);
 
 	CdpJournalInitializeWithStore(
-		&journal,
-		store,
-		&sourceGuid,
-		TestPointerTime100ns,
-		(PVOID)(ULONG_PTR)70000);
+		&mounted, store, &sourceGuid, TestPointerTime100ns,
+		(PVOID)(ULONG_PTR)92600);
+	Expect(NT_SUCCESS(CdpJournalMount(&mounted)),
+		"mount journal with an empty record-header write cache");
+	FillPattern(payload, sizeof(payload), 0x4D);
+	TestFailStoreInstall(store, &trace);
+	status = CdpJournalAppend(
+		&mounted, 0, sizeof(payload), payload, NULL);
+	Expect(NT_SUCCESS(status), "append first cached-header record");
+	status = CdpJournalAppend(
+		&mounted, sizeof(payload), sizeof(payload), payload, NULL);
+	Expect(NT_SUCCESS(status), "append second cached-header record");
+	Expect(trace.ReadCallCount == 1 && trace.LastReadLength == SECTOR,
+		"two headers in one sector require only one sector read");
+	TestFailStoreRemove(store, &trace);
+
+	CdpJournalClose(&mounted);
+	CdpMemStoreDestroy(store);
+	return g_caseFailed;
+}
+
+static int TestAfterImageBranchNumbersIncrease(void)
+{
+	PCdp_STORE store = NULL;
+	Cdp_JOURNAL journal;
+	GUID sourceGuid = { 0 };
+	PCdp_JOURNAL_BRANCH_RECORD_HEADER branch;
+	UINT64 parentRegion;
+	PUCHAR bytes;
+	UCHAR payload[512];
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &store)),
+		"create journal for branch increment test");
+	if (!store)
+		return g_caseFailed;
+	CdpJournalInitializeWithStore(
+		&journal, store, &sourceGuid, TestPointerTime100ns,
+		(PVOID)(ULONG_PTR)93000);
 	Expect(NT_SUCCESS(CdpJournalFormat(&journal)),
-		"format journal for payload threshold rotation");
-	firstRegion = journal.LastHeaderRegionOff;
+		"format journal with branch 1");
+	FillPattern(payload, sizeof(payload), 0xC6);
 	Expect(NT_SUCCESS(CdpJournalAppend(
-		&journal, 0, payloadSize, payload, &written)),
-		"append first payload below one-tenth threshold");
-	Expect(journal.LastHeaderRegionOff == firstRegion &&
-		journal.CurrentHeaderCount == 1,
-		"first payload stays in initial header region");
+		&journal, 0, sizeof(payload), payload, NULL)),
+		"append parent branch data record");
+	parentRegion = journal.LastHeaderRegionOff;
+	status = CdpJournalAppendBranch(&journal, 2, 1, 2);
+	Expect(NT_SUCCESS(status), "append monotonically increasing branch 2");
+	Expect(journal.CurrentBranchNumber == 2 &&
+		journal.HighestBranchNumber == 2 &&
+		journal.LastHeaderRegionOff != parentRegion &&
+		journal.CurrentHeaderRegionStartSequence == 3,
+		"new branch starts a new region without resetting global Sequence");
 
-	journal.QueryTimeContext = (PVOID)(ULONG_PTR)70001;
+	bytes = (PUCHAR)CdpMemStoreData(store);
+	branch = (PCdp_JOURNAL_BRANCH_RECORD_HEADER)(
+		bytes + journal.LastHeaderRegionOff);
+	Expect((branch->Sequence & Cdp_JOURNAL_RECORD_FLAG_BRANCH) != 0 &&
+		(branch->Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) == 0 &&
+		branch->BranchNumber == 2 &&
+		branch->ParentBranchNumber == 1 &&
+		branch->InheritedRecordSequence == 2 &&
+		branch->Reserved == 0,
+		"branch 2 marker stores parent and inherited record sequence");
+	ExpectStatus(
+		CdpJournalAppendBranch(&journal, 4, 2, 2),
+		STATUS_INVALID_PARAMETER,
+		"branch numbers cannot skip the next value");
+	ExpectStatus(
+		CdpJournalAppendBranch(&journal, 2, 1, 2),
+		STATUS_INVALID_PARAMETER,
+		"branch numbers cannot be reused");
+
+	CdpJournalClose(&journal);
+	CdpMemStoreDestroy(store);
+	return g_caseFailed;
+}
+
+static int TestAfterImageMixedReadAndLatestOverlap(void)
+{
+	TEST_CTX ctx;
+	UCHAR source[2048];
+	UCHAR first[1024];
+	UCHAR latest[512];
+	UCHAR expected[2048];
+	UCHAR output[2048];
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(TestCtxCreate(
+		&ctx, SRC_SIZE, JNL_SIZE, 94000)),
+		"setup mixed after-image read test");
+	FillPattern(source, sizeof(source), 0x10);
+	RtlFillMemory(first, sizeof(first), 0xA1);
+	RtlFillMemory(latest, sizeof(latest), 0xB2);
+	Expect(NT_SUCCESS(ctx.Source->Write(
+		ctx.Source, 0, sizeof(source), source)),
+		"seed source for mixed read");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 512, sizeof(first), first, NULL)),
+		"append first current-branch range");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 1024, sizeof(latest), latest, NULL)),
+		"append latest overlapping current-branch range");
+
+	RtlCopyMemory(expected, source, sizeof(expected));
+	RtlCopyMemory(expected + 512, first, sizeof(first));
+	RtlCopyMemory(expected + 1024, latest, sizeof(latest));
+	RtlZeroMemory(output, sizeof(output));
+	status = CdpCoreRead(ctx.Core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(output, expected, sizeof(output)) == 0,
+		"read combines source gaps with latest journal coverage");
+
+	CdpCoreDestroy(ctx.Core);
+	ctx.Core = NULL;
+	status = CdpCoreCreate(ctx.Source, ctx.Journal, &ctx.Core);
+	Expect(NT_SUCCESS(status), "recreate core for meta-tree mount scan");
+	if (NT_SUCCESS(status))
+		status = CdpCoreMountJournal(ctx.Core);
+	Expect(NT_SUCCESS(status), "mount rebuilds current-branch meta tree");
+	RtlZeroMemory(output, sizeof(output));
+	if (NT_SUCCESS(status))
+		status = CdpCoreRead(ctx.Core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(output, expected, sizeof(output)) == 0,
+		"remounted meta tree returns the same mixed view");
+
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
+static int TestAfterImageAllOverlapShapes(void)
+{
+	TEST_CTX ctx;
+	Cdp_JOURNAL_RECORD latestRecord;
+	UCHAR source[16384];
+	UCHAR expected[16384];
+	UCHAR output[16384];
+	UCHAR oldLeft[1024];
+	UCHAR newLeft[1024];
+	UCHAR oldRight[1024];
+	UCHAR newRight[1024];
+	UCHAR oldContained[512];
+	UCHAR newContains[1536];
+	UCHAR oldSplit[1536];
+	UCHAR newMiddle[512];
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(TestCtxCreate(
+		&ctx, SRC_SIZE, JNL_SIZE, 94500)),
+		"setup all-overlap-shapes test");
+	FillPattern(source, sizeof(source), 0x09);
+	RtlCopyMemory(expected, source, sizeof(expected));
+	RtlFillMemory(oldLeft, sizeof(oldLeft), 0x11);
+	RtlFillMemory(newLeft, sizeof(newLeft), 0x21);
+	RtlFillMemory(oldRight, sizeof(oldRight), 0x32);
+	RtlFillMemory(newRight, sizeof(newRight), 0x42);
+	RtlFillMemory(oldContained, sizeof(oldContained), 0x53);
+	RtlFillMemory(newContains, sizeof(newContains), 0x63);
+	RtlFillMemory(oldSplit, sizeof(oldSplit), 0x74);
+	RtlFillMemory(newMiddle, sizeof(newMiddle), 0x84);
+	Expect(NT_SUCCESS(ctx.Source->Write(
+		ctx.Source, 0, sizeof(source), source)),
+		"seed source for all overlap shapes");
+
+	// Left overlap: newer [0, 1024) replaces the left side of older
+	// [512, 1536), leaving only the older right fragment.
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 512, sizeof(oldLeft), oldLeft, NULL)),
+		"append old range for left overlap");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(newLeft), newLeft, NULL)),
+		"append newer range overlapping from the left");
+	RtlCopyMemory(expected + 512, oldLeft, sizeof(oldLeft));
+	RtlCopyMemory(expected, newLeft, sizeof(newLeft));
+
+	// Right overlap: newer [4608, 5632) replaces the right side of older
+	// [4096, 5120), leaving only the older left fragment.
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 4096, sizeof(oldRight), oldRight, NULL)),
+		"append old range for right overlap");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 4608, sizeof(newRight), newRight, NULL)),
+		"append newer range overlapping from the right");
+	RtlCopyMemory(expected + 4096, oldRight, sizeof(oldRight));
+	RtlCopyMemory(expected + 4608, newRight, sizeof(newRight));
+
+	// Contains: newer [8192, 9728) completely covers older [8704, 9216).
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 8704, sizeof(oldContained), oldContained, NULL)),
+		"append old range that will be fully contained");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 8192, sizeof(newContains), newContains, NULL)),
+		"append newer range containing the old range");
+	RtlCopyMemory(expected + 8704, oldContained, sizeof(oldContained));
+	RtlCopyMemory(expected + 8192, newContains, sizeof(newContains));
+
+	// Middle overlap: newer [12800, 13312) splits older
+	// [12288, 13824) into independently readable left and right fragments.
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 12288, sizeof(oldSplit), oldSplit, NULL)),
+		"append old range for middle split");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 12800, sizeof(newMiddle), newMiddle, &latestRecord)),
+		"append newer middle range that splits the old range");
+	RtlCopyMemory(expected + 12288, oldSplit, sizeof(oldSplit));
+	RtlCopyMemory(expected + 12800, newMiddle, sizeof(newMiddle));
+
+	RtlZeroMemory(output, sizeof(output));
+	status = CdpCoreRead(ctx.Core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(output, expected, sizeof(output)) == 0,
+		"live MetaTree read resolves all four overlap shapes and source gaps");
+
+	// Each read crosses a fragment boundary, so correctness cannot be achieved
+	// by merely selecting one covering node for the request.
+	RtlZeroMemory(output, 2048);
+	status = CdpCoreRead(ctx.Core, 768, 512, output);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(output, expected + 768, 512) == 0,
+		"read across left-overlap new-to-old boundary");
+	status = CdpCoreRead(ctx.Core, 4352, 512, output);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(output, expected + 4352, 512) == 0,
+		"read across right-overlap old-to-new boundary");
+	status = CdpCoreRead(ctx.Core, 7936, 2048, output);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(output, expected + 7936, 2048) == 0,
+		"read across both edges of a containing record");
+	status = CdpCoreRead(ctx.Core, 12544, 1024, output);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(output, expected + 12544, 1024) == 0,
+		"read across old-left, new-middle and old-right fragments");
+
+	status = CdpCorePreviewBegin(
+		ctx.Core, latestRecord.WallClock100ns);
+	Expect(NT_SUCCESS(status),
+		"build PreviewTree containing all overlap shapes");
+	RtlZeroMemory(output, sizeof(output));
+	if (NT_SUCCESS(status))
+		status = CdpCorePreviewRead(ctx.Core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(output, expected, sizeof(output)) == 0,
+		"PreviewTree read resolves all four overlap shapes");
+	Expect(NT_SUCCESS(CdpCorePreviewEnd(ctx.Core)),
+		"end all-overlap-shapes preview");
+
+	status = CdpCoreRecoveryBegin(
+		ctx.Core, latestRecord.WallClock100ns);
+	Expect(NT_SUCCESS(status),
+		"recovery rebuilds MetaTree containing all overlap shapes");
+	RtlZeroMemory(output, sizeof(output));
+	if (NT_SUCCESS(status))
+		status = CdpCoreRead(ctx.Core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(output, expected, sizeof(output)) == 0,
+		"recovery replacement MetaTree preserves all overlap results");
+
+	CdpCoreDestroy(ctx.Core);
+	ctx.Core = NULL;
+	status = CdpCoreCreate(ctx.Source, ctx.Journal, &ctx.Core);
+	if (NT_SUCCESS(status))
+		status = CdpCoreMountJournal(ctx.Core);
+	Expect(NT_SUCCESS(status),
+		"remount rebuilds MetaTree after all overlap shapes");
+	RtlZeroMemory(output, sizeof(output));
+	if (NT_SUCCESS(status))
+		status = CdpCoreRead(ctx.Core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(output, expected, sizeof(output)) == 0,
+		"remounted MetaTree preserves all overlap results");
+
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
+static int TestAfterImageBranchAncestryRead(void)
+{
+	PCdp_STORE sourceStore = NULL;
+	PCdp_STORE journalStore = NULL;
+	PCdp_CORE core = NULL;
+	Cdp_JOURNAL journal;
+	GUID sourceGuid = { 0 };
+	UCHAR source[1536];
+	UCHAR branch1Kept[512];
+	UCHAR branch1Excluded[512];
+	UCHAR sibling[512];
+	UCHAR current[512];
+	UCHAR expected[1536];
+	UCHAR output[1536];
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(CdpMemStoreCreate(SRC_SIZE, SECTOR, &sourceStore)),
+		"create source for branch ancestry read");
+	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &journalStore)),
+		"create journal for branch ancestry read");
+	if (!sourceStore || !journalStore)
+		goto cleanup;
+	FillPattern(source, sizeof(source), 0x20);
+	RtlFillMemory(branch1Kept, sizeof(branch1Kept), 0x31);
+	RtlFillMemory(branch1Excluded, sizeof(branch1Excluded), 0x42);
+	RtlFillMemory(sibling, sizeof(sibling), 0x53);
+	RtlFillMemory(current, sizeof(current), 0x64);
+	Expect(NT_SUCCESS(sourceStore->Write(
+		sourceStore, 0, sizeof(source), source)),
+		"seed branch ancestry source");
+
+	CdpJournalInitializeWithStore(
+		&journal, journalStore, &sourceGuid, TestPointerTime100ns,
+		(PVOID)(ULONG_PTR)95000);
+	Expect(NT_SUCCESS(CdpJournalFormat(&journal)), "format branch journal");
 	Expect(NT_SUCCESS(CdpJournalAppend(
-		&journal, payloadSize, payloadSize, payload, &written)),
-		"append crossing one-tenth threshold");
-	Expect(journal.LastHeaderRegionOff != firstRegion &&
-		journal.CurrentHeaderCount == 1,
-		"threshold rotates a partially filled header region");
-	Expect(journal.NextSequence == 3,
-		"sequence remains continuous across partial header regions");
+		&journal, 0, sizeof(branch1Kept), branch1Kept, NULL)),
+		"append inherited branch-1 record sequence 2");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 512, sizeof(branch1Excluded), branch1Excluded, NULL)),
+		"append non-inherited branch-1 record sequence 3");
+	Expect(NT_SUCCESS(CdpJournalAppendBranch(&journal, 2, 1, 2)),
+		"create sibling branch 2 from sequence 2");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 512, sizeof(sibling), sibling, NULL)),
+		"append sibling-only record");
+	Expect(NT_SUCCESS(CdpJournalAppendBranch(&journal, 3, 1, 2)),
+		"create current branch 3 from branch 1 sequence 2");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 1024, sizeof(current), current, NULL)),
+		"append current-branch record");
+	CdpJournalClose(&journal);
 
-	st = CdpJournalQueryRecordHeaders(
-		&journal, 0, 0, records, RTL_NUMBER_OF(records),
+	status = CdpCoreCreate(sourceStore, journalStore, &core);
+	Expect(NT_SUCCESS(status), "create core for current branch view");
+	if (NT_SUCCESS(status))
+		status = CdpCoreMountJournal(core);
+	Expect(NT_SUCCESS(status), "mount follows current branch ancestry");
+	RtlCopyMemory(expected, branch1Kept, sizeof(branch1Kept));
+	RtlCopyMemory(expected + 512, source + 512, 512);
+	RtlCopyMemory(expected + 1024, current, sizeof(current));
+	RtlZeroMemory(output, sizeof(output));
+	if (NT_SUCCESS(status))
+		status = CdpCoreRead(core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(output, expected, sizeof(output)) == 0,
+		"current view keeps inherited data and discards excluded/sibling records");
+
+cleanup:
+	if (core)
+		CdpCoreDestroy(core);
+	if (journalStore)
+		CdpMemStoreDestroy(journalStore);
+	if (sourceStore)
+		CdpMemStoreDestroy(sourceStore);
+	return g_caseFailed;
+}
+
+static int TestAfterImageCompactsOnlyCurrentBranch(void)
+{
+	PCdp_STORE sourceStore = NULL;
+	PCdp_STORE journalStore = NULL;
+	PCdp_CORE core = NULL;
+	Cdp_JOURNAL journal;
+	GUID sourceGuid = { 0 };
+	UCHAR source[1536];
+	UCHAR inherited[512];
+	UCHAR excluded[512];
+	UCHAR sibling[512];
+	UCHAR current[512];
+	PUCHAR filler = NULL;
+	UCHAR output[1536];
+	UCHAR expected[1536];
+	UCHAR fillerOut[512];
+	UINT64 oldRegion;
+	UINT64 firstSequence;
+	UINT64 endSequence;
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(CdpMemStoreCreate(SRC_SIZE * 32, SECTOR, &sourceStore)),
+		"create source for compaction test");
+	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &journalStore)),
+		"create journal for compaction test");
+	if (!sourceStore || !journalStore)
+		goto cleanup;
+	filler = (PUCHAR)malloc(1024 * 1024);
+	if (!filler)
+		goto cleanup;
+	FillPattern(source, sizeof(source), 0x70);
+	RtlFillMemory(inherited, sizeof(inherited), 0x81);
+	RtlFillMemory(excluded, sizeof(excluded), 0x92);
+	RtlFillMemory(sibling, sizeof(sibling), 0xA3);
+	RtlFillMemory(current, sizeof(current), 0xB4);
+	RtlFillMemory(filler, 1024 * 1024, 0xC5);
+	Expect(NT_SUCCESS(sourceStore->Write(
+		sourceStore, 0, sizeof(source), source)),
+		"seed compaction source");
+
+	CdpJournalInitializeWithStore(
+		&journal, journalStore, &sourceGuid, TestPointerTime100ns,
+		(PVOID)(ULONG_PTR)96000);
+	Expect(NT_SUCCESS(CdpJournalFormat(&journal)),
+		"format compaction journal");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 0, sizeof(inherited), inherited, NULL)),
+		"append inherited parent value");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 512, sizeof(excluded), excluded, NULL)),
+		"append excluded parent value");
+	Expect(NT_SUCCESS(CdpJournalAppendBranch(&journal, 2, 1, 2)),
+		"create sibling branch for compaction");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 512, sizeof(sibling), sibling, NULL)),
+		"append sibling value that must be discarded");
+	Expect(NT_SUCCESS(CdpJournalAppendBranch(&journal, 3, 1, 2)),
+		"create current branch for compaction");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 1024, sizeof(current), current, NULL)),
+		"append current value in oldest region");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 4096, 1024 * 1024, filler, NULL)),
+		"rotate to a newer header region");
+	Expect(NT_SUCCESS(CdpJournalGetOldestCompactableRegion(
+		&journal, &oldRegion, &firstSequence, &endSequence)),
+		"oldest region is compactable");
+	CdpJournalClose(&journal);
+
+	status = CdpCoreCreate(sourceStore, journalStore, &core);
+	Expect(NT_SUCCESS(status), "create compaction core");
+	if (NT_SUCCESS(status))
+		status = CdpCoreMountJournal(core);
+	Expect(NT_SUCCESS(status), "mount current branch before compaction");
+	if (NT_SUCCESS(status))
+		status = CdpCoreCompactOldestRegion(core);
+	Expect(NT_SUCCESS(status), "materialize and delete oldest region");
+	Expect(memcmp(CdpMemStoreData(sourceStore), inherited, 512) == 0 &&
+		memcmp((PUCHAR)CdpMemStoreData(sourceStore) + 512,
+			source + 512, 512) == 0 &&
+		memcmp((PUCHAR)CdpMemStoreData(sourceStore) + 1024,
+			source + 1024, 512) == 0,
+		"compaction materializes only live values from the deleted region");
+
+	RtlCopyMemory(expected, inherited, 512);
+	RtlCopyMemory(expected + 512, source + 512, 512);
+	RtlCopyMemory(expected + 1024, current, 512);
+	RtlZeroMemory(output, sizeof(output));
+	if (NT_SUCCESS(status))
+		status = CdpCoreRead(core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) && memcmp(output, expected, sizeof(output)) == 0,
+		"read falls back to materialized source values after tree removal");
+
+	CdpCoreDestroy(core);
+	core = NULL;
+	status = CdpCoreCreate(sourceStore, journalStore, &core);
+	if (NT_SUCCESS(status))
+		status = CdpCoreMountJournal(core);
+	Expect(NT_SUCCESS(status),
+		"remount succeeds after branch markers in old region were reclaimed");
+	RtlZeroMemory(fillerOut, sizeof(fillerOut));
+	if (NT_SUCCESS(status))
+		status = CdpCoreRead(core, 4096, sizeof(fillerOut), fillerOut);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(fillerOut, filler, sizeof(fillerOut)) == 0,
+		"remounted MetaTree retains newer-region journal data");
+
+cleanup:
+	if (core)
+		CdpCoreDestroy(core);
+	if (filler)
+		free(filler);
+	if (journalStore)
+		CdpMemStoreDestroy(journalStore);
+	if (sourceStore)
+		CdpMemStoreDestroy(sourceStore);
+	return g_caseFailed;
+}
+
+static int TestAfterImageCompactionPrunesOnlyAtInheritancePoint(void)
+{
+	PCdp_STORE sourceStore = NULL;
+	PCdp_STORE journalStore = NULL;
+	PCdp_CORE core = NULL;
+	Cdp_JOURNAL journal;
+	GUID sourceGuid = { 0 };
+	Cdp_JOURNAL_RECORD aRecord;
+	Cdp_JOURNAL_RECORD bRecord;
+	Cdp_JOURNAL_RECORD xRecord;
+	Cdp_JOURNAL_RECORD headers[16];
+	PUCHAR b = NULL;
+	UCHAR a[512];
+	UCHAR c[512];
+	UCHAR x[512];
+	UCHAR sibling[512];
+	UCHAR z[512];
+	UCHAR y[512];
+	UCHAR postPrune[512];
+	Cdp_JOURNAL_RECORD postPruneRecord;
+	UINT64 total = 0;
+	UINT64 generation = 0;
+	ULONG returned = 0;
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(CdpMemStoreCreate(
+		4ULL * 1024 * 1024, SECTOR, &sourceStore)),
+		"create source for inheritance-point compaction test");
+	Expect(NT_SUCCESS(CdpMemStoreCreate(
+		16ULL * 1024 * 1024, SECTOR, &journalStore)),
+		"create journal for inheritance-point compaction test");
+	if (!sourceStore || !journalStore)
+		goto cleanup;
+	b = (PUCHAR)malloc(2 * 1024 * 1024);
+	if (!b)
+		goto cleanup;
+	RtlFillMemory(a, sizeof(a), 0x11);
+	RtlFillMemory(b, 2 * 1024 * 1024, 0x22);
+	RtlFillMemory(c, sizeof(c), 0x33);
+	RtlFillMemory(x, sizeof(x), 0x44);
+	RtlFillMemory(sibling, sizeof(sibling), 0x55);
+	RtlFillMemory(z, sizeof(z), 0x66);
+	RtlFillMemory(y, sizeof(y), 0x77);
+	RtlFillMemory(postPrune, sizeof(postPrune), 0x88);
+
+	CdpJournalInitializeWithStore(
+		&journal, journalStore, &sourceGuid, TestPointerTime100ns,
+		(PVOID)(ULONG_PTR)140000);
+	Expect(NT_SUCCESS(CdpJournalFormat(&journal)),
+		"format inheritance-point journal");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 0, sizeof(a), a, &aRecord)),
+		"append branch-1 record a in oldest region");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 4096, 2 * 1024 * 1024, b, &bRecord)),
+		"rotate and append branch-1 inheritance record b");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 2ULL * 1024 * 1024, sizeof(c), c, NULL)),
+		"append branch-1 suffix c after inheritance point");
+	Expect(NT_SUCCESS(CdpJournalAppendBranch(
+		&journal, 2, 1, bRecord.Sequence + 1)),
+		"create branch 2 from c");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 2ULL * 1024 * 1024 + 512, sizeof(x), x, &xRecord)),
+		"append branch-2 data");
+	Expect(NT_SUCCESS(CdpJournalAppendBranch(
+		&journal, 3, 1, bRecord.Sequence)),
+		"create valid sibling branch 3 from retained record b");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 2ULL * 1024 * 1024 + 1024,
+		sizeof(sibling), sibling, NULL)),
+		"append valid sibling branch-3 data");
+	Expect(NT_SUCCESS(CdpJournalAppendBranch(
+		&journal, 4, 2, xRecord.Sequence)),
+		"create recursive child branch 4 from branch 2");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 2ULL * 1024 * 1024 + 1536, sizeof(z), z, NULL)),
+		"append branch-4 descendant data");
+	Expect(NT_SUCCESS(CdpJournalAppendBranch(
+		&journal, 5, 1, bRecord.Sequence)),
+		"create latest branch 5 from b");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 3ULL * 1024 * 1024, sizeof(y), y, NULL)),
+		"append latest-branch data");
+	Expect(aRecord.Sequence == 2 && bRecord.Sequence == 3 &&
+		journal.NextSequence == 13,
+		"global Record Sequence is unique and monotonic across branches");
+	CdpJournalClose(&journal);
+
+	status = CdpCoreCreate(sourceStore, journalStore, &core);
+	if (NT_SUCCESS(status))
+		status = CdpCoreMountJournal(core);
+	Expect(NT_SUCCESS(status), "mount inheritance-point compaction core");
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+
+	status = CdpCoreCompactOldestRegion(core);
+	Expect(NT_SUCCESS(status),
+		"compact region without an inheritance point");
+	if (NT_SUCCESS(status))
+		status = CdpCoreQueryRecordHeaders(
+			core, 0, 0, headers, RTL_NUMBER_OF(headers),
+			&total, &generation, &returned);
+	Expect(NT_SUCCESS(status) && total == 10 && returned == 10,
+		"no-point compaction keeps unreachable sibling subtree for now");
+
+	returned = 0;
+	status = CdpCoreCompactOldestRegion(core);
+	Expect(NT_SUCCESS(status),
+		"compact region containing the latest-branch inheritance point");
+	if (NT_SUCCESS(status))
+		status = CdpCoreQueryRecordHeaders(
+			core, 0, 0, headers, RTL_NUMBER_OF(headers),
+			&total, &generation, &returned);
+	Expect(NT_SUCCESS(status) && total == 4 && returned == 4 &&
+		headers[0].Flags == Cdp_JOURNAL_RECORD_FLAG_BRANCH &&
+		headers[0].Sequence == 7 && headers[1].Sequence == 8 &&
+		headers[2].Sequence == 11 && headers[3].Sequence == 12,
+		"point compaction keeps sibling from retained b and prunes c descendants");
+
+	// Regions for tombstoned c and branch 2 are reclaimed first. Branch 3
+	// remains queryable until compaction actually reaches its own first region.
+	Expect(NT_SUCCESS(CdpCoreCompactOldestRegion(core)),
+		"reclaim tombstoned parent-suffix region");
+	Expect(NT_SUCCESS(CdpCoreCompactOldestRegion(core)),
+		"reclaim tombstoned branch-2 region");
+	returned = 0;
+	status = CdpCoreQueryRecordHeaders(
+		core, 0, 0, headers, RTL_NUMBER_OF(headers),
 		&total, &generation, &returned);
-	Expect(NT_SUCCESS(st) && total == 2 && returned == 2 &&
-		records[0].Sequence == 1 && records[1].Sequence == 2,
-		"record listing derives partial-region count from StartSequence");
-	st = CdpJournalQueryUsage(
-		&journal,
-		&partitionBytes,
-		&metadataBytes,
-		&payloadUsed,
-		&payloadFree,
-		&total);
-	Expect(NT_SUCCESS(st) &&
-		metadataBytes == SECTOR + 2ULL * Cdp_JOURNAL_HEADER_REGION_SIZE,
-		"usage counts both active partial header regions");
+	Expect(NT_SUCCESS(status) && total == 4 && returned == 4,
+		"valid sibling remains before merge reaches its own region");
+	Expect(NT_SUCCESS(CdpCoreCompactOldestRegion(core)),
+		"merge reaches and deletes non-current sibling branch 3");
+	returned = 0;
+	status = CdpCoreQueryRecordHeaders(
+		core, 0, 0, headers, RTL_NUMBER_OF(headers),
+		&total, &generation, &returned);
+	Expect(NT_SUCCESS(status) && total == 2 && returned == 2 &&
+		headers[0].Sequence == 11 && headers[1].Sequence == 12,
+		"sibling branch is deleted only when its own region is merged");
 
-	CdpPreviewTreeInitialize(&tree);
-	st = CdpJournalBuildPreviewTree(
-		&journal, 70000, journal.NextSequence, TRUE, &tree);
-	Expect(NT_SUCCESS(st) && tree.NodeCount == 2,
-		"preview scans partially filled non-current header region");
-	CdpPreviewTreeFree(&tree);
+	CdpCoreDestroy(core);
+	core = NULL;
+	status = CdpCoreCreate(sourceStore, journalStore, &core);
+	if (NT_SUCCESS(status))
+		status = CdpCoreMountJournal(core);
+	Expect(NT_SUCCESS(status),
+		"remount accepts tombstoned global-sequence slots");
+	if (NT_SUCCESS(status))
+	{
+		returned = 0;
+		status = CdpCoreQueryRecordHeaders(
+			core, 0, 0, headers, RTL_NUMBER_OF(headers),
+			&total, &generation, &returned);
+		Expect(NT_SUCCESS(status) && total == 2 && returned == 2,
+			"remount does not resurrect pruned records or branches");
+		status = CdpCoreAppendAfterImage(
+			core, 3ULL * 1024 * 1024 + 512,
+			sizeof(postPrune), postPrune, &postPruneRecord);
+		Expect(NT_SUCCESS(status) && postPruneRecord.Sequence == 13,
+			"new append does not reuse tombstoned global Sequences");
+	}
+
+cleanup:
+	if (core)
+		CdpCoreDestroy(core);
+	if (b)
+		free(b);
+	if (journalStore)
+		CdpMemStoreDestroy(journalStore);
+	if (sourceStore)
+		CdpMemStoreDestroy(sourceStore);
+	return g_caseFailed;
+}
+
+static int TestAfterImageCompactionFailureKeepsRegion(void)
+{
+	TEST_CTX ctx;
+	TEST_FAIL_STORE sourceFail;
+	UCHAR baseline[512];
+	UCHAR live[512];
+	PUCHAR filler = NULL;
+	UCHAR output[512];
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(TestCtxCreate(
+		&ctx, 2ULL * 1024 * 1024, JNL_SIZE, 97000)),
+		"setup compaction failure test");
+	filler = (PUCHAR)malloc(1024 * 1024);
+	if (!filler)
+	{
+		TestCtxDestroy(&ctx);
+		return g_caseFailed;
+	}
+	FillPattern(baseline, sizeof(baseline), 0x11);
+	RtlFillMemory(live, sizeof(live), 0xD6);
+	RtlFillMemory(filler, 1024 * 1024, 0xE7);
+	Expect(NT_SUCCESS(ctx.Source->Write(
+		ctx.Source, 0, sizeof(baseline), baseline)),
+		"seed source before failed compaction");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(live), live, NULL)),
+		"append live value in oldest region");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 4096, 1024 * 1024, filler, NULL)),
+		"create newer region before failed compaction");
+	TestFailStoreInstall(ctx.Source, &sourceFail);
+	sourceFail.FailNextWrites = 1;
+	status = CdpCoreCompactOldestRegion(ctx.Core);
+	Expect(status == STATUS_IO_DEVICE_ERROR,
+		"source write failure aborts compaction");
+	TestFailStoreRemove(ctx.Source, &sourceFail);
+	RtlZeroMemory(output, sizeof(output));
+	status = CdpCoreRead(ctx.Core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) && memcmp(output, live, sizeof(output)) == 0,
+		"failed compaction keeps MetaTree journal coverage");
+	Expect(NT_SUCCESS(CdpCoreCompactOldestRegion(ctx.Core)),
+		"failed attempt kept the region for a successful retry");
+
+	free(filler);
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
+static int TestAfterImageCompactionMaterializesRegionLatest(void)
+{
+	TEST_CTX ctx;
+	UCHAR baseline[1024];
+	UCHAR oldRegionLatest[1024];
+	UCHAR newerOverlay[512];
+	UCHAR expected[1024];
+	UCHAR output[1024];
+	PUCHAR filler = NULL;
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(TestCtxCreate(
+		&ctx, 2ULL * 1024 * 1024, JNL_SIZE, 98000)),
+		"setup region-latest materialization test");
+	filler = (PUCHAR)malloc(1024 * 1024);
+	if (!filler)
+	{
+		TestCtxDestroy(&ctx);
+		return g_caseFailed;
+	}
+	RtlFillMemory(baseline, sizeof(baseline), 0x12);
+	RtlFillMemory(oldRegionLatest, sizeof(oldRegionLatest), 0xA8);
+	RtlFillMemory(newerOverlay, sizeof(newerOverlay), 0xB9);
+	RtlFillMemory(filler, 1024 * 1024, 0xCA);
+	Expect(NT_SUCCESS(ctx.Source->Write(
+		ctx.Source, 0, sizeof(baseline), baseline)),
+		"seed source for region-latest materialization");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(oldRegionLatest), oldRegionLatest, NULL)),
+		"append full old-region latest record");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 4096, 1024 * 1024, filler, NULL)),
+		"rotate old record into a compactable region");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 512, sizeof(newerOverlay), newerOverlay, NULL)),
+		"append newer-region partial overlay");
+
+	status = CdpCoreCompactOldestRegion(ctx.Core);
+	Expect(NT_SUCCESS(status), "compact partially overlaid old region");
+	Expect(memcmp(CdpMemStoreData(ctx.Source),
+		oldRegionLatest, sizeof(oldRegionLatest)) == 0,
+		"source receives the complete latest value inside deleted region");
+	RtlCopyMemory(expected, oldRegionLatest, sizeof(expected));
+	RtlCopyMemory(expected + 512, newerOverlay, sizeof(newerOverlay));
+	RtlZeroMemory(output, sizeof(output));
+	status = CdpCoreRead(ctx.Core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) && memcmp(output, expected, sizeof(output)) == 0,
+		"MetaTree keeps newer intersection over materialized source baseline");
+
+	free(filler);
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
+static int TestAfterImageBranchInfoTree(void)
+{
+	PCdp_STORE store = NULL;
+	Cdp_JOURNAL journal;
+	Cdp_JOURNAL remounted;
+	Cdp_JOURNAL_RECORD parentRecord;
+	Cdp_JOURNAL_RECORD childRecord;
+	GUID sourceGuid = { 0 };
+	UCHAR value[512];
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &store)),
+		"create journal for branch-info tree test");
+	if (!store)
+		return g_caseFailed;
+	RtlFillMemory(value, sizeof(value), 0x5A);
+	CdpJournalInitializeWithStore(
+		&journal, store, &sourceGuid, TestPointerTime100ns,
+		(PVOID)(ULONG_PTR)99000);
+	Expect(NT_SUCCESS(CdpJournalFormat(&journal)),
+		"format journal and create branch-info root");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 0, sizeof(value), value, &parentRecord)),
+		"advance branch-1 end record");
+	Expect(NT_SUCCESS(CdpJournalAppendBranch(
+		&journal, 2, 1, parentRecord.Sequence)),
+		"create child branch and update branch-info tree");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 512, sizeof(value), value, &childRecord)),
+		"advance latest branch end record");
+	Expect(journal.BranchTree.Count == 2 &&
+		journal.BranchTree.Root != NULL &&
+		journal.BranchTree.Root->BranchNumber == 1 &&
+		journal.BranchTree.Root->EndRecord.Sequence == parentRecord.Sequence &&
+		!journal.BranchTree.Root->Latest &&
+		journal.BranchTree.Latest != NULL &&
+		journal.BranchTree.Latest->BranchNumber == 2 &&
+		journal.BranchTree.Latest->Parent == journal.BranchTree.Root &&
+		journal.BranchTree.Latest->InheritedRecordSequence ==
+			parentRecord.Sequence &&
+		journal.BranchTree.Latest->EndRecord.Sequence == childRecord.Sequence &&
+		journal.BranchTree.Latest->Latest,
+		"dynamic branch-info tree records ancestry, endpoints and latest flag");
 	CdpJournalClose(&journal);
 
 	CdpJournalInitializeWithStore(
-		&remounted, store, &sourceGuid, NULL, NULL);
-	st = CdpJournalMount(&remounted);
-	Expect(NT_SUCCESS(st) && remounted.TotalRecords == 2 &&
-		remounted.CurrentHeaderCount == 1,
-		"mount rebuilds partially filled non-current header region");
-	if (NT_SUCCESS(st))
-	{
-		returned = 0;
-		st = CdpJournalQueryRecordHeaders(
-			&remounted, 0, 0, records, RTL_NUMBER_OF(records),
-			&total, &generation, &returned);
-		Expect(NT_SUCCESS(st) && total == 2 && returned == 2,
-			"record listing survives remount after threshold rotation");
-	}
+		&remounted, store, &sourceGuid, TestPointerTime100ns,
+		(PVOID)(ULONG_PTR)100000);
+	status = CdpJournalMount(&remounted);
+	Expect(NT_SUCCESS(status) && remounted.BranchTree.Count == 2 &&
+		remounted.BranchTree.Root != NULL &&
+		remounted.BranchTree.Latest != NULL &&
+		remounted.BranchTree.Latest->Parent == remounted.BranchTree.Root &&
+		remounted.BranchTree.Latest->EndRecord.Sequence == childRecord.Sequence,
+		"mount scan rebuilds the same branch-info topology");
 	CdpJournalClose(&remounted);
-	free(payload);
 	CdpMemStoreDestroy(store);
+	return g_caseFailed;
+}
+
+static int TestAfterImagePreviewBranchPath(void)
+{
+	PCdp_STORE sourceStore = NULL;
+	PCdp_STORE journalStore = NULL;
+	PCdp_CORE core = NULL;
+	Cdp_JOURNAL journal;
+	Cdp_JOURNAL_RECORD inheritedRecord;
+	Cdp_JOURNAL_RECORD excludedRecord;
+	Cdp_JOURNAL_RECORD siblingRecord;
+	Cdp_JOURNAL_RECORD currentRecord;
+	GUID sourceGuid = { 0 };
+	UCHAR source[1536];
+	UCHAR inherited[512];
+	UCHAR excluded[512];
+	UCHAR sibling[512];
+	UCHAR current[512];
+	UCHAR expected[1536];
+	UCHAR output[1536];
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(CdpMemStoreCreate(SRC_SIZE, SECTOR, &sourceStore)),
+		"create preview source store");
+	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &journalStore)),
+		"create preview journal store");
+	if (!sourceStore || !journalStore)
+		goto cleanup;
+	RtlFillMemory(source, sizeof(source), 0x10);
+	RtlFillMemory(inherited, sizeof(inherited), 0x21);
+	RtlFillMemory(excluded, sizeof(excluded), 0x32);
+	RtlFillMemory(sibling, sizeof(sibling), 0x43);
+	RtlFillMemory(current, sizeof(current), 0x54);
+	Expect(NT_SUCCESS(sourceStore->Write(
+		sourceStore, 0, sizeof(source), source)),
+		"seed source fallback for branch preview");
+
+	CdpJournalInitializeWithStore(
+		&journal, journalStore, &sourceGuid, TestPointerTime100ns,
+		(PVOID)(ULONG_PTR)100000);
+	Expect(NT_SUCCESS(CdpJournalFormat(&journal)), "format preview journal");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 0, 512, inherited, &inheritedRecord)),
+		"append inherited parent value");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 512, 512, excluded, &excludedRecord)),
+		"append parent value excluded by inheritance point");
+	Expect(NT_SUCCESS(CdpJournalAppendBranch(
+		&journal, 2, 1, inheritedRecord.Sequence)),
+		"create historical sibling branch");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 512, 512, sibling, &siblingRecord)),
+		"append sibling branch value");
+	Expect(NT_SUCCESS(CdpJournalAppendBranch(
+		&journal, 3, 1, inheritedRecord.Sequence)),
+		"create latest branch from the same parent point");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 1024, 512, current, &currentRecord)),
+		"append latest-branch value");
+	CdpJournalClose(&journal);
+
+	status = CdpCoreCreate(sourceStore, journalStore, &core);
+	if (NT_SUCCESS(status))
+		status = CdpCoreMountJournal(core);
+	Expect(NT_SUCCESS(status), "mount branch-aware preview core");
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+
+	status = CdpCorePreviewBegin(core, siblingRecord.WallClock100ns);
+	Expect(NT_SUCCESS(status), "select branch 2 from target time");
+	RtlCopyMemory(expected, inherited, 512);
+	RtlCopyMemory(expected + 512, sibling, 512);
+	RtlCopyMemory(expected + 1024, source + 1024, 512);
+	RtlZeroMemory(output, sizeof(output));
+	if (NT_SUCCESS(status))
+		status = CdpCorePreviewRead(core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) && memcmp(output, expected, sizeof(output)) == 0,
+		"preview recursively includes parent inheritance and excludes other branches");
+	Expect(NT_SUCCESS(CdpCorePreviewEnd(core)), "end sibling preview");
+
+	status = CdpCorePreviewBegin(core, currentRecord.WallClock100ns);
+	Expect(NT_SUCCESS(status), "select latest branch from target time");
+	RtlCopyMemory(expected, inherited, 512);
+	RtlCopyMemory(expected + 512, source + 512, 512);
+	RtlCopyMemory(expected + 1024, current, 512);
+	RtlZeroMemory(output, sizeof(output));
+	if (NT_SUCCESS(status))
+		status = CdpCorePreviewRead(core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) && memcmp(output, expected, sizeof(output)) == 0,
+		"latest preview follows its own recursive ancestry path");
+	Expect(NT_SUCCESS(CdpCorePreviewEnd(core)), "end latest preview");
+
+cleanup:
+	if (core)
+		CdpCoreDestroy(core);
+	if (journalStore)
+		CdpMemStoreDestroy(journalStore);
+	if (sourceStore)
+		CdpMemStoreDestroy(sourceStore);
+	UNREFERENCED_PARAMETER(excludedRecord);
+	return g_caseFailed;
+}
+
+static int TestAfterImagePreviewMergeCoordination(void)
+{
+	TEST_CTX ctx;
+	UCHAR baseline[512];
+	UCHAR oldValue[512];
+	UCHAR output[512];
+	PUCHAR filler = NULL;
+	Cdp_JOURNAL_RECORD oldRecord;
+	Cdp_JOURNAL_RECORD newerRecord;
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(TestCtxCreate(
+		&ctx, 2ULL * 1024 * 1024, JNL_SIZE, 110000)),
+		"setup preview/merge coordination test");
+	filler = (PUCHAR)malloc(1024 * 1024);
+	if (!filler)
+	{
+		TestCtxDestroy(&ctx);
+		return g_caseFailed;
+	}
+	RtlFillMemory(baseline, sizeof(baseline), 0x61);
+	RtlFillMemory(oldValue, sizeof(oldValue), 0x72);
+	RtlFillMemory(filler, 1024 * 1024, 0x83);
+	Expect(NT_SUCCESS(ctx.Source->Write(
+		ctx.Source, 0, sizeof(baseline), baseline)),
+		"seed preview/merge source");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(oldValue), oldValue, &oldRecord)),
+		"append preview value in oldest region");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 4096, 1024 * 1024, filler, &newerRecord)),
+		"rotate preview target into a newer region");
+
+	Expect(NT_SUCCESS(CdpCoreSetMergeActive(ctx.Core, TRUE)),
+		"mark merge thread active");
+	ExpectStatus(CdpCorePreviewBegin(ctx.Core, newerRecord.WallClock100ns),
+		STATUS_DEVICE_BUSY,
+		"preview begin is rejected while merge is running");
+	Expect(NT_SUCCESS(CdpCoreSetMergeActive(ctx.Core, FALSE)),
+		"clear merge-thread gate");
+
+	Expect(NT_SUCCESS(CdpCorePreviewBegin(
+		ctx.Core, newerRecord.WallClock100ns)),
+		"begin preview whose target is in the retained newer region");
+	Expect(NT_SUCCESS(CdpCoreSetMergeActive(ctx.Core, TRUE)),
+		"start merge while preview is active");
+	status = CdpCoreCompactOldestRegion(ctx.Core);
+	Expect(NT_SUCCESS(status) &&
+		CdpCoreGetPhase(ctx.Core) == Cdp_CORE_PHASE_PREVIEW &&
+		!CdpCoreConsumePreviewStoppedByMerge(ctx.Core),
+		"merge keeps preview active before reaching its target record");
+	RtlZeroMemory(output, sizeof(output));
+	status = CdpCorePreviewRead(ctx.Core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) && memcmp(output, oldValue, sizeof(output)) == 0,
+		"merge rebases reclaimed PreviewTree coverage onto source data");
+	Expect(NT_SUCCESS(CdpCoreSetMergeActive(ctx.Core, FALSE)),
+		"finish merge before ending preview");
+	Expect(NT_SUCCESS(CdpCorePreviewEnd(ctx.Core)),
+		"end preview after non-target compaction");
+
+	free(filler);
+	TestCtxDestroy(&ctx);
+
+	Expect(NT_SUCCESS(TestCtxCreate(
+		&ctx, 2ULL * 1024 * 1024, JNL_SIZE, 120000)),
+		"setup target-region preview stop test");
+	filler = (PUCHAR)malloc(1024 * 1024);
+	if (!filler)
+	{
+		TestCtxDestroy(&ctx);
+		return g_caseFailed;
+	}
+	RtlFillMemory(oldValue, sizeof(oldValue), 0x94);
+	RtlFillMemory(filler, 1024 * 1024, 0xA5);
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(oldValue), oldValue, &oldRecord)),
+		"append target record in oldest region");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 4096, 1024 * 1024, filler, NULL)),
+		"create a newer region for target-stop compaction");
+	Expect(NT_SUCCESS(CdpCorePreviewBegin(
+		ctx.Core, oldRecord.WallClock100ns)),
+		"begin preview anchored in oldest region");
+	Expect(NT_SUCCESS(CdpCoreSetMergeActive(ctx.Core, TRUE)),
+		"start target-region merge");
+	status = CdpCoreCompactOldestRegion(ctx.Core);
+	Expect(NT_SUCCESS(status) &&
+		CdpCoreGetPhase(ctx.Core) == Cdp_CORE_PHASE_GENERAL &&
+		CdpCoreConsumePreviewStoppedByMerge(ctx.Core),
+		"merge stops preview when deleting its target-record region");
+	ExpectStatus(CdpCorePreviewRead(ctx.Core, 0, sizeof(output), output),
+		STATUS_INVALID_DEVICE_STATE,
+		"stopped preview can no longer serve reads");
+	Expect(NT_SUCCESS(CdpCoreSetMergeActive(ctx.Core, FALSE)),
+		"finish target-region merge");
+
+	free(filler);
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
+static int TestAfterImageRecoveryBranchSwitch(void)
+{
+	TEST_CTX ctx;
+	TEST_FAIL_STORE sourceTrace;
+	Cdp_JOURNAL_RECORD firstRecord;
+	Cdp_JOURNAL_RECORD latestRecord;
+	Cdp_JOURNAL_RECORD postRecoveryRecord;
+	Cdp_JOURNAL_RECORD headers[8];
+	UCHAR source[512];
+	UCHAR first[512];
+	UCHAR latest[512];
+	UCHAR postRecovery[512];
+	UCHAR output[512];
+	UINT64 total = 0;
+	UINT64 generation = 0;
+	ULONG returned = 0;
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(TestCtxCreate(
+		&ctx, SRC_SIZE, JNL_SIZE, 130000)),
+		"setup after-image recovery branch-switch test");
+	RtlFillMemory(source, sizeof(source), 0x11);
+	RtlFillMemory(first, sizeof(first), 0x22);
+	RtlFillMemory(latest, sizeof(latest), 0x33);
+	RtlFillMemory(postRecovery, sizeof(postRecovery), 0x44);
+	Expect(NT_SUCCESS(ctx.Source->Write(
+		ctx.Source, 0, sizeof(source), source)),
+		"seed recovery source fallback");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(first), first, &firstRecord)),
+		"append recovery target record");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(latest), latest, &latestRecord)),
+		"append value newer than recovery target");
+	Expect(NT_SUCCESS(CdpCoreSetMergeActive(ctx.Core, TRUE)),
+		"mark merge active before direct core recovery");
+	ExpectStatus(CdpCoreRecoveryBegin(
+		ctx.Core, firstRecord.WallClock100ns),
+		STATUS_DEVICE_BUSY,
+		"core recovery refuses to race an unstopped merge owner");
+	Expect(NT_SUCCESS(CdpCoreSetMergeActive(ctx.Core, FALSE)),
+		"clear merge owner as the driver stop/join path would do");
+
+	TestFailStoreInstall(ctx.Source, &sourceTrace);
+	status = CdpCoreRecoveryBegin(ctx.Core, firstRecord.WallClock100ns);
+	Expect(NT_SUCCESS(status) &&
+		CdpCoreGetPhase(ctx.Core) == Cdp_CORE_PHASE_GENERAL,
+		"recovery creates and publishes a new branch in one begin operation");
+	Expect(sourceTrace.ReadCallCount == 0 && sourceTrace.WriteCallCount == 0,
+		"recovery branch switch performs no source read or writeback");
+	TestFailStoreRemove(ctx.Source, &sourceTrace);
+	RtlZeroMemory(output, sizeof(output));
+	status = CdpCoreRead(ctx.Core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) && memcmp(output, first, sizeof(output)) == 0,
+		"replacement MetaTree exposes the requested historical value");
+	Expect(NT_SUCCESS(CdpCoreRecoveryCommit(ctx.Core)),
+		"recovery commit is an idempotent no-writeback acknowledgement");
+
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(postRecovery), postRecovery,
+		&postRecoveryRecord)),
+		"new writes continue on the recovery-created branch");
+	RtlZeroMemory(output, sizeof(output));
+	status = CdpCoreRead(ctx.Core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(output, postRecovery, sizeof(output)) == 0,
+		"post-recovery write updates the new branch MetaTree");
+
+	status = CdpCoreQueryRecordHeaders(
+		ctx.Core, 0, 0, headers, RTL_NUMBER_OF(headers),
+		&total, &generation, &returned);
+	Expect(NT_SUCCESS(status) && total == 5 && returned == 5 &&
+		headers[3].Flags == Cdp_JOURNAL_RECORD_FLAG_BRANCH &&
+		headers[4].Sequence == postRecoveryRecord.Sequence,
+		"journal contains the recovery branch marker followed by new-branch data");
+
+	// A later Recovery fails after its branch marker was appended. The marker
+	// must be removed and the already-published MetaTree must remain untouched.
+	CdpCoreTestSetRecoveryBuildFailure(STATUS_IO_DEVICE_ERROR);
+	status = CdpCoreRecoveryBegin(ctx.Core, firstRecord.WallClock100ns);
+	Expect(status == STATUS_IO_DEVICE_ERROR,
+		"recovery reports replacement-tree scan failure");
+	RtlZeroMemory(output, sizeof(output));
+	Expect(CdpCoreGetPhase(ctx.Core) == Cdp_CORE_PHASE_GENERAL &&
+		NT_SUCCESS(CdpCoreRead(ctx.Core, 0, sizeof(output), output)) &&
+		memcmp(output, postRecovery, sizeof(output)) == 0,
+		"failed recovery preserves the old MetaTree and returns to General");
+	returned = 0;
+	status = CdpCoreQueryRecordHeaders(
+		ctx.Core, 0, 0, headers, RTL_NUMBER_OF(headers),
+		&total, &generation, &returned);
+	Expect(NT_SUCCESS(status) && total == 5 && returned == 5,
+		"failed recovery removes its newly created branch record");
+
+	UNREFERENCED_PARAMETER(latestRecord);
+	TestCtxDestroy(&ctx);
 	return g_caseFailed;
 }
 
 int main(void)
 {
 	int failed = 0;
+	setvbuf(stdout, NULL, _IONBF, 0);
 
-	failed += RunCase("COW / Preview / Recovery", TestCowPreviewRecovery);
-	failed += RunCase("Recovery concurrent write Invalid", TestRecoveryInvalidate);
-	failed += RunCase("CaptureAppend (driver path)", TestCaptureAppendPath);
-	failed += RunCase("Preview mixed journal+live read", TestMixedReadPartialCoverage);
-	failed += RunCase("Multi-offset and dedup", TestMultiOffsetAndDedup);
-	failed += RunCase("QueryTimeRange and Mount", TestQueryTimeRangeAndMount);
-	failed += RunCase("Errors and phase guards", TestErrorsAndPhaseGuards);
-	failed += RunCase("Preview write during session", TestPreviewWriteDuringSession);
-	failed += RunCase("Preview before any COW", TestPreviewBeforeAnyCow);
-	failed += RunCase("Preview Staging merge", TestPreviewStagingMerge);
-	failed += RunCase("Recovery Staging punch", TestRecoveryStagingPunch);
-	failed += RunCase("Recovery writeback overlap", TestRecoveryWritebackOverlap);
-	failed += RunCase("Unmounted journal guards", TestUnmountedJournal);
-	failed += RunCase("QueryTimeRange empty journal", TestQueryTimeRangeEmptyJournal);
-	failed += RunCase("QueryTimeRange wall clocks", TestQueryTimeRangeWallClocks);
-	failed += RunCase("Journal usage and record headers", TestJournalUsageAndRecordHeaders);
-	failed += RunCase("Record sequence flags and remount", TestRecordSequenceFlagsAndRemount);
-	failed += RunCase("Backfill target scan continues", TestBackfillTargetScanContinuesPastTimeStop);
-	failed += RunCase("Recovery COW records are backfill", TestRecoveryCowRecordsAreBackfill);
-	failed += RunCase("Recovery commit coalesced large payload", TestRecoveryCommitCoalescedLargePayload);
-	failed += RunCase("Recovery commit step coalesced large payload", TestRecoveryCommitStepCoalescedLargePayload);
-	failed += RunCase("QueryTimeRange after eviction", TestQueryTimeRangeAfterEviction);
-	failed += RunCase("QueryTimeRange guards", TestQueryTimeRangeGuards);
-	failed += RunCase("Recovery time boundaries", TestRecoveryTimeBoundaries);
-	failed += RunCase("Preview target at/after newest", TestPreviewTargetAtOrAfterNewest);
-	failed += RunCase("Journal append too large", TestJournalAppendTooLarge);
-	failed += RunCase("Journal append max size", TestJournalAppendMaxSize);
-	failed += RunCase("CaptureAppend source bounds", TestCaptureAppendSourceBounds);
-	failed += RunCase("Mount unformatted journal", TestMountUnformattedJournal);
-	failed += RunCase("Recovery WritebackActive", TestRecoveryWritebackActive);
-	failed += RunCase("Journal drop oldest (ring full)", TestJournalDropOldest);
-	failed += RunCase("Journal payload tail wrap", TestJournalPayloadTailWrap);
-	failed += RunCase("Journal tiny partition large record", TestJournalTinyPartitionLargeRecord);
-	failed += RunCase("Journal format too small", TestJournalFormatTooSmall);
-	failed += RunCase("Journal format write chunk fallback", TestJournalFormatWriteChunkFallback);
-	failed += RunCase("4KiB-sector COW / Preview / Recovery", TestFourKiBSectorCowPreviewRecovery);
-	failed += RunCase("Single superblock metadata", TestSingleSuperblockMetadata);
-	failed += RunCase("Journal UINT64 global sequence rollover", TestJournalGlobalSequenceCrossesUlong);
-	failed += RunCase("Journal invalidate rejects remount", TestJournalInvalidateRejectsRemount);
-	failed += RunCase("Append superblock write policy", TestAppendWritesSuperblockOnlyForNewRegion);
-	failed += RunCase("Journal failure keeps live source unchanged", TestJournalWriteFailureDoesNotWriteSource);
-	failed += RunCase("Prepared Recovery commit/cancel", TestPreparedRecoveryCommitCancel);
-	failed += RunCase("Prepared Recovery partial concurrent write", TestPreparedRecoveryPartialConcurrentWrite);
-	failed += RunCase("Recovery commit interleaves new write", TestRecoveryCommitInterleavesNewWrite);
-	failed += RunCase("Prepared Recovery overlap matrix", TestPreparedRecoveryOverlapMatrix);
-	failed += RunCase("Preview overlap matrix", TestPreviewOverlapMatrix);
-	failed += RunCase("Recovery commit interleave overlap matrix", TestRecoveryCommitInterleaveOverlapMatrix);
-	failed += RunCase("Build staging overlap matrix", TestBuildStagingOverlapMatrix);
-	failed += RunCase("Fully covered Recovery read", TestFullyCoveredRecoveryReadSkipsSource);
-	failed += RunCase("Header-region read chunk reuse", TestHeaderRegionReadUsesDiscoveredChunk);
-	failed += RunCase("Partial coverage reads only live gap", TestPartialCoverageReadsOnlyLiveGap);
-	failed += RunCase("Header-region read fallback on mount", TestHeaderRegionReadFallbackOnMount);
-	failed += RunCase("Preview tree min valid sequence summary", TestPreviewTreeMinValidSequenceSummary);
-	failed += RunCase("Preview tree interval gap insert", TestPreviewTreeGapInsert);
-	failed += RunCase("Payload threshold rotates partial header region",
-		TestPayloadThresholdRotatesPartialHeaderRegion);
+	failed += RunCase("After-image initial branch record",
+		TestAfterImageInitialBranchRecord);
+	failed += RunCase("After-image append does not touch source",
+		TestAfterImageAppendDoesNotTouchSource);
+	failed += RunCase("After-image journal failure does not bypass source",
+		TestAfterImageJournalFailureDoesNotBypassSource);
+	failed += RunCase("After-image payload zero-copy and fallback",
+		TestAfterImagePayloadZeroCopyAndFallback);
+	failed += RunCase("Record-header sector write cache",
+		TestRecordHeaderWriteReusesSectorCache);
+	failed += RunCase("After-image branch numbers increase",
+		TestAfterImageBranchNumbersIncrease);
+	failed += RunCase("After-image mixed read and latest overlap",
+		TestAfterImageMixedReadAndLatestOverlap);
+	failed += RunCase("After-image all overlap shapes",
+		TestAfterImageAllOverlapShapes);
+	failed += RunCase("After-image branch ancestry read",
+		TestAfterImageBranchAncestryRead);
+	failed += RunCase("After-image compacts current branch only",
+		TestAfterImageCompactsOnlyCurrentBranch);
+	failed += RunCase("After-image inheritance-point reachability pruning",
+		TestAfterImageCompactionPrunesOnlyAtInheritancePoint);
+	failed += RunCase("After-image compaction failure keeps region",
+		TestAfterImageCompactionFailureKeepsRegion);
+	failed += RunCase("After-image compaction materializes region latest",
+		TestAfterImageCompactionMaterializesRegionLatest);
+	failed += RunCase("After-image branch information tree",
+		TestAfterImageBranchInfoTree);
+	failed += RunCase("After-image preview branch path",
+		TestAfterImagePreviewBranchPath);
+	failed += RunCase("After-image preview/merge coordination",
+		TestAfterImagePreviewMergeCoordination);
+	failed += RunCase("After-image recovery branch switch",
+		TestAfterImageRecoveryBranchSwitch);
 
 	printf("\n%s (%d failures)\n", failed ? "FAILED" : "ALL PASSED", failed);
 	return failed ? 1 : 0;
