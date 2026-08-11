@@ -16,6 +16,10 @@
 #define Cdp_JOURNAL_PAYLOAD_REGION_CAPACITY_DIVISOR 10ULL
 #define Cdp_JOURNAL_FLAG_RECOVERY_PENDING 0x00000001UL
 #define Cdp_JOURNAL_FLAG_CREDENTIAL_CONFIGURED 0x00000002UL
+// Reserved compatibility bit used by an earlier AutoChk experiment. New
+// recovery intents do not set it and reboot recovery performs no filesystem
+// repair.
+#define Cdp_JOURNAL_FLAG_RECOVERY_FS_REPAIR_PENDING 0x00000004UL
 #define Cdp_JOURNAL_RECORD_INDEX_MASK     0x0000FFFFUL
 #define Cdp_JOURNAL_RECORD_FLAGS_MASK     0xFFFF0000UL
 // Highest Sequence bit selects the branch-record interpretation.
@@ -23,6 +27,11 @@
 // Internal persistent tombstone. The slot keeps its global Sequence reserved
 // but is absent from runtime trees, time ranges and record queries.
 #define Cdp_JOURNAL_RECORD_FLAG_DELETED   0x40000000UL
+// Runtime/query-only annotation: the branch header is the per-region
+// continuation marker, rather than this branch's creation marker.
+#define Cdp_JOURNAL_RECORD_FLAG_BRANCH_CONTINUATION 0x20000000UL
+#define Cdp_JOURNAL_BRANCH_RECORD_FLAG_FIRST        0UL
+#define Cdp_JOURNAL_BRANCH_RECORD_FLAG_CONTINUATION 1UL
 #define Cdp_CREDENTIAL_KDF_PBKDF2_SHA256 1UL
 #define Cdp_CREDENTIAL_SALT_BYTES 16UL
 #define Cdp_CREDENTIAL_VERIFIER_BYTES 32UL
@@ -48,7 +57,9 @@ C_ASSERT(sizeof(Cdp_JOURNAL_RECORD_HEADER) == 32);
 // Cdp_JOURNAL_RECORD_FLAG_BRANCH. It occupies exactly the same 32 bytes:
 // BranchNumber/ParentBranchNumber overlay VolumeOffset,
 // InheritedRecordSequence overlays FileOffset, and Reserved overlays
-// DataLength. Branch records have no payload.
+// DataLength. Reserved is FIRST (0) only at branch creation; CONTINUATION (1)
+// marks the otherwise identical branch header at the start of later regions.
+// Branch records have no payload.
 typedef struct _Cdp_JOURNAL_BRANCH_RECORD_HEADER
 {
 	UINT64 WallClock100ns;
@@ -169,6 +180,22 @@ typedef struct _Cdp_BRANCH_INFO_TREE
 	ULONG Count;
 } Cdp_BRANCH_INFO_TREE, *PCdp_BRANCH_INFO_TREE;
 
+// Snapshot-safe public projection of an in-memory BranchTree node.  This
+// deliberately contains topology only; no record-header scan is required.
+#define Cdp_JOURNAL_BRANCH_INFO_FLAG_CURRENT   0x00000001UL
+#define Cdp_JOURNAL_BRANCH_INFO_FLAG_SYNTHETIC 0x00000002UL
+typedef struct _Cdp_JOURNAL_BRANCH_TREE_INFO
+{
+	LONG BranchNumber;
+	LONG ParentBranchNumber;
+	UINT64 InheritedRecordSequence;
+	UINT64 CreatedWallClock100ns;
+	UINT64 StartSequence;
+	UINT64 EndSequence;
+	ULONG Flags;
+	ULONG Reserved;
+} Cdp_JOURNAL_BRANCH_TREE_INFO, *PCdp_JOURNAL_BRANCH_TREE_INFO;
+
 typedef struct _Cdp_JOURNAL
 {
 	BOOLEAN Mounted;
@@ -198,8 +225,12 @@ typedef struct _Cdp_JOURNAL
 	PUCHAR HeaderWriteBuffer;
 	UINT64 HeaderWriteSectorOffset;
 	BOOLEAN HeaderWriteCacheValid;
+	BOOLEAN HeaderWriteCacheDirty;
 	UINT64 NextSequence;
 	UINT64 TotalRecords;
+	// Maintained under Lock. Mount reconstructs this once; hot merge-threshold
+	// checks use it directly and never walk Header region links.
+	UINT64 ActiveHeaderRegionCount;
 	UINT64 PayloadBytesUsed;
 	UINT64 RecordGeneration;
 	UINT64 Oldest100ns;
@@ -208,6 +239,8 @@ typedef struct _Cdp_JOURNAL
 	LONG HighestBranchNumber;
 	Cdp_BRANCH_INFO_TREE BranchTree;
 	BOOLEAN RecoveryPending;
+	BOOLEAN RecoveryFsRepairPending;
+	volatile LONG RecoveryFsRepairAttempts;
 	BOOLEAN SuperblockDirty;
 	UINT64 RecoveryTargetTime100ns;
 	BOOLEAN CredentialConfigured;
@@ -300,6 +333,13 @@ NTSTATUS CdpJournalSetRecoveryIntent(
 
 NTSTATUS CdpJournalClearRecoveryIntent(_Inout_ PCdp_JOURNAL Journal);
 
+// Completes only the branch-switch half of a reboot recovery.  The separate
+// filesystem-repair bit intentionally remains durable until marking dirty
+// succeeds, so a failed attempt cannot create the recovery branch twice.
+NTSTATUS CdpJournalCompleteRecoveryIntent(_Inout_ PCdp_JOURNAL Journal);
+
+NTSTATUS CdpJournalClearRecoveryFsRepairPending(_Inout_ PCdp_JOURNAL Journal);
+
 NTSTATUS CdpJournalSetCredential(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ const Cdp_CREDENTIAL_DESCRIPTOR* Credential);
@@ -324,6 +364,16 @@ NTSTATUS CdpJournalAppendEx(
 	_In_ ULONG DataLength,
 	_In_reads_bytes_(DataLength) const VOID* AfterImage,
 	_In_ ULONG RecordFlags,
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
+
+// Test-only zero-copy redirect support. Reserve the next Journal payload
+// extent using the normal Journal cursor and queue its record header through
+// the cached asynchronous header writer. No payload I/O or flush is issued.
+NTSTATUS CdpJournalReserveRedirectPayload(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_Out_ PUINT64 PayloadOffset,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
 
 NTSTATUS CdpJournalQueryTimeRange(
@@ -356,6 +406,13 @@ NTSTATUS CdpJournalDeleteOldestRegion(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 ExpectedRegionOffset);
 
+// After one materializing compaction, reclaim every immediately following
+// complete RR whose headers are all tombstones. Never skips a retained RR and
+// never removes the active/newest RR.
+NTSTATUS CdpJournalDeleteContiguousTombstonedRegions(
+	_Inout_ PCdp_JOURNAL Journal,
+	_Out_ PULONG DeletedRegionCount);
+
 // If the compacted range contains a branch inheritance point, tombstone all
 // records and branch markers unreachable from the current branch. Otherwise
 // this is a no-op. PreviewTargetDeleted reports whether the active preview
@@ -378,6 +435,29 @@ NTSTATUS CdpJournalQueryRecordHeaders(
 	_Out_writes_to_(RecordCapacity, *ReturnedCount) PCdp_JOURNAL_RECORD Records,
 	_In_ ULONG RecordCapacity,
 	_Out_ PUINT64 TotalRecords,
+	_Out_ PUINT64 Generation,
+	_Out_ PULONG ReturnedCount);
+
+// Resolve a live record's global Sequence to the same zero-based logical
+// Index printed by CdpConsole command 'l', plus its physical RR location.
+NTSTATUS CdpJournalFindRecordLocationBySequence(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 RecordSequence,
+	_Out_ PUINT64 RecordIndex,
+	_Out_ PUINT64 RecordTime100ns,
+	_Out_ PUINT64 HeaderRegionOffset,
+	_Out_ PULONG HeaderIndex);
+
+// Query the retained in-memory branch topology in creation order. Generation
+// is the journal record generation and makes multi-page snapshots coherent.
+NTSTATUS CdpJournalQueryBranches(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 StartIndex,
+	_In_ UINT64 ExpectedGeneration,
+	_Out_writes_to_(BranchCapacity, *ReturnedCount) PCdp_JOURNAL_BRANCH_TREE_INFO Branches,
+	_In_ ULONG BranchCapacity,
+	_Out_ PULONG TotalBranches,
+	_Out_ PLONG CurrentBranchNumber,
 	_Out_ PUINT64 Generation,
 	_Out_ PULONG ReturnedCount);
 

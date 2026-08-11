@@ -18,14 +18,15 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.4.7"
+#define Cdp_DRIVER_VERSION_STRING "1.4.8"
 #define Cdp_DRIVER_BUILD_STRING   "20260806.6"
 
 #define Cdp_COW_BATCH_MAX_ITEMS 16UL
 #define Cdp_COW_BATCH_MAX_BYTES (16UL * 1024UL * 1024UL)
 #define Cdp_PERF_TIMING_ENABLED 1
-#define Cdp_PERF_TEST_DISABLE_MERGE 1
-#define Cdp_PERF_TEST_COMPLETE_WRITE_BEFORE_JOURNAL_IO 1
+#define Cdp_PERF_TEST_DISABLE_MERGE 0
+// Application writes are redirected in place to a reserved Journal payload.
+// Record-header sectors are cached and issued asynchronously; no flush occurs.
 
 // Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.
 // Cdp_DBG: Debug builds only — verbose I/O and path tracing.
@@ -185,6 +186,10 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	// whether it is a recovery source.  This closes the source-identification
 	// window before CaptureEnabled/Recovery Phase can be established.
 	volatile LONG AutoDiscoveryGateActive;
+	// A persisted reboot recovery keeps the discovery gate closed while the
+	// driver synchronously attempts Recovery Begin (e) and Commit (r). Success
+	// or failure ends the attempt; boot is allowed to continue in either case.
+	volatile LONG RebootRecoveryGateRequired;
 	KEVENT AutoDiscoveryGateEvent;
 	GUID VolumeGuid;
 	PDEVICE_OBJECT LowerDeviceObject;
@@ -196,6 +201,11 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	KEVENT CaptureEvent;
 	HANDLE CaptureThreadHandle;
 	volatile LONG CaptureStopping;
+	volatile LONG RedirectWritesInFlight;
+	KEVENT RedirectWritesDrainedEvent;
+	// First failure observed while graceful disable is writing/punching the
+	// current MetaTree. Zero means the drain may continue.
+	volatile LONG DrainFailureStatus;
 	KSPIN_LOCK RecoveryReadQueueLock;
 	LIST_ENTRY RecoveryReadQueue;
 	KEVENT RecoveryReadEvent;
@@ -209,6 +219,10 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	PCdp_CORE Core;
 	// Journal VolumeHandleList entry used while CaptureEnabled is set.
 	UINT64 JournalHandleId;
+	// Direct-redirect test path keeps one reference for the entire protection
+	// session.  Write dispatch must only read this cached entry; acquiring it for
+	// every I/O serializes on VolumeHandleMutex and destroys large-I/O throughput.
+	PCdp_VOLUME_HANDLE_ENTRY RedirectJournalEntry;
 	UINT64 PerfWindowStartTicks;
 	UINT64 PerfQueueWaitTicks;
 	UINT64 PerfHistoryLockWaitTicks;
@@ -224,10 +238,6 @@ typedef struct _Cdp_CAPTURE_ITEM
 	LIST_ENTRY Entry;
 	PIRP Irp;
 	UINT64 EnqueueTicks;
-	PVOID WriteCopy;
-	UINT64 WriteOffset;
-	ULONG WriteLength;
-	BOOLEAN EarlyCompleted;
 } Cdp_CAPTURE_ITEM, *PCdp_CAPTURE_ITEM;
 
 typedef struct _Cdp_RECOVERY_READ_ITEM

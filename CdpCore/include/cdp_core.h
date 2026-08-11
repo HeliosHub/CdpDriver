@@ -83,6 +83,17 @@ NTSTATUS CdpCoreQueryRecordHeaders(
 	_Out_ PUINT64 Generation,
 	_Out_ PULONG ReturnedCount);
 
+NTSTATUS CdpCoreQueryBranches(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 StartIndex,
+	_In_ UINT64 ExpectedGeneration,
+	_Out_writes_to_(BranchCapacity, *ReturnedCount) PCdp_JOURNAL_BRANCH_TREE_INFO Branches,
+	_In_ ULONG BranchCapacity,
+	_Out_ PULONG TotalBranches,
+	_Out_ PLONG CurrentBranchNumber,
+	_Out_ PUINT64 Generation,
+	_Out_ PULONG ReturnedCount);
+
 Cdp_CORE_PHASE CdpCoreGetPhase(_In_ PCdp_CORE Core);
 
 // Persist application bytes to the journal and publish them in MetaTree.
@@ -92,6 +103,27 @@ NTSTATUS CdpCoreAppendAfterImage(
 	_In_ ULONG Length,
 	_In_reads_bytes_(Length) const VOID* AfterImage,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
+
+// Publish a record whose payload was already written directly to the Journal.
+// This updates only the in-memory latest-value map; it never issues payload I/O.
+NTSTATUS CdpCorePublishRedirectRecord(
+	_Inout_ PCdp_CORE Core,
+	_In_ const Cdp_JOURNAL_RECORD* Record);
+
+// Graceful protection shutdown: materialize one current-view interval to the
+// source and punch it from MetaTree. Complete is TRUE when no coverage remains.
+NTSTATUS CdpCoreDrainOneMetaRange(
+	_Inout_ PCdp_CORE Core,
+	_Out_ PBOOLEAN Complete,
+	_Out_opt_ PUINT64 DrainedOffset,
+	_Out_opt_ PULONG DrainedLength);
+
+// An application write was committed directly to the source while draining;
+// remove the same interval from MetaTree so reads fall through to the source.
+NTSTATUS CdpCorePunchMetaRange(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length);
 
 NTSTATUS CdpCoreRead(
 	_Inout_ PCdp_CORE Core,

@@ -51,10 +51,14 @@
 #define IOCTL_Cdp_AUTHENTICATE          CTL_CODE(Cdp_IOCTL_TYPE, 0x80F, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_QUERY_CREDENTIAL      CTL_CODE(Cdp_IOCTL_TYPE, 0x810, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_CHANGE_PASSWORD       CTL_CODE(Cdp_IOCTL_TYPE, 0x811, METHOD_BUFFERED, FILE_ANY_ACCESS)
+// Return the Journal runtime BranchTree; this is not derived by scanning
+// record headers and contains only retained, currently valid branches.
+#define IOCTL_Cdp_QUERY_JOURNAL_BRANCHES CTL_CODE(Cdp_IOCTL_TYPE, 0x812, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define Cdp_PHASE_GENERAL  0UL
 #define Cdp_PHASE_PREVIEW  1UL
 #define Cdp_PHASE_RECOVERY 2UL
+#define Cdp_PHASE_DRAINING 3UL
 #define Cdp_STATUS_UNPROTECTED (-1L)
 
 #define Cdp_CMD_1 1
@@ -66,7 +70,10 @@
 #define Cdp_VERSION_STRING_CHARS 32
 #define Cdp_BUILD_STRING_CHARS 32
 #define Cdp_JOURNAL_RECORD_QUERY_MAX_PER_CALL 512u
+#define Cdp_JOURNAL_BRANCH_QUERY_MAX_PER_CALL 512u
 #define Cdp_RECORD_FLAG_BRANCH   0x80000000UL
+#define Cdp_BRANCH_INFO_FLAG_CURRENT   0x00000001UL
+#define Cdp_BRANCH_INFO_FLAG_SYNTHETIC 0x00000002UL
 #define Cdp_PASSWORD_MAX_UTF8_BYTES 128u
 
 #pragma pack(push, 8)
@@ -158,7 +165,8 @@ typedef struct _Cdp_PHASE_QUERY_REQUEST
 
 typedef struct _Cdp_PHASE_QUERY_REPLY
 {
-	// Cdp_PHASE_GENERAL / PREVIEW / RECOVERY, or Cdp_STATUS_UNPROTECTED (-1).
+	// Cdp_PHASE_GENERAL / PREVIEW / RECOVERY / DRAINING,
+	// or Cdp_STATUS_UNPROTECTED (-1).
 	LONG Status;
 	ULONG Reserved;
 	GUID JournalPartitionGuid; // valid when Status >= 0 and protection is on
@@ -248,6 +256,38 @@ typedef struct _Cdp_JOURNAL_RECORD_INFO
 } Cdp_JOURNAL_RECORD_INFO, *PCdp_JOURNAL_RECORD_INFO;
 
 C_ASSERT(sizeof(Cdp_JOURNAL_RECORD_INFO) == 40);
+
+typedef struct _Cdp_JOURNAL_BRANCH_QUERY_REQUEST
+{
+	GUID SourceVolumeGuid;
+	UINT64 StartIndex;          // zero-based, BranchTree creation order
+	UINT64 ExpectedGeneration;  // zero for first page; later pages echo reply
+	ULONG MaxBranches;
+	ULONG Reserved;
+} Cdp_JOURNAL_BRANCH_QUERY_REQUEST, *PCdp_JOURNAL_BRANCH_QUERY_REQUEST;
+
+typedef struct _Cdp_JOURNAL_BRANCH_QUERY_REPLY
+{
+	ULONG TotalBranches;
+	LONG CurrentBranchNumber;
+	UINT64 Generation;
+	ULONG BranchCount;
+	ULONG Reserved;
+} Cdp_JOURNAL_BRANCH_QUERY_REPLY, *PCdp_JOURNAL_BRANCH_QUERY_REPLY;
+
+typedef struct _Cdp_JOURNAL_BRANCH_INFO
+{
+	LONG BranchNumber;
+	LONG ParentBranchNumber;
+	UINT64 InheritedRecordSequence;
+	UINT64 CreatedWallClock100ns;
+	UINT64 StartSequence;
+	UINT64 EndSequence;
+	ULONG Flags; // Cdp_BRANCH_INFO_FLAG_*
+	ULONG Reserved;
+} Cdp_JOURNAL_BRANCH_INFO, *PCdp_JOURNAL_BRANCH_INFO;
+
+C_ASSERT(sizeof(Cdp_JOURNAL_BRANCH_INFO) == 48);
 
 typedef struct _Cdp_VERSION_REPLY
 {

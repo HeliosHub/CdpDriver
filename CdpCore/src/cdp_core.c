@@ -6,8 +6,43 @@
 #include "cdp_dev_store.h"
 #define Cdp_RECOVERY_TRACE(fmt, ...) \
 	Cdp_LOG("[RECOVERY] " fmt, ##__VA_ARGS__)
+
+static VOID CdpCoreTraceTargetRecord(
+	_In_ PCSTR Operation,
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 RequestedTime100ns,
+	_In_ UINT64 EffectiveTime100ns,
+	_In_ UINT64 TargetSequence)
+{
+	UINT64 recordIndex = 0;
+	UINT64 recordTime = 0;
+	UINT64 regionOffset = 0;
+	ULONG headerIndex = 0;
+	NTSTATUS status;
+
+	status = CdpJournalFindRecordLocationBySequence(
+		Journal,
+		TargetSequence,
+		&recordIndex,
+		&recordTime,
+		&regionOffset,
+		&headerIndex);
+	if (NT_SUCCESS(status))
+	{
+		Cdp_LOG("[%s-TARGET] requestedTime=%llu effectiveTime=%llu recordTime=%llu recordIndex=%llu sequence=%llu rrOffset=%llu headerIndex=%lu\n",
+			Operation, RequestedTime100ns, EffectiveTime100ns, recordTime,
+			recordIndex, TargetSequence, regionOffset, headerIndex);
+	}
+	else
+	{
+		Cdp_LOG("[%s-TARGET] requestedTime=%llu effectiveTime=%llu target sequence=%llu location unavailable status=0x%08X\n",
+			Operation, RequestedTime100ns, EffectiveTime100ns,
+			TargetSequence, status);
+	}
+}
 #else
 #define Cdp_RECOVERY_TRACE(fmt, ...) ((void)0)
+#define CdpCoreTraceTargetRecord(Operation, Journal, Requested, Effective, Sequence) ((void)0)
 #endif
 
 #ifdef Cdp_USERMODE
@@ -284,7 +319,7 @@ NTSTATUS CdpCoreJournalUsageAtLeast(
 	UINT64 payloadBytesUsed;
 	UINT64 payloadBytesFree;
 	UINT64 totalRecords;
-	UINT64 usedBytes;
+	UINT64 payloadCapacity;
 	NTSTATUS status;
 
 	if (!Core || !AtLeast || Percent == 0 || Percent > 100)
@@ -297,16 +332,17 @@ NTSTATUS CdpCoreJournalUsageAtLeast(
 		&payloadBytesUsed,
 		&payloadBytesFree,
 		&totalRecords);
-	UNREFERENCED_PARAMETER(payloadBytesFree);
+	UNREFERENCED_PARAMETER(partitionBytes);
+	UNREFERENCED_PARAMETER(metadataBytes);
 	UNREFERENCED_PARAMETER(totalRecords);
 	if (!NT_SUCCESS(status))
 		return status;
-	if (metadataBytes > MAXUINT64 - payloadBytesUsed)
+	if (payloadBytesUsed > MAXUINT64 - payloadBytesFree)
 		return STATUS_INTEGER_OVERFLOW;
-	usedBytes = metadataBytes + payloadBytesUsed;
-	*AtLeast = usedBytes >=
-		(partitionBytes / 100) * Percent +
-		((partitionBytes % 100) * Percent + 99) / 100;
+	payloadCapacity = payloadBytesUsed + payloadBytesFree;
+	*AtLeast = payloadBytesUsed >=
+		(payloadCapacity / 100) * Percent +
+		((payloadCapacity % 100) * Percent + 99) / 100;
 	return STATUS_SUCCESS;
 }
 
@@ -526,6 +562,15 @@ NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
 	// Only after that point is its header/payload span made reclaimable.
 	status = CdpJournalDeleteOldestRegion(
 		Core->Journal, regionOffset);
+	if (NT_SUCCESS(status))
+	{
+		ULONG deletedTombstoneRegions = 0;
+		status = CdpJournalDeleteContiguousTombstonedRegions(
+			Core->Journal, &deletedTombstoneRegions);
+		Cdp_RECOVERY_TRACE(
+			"compaction reclaimed primary RR plus %lu contiguous tombstone RRs\n",
+			deletedTombstoneRegions);
+	}
 
 cleanup:
 	if (regionTreeInitialized)
@@ -553,6 +598,31 @@ NTSTATUS CdpCoreQueryRecordHeaders(
 		Records,
 		RecordCapacity,
 		TotalRecords,
+		Generation,
+		ReturnedCount);
+}
+
+NTSTATUS CdpCoreQueryBranches(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 StartIndex,
+	_In_ UINT64 ExpectedGeneration,
+	_Out_writes_to_(BranchCapacity, *ReturnedCount) PCdp_JOURNAL_BRANCH_TREE_INFO Branches,
+	_In_ ULONG BranchCapacity,
+	_Out_ PULONG TotalBranches,
+	_Out_ PLONG CurrentBranchNumber,
+	_Out_ PUINT64 Generation,
+	_Out_ PULONG ReturnedCount)
+{
+	if (!Core)
+		return STATUS_INVALID_PARAMETER;
+	return CdpJournalQueryBranches(
+		Core->Journal,
+		StartIndex,
+		ExpectedGeneration,
+		Branches,
+		BranchCapacity,
+		TotalBranches,
+		CurrentBranchNumber,
 		Generation,
 		ReturnedCount);
 }
@@ -641,6 +711,138 @@ NTSTATUS CdpCoreAppendAfterImage(
 		if (WrittenRecord)
 			*WrittenRecord = record;
 	}
+	return status;
+}
+
+NTSTATUS CdpCorePublishRedirectRecord(
+	_Inout_ PCdp_CORE Core,
+	_In_ const Cdp_JOURNAL_RECORD* Record)
+{
+	NTSTATUS status;
+
+	if (!Core || !Record || Record->DataLength == 0 ||
+		Record->DataLength > Cdp_JOURNAL_MAX_RECORD_DATA)
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+	if (!Core->Journal || !Core->Journal->Mounted)
+		return STATUS_DEVICE_NOT_READY;
+
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	if (!Core->MetaTreeReady)
+	{
+		Cdp_LOCK_RELEASE(&Core->TreeLock);
+		return STATUS_DEVICE_NOT_READY;
+	}
+	status = CdpPreviewTreeOverlayLatest(&Core->MetaTree, Record);
+	if (!NT_SUCCESS(status))
+		Core->MetaTreeReady = FALSE;
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	return status;
+}
+
+static PCdp_PREVIEW_TREE_NODE CdpCoreFindFirstValidMetaNode(
+	_In_opt_ PCdp_PREVIEW_TREE_NODE Node)
+{
+	PCdp_PREVIEW_TREE_NODE found;
+
+	if (!Node)
+		return NULL;
+	found = CdpCoreFindFirstValidMetaNode(Node->Left);
+	if (found)
+		return found;
+	if (!Node->Invalid && Node->DataLength != 0)
+		return Node;
+	return CdpCoreFindFirstValidMetaNode(Node->Right);
+}
+
+NTSTATUS CdpCoreDrainOneMetaRange(
+	_Inout_ PCdp_CORE Core,
+	_Out_ PBOOLEAN Complete,
+	_Out_opt_ PUINT64 DrainedOffset,
+	_Out_opt_ PULONG DrainedLength)
+{
+	PCdp_PREVIEW_TREE_NODE node;
+	PVOID payload = NULL;
+	UINT64 offset = 0;
+	ULONG length = 0;
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Core || !Complete)
+		return STATUS_INVALID_PARAMETER;
+	*Complete = FALSE;
+	if (DrainedOffset)
+		*DrainedOffset = 0;
+	if (DrainedLength)
+		*DrainedLength = 0;
+
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	if (!Core->MetaTreeReady)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup;
+	}
+	node = CdpCoreFindFirstValidMetaNode(Core->MetaTree.Root);
+	if (!node)
+	{
+		*Complete = TRUE;
+		goto cleanup;
+	}
+	offset = node->Start;
+	length = node->DataLength;
+	payload = Cdp_ALLOC(length);
+	if (!payload)
+	{
+		status = STATUS_INSUFFICIENT_RESOURCES;
+		goto cleanup;
+	}
+	status = CdpJournalReadPayload(
+		Core->Journal, node->FileOffset, length, payload);
+	if (NT_SUCCESS(status))
+		status = CdpCoreSourceWriteDirect(Core, offset, length, payload);
+	if (NT_SUCCESS(status))
+	{
+		status = CdpPreviewTreePunchRange(&Core->MetaTree, offset, length);
+		if (!NT_SUCCESS(status))
+			Core->MetaTreeReady = FALSE;
+	}
+	if (NT_SUCCESS(status))
+	{
+		if (DrainedOffset)
+			*DrainedOffset = offset;
+		if (DrainedLength)
+			*DrainedLength = length;
+		*Complete = CdpCoreFindFirstValidMetaNode(Core->MetaTree.Root) == NULL;
+	}
+
+cleanup:
+	if (payload)
+		Cdp_FREE(payload);
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	return status;
+}
+
+NTSTATUS CdpCorePunchMetaRange(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length)
+{
+	NTSTATUS status;
+
+	if (!Core || Length == 0 || Offset > MAXUINT64 - Length)
+		return STATUS_INVALID_PARAMETER;
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	if (!Core->MetaTreeReady)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+	}
+	else
+	{
+		status = CdpPreviewTreePunchRange(&Core->MetaTree, Offset, Length);
+		if (!NT_SUCCESS(status))
+			Core->MetaTreeReady = FALSE;
+	}
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
 	return status;
 }
 
@@ -853,6 +1055,12 @@ NTSTATUS CdpCorePreviewBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns
 	Core->PreviewTargetSequence = targetRecordSequence;
 	Core->Building = 0;
 	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	CdpCoreTraceTargetRecord(
+		"PREVIEW",
+		Core->Journal,
+		TargetTime100ns,
+		effectiveTargetTime100ns,
+		targetRecordSequence);
 
 	return STATUS_SUCCESS;
 }
@@ -936,6 +1144,12 @@ NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100n
 		&inheritedSequence);
 	if (!NT_SUCCESS(status))
 		goto failure;
+	CdpCoreTraceTargetRecord(
+		"RECOVERY",
+		Core->Journal,
+		TargetTime100ns,
+		effectiveTargetTime100ns,
+		inheritedSequence);
 	if (Core->Journal->HighestBranchNumber >= 0x7FFFFFFFL)
 	{
 		status = STATUS_INTEGER_OVERFLOW;

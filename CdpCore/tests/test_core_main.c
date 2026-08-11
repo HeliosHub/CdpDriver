@@ -988,6 +988,11 @@ static int TestAfterImageCompactionPrunesOnlyAtInheritancePoint(void)
 	Cdp_JOURNAL_RECORD postPruneRecord;
 	UINT64 total = 0;
 	UINT64 generation = 0;
+	UINT64 partitionBytes = 0;
+	UINT64 metadataBytes = 0;
+	UINT64 payloadBytesUsed = 0;
+	UINT64 payloadBytesFree = 0;
+	UINT64 usageRecords = 0;
 	ULONG returned = 0;
 	NTSTATUS status;
 
@@ -1050,8 +1055,8 @@ static int TestAfterImageCompactionPrunesOnlyAtInheritancePoint(void)
 	Expect(NT_SUCCESS(CdpJournalAppend(
 		&journal, 3ULL * 1024 * 1024, sizeof(y), y, NULL)),
 		"append latest-branch data");
-	Expect(aRecord.Sequence == 2 && bRecord.Sequence == 3 &&
-		journal.NextSequence == 13,
+	Expect(aRecord.Sequence == 2 && bRecord.Sequence == 4 &&
+		journal.NextSequence == 15,
 		"global Record Sequence is unique and monotonic across branches");
 	CdpJournalClose(&journal);
 
@@ -1069,7 +1074,7 @@ static int TestAfterImageCompactionPrunesOnlyAtInheritancePoint(void)
 		status = CdpCoreQueryRecordHeaders(
 			core, 0, 0, headers, RTL_NUMBER_OF(headers),
 			&total, &generation, &returned);
-	Expect(NT_SUCCESS(status) && total == 10 && returned == 10,
+	Expect(NT_SUCCESS(status) && total == 12 && returned == 12,
 		"no-point compaction keeps unreachable sibling subtree for now");
 
 	returned = 0;
@@ -1081,32 +1086,34 @@ static int TestAfterImageCompactionPrunesOnlyAtInheritancePoint(void)
 			core, 0, 0, headers, RTL_NUMBER_OF(headers),
 			&total, &generation, &returned);
 	Expect(NT_SUCCESS(status) && total == 4 && returned == 4 &&
-		headers[0].Flags == Cdp_JOURNAL_RECORD_FLAG_BRANCH &&
-		headers[0].Sequence == 7 && headers[1].Sequence == 8 &&
-		headers[2].Sequence == 11 && headers[3].Sequence == 12,
+		headers[0].Sequence == 9 && headers[1].Sequence == 10 &&
+		headers[2].Sequence == 13 && headers[3].Sequence == 14,
 		"point compaction keeps sibling from retained b and prunes c descendants");
 
-	// Regions for tombstoned c and branch 2 are reclaimed first. Branch 3
-	// remains queryable until compaction actually reaches its own first region.
+	/* The parent suffix RR and branch-2 RR were contiguous tombstone regions
+	 * and therefore disappeared in the same call. Branch-4 is also tombstoned,
+	 * but the still-valid branch-3 RR sits before it and prevents a skip. */
+	status = CdpCoreQueryJournalUsage(
+		core, &partitionBytes, &metadataBytes, &payloadBytesUsed,
+		&payloadBytesFree, &usageRecords);
+	Expect(NT_SUCCESS(status) &&
+		metadataBytes == SECTOR + 3ULL * Cdp_JOURNAL_HEADER_REGION_SIZE,
+		"contiguous deleted RRs reclaim immediately but a retained RR blocks later tombstones");
 	Expect(NT_SUCCESS(CdpCoreCompactOldestRegion(core)),
-		"reclaim tombstoned parent-suffix region");
-	Expect(NT_SUCCESS(CdpCoreCompactOldestRegion(core)),
-		"reclaim tombstoned branch-2 region");
-	returned = 0;
-	status = CdpCoreQueryRecordHeaders(
-		core, 0, 0, headers, RTL_NUMBER_OF(headers),
-		&total, &generation, &returned);
-	Expect(NT_SUCCESS(status) && total == 4 && returned == 4,
-		"valid sibling remains before merge reaches its own region");
-	Expect(NT_SUCCESS(CdpCoreCompactOldestRegion(core)),
-		"merge reaches and deletes non-current sibling branch 3");
+		"merge reaches non-current sibling and then reclaims its tombstoned successor");
 	returned = 0;
 	status = CdpCoreQueryRecordHeaders(
 		core, 0, 0, headers, RTL_NUMBER_OF(headers),
 		&total, &generation, &returned);
 	Expect(NT_SUCCESS(status) && total == 2 && returned == 2 &&
-		headers[0].Sequence == 11 && headers[1].Sequence == 12,
+		headers[0].Sequence == 13 && headers[1].Sequence == 14,
 		"sibling branch is deleted only when its own region is merged");
+	status = CdpCoreQueryJournalUsage(
+		core, &partitionBytes, &metadataBytes, &payloadBytesUsed,
+		&payloadBytesFree, &usageRecords);
+	Expect(NT_SUCCESS(status) &&
+		metadataBytes == SECTOR + Cdp_JOURNAL_HEADER_REGION_SIZE,
+		"blocked tombstone RR is physically reclaimed as soon as the gap is removed");
 
 	CdpCoreDestroy(core);
 	core = NULL;
@@ -1126,7 +1133,7 @@ static int TestAfterImageCompactionPrunesOnlyAtInheritancePoint(void)
 		status = CdpCoreAppendAfterImage(
 			core, 3ULL * 1024 * 1024 + 512,
 			sizeof(postPrune), postPrune, &postPruneRecord);
-		Expect(NT_SUCCESS(status) && postPruneRecord.Sequence == 13,
+		Expect(NT_SUCCESS(status) && postPruneRecord.Sequence == 15,
 			"new append does not reuse tombstoned global Sequences");
 	}
 
@@ -1606,6 +1613,181 @@ static int TestAfterImageRecoveryBranchSwitch(void)
 	return g_caseFailed;
 }
 
+static int TestGracefulDisableDrainsMetaTree(void)
+{
+	TEST_CTX ctx;
+	UCHAR journalA[512];
+	UCHAR journalB[512];
+	UCHAR applicationWrite[512];
+	UCHAR expected[1024];
+	UCHAR output[1024];
+	BOOLEAN complete = FALSE;
+	ULONG iterations = 0;
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(TestCtxCreate(
+		&ctx, SRC_SIZE, JNL_SIZE, 180000)),
+		"setup graceful-disable drain test");
+	if (!ctx.Core)
+		return g_caseFailed;
+	RtlFillMemory(journalA, sizeof(journalA), 0x31);
+	RtlFillMemory(journalB, sizeof(journalB), 0x42);
+	RtlFillMemory(applicationWrite, sizeof(applicationWrite), 0x53);
+
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(journalA), journalA, NULL)),
+		"append first protected value before graceful disable");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 512, sizeof(journalB), journalB, NULL)),
+		"append second protected value before graceful disable");
+
+	/* Model the DRAINING write worker: source write completes first while
+	 * HistoryMutex excludes reads/backfill, then its MetaTree range is punched. */
+	Expect(NT_SUCCESS(ctx.Source->Write(
+		ctx.Source, 0, sizeof(applicationWrite), applicationWrite)),
+		"draining application write commits directly to source");
+	Expect(NT_SUCCESS(CdpCorePunchMetaRange(
+		ctx.Core, 0, sizeof(applicationWrite))),
+		"draining application write holes matching MetaTree coverage");
+	RtlCopyMemory(expected, applicationWrite, sizeof(applicationWrite));
+	RtlCopyMemory(expected + 512, journalB, sizeof(journalB));
+	RtlZeroMemory(output, sizeof(output));
+	Expect(NT_SUCCESS(CdpCoreRead(ctx.Core, 0, sizeof(output), output)) &&
+		memcmp(output, expected, sizeof(output)) == 0,
+		"reads combine punched source bytes with undrained journal bytes");
+
+	while (!complete && iterations++ < 16)
+	{
+		status = CdpCoreDrainOneMetaRange(
+			ctx.Core, &complete, NULL, NULL);
+		if (!NT_SUCCESS(status))
+			break;
+	}
+	Expect(NT_SUCCESS(status) && complete,
+		"graceful disable drains all remaining MetaTree coverage");
+	Expect(memcmp(CdpMemStoreData(ctx.Source), expected, sizeof(expected)) == 0,
+		"drain materializes the final current view into source");
+	RtlZeroMemory(output, sizeof(output));
+	Expect(NT_SUCCESS(CdpCoreRead(ctx.Core, 0, sizeof(output), output)) &&
+		memcmp(output, expected, sizeof(output)) == 0,
+		"empty MetaTree reads the fully materialized source view");
+
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
+static VOID RunSiblingInheritanceRetentionCase(_In_ BOOLEAN SharedPoint)
+{
+	PCdp_STORE sourceStore = NULL;
+	PCdp_STORE journalStore = NULL;
+	PCdp_CORE core = NULL;
+	Cdp_JOURNAL journal;
+	GUID sourceGuid = { 0 };
+	Cdp_JOURNAL_RECORD earlyRecord;
+	Cdp_JOURNAL_RECORD laterRecord;
+	Cdp_JOURNAL_RECORD headers[8];
+	UCHAR early[512];
+	UCHAR later[512];
+	UCHAR sibling[512];
+	UCHAR current[512];
+	UINT64 total = 0;
+	UINT64 generation = 0;
+	UINT64 partitionBytes = 0;
+	UINT64 metadataBytes = 0;
+	UINT64 payloadBytesUsed = 0;
+	UINT64 payloadBytesFree = 0;
+	UINT64 usageRecords = 0;
+	ULONG returned = 0;
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(CdpMemStoreCreate(SRC_SIZE, SECTOR, &sourceStore)),
+		SharedPoint ? "create source for shared-point sibling case" :
+			"create source for earlier-point sibling case");
+	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &journalStore)),
+		SharedPoint ? "create journal for shared-point sibling case" :
+			"create journal for earlier-point sibling case");
+	if (!sourceStore || !journalStore)
+		goto cleanup;
+	RtlFillMemory(early, sizeof(early), 0x21);
+	RtlFillMemory(later, sizeof(later), 0x32);
+	RtlFillMemory(sibling, sizeof(sibling), 0x43);
+	RtlFillMemory(current, sizeof(current), 0x54);
+	CdpJournalInitializeWithStore(
+		&journal, journalStore, &sourceGuid, TestPointerTime100ns,
+		(PVOID)(ULONG_PTR)(SharedPoint ? 191000 : 190000));
+	Expect(NT_SUCCESS(CdpJournalFormat(&journal)),
+		"format sibling inheritance journal");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 0, sizeof(early), early, &earlyRecord)),
+		"append earlier inheritance candidate in root RR");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 512, sizeof(later), later, &laterRecord)),
+		"append later inheritance candidate in root RR");
+	Expect(NT_SUCCESS(CdpJournalAppendBranch(
+		&journal, 2, 1, earlyRecord.Sequence)),
+		"create historical sibling from earlier point");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 1024, sizeof(sibling), sibling, NULL)),
+		"append historical sibling data");
+	Expect(NT_SUCCESS(CdpJournalAppendBranch(
+		&journal, 3, 1,
+		SharedPoint ? earlyRecord.Sequence : laterRecord.Sequence)),
+		SharedPoint ? "create latest branch from the exact shared point" :
+			"create latest branch from the later point");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 1536, sizeof(current), current, NULL)),
+		"append latest-branch data");
+	CdpJournalClose(&journal);
+
+	status = CdpCoreCreate(sourceStore, journalStore, &core);
+	if (NT_SUCCESS(status))
+		status = CdpCoreMountJournal(core);
+	Expect(NT_SUCCESS(status), "mount sibling inheritance case");
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+	status = CdpCoreCompactOldestRegion(core);
+	Expect(NT_SUCCESS(status), "compact RR containing sibling inheritance points");
+	if (NT_SUCCESS(status))
+		status = CdpCoreQueryRecordHeaders(
+			core, 0, 0, headers, RTL_NUMBER_OF(headers),
+			&total, &generation, &returned);
+	if (SharedPoint)
+	{
+		Expect(NT_SUCCESS(status) && total == 4 && returned == 4 &&
+			headers[0].Sequence == 4 && headers[1].Sequence == 5 &&
+			headers[2].Sequence == 6 && headers[3].Sequence == 7,
+			"off-path sibling remains valid when latest path shares its exact inheritance point");
+	}
+	else
+	{
+		Expect(NT_SUCCESS(status) && total == 2 && returned == 2 &&
+			headers[0].Sequence == 6 && headers[1].Sequence == 7,
+			"earlier-point sibling becomes invalid when source advances to a later baseline");
+	}
+	status = CdpCoreQueryJournalUsage(
+		core, &partitionBytes, &metadataBytes, &payloadBytesUsed,
+		&payloadBytesFree, &usageRecords);
+	Expect(NT_SUCCESS(status) && metadataBytes == SECTOR +
+		(SharedPoint ? 2ULL : 1ULL) * Cdp_JOURNAL_HEADER_REGION_SIZE,
+		SharedPoint ? "shared-point sibling RR blocks contiguous physical reclaim" :
+			"invalid earlier-point sibling RR is reclaimed immediately");
+
+cleanup:
+	if (core)
+		CdpCoreDestroy(core);
+	if (journalStore)
+		CdpMemStoreDestroy(journalStore);
+	if (sourceStore)
+		CdpMemStoreDestroy(sourceStore);
+}
+
+static int TestSiblingInheritancePointRetention(void)
+{
+	RunSiblingInheritanceRetentionCase(FALSE);
+	RunSiblingInheritanceRetentionCase(TRUE);
+	return g_caseFailed;
+}
+
 int main(void)
 {
 	int failed = 0;
@@ -1645,6 +1827,10 @@ int main(void)
 		TestAfterImagePreviewMergeCoordination);
 	failed += RunCase("After-image recovery branch switch",
 		TestAfterImageRecoveryBranchSwitch);
+	failed += RunCase("Graceful disable drains MetaTree",
+		TestGracefulDisableDrainsMetaTree);
+	failed += RunCase("Sibling inheritance point retention",
+		TestSiblingInheritancePointRetention);
 
 	printf("\n%s (%d failures)\n", failed ? "FAILED" : "ALL PASSED", failed);
 	return failed ? 1 : 0;

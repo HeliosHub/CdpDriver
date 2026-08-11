@@ -841,6 +841,9 @@ static BOOL DoQueryStatus(HANDLE hDevice)
 	case (LONG)Cdp_PHASE_RECOVERY:
 		ConOut(L"(recovery)\n");
 		break;
+	case (LONG)Cdp_PHASE_DRAINING:
+		ConOut(L"(draining to source)\n");
+		break;
 	default:
 		ConOut(L"(unknown)\n");
 		break;
@@ -1050,6 +1053,265 @@ static BOOL DoListJournalRecords(HANDLE hDevice)
 	return TRUE;
 }
 
+typedef struct _Cdp_CONSOLE_BRANCH_ENTRY
+{
+	Cdp_JOURNAL_BRANCH_INFO Info;
+	BOOL Printed;
+} Cdp_CONSOLE_BRANCH_ENTRY, *PCdp_CONSOLE_BRANCH_ENTRY;
+
+static BOOL HasLaterUnprintedBranchSibling(
+	_In_reads_(Count) const Cdp_CONSOLE_BRANCH_ENTRY* Entries,
+	_In_ ULONG Count,
+	_In_ LONG ParentBranchNumber,
+	_In_ ULONG Index)
+{
+	for (ULONG i = Index + 1; i < Count; ++i)
+	{
+		if (!Entries[i].Printed &&
+			Entries[i].Info.ParentBranchNumber == ParentBranchNumber)
+		{
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+static void PrintBranchEntry(
+	_In_ const Cdp_CONSOLE_BRANCH_ENTRY* Entry,
+	_In_ ULONG Depth,
+	_In_ BOOL IsLast,
+	_In_reads_(Depth) const BOOL* AncestorHasMore)
+{
+	wchar_t prefix[256];
+	ULONG chars = 0;
+	ULONG level;
+
+	for (level = 0; level < Depth && chars + 2 < _countof(prefix); ++level)
+	{
+		prefix[chars++] = AncestorHasMore[level] ? L'|' : L' ';
+		prefix[chars++] = L' ';
+	}
+	if (chars + 3 < _countof(prefix))
+	{
+		prefix[chars++] = IsLast ? L'\\' : L'+';
+		prefix[chars++] = L'-';
+		prefix[chars++] = L'-';
+	}
+	prefix[chars] = L'\0';
+
+	ConOutFmt(L"%s Branch %ld%s%s",
+		prefix,
+		Entry->Info.BranchNumber,
+		(Entry->Info.Flags & Cdp_BRANCH_INFO_FLAG_CURRENT) != 0 ?
+			L" [CURRENT]" : L"",
+		(Entry->Info.Flags & Cdp_BRANCH_INFO_FLAG_SYNTHETIC) != 0 ?
+			L" [RETAINED-BASE]" : L"");
+	if (Entry->Info.ParentBranchNumber == 0)
+	{
+		ConOutFmt(L"  root | created=%llu | retained seq=%llu..%llu\n",
+			Entry->Info.CreatedWallClock100ns,
+			Entry->Info.StartSequence,
+			Entry->Info.EndSequence);
+	}
+	else
+	{
+		ConOutFmt(
+			L"  <- Branch %ld @ inherit record #%llu | created=%llu | retained seq=%llu..%llu\n",
+			Entry->Info.ParentBranchNumber,
+			Entry->Info.InheritedRecordSequence,
+			Entry->Info.CreatedWallClock100ns,
+			Entry->Info.StartSequence,
+			Entry->Info.EndSequence);
+	}
+}
+
+static void PrintBranchChildren(
+	_Inout_updates_(Count) PCdp_CONSOLE_BRANCH_ENTRY Entries,
+	_In_ ULONG Count,
+	_In_ LONG ParentBranchNumber,
+	_In_ ULONG Depth,
+	_Inout_updates_(64) BOOL* AncestorHasMore)
+{
+	ULONG i;
+
+	if (Depth > Count || Depth >= 64)
+		return;
+	for (i = 0; i < Count; ++i)
+	{
+		if (Entries[i].Printed ||
+			Entries[i].Info.ParentBranchNumber != ParentBranchNumber)
+		{
+			continue;
+		}
+		BOOL hasLaterSibling = HasLaterUnprintedBranchSibling(
+			Entries, Count, ParentBranchNumber, i);
+		Entries[i].Printed = TRUE;
+		PrintBranchEntry(&Entries[i], Depth, !hasLaterSibling,
+			AncestorHasMore);
+		AncestorHasMore[Depth] = hasLaterSibling;
+		PrintBranchChildren(
+			Entries,
+			Count,
+			Entries[i].Info.BranchNumber,
+			Depth + 1,
+			AncestorHasMore);
+	}
+}
+
+static BOOL DoListJournalBranches(HANDLE hDevice)
+{
+	const ULONG batchSize = Cdp_JOURNAL_BRANCH_QUERY_MAX_PER_CALL;
+	const SIZE_T bufferSize = sizeof(Cdp_JOURNAL_BRANCH_QUERY_REPLY) +
+		(SIZE_T)batchSize * sizeof(Cdp_JOURNAL_BRANCH_INFO);
+	Cdp_JOURNAL_BRANCH_QUERY_REQUEST req = { 0 };
+	BYTE* buffer = NULL;
+	PCdp_CONSOLE_BRANCH_ENTRY entries = NULL;
+	UINT64 nextIndex = 0;
+	UINT64 generation = 0;
+	ULONG totalBranches = 0;
+	LONG currentBranch = 0;
+	ULONG copied = 0;
+	BOOL firstPage = TRUE;
+	DWORD bytesReturned;
+
+	ListVolumes();
+	if (!PromptGuid(L"Protected source volume GUID: ", &req.SourceVolumeGuid))
+		return FALSE;
+	if (!AuthenticatePassword(hDevice))
+		return FALSE;
+
+	buffer = (BYTE*)malloc(bufferSize);
+	if (!buffer)
+	{
+		ConOut(L"Unable to allocate branch-query buffer.\n");
+		return FALSE;
+	}
+
+	for (;;)
+	{
+		PCdp_JOURNAL_BRANCH_QUERY_REPLY reply;
+		PCdp_JOURNAL_BRANCH_INFO branches;
+
+		req.StartIndex = nextIndex;
+		req.ExpectedGeneration = generation;
+		req.MaxBranches = batchSize;
+		req.Reserved = 0;
+		bytesReturned = 0;
+		if (!DeviceIoControl(
+				hDevice,
+				IOCTL_Cdp_QUERY_JOURNAL_BRANCHES,
+				&req,
+				sizeof(req),
+				buffer,
+				(DWORD)bufferSize,
+				&bytesReturned,
+				NULL))
+		{
+			DWORD err = GetLastError();
+			ConOutFmt(err == ERROR_RETRY ?
+				L"Journal changed while listing branches; run b again.\n" :
+				L"List journal branches failed (err=%lu).\n",
+				err);
+			free(entries);
+			free(buffer);
+			return FALSE;
+		}
+
+		reply = (PCdp_JOURNAL_BRANCH_QUERY_REPLY)buffer;
+		if (bytesReturned < sizeof(*reply) ||
+			reply->BranchCount > batchSize ||
+			bytesReturned < sizeof(*reply) +
+				reply->BranchCount * sizeof(Cdp_JOURNAL_BRANCH_INFO))
+		{
+			ConOut(L"Driver returned an invalid branch-list reply.\n");
+			free(entries);
+			free(buffer);
+			return FALSE;
+		}
+		if (firstPage)
+		{
+			totalBranches = reply->TotalBranches;
+			generation = reply->Generation;
+			currentBranch = reply->CurrentBranchNumber;
+			if (totalBranches != 0)
+			{
+				entries = (PCdp_CONSOLE_BRANCH_ENTRY)calloc(
+					totalBranches, sizeof(*entries));
+				if (!entries)
+				{
+					ConOut(L"Unable to allocate branch topology.\n");
+					free(buffer);
+					return FALSE;
+				}
+			}
+			firstPage = FALSE;
+		}
+		else if (reply->TotalBranches != totalBranches ||
+			reply->Generation != generation ||
+			reply->CurrentBranchNumber != currentBranch)
+		{
+			ConOut(L"Journal changed while listing branches; run b again.\n");
+			free(entries);
+			free(buffer);
+			return FALSE;
+		}
+
+		if (reply->BranchCount > totalBranches - copied)
+		{
+			ConOut(L"Driver returned an inconsistent branch-list page.\n");
+			free(entries);
+			free(buffer);
+			return FALSE;
+		}
+		branches = (PCdp_JOURNAL_BRANCH_INFO)(reply + 1);
+		for (ULONG i = 0; i < reply->BranchCount; ++i)
+			entries[copied + i].Info = branches[i];
+		copied += reply->BranchCount;
+		nextIndex += reply->BranchCount;
+		if (nextIndex >= totalBranches)
+			break;
+		if (reply->BranchCount == 0)
+		{
+			ConOut(L"Driver returned an incomplete branch-list page.\n");
+			free(entries);
+			free(buffer);
+			return FALSE;
+		}
+	}
+
+	ConOutFmt(L"Journal branch topology: %lu retained branch(es); current=Branch %ld\n",
+		totalBranches, currentBranch);
+	if (totalBranches == 0)
+	{
+		ConOut(L"  (no retained branches)\n");
+	}
+	else
+	{
+		BOOL ancestorHasMore[64] = { FALSE };
+		ConOut(L"Legend: `<- Branch N @ inherit record #S` means this branch inherits parent state through record S.\n\n");
+		PrintBranchChildren(entries, totalBranches, 0, 0, ancestorHasMore);
+		for (ULONG i = 0; i < totalBranches; ++i)
+		{
+			if (!entries[i].Printed)
+			{
+				ConOut(L"Orphaned retained branch (parent was compacted/pruned):\n");
+				entries[i].Printed = TRUE;
+				PrintBranchEntry(&entries[i], 0, TRUE, ancestorHasMore);
+				PrintBranchChildren(
+					entries,
+					totalBranches,
+					entries[i].Info.BranchNumber,
+					1,
+					ancestorHasMore);
+			}
+		}
+	}
+
+	free(entries);
+	free(buffer);
+	return TRUE;
+}
+
 static BOOL DoQueryVersion(HANDLE hDevice)
 {
 	Cdp_VERSION_REPLY reply = { 0 };
@@ -1130,6 +1392,7 @@ static void PrintHelp(void)
 	ConOut(L"  9  - query journal oldest/newest record time (source GUID)\n");
 	ConOut(L"  u  - query journal record payload usage/free space (source GUID)\n");
 	ConOut(L"  l  - list current journal record metadata (source GUID; no payload)\n");
+	ConOut(L"  b  - print retained journal branch topology and inheritance points (source GUID)\n");
 	ConOut(L"  s  - query protect status (source GUID -> status + journal GUID)\n");
 	ConOut(L"  e  - enter prepared recovery (source GUID + time; no writeback)\n");
 	ConOut(L"  r  - commit prepared recovery synchronously (writeback to source)\n");
@@ -1229,6 +1492,12 @@ int wmain(void)
 			hDevice = EnsureControlDevice(hDevice);
 			if (hDevice != INVALID_HANDLE_VALUE)
 				DoListJournalRecords(hDevice);
+			break;
+		case L'b':
+		case L'B':
+			hDevice = EnsureControlDevice(hDevice);
+			if (hDevice != INVALID_HANDLE_VALUE)
+				DoListJournalBranches(hDevice);
 			break;
 		case L's':
 		case L'S':

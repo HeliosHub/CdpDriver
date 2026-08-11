@@ -113,6 +113,9 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 	KeInitializeSpinLock(&DeviceExtension->CaptureQueueLock);
 	InitializeListHead(&DeviceExtension->CaptureQueue);
 	KeInitializeEvent(&DeviceExtension->CaptureEvent, NotificationEvent, FALSE);
+	KeInitializeEvent(&DeviceExtension->RedirectWritesDrainedEvent,
+		NotificationEvent, TRUE);
+	InterlockedExchange(&DeviceExtension->RedirectWritesInFlight, 0);
 	KeInitializeSpinLock(&DeviceExtension->RecoveryReadQueueLock);
 	InitializeListHead(&DeviceExtension->RecoveryReadQueue);
 	KeInitializeEvent(&DeviceExtension->RecoveryReadEvent, NotificationEvent, FALSE);
@@ -121,6 +124,7 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 	KeInitializeMutex(&DeviceExtension->HistoryMutex, 0);
 	ExInitializeRundownProtection(&DeviceExtension->AutoDiscoveryRundown);
 	InterlockedExchange(&DeviceExtension->AutoDiscoveryGateActive, 1);
+	InterlockedExchange(&DeviceExtension->RebootRecoveryGateRequired, 0);
 	KeInitializeEvent(&DeviceExtension->AutoDiscoveryGateEvent,
 		NotificationEvent, FALSE);
 	DeviceExtension->SectorSize = Cdp_SECTOR_SIZE_DEFAULT;
