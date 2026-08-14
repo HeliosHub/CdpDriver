@@ -1,0 +1,56 @@
+[Version]
+Signature   = "$WINDOWS NT$"
+Class       = DiskDrive
+ClassGuid   = {4d36e967-e325-11ce-bfc1-08002be10318}
+Provider    = %ProviderName%
+DriverVer   = 08/13/2026,1.0.2.0
+CatalogFile = CdpDiskFilter.cat
+PnpLockdown = 1
+
+[SourceDisksNames]
+1 = %DiskName%,,,
+
+[SourceDisksFiles.amd64]
+CdpDiskFilter.sys = 1,,
+
+[DestinationDirs]
+DefaultDestDir = 12
+CdpDiskFilter_CopyFiles.NTamd64 = 12
+
+[DefaultInstall.NTamd64]
+CopyFiles = CdpDiskFilter_CopyFiles.NTamd64
+AddReg = CdpDiskFilter_ClassUpperFilter_AddReg
+
+[DefaultInstall.NTamd64.Services]
+AddService = CdpDiskFilter,,CdpDiskFilter_ServiceInstall
+
+[DefaultUninstall.NTamd64]
+DelFiles = CdpDiskFilter_CopyFiles.NTamd64
+DelReg = CdpDiskFilter_ClassUpperFilter_DelReg
+
+[DefaultUninstall.NTamd64.Services]
+DelService = CdpDiskFilter,0x00000002
+
+[CdpDiskFilter_ClassUpperFilter_AddReg]
+HKLM,"SYSTEM\CurrentControlSet\Control\Class\{4d36e967-e325-11ce-bfc1-08002be10318}","UpperFilters",0x00010008,"CdpDiskFilter"
+
+[CdpDiskFilter_ClassUpperFilter_DelReg]
+HKLM,"SYSTEM\CurrentControlSet\Control\Class\{4d36e967-e325-11ce-bfc1-08002be10318}","UpperFilters",0x00018002,"CdpDiskFilter"
+
+[CdpDiskFilter_CopyFiles.NTamd64]
+CdpDiskFilter.sys,,,0x00000002
+
+[CdpDiskFilter_ServiceInstall]
+DisplayName   = %ServiceName%
+Description   = %ServiceDesc%
+ServiceBinary = %12%\CdpDiskFilter.sys
+ServiceType   = 1
+StartType     = 0
+ErrorControl  = 1
+LoadOrderGroup = "PnP Filter"
+
+[Strings]
+ProviderName = "CdpDriver"
+DiskName     = "CDP Disk Filter Installation Disk"
+ServiceName  = "CdpDiskFilter"
+ServiceDesc  = "Minimal physical disk redirect verification filter"

@@ -242,11 +242,8 @@ BOOL CdpInstallDriverFromInf(_In_ const wchar_t* infPath)
 	return CdpEnsureDriverService();
 }
 
-BOOL CdpRegisterVolumeUpperFilter(void)
+static BOOL CdpRegisterClassUpperFilter(_In_ const wchar_t* classKey)
 {
-	const wchar_t* volumeClassKey =
-		L"SYSTEM\\CurrentControlSet\\Control\\Class\\"
-		L"{71a27cdd-812a-11d0-bec7-08002be2092f}";
 	wchar_t existing[4096];
 	wchar_t* pEnd;
 	DWORD existingSize;
@@ -258,7 +255,7 @@ BOOL CdpRegisterVolumeUpperFilter(void)
 
 	result = RegOpenKeyExW(
 		HKEY_LOCAL_MACHINE,
-		volumeClassKey,
+		classKey,
 		0,
 		KEY_READ | KEY_SET_VALUE,
 		&hKey);
@@ -333,6 +330,22 @@ BOOL CdpRegisterVolumeUpperFilter(void)
 	return TRUE;
 }
 
+BOOL CdpRegisterVolumeUpperFilter(void)
+{
+	return CdpRegisterClassUpperFilter(
+		L"SYSTEM\\CurrentControlSet\\Control\\Class\\"
+		L"{71a27cdd-812a-11d0-bec7-08002be2092f}");
+}
+
+BOOL CdpRegisterDiskUpperFilter(void)
+{
+	/* Append without replacing the existing REG_MULTI_SZ. In particular,
+	 * PartMgr must remain in the DiskDrive class filter chain. */
+	return CdpRegisterClassUpperFilter(
+		L"SYSTEM\\CurrentControlSet\\Control\\Class\\"
+		L"{4d36e967-e325-11ce-bfc1-08002be10318}");
+}
+
 BOOL CdpInstallDriverPackage(void)
 {
 	wchar_t infPath[MAX_PATH];
@@ -344,6 +357,8 @@ BOOL CdpInstallDriverPackage(void)
 		return FALSE;
 
 	if (!CdpRegisterVolumeUpperFilter())
+		return FALSE;
+	if (!CdpRegisterDiskUpperFilter())
 		return FALSE;
 
 	/* System Settings Change reboot dialog (same family as INF AddFilter). */

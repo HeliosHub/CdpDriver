@@ -5,6 +5,8 @@
 typedef struct _Cdp_DEV_STORE_CTX
 {
 	PDEVICE_OBJECT Device;
+	UINT64 BaseOffset;
+	UINT64 LogicalStart;
 	UINT64 Size;
 	ULONG SectorSize;
 } Cdp_DEV_STORE_CTX, *PCdp_DEV_STORE_CTX;
@@ -109,12 +111,13 @@ static NTSTATUS CdpDevStoreRead(
 	_Out_writes_bytes_(Length) PVOID Buffer)
 {
 	PCdp_DEV_STORE_CTX ctx = (PCdp_DEV_STORE_CTX)Store->Context;
-	if (!ctx || Offset > ctx->Size || Length > ctx->Size - Offset)
+	if (!ctx || Offset < ctx->LogicalStart || Offset > ctx->Size ||
+		Length > ctx->Size - Offset)
 		return STATUS_INVALID_PARAMETER;
 	return CdpDevStoreRawIo(
 		ctx->Device,
 		IRP_MJ_READ,
-		Offset,
+		ctx->BaseOffset + Offset,
 		Length,
 		Buffer);
 }
@@ -126,12 +129,13 @@ static NTSTATUS CdpDevStoreWrite(
 	_In_reads_bytes_(Length) const VOID* Buffer)
 {
 	PCdp_DEV_STORE_CTX ctx = (PCdp_DEV_STORE_CTX)Store->Context;
-	if (!ctx || Offset > ctx->Size || Length > ctx->Size - Offset)
+	if (!ctx || Offset < ctx->LogicalStart || Offset > ctx->Size ||
+		Length > ctx->Size - Offset)
 		return STATUS_INVALID_PARAMETER;
 	return CdpDevStoreRawIo(
 		ctx->Device,
 		IRP_MJ_WRITE,
-		Offset,
+		ctx->BaseOffset + Offset,
 		Length,
 		(PVOID)Buffer);
 }
@@ -142,10 +146,22 @@ NTSTATUS CdpDevStoreCreate(
 	_In_ ULONG SectorSize,
 	_Outptr_ PCdp_STORE* OutStore)
 {
+	return CdpDevStoreCreateOffset(
+		Device, 0, Size, SectorSize, OutStore);
+}
+
+NTSTATUS CdpDevStoreCreateOffset(
+	_In_ PDEVICE_OBJECT Device,
+	_In_ UINT64 BaseOffset,
+	_In_ UINT64 Size,
+	_In_ ULONG SectorSize,
+	_Outptr_ PCdp_STORE* OutStore)
+{
 	PCdp_STORE store;
 	PCdp_DEV_STORE_CTX ctx;
 
-	if (!Device || !OutStore || Size == 0)
+	if (!Device || !OutStore || Size == 0 ||
+		BaseOffset > MAXULONGLONG - Size)
 		return STATUS_INVALID_PARAMETER;
 
 	store = (PCdp_STORE)Cdp_ALLOC(sizeof(*store));
@@ -162,11 +178,57 @@ NTSTATUS CdpDevStoreCreate(
 	RtlZeroMemory(store, sizeof(*store));
 	RtlZeroMemory(ctx, sizeof(*ctx));
 	ctx->Device = Device;
+	ctx->BaseOffset = BaseOffset;
+	ctx->LogicalStart = 0;
 	ctx->Size = Size;
 	ctx->SectorSize = SectorSize;
 	store->Read = CdpDevStoreRead;
 	store->Write = CdpDevStoreWrite;
 	store->Size = Size;
+	store->SectorSize = SectorSize;
+	store->Context = ctx;
+	*OutStore = store;
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS CdpDevStoreCreateAbsoluteRange(
+	_In_ PDEVICE_OBJECT Device,
+	_In_ UINT64 AbsoluteStart,
+	_In_ UINT64 Size,
+	_In_ ULONG SectorSize,
+	_Outptr_ PCdp_STORE* OutStore)
+{
+	PCdp_STORE store;
+	PCdp_DEV_STORE_CTX ctx;
+	UINT64 absoluteEnd;
+
+	if (!Device || !OutStore || Size == 0 ||
+		AbsoluteStart > MAXULONGLONG - Size)
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+	absoluteEnd = AbsoluteStart + Size;
+	store = (PCdp_STORE)Cdp_ALLOC(sizeof(*store));
+	ctx = (PCdp_DEV_STORE_CTX)Cdp_ALLOC(sizeof(*ctx));
+	if (!store || !ctx)
+	{
+		if (store)
+			Cdp_FREE(store);
+		if (ctx)
+			Cdp_FREE(ctx);
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+
+	RtlZeroMemory(store, sizeof(*store));
+	RtlZeroMemory(ctx, sizeof(*ctx));
+	ctx->Device = Device;
+	ctx->BaseOffset = 0;
+	ctx->LogicalStart = AbsoluteStart;
+	ctx->Size = absoluteEnd;
+	ctx->SectorSize = SectorSize;
+	store->Read = CdpDevStoreRead;
+	store->Write = CdpDevStoreWrite;
+	store->Size = absoluteEnd;
 	store->SectorSize = SectorSize;
 	store->Context = ctx;
 	*OutStore = store;

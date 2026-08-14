@@ -16,6 +16,8 @@ BOOL CdpInstallDriverFromInf(_In_ const wchar_t* infPath);
 
 BOOL CdpRegisterVolumeUpperFilter(void);
 
+BOOL CdpRegisterDiskUpperFilter(void);
+
 BOOL CdpInstallDriverPackage(void);
 
 #ifdef __cplusplus

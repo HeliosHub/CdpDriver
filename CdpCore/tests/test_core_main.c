@@ -769,6 +769,387 @@ static int TestAfterImageAllOverlapShapes(void)
 	return g_caseFailed;
 }
 
+#define TEST_TREE_MODEL_SIZE 8192UL
+
+typedef struct _TEST_TREE_STATS
+{
+	ULONG Count;
+	LONG Height;
+	UINT64 MaxEnd;
+	UINT64 MinValidSequence;
+} TEST_TREE_STATS, *PTEST_TREE_STATS;
+
+static ULONG TestRandomNext(_Inout_ PULONG State)
+{
+	ULONG value = *State;
+
+	value ^= value << 13;
+	value ^= value >> 17;
+	value ^= value << 5;
+	*State = value;
+	return value;
+}
+
+static BOOLEAN TestValidateTreeNode(
+	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
+	_Inout_ PUINT64 PreviousEnd,
+	_Inout_ PBOOLEAN HavePrevious,
+	_Out_ PTEST_TREE_STATS Stats)
+{
+	TEST_TREE_STATS left;
+	TEST_TREE_STATS right;
+	UINT64 expectedMaxEnd;
+	UINT64 expectedMinSequence;
+	LONG expectedHeight;
+
+	RtlZeroMemory(Stats, sizeof(*Stats));
+	Stats->MinValidSequence = MAXUINT64;
+	if (!Node)
+		return TRUE;
+
+	if (!TestValidateTreeNode(
+		Node->Left, PreviousEnd, HavePrevious, &left))
+	{
+		return FALSE;
+	}
+	if (Node->Start >= Node->End ||
+		Node->End - Node->Start != Node->DataLength ||
+		(*HavePrevious && Node->Start < *PreviousEnd))
+	{
+		return FALSE;
+	}
+	*PreviousEnd = Node->End;
+	*HavePrevious = TRUE;
+	if (!TestValidateTreeNode(
+		Node->Right, PreviousEnd, HavePrevious, &right))
+	{
+		return FALSE;
+	}
+
+	expectedHeight = 1 +
+		(left.Height > right.Height ? left.Height : right.Height);
+	expectedMaxEnd = Node->End;
+	if (left.MaxEnd > expectedMaxEnd)
+		expectedMaxEnd = left.MaxEnd;
+	if (right.MaxEnd > expectedMaxEnd)
+		expectedMaxEnd = right.MaxEnd;
+	expectedMinSequence = Node->Invalid ? MAXUINT64 : Node->Sequence;
+	if (left.MinValidSequence < expectedMinSequence)
+		expectedMinSequence = left.MinValidSequence;
+	if (right.MinValidSequence < expectedMinSequence)
+		expectedMinSequence = right.MinValidSequence;
+	if (Node->Height != expectedHeight ||
+		Node->MaxEnd != expectedMaxEnd ||
+		Node->MinValidSequence != expectedMinSequence ||
+		left.Height - right.Height > 1 ||
+		right.Height - left.Height > 1)
+	{
+		return FALSE;
+	}
+
+	Stats->Count = left.Count + right.Count + 1;
+	Stats->Height = expectedHeight;
+	Stats->MaxEnd = expectedMaxEnd;
+	Stats->MinValidSequence = expectedMinSequence;
+	return TRUE;
+}
+
+static PCdp_PREVIEW_TREE_NODE TestTreeFindByte(
+	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
+	_In_ UINT64 Offset)
+{
+	while (Node)
+	{
+		if (Offset < Node->Start)
+			Node = Node->Left;
+		else if (Offset >= Node->End)
+			Node = Node->Right;
+		else
+			return Node;
+	}
+	return NULL;
+}
+
+static BOOLEAN TestValidateTreeAgainstModel(
+	_In_ PCdp_PREVIEW_TREE Tree,
+	_In_reads_(ModelSize) const UCHAR* Covered,
+	_In_reads_(ModelSize) const UINT64* Sequences,
+	_In_reads_(ModelSize) const UINT64* PayloadOffsets,
+	_In_ ULONG ModelSize)
+{
+	TEST_TREE_STATS stats;
+	UINT64 previousEnd = 0;
+	BOOLEAN havePrevious = FALSE;
+	ULONG i;
+
+	if (!TestValidateTreeNode(
+		Tree->Root, &previousEnd, &havePrevious, &stats) ||
+		stats.Count != Tree->NodeCount)
+	{
+		return FALSE;
+	}
+
+	for (i = 0; i < ModelSize; ++i)
+	{
+		PCdp_PREVIEW_TREE_NODE node =
+			TestTreeFindByte(Tree->Root, i);
+		if (!Covered[i])
+		{
+			if (node)
+				return FALSE;
+			continue;
+		}
+		if (!node || node->Invalid ||
+			node->Sequence != Sequences[i] ||
+			node->FileOffset + (i - node->Start) != PayloadOffsets[i])
+		{
+			return FALSE;
+		}
+	}
+	return TRUE;
+}
+
+static NTSTATUS TestOverlayTreeAndModel(
+	_Inout_ PCdp_PREVIEW_TREE Tree,
+	_Inout_updates_(ModelSize) PUCHAR Covered,
+	_Inout_updates_(ModelSize) PUINT64 Sequences,
+	_Inout_updates_(ModelSize) PUINT64 PayloadOffsets,
+	_In_ ULONG ModelSize,
+	_In_ ULONG Start,
+	_In_ ULONG Length,
+	_In_ UINT64 Sequence,
+	_In_ UINT64 FileOffset)
+{
+	Cdp_JOURNAL_RECORD record;
+	NTSTATUS status;
+	ULONG i;
+
+	if (Length == 0 || Start > ModelSize || Length > ModelSize - Start)
+		return STATUS_INVALID_PARAMETER;
+	RtlZeroMemory(&record, sizeof(record));
+	record.VolumeOffset = Start;
+	record.DataLength = Length;
+	record.Sequence = Sequence;
+	record.FileOffset = FileOffset;
+	record.WallClock100ns = Sequence;
+	status = CdpPreviewTreeOverlayLatest(Tree, &record);
+	if (!NT_SUCCESS(status))
+		return status;
+	for (i = 0; i < Length; ++i)
+	{
+		Covered[Start + i] = TRUE;
+		Sequences[Start + i] = Sequence;
+		PayloadOffsets[Start + i] = FileOffset + i;
+	}
+	return STATUS_SUCCESS;
+}
+
+static int TestMetaTreeCompoundOverlapModel(void)
+{
+	static const struct
+	{
+		ULONG Start;
+		ULONG Length;
+	} operations[] =
+	{
+		{ 512, 3072 },
+		{ 1024, 1024 },
+		{ 1536, 1536 },
+		{ 768, 512 },
+		{ 768, 256 },
+		{ 3072, 512 },
+		{ 1792, 768 },
+		{ 0, 512 },
+		{ 3584, 512 },
+		{ 256, 3584 },
+		{ 4096, 2048 },
+		{ 5632, 1536 },
+		{ 4864, 1024 },
+		{ 0, TEST_TREE_MODEL_SIZE }
+	};
+	Cdp_PREVIEW_TREE tree;
+	UCHAR covered[TEST_TREE_MODEL_SIZE];
+	UINT64 sequences[TEST_TREE_MODEL_SIZE];
+	UINT64 payloadOffsets[TEST_TREE_MODEL_SIZE];
+	BOOLEAN valid = TRUE;
+	ULONG i;
+
+	CdpPreviewTreeInitialize(&tree);
+	RtlZeroMemory(covered, sizeof(covered));
+	RtlZeroMemory(sequences, sizeof(sequences));
+	RtlZeroMemory(payloadOffsets, sizeof(payloadOffsets));
+	for (i = 0; i < ARRAYSIZE(operations); ++i)
+	{
+		UINT64 sequence = i + 1;
+		UINT64 fileOffset = 0x100000000ULL + sequence * 0x10000ULL;
+
+		if (!NT_SUCCESS(TestOverlayTreeAndModel(
+			&tree, covered, sequences, payloadOffsets,
+			ARRAYSIZE(covered), operations[i].Start,
+			operations[i].Length, sequence, fileOffset)) ||
+			!TestValidateTreeAgainstModel(
+				&tree, covered, sequences, payloadOffsets,
+				ARRAYSIZE(covered)))
+		{
+			valid = FALSE;
+			break;
+		}
+	}
+	Expect(valid,
+		"compound overlays preserve interval, payload-offset and AVL invariants");
+	CdpPreviewTreeFree(&tree);
+	return g_caseFailed;
+}
+
+static int TestMetaTreeRandomizedReferenceModel(void)
+{
+	Cdp_PREVIEW_TREE tree;
+	UCHAR covered[TEST_TREE_MODEL_SIZE];
+	UINT64 sequences[TEST_TREE_MODEL_SIZE];
+	UINT64 payloadOffsets[TEST_TREE_MODEL_SIZE];
+	ULONG randomState = 0x4d595df4UL;
+	BOOLEAN valid = TRUE;
+	ULONG iteration;
+
+	CdpPreviewTreeInitialize(&tree);
+	RtlZeroMemory(covered, sizeof(covered));
+	RtlZeroMemory(sequences, sizeof(sequences));
+	RtlZeroMemory(payloadOffsets, sizeof(payloadOffsets));
+	for (iteration = 0; iteration < 6000; ++iteration)
+	{
+		ULONG start = TestRandomNext(&randomState) % TEST_TREE_MODEL_SIZE;
+		ULONG maxLength = TEST_TREE_MODEL_SIZE - start;
+		ULONG length = 1 + TestRandomNext(&randomState) %
+			(maxLength < 1536 ? maxLength : 1536);
+		UINT64 sequence = iteration + 1;
+		UINT64 fileOffset = 0x200000000ULL + sequence * 0x2000ULL;
+
+		if (!NT_SUCCESS(TestOverlayTreeAndModel(
+			&tree, covered, sequences, payloadOffsets,
+			ARRAYSIZE(covered), start, length, sequence, fileOffset)))
+		{
+			valid = FALSE;
+			break;
+		}
+		if ((iteration % 20) == 0 &&
+			!TestValidateTreeAgainstModel(
+				&tree, covered, sequences, payloadOffsets,
+				ARRAYSIZE(covered)))
+		{
+			valid = FALSE;
+			break;
+		}
+	}
+	if (valid)
+	{
+		valid = TestValidateTreeAgainstModel(
+			&tree, covered, sequences, payloadOffsets,
+			ARRAYSIZE(covered));
+	}
+	Expect(valid,
+		"6000 randomized overlays match byte reference model and tree invariants");
+	CdpPreviewTreeFree(&tree);
+	return g_caseFailed;
+}
+
+static int TestMetaTreeRandomizedWriteReadRemount(void)
+{
+	TEST_CTX ctx;
+	UCHAR source[SRC_SIZE];
+	UCHAR expected[SRC_SIZE];
+	UCHAR output[SRC_SIZE];
+	UCHAR payload[4096];
+	ULONG randomState = 0x9e3779b9UL;
+	BOOLEAN valid = TRUE;
+	const char* failStage = NULL;
+	ULONG failIteration = 0;
+	NTSTATUS status;
+	ULONG iteration;
+
+	status = TestCtxCreate(&ctx, SRC_SIZE, JNL_SIZE, 130000);
+	Expect(NT_SUCCESS(status), "setup randomized write/read/remount test");
+	if (!NT_SUCCESS(status))
+		return g_caseFailed;
+	FillPattern(source, sizeof(source), 0x37);
+	RtlCopyMemory(expected, source, sizeof(expected));
+	status = ctx.Source->Write(ctx.Source, 0, sizeof(source), source);
+	if (!NT_SUCCESS(status))
+	{
+		valid = FALSE;
+		failStage = "source seed";
+	}
+
+	for (iteration = 0; valid && iteration < 1000; ++iteration)
+	{
+		ULONG start = (TestRandomNext(&randomState) %
+			((ULONG)SRC_SIZE / SECTOR)) * SECTOR;
+		ULONG maxSectors = ((ULONG)SRC_SIZE - start) / SECTOR;
+		ULONG length = (1 + TestRandomNext(&randomState) %
+			(maxSectors < ARRAYSIZE(payload) / SECTOR ?
+				maxSectors : ARRAYSIZE(payload) / SECTOR)) * SECTOR;
+		ULONG i;
+
+		for (i = 0; i < length; ++i)
+			payload[i] = (UCHAR)(iteration * 29 + i * 17);
+		status = CdpCoreAppendAfterImage(
+			ctx.Core, start, length, payload, NULL);
+		if (!NT_SUCCESS(status))
+		{
+			valid = FALSE;
+			failStage = "append";
+			failIteration = iteration;
+			break;
+		}
+		RtlCopyMemory(expected + start, payload, length);
+
+		if ((iteration % 25) == 24)
+		{
+			ULONG readStart = (TestRandomNext(&randomState) %
+				((ULONG)SRC_SIZE / SECTOR)) * SECTOR;
+			ULONG readLength = (1 + TestRandomNext(&randomState) %
+				(((ULONG)SRC_SIZE - readStart) / SECTOR)) * SECTOR;
+
+			status = CdpCoreRead(
+				ctx.Core, readStart, readLength, output);
+			if (!NT_SUCCESS(status) ||
+				memcmp(output, expected + readStart, readLength) != 0)
+			{
+				valid = FALSE;
+				failStage = "live partial read";
+				failIteration = iteration;
+				break;
+			}
+		}
+		if ((iteration % 100) == 99)
+		{
+			CdpCoreDestroy(ctx.Core);
+			ctx.Core = NULL;
+			status = CdpCoreCreate(ctx.Source, ctx.Journal, &ctx.Core);
+			if (NT_SUCCESS(status))
+				status = CdpCoreMountJournal(ctx.Core);
+			if (NT_SUCCESS(status))
+				status = CdpCoreRead(ctx.Core, 0, sizeof(output), output);
+			if (!NT_SUCCESS(status) ||
+				memcmp(output, expected, sizeof(output)) != 0)
+			{
+				valid = FALSE;
+				failStage = "remount full read";
+				failIteration = iteration;
+				break;
+			}
+		}
+	}
+	if (!valid)
+	{
+		printf("MetaTree randomized failure: stage=%s iteration=%lu status=0x%08lx\n",
+			failStage ? failStage : "unknown", failIteration, (ULONG)status);
+	}
+	Expect(valid,
+		"1000 writes stay correct during live reads and ten MetaTree rebuilds");
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
 static int TestAfterImageBranchAncestryRead(void)
 {
 	PCdp_STORE sourceStore = NULL;
@@ -1809,6 +2190,12 @@ int main(void)
 		TestAfterImageMixedReadAndLatestOverlap);
 	failed += RunCase("After-image all overlap shapes",
 		TestAfterImageAllOverlapShapes);
+	failed += RunCase("MetaTree compound overlap model",
+		TestMetaTreeCompoundOverlapModel);
+	failed += RunCase("MetaTree randomized reference model",
+		TestMetaTreeRandomizedReferenceModel);
+	failed += RunCase("MetaTree randomized write/read/remount",
+		TestMetaTreeRandomizedWriteReadRemount);
 	failed += RunCase("After-image branch ancestry read",
 		TestAfterImageBranchAncestryRead);
 	failed += RunCase("After-image compacts current branch only",

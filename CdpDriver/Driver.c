@@ -5,6 +5,40 @@
 PDRIVER_OBJECT g_DriverObject = NULL;
 Cdp_PERF_COUNTERS g_CdpPerfCounters = { 0 };
 
+static Cdp_DEVICE_KIND CdpGetAttachedDeviceKind(
+	_In_ PDEVICE_OBJECT PhysicalDeviceObject)
+{
+	WCHAR classGuidBuffer[64];
+	UNICODE_STRING classGuid;
+	UNICODE_STRING volumeClass;
+	UNICODE_STRING diskClass;
+	ULONG bytes = 0;
+	NTSTATUS status;
+
+	RtlZeroMemory(classGuidBuffer, sizeof(classGuidBuffer));
+	status = IoGetDeviceProperty(
+		PhysicalDeviceObject,
+		DevicePropertyClassGuid,
+		sizeof(classGuidBuffer) - sizeof(WCHAR),
+		classGuidBuffer,
+		&bytes);
+	if (!NT_SUCCESS(status))
+		return Cdp_DEVICE_KIND_UNKNOWN;
+
+	RtlInitUnicodeString(&classGuid, classGuidBuffer);
+	RtlInitUnicodeString(
+		&volumeClass,
+		L"{71a27cdd-812a-11d0-bec7-08002be2092f}");
+	RtlInitUnicodeString(
+		&diskClass,
+		L"{4d36e967-e325-11ce-bfc1-08002be10318}");
+	if (RtlEqualUnicodeString(&classGuid, &volumeClass, TRUE))
+		return Cdp_DEVICE_KIND_VOLUME;
+	if (RtlEqualUnicodeString(&classGuid, &diskClass, TRUE))
+		return Cdp_DEVICE_KIND_DISK;
+	return Cdp_DEVICE_KIND_UNKNOWN;
+}
+
 static VOID CdpBootDriverReinitialize(
 	_In_ PDRIVER_OBJECT DriverObject,
 	_In_opt_ PVOID Context,
@@ -87,6 +121,15 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 	PCdp_DEVICE_EXTENSION DeviceExtension = NULL;
 	PDEVICE_OBJECT FilterDeviceObject = NULL;
 	PCdp_DEVICE_LIST_NODE DeviceListNode = NULL;
+	Cdp_DEVICE_KIND deviceKind;
+
+	deviceKind = CdpGetAttachedDeviceKind(PhysicalDeviceObject);
+	if (deviceKind == Cdp_DEVICE_KIND_UNKNOWN)
+	{
+		Cdp_LOG("AddDevice rejected unknown class PDO=%p\n",
+			PhysicalDeviceObject);
+		return STATUS_NOT_SUPPORTED;
+	}
 
 	DriverExtension = IoGetDriverObjectExtension(DriverObject, &g_DriverObject);
 	if (!DriverExtension)
@@ -109,6 +152,8 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 
 	DeviceExtension = (PCdp_DEVICE_EXTENSION)FilterDeviceObject->DeviceExtension;
 	RtlZeroMemory(DeviceExtension, sizeof(Cdp_DEVICE_EXTENSION));
+	DeviceExtension->DeviceKind = deviceKind;
+	DeviceExtension->FilterDeviceObject = FilterDeviceObject;
 	DeviceExtension->PhysicalDeviceObject = PhysicalDeviceObject;
 	KeInitializeSpinLock(&DeviceExtension->CaptureQueueLock);
 	InitializeListHead(&DeviceExtension->CaptureQueue);
@@ -116,17 +161,34 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 	KeInitializeEvent(&DeviceExtension->RedirectWritesDrainedEvent,
 		NotificationEvent, TRUE);
 	InterlockedExchange(&DeviceExtension->RedirectWritesInFlight, 0);
+	KeInitializeEvent(&DeviceExtension->DiskIoDrainedEvent,
+		NotificationEvent, TRUE);
+	InterlockedExchange(&DeviceExtension->DiskIoAccepting, 0);
+	InterlockedExchange(&DeviceExtension->DiskIoOutstanding, 0);
 	KeInitializeSpinLock(&DeviceExtension->RecoveryReadQueueLock);
 	InitializeListHead(&DeviceExtension->RecoveryReadQueue);
 	KeInitializeEvent(&DeviceExtension->RecoveryReadEvent, NotificationEvent, FALSE);
 	KeInitializeEvent(&DeviceExtension->MergeThreadDoneEvent,
 		NotificationEvent, TRUE);
 	KeInitializeMutex(&DeviceExtension->HistoryMutex, 0);
+	InitializeListHead(&DeviceExtension->SequentialWriteList);
+	DeviceExtension->SequentialWriteCount = 0;
 	ExInitializeRundownProtection(&DeviceExtension->AutoDiscoveryRundown);
-	InterlockedExchange(&DeviceExtension->AutoDiscoveryGateActive, 1);
+	InterlockedExchange(
+		&DeviceExtension->AutoDiscoveryGateActive,
+#if Cdp_TEST_BOOT_PASSTHROUGH || Cdp_TEST_BOOT_OPEN_GATES
+		0);
+#else
+		deviceKind == Cdp_DEVICE_KIND_VOLUME ? 1 : 0);
+#endif
 	InterlockedExchange(&DeviceExtension->RebootRecoveryGateRequired, 0);
 	KeInitializeEvent(&DeviceExtension->AutoDiscoveryGateEvent,
-		NotificationEvent, FALSE);
+		NotificationEvent,
+#if Cdp_TEST_BOOT_PASSTHROUGH || Cdp_TEST_BOOT_OPEN_GATES
+		TRUE);
+#else
+		deviceKind == Cdp_DEVICE_KIND_VOLUME ? FALSE : TRUE);
+#endif
 	DeviceExtension->SectorSize = Cdp_SECTOR_SIZE_DEFAULT;
 	InterlockedExchange(&DeviceExtension->Phase, Cdp_PHASE_GENERAL);
 
@@ -135,13 +197,12 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 		goto cleanup;
 
 	FilterDeviceObject->Flags = DeviceExtension->LowerDeviceObject->Flags | DO_POWER_PAGABLE | DO_DIRECT_IO;
-	Status = CdpStartCaptureWorker(DeviceExtension);
-	if (!NT_SUCCESS(Status))
-		goto cleanup;
-	Status = CdpStartRecoveryReadWorker(DeviceExtension);
-	if (!NT_SUCCESS(Status))
-		goto cleanup;
-
+	if (deviceKind == Cdp_DEVICE_KIND_DISK)
+	{
+		Status = CdpStartCaptureWorker(DeviceExtension);
+		if (!NT_SUCCESS(Status))
+			goto cleanup;
+	}
 	DeviceListNode = cdpalloc(sizeof(Cdp_DEVICE_LIST_NODE));
 	if (!DeviceListNode)
 	{
@@ -154,6 +215,11 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 		&DriverExtension->DeviceObjectListLock);
 
 	FilterDeviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
+	Cdp_LOG("attached kind=%s filter=%p lower=%p pdo=%p\n",
+		deviceKind == Cdp_DEVICE_KIND_DISK ? "disk" : "volume",
+		FilterDeviceObject,
+		DeviceExtension->LowerDeviceObject,
+		PhysicalDeviceObject);
 	CdpScheduleAutoDiscovery(DriverExtension);
 
 cleanup:
@@ -257,6 +323,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 	DriverObject->MajorFunction[IRP_MJ_POWER] = CdpIrpDispatchPower;
 	DriverObject->MajorFunction[IRP_MJ_READ] = CdpIrpDispatchRead;
 	DriverObject->MajorFunction[IRP_MJ_WRITE] = CdpIrpDispatchWrite;
+	DriverObject->MajorFunction[IRP_MJ_FLUSH_BUFFERS] = CdpIrpDispatchFlush;
 	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = CdpIrpDispatchDeviceControl;
 	DriverObject->MajorFunction[IRP_MJ_CREATE] = CdpIrpDispatchCreateClose;
 	DriverObject->MajorFunction[IRP_MJ_CLOSE] = CdpIrpDispatchCreateClose;

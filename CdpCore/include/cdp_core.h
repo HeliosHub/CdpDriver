@@ -29,6 +29,20 @@ NTSTATUS CdpCoreBind(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ const GUID* SourceVolumeGuid,
 	_Outptr_ PCdp_CORE* OutCore);
+
+// Diagnostic dual-I/O helpers. They bypass MetaTree and access only the
+// lower source-volume store bound to this Core.
+NTSTATUS CdpCoreReadSourceForTest(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_Out_writes_bytes_(Length) PVOID Buffer);
+
+NTSTATUS CdpCoreWriteSourceForTest(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_In_reads_bytes_(Length) const VOID* Buffer);
 #endif
 
 VOID CdpCoreDestroy(_Inout_opt_ PCdp_CORE Core);
@@ -83,6 +97,12 @@ NTSTATUS CdpCoreQueryRecordHeaders(
 	_Out_ PUINT64 Generation,
 	_Out_ PULONG ReturnedCount);
 
+NTSTATUS CdpCoreQueryMetaTreeStats(
+	_Inout_ PCdp_CORE Core,
+	_Out_ PULONG NodeCount,
+	_Out_ PUINT64 LowestOffset,
+	_Out_ PUINT64 HighestEndOffset);
+
 NTSTATUS CdpCoreQueryBranches(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 StartIndex,
@@ -130,6 +150,32 @@ NTSTATUS CdpCoreRead(
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
 	_Out_writes_bytes_(Length) PVOID Buffer);
+
+BOOLEAN CdpCoreCurrentReadHasOverlap(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length);
+
+// Snapshot the first current-view journal mapping intersecting the requested
+// source range. The returned payload offset already includes any left-side
+// fragment displacement and remains valid for an immediate diagnostic read.
+NTSTATUS CdpCoreQueryFirstJournalOverlap(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_Out_ PUINT64 SourceIntersectionOffset,
+	_Out_ PUINT64 JournalPayloadOffset,
+	_Out_ PULONG IntersectionLength);
+
+/* Test-only split read: Buffer already contains a complete baseline from a
+ * separate shadow volume. Overlay current/preview journal hits only; this
+ * function never reads Core->Source. */
+NTSTATUS CdpCoreOverlayJournalRead(
+	_Inout_ PCdp_CORE Core,
+	_In_ BOOLEAN Preview,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_Inout_updates_bytes_(Length) PVOID Buffer);
 
 NTSTATUS CdpCorePreviewRead(
 	_Inout_ PCdp_CORE Core,

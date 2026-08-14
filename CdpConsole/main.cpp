@@ -1373,15 +1373,15 @@ static BOOL DoInstallDriver(void)
 
 	if (CdpResolveDriverInfPath(infPath, _countof(infPath)))
 		ConOutFmt(L"Driver package: %s\n", infPath);
-	ConOut(L"Driver installed and UpperFilters registered.\n");
-	ConOut(L"Reboot may be required before the filter attaches to volumes.\n");
+	ConOut(L"Driver installed; Volume and DiskDrive UpperFilters registered.\n");
+	ConOut(L"Reboot is required before both filter layers attach.\n");
 	return TRUE;
 }
 
 static void PrintHelp(void)
 {
 	ConOut(L"\nCommands:\n");
-	ConOut(L"  i  - install/register CdpDriver (INF + UpperFilters)\n");
+	ConOut(L"  i  - install/register CdpDriver (Volume + DiskDrive UpperFilters)\n");
 	ConOut(L"  1  - configure capture: source GUID + dedicated journal GUID\n");
 	ConOut(L"  2  - stop capture for a source GUID (invalidate its journal)\n");
 	ConOut(L"  6  - begin point-in-time preview (source GUID + time)\n");

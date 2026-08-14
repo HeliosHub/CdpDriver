@@ -39,6 +39,9 @@ typedef LONG NTSTATUS;
 #ifndef STATUS_DISK_CORRUPT_ERROR
 #define STATUS_DISK_CORRUPT_ERROR        ((NTSTATUS)0xC0000032L)
 #endif
+#ifndef STATUS_DATA_ERROR
+#define STATUS_DATA_ERROR                ((NTSTATUS)0xC000003EL)
+#endif
 #ifndef STATUS_NOT_FOUND
 #define STATUS_NOT_FOUND                 ((NTSTATUS)0xC0000225L)
 #endif

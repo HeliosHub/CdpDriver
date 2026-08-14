@@ -9,7 +9,7 @@
 #endif
 
 #define Cdp_JOURNAL_MAGIC            0x4C4E4A51UL /* 'QJNL' */
-#define Cdp_JOURNAL_VERSION          12UL
+#define Cdp_JOURNAL_VERSION          13UL
 #define Cdp_JOURNAL_MAX_RECORD_DATA  (2UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_REGION_SIZE (1UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_LINK_SIZE 32UL
@@ -43,8 +43,8 @@
 typedef struct _Cdp_JOURNAL_RECORD_HEADER
 {
 	UINT64 WallClock100ns; // 8  local wall-clock 100ns (FILETIME epoch)
-	UINT64 VolumeOffset;   // 8  source volume byte offset
-	UINT64 FileOffset;     // 8  payload offset inside CDP partition
+	UINT64 VolumeOffset;   // 8  absolute byte offset on the source physical disk
+	UINT64 FileOffset;     // 8  payload offset inside the CDP partition
 	ULONG DataLength;      // 4
 	// Low 16 bits: zero-based index within this header region.
 	// High 16 bits: Cdp_JOURNAL_RECORD_FLAG_*.
@@ -94,7 +94,9 @@ typedef struct _Cdp_CREDENTIAL_DESCRIPTOR
 	UINT64 AuthEpoch;
 } Cdp_CREDENTIAL_DESCRIPTOR, *PCdp_CREDENTIAL_DESCRIPTOR;
 
-// On-disk layout (v12): one superblock, then alternating header/payload areas.
+// On-disk layout (v13): VolumeOffset uses the absolute physical-disk address;
+// FileOffset remains relative to the journal partition's own storage backend.
+// One superblock is followed by alternating header/payload areas.
 //   [Superblock]
 //   [HeaderRegion0 1MB][Payload0 ...]
 //   [HeaderRegion1 1MB][Payload1 ...]
@@ -366,6 +368,18 @@ NTSTATUS CdpJournalAppendEx(
 	_In_ ULONG RecordFlags,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
 
+// Serialize a durability barrier with journal append transactions.
+NTSTATUS CdpJournalFlushBuffers(_Inout_ PCdp_JOURNAL Journal);
+
+// Correctness-test helper: read the committed payload bytes for one decoded
+// record and compare them with the source write snapshot.
+NTSTATUS CdpJournalVerifyRecordPayload(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ const Cdp_JOURNAL_RECORD* Record,
+	_In_reads_bytes_(Record->DataLength) const VOID* Expected,
+	_Out_opt_ PULONG FirstMismatch,
+	_Out_opt_ PUCHAR ActualByte);
+
 // Test-only zero-copy redirect support. Reserve the next Journal payload
 // extent using the normal Journal cursor and queue its record header through
 // the cached asynchronous header writer. No payload I/O or flush is issued.
@@ -375,6 +389,14 @@ NTSTATUS CdpJournalReserveRedirectPayload(
 	_In_ ULONG DataLength,
 	_Out_ PUINT64 PayloadOffset,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
+
+// Write bytes into a payload slot returned by ReserveRedirectPayload using an
+// independent raw IRP. This does not flush and does not advance journal state.
+NTSTATUS CdpJournalWriteReservedPayload(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 PayloadOffset,
+	_In_ ULONG DataLength,
+	_In_reads_bytes_(DataLength) const VOID* Data);
 
 NTSTATUS CdpJournalQueryTimeRange(
 	_Inout_ PCdp_JOURNAL Journal,
@@ -522,5 +544,17 @@ NTSTATUS CdpPreviewTreePunchRange(
 	_Inout_ PCdp_PREVIEW_TREE Tree,
 	_In_ UINT64 VolumeOffset,
 	_In_ ULONG DataLength);
+
+// Caller serializes Tree. Verify that every byte in [VolumeOffset, end) maps
+// to the expected record identity and consecutive payload bytes.
+BOOLEAN CdpPreviewTreeValidateMapping(
+	_In_ PCdp_PREVIEW_TREE Tree,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_In_ UINT64 ExpectedSequence,
+	_In_ UINT64 ExpectedFileOffset,
+	_Out_ PUINT64 FirstMismatch,
+	_Out_opt_ PUINT64 ActualSequence,
+	_Out_opt_ PUINT64 ActualFileOffset);
 
 VOID CdpJournalClose(_Inout_ PCdp_JOURNAL Journal);
