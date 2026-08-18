@@ -303,10 +303,6 @@ NTSTATUS CdpJournalFormat(_Inout_ PCdp_JOURNAL Journal);
 
 NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal);
 
-// Ensure a newly formatted/empty after-image journal starts with branch 1.
-// The branch marker is durable before this function returns.
-NTSTATUS CdpJournalEnsureInitialBranch(_Inout_ PCdp_JOURNAL Journal);
-
 // Append a branch marker. BranchNumber must be the next monotonically
 // increasing number. Parent 0 means no parent and requires inherit sequence 0.
 NTSTATUS CdpJournalAppendBranch(
@@ -370,33 +366,6 @@ NTSTATUS CdpJournalAppendEx(
 
 // Serialize a durability barrier with journal append transactions.
 NTSTATUS CdpJournalFlushBuffers(_Inout_ PCdp_JOURNAL Journal);
-
-// Correctness-test helper: read the committed payload bytes for one decoded
-// record and compare them with the source write snapshot.
-NTSTATUS CdpJournalVerifyRecordPayload(
-	_Inout_ PCdp_JOURNAL Journal,
-	_In_ const Cdp_JOURNAL_RECORD* Record,
-	_In_reads_bytes_(Record->DataLength) const VOID* Expected,
-	_Out_opt_ PULONG FirstMismatch,
-	_Out_opt_ PUCHAR ActualByte);
-
-// Test-only zero-copy redirect support. Reserve the next Journal payload
-// extent using the normal Journal cursor and queue its record header through
-// the cached asynchronous header writer. No payload I/O or flush is issued.
-NTSTATUS CdpJournalReserveRedirectPayload(
-	_Inout_ PCdp_JOURNAL Journal,
-	_In_ UINT64 VolumeOffset,
-	_In_ ULONG DataLength,
-	_Out_ PUINT64 PayloadOffset,
-	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
-
-// Write bytes into a payload slot returned by ReserveRedirectPayload using an
-// independent raw IRP. This does not flush and does not advance journal state.
-NTSTATUS CdpJournalWriteReservedPayload(
-	_Inout_ PCdp_JOURNAL Journal,
-	_In_ UINT64 PayloadOffset,
-	_In_ ULONG DataLength,
-	_In_reads_bytes_(DataLength) const VOID* Data);
 
 NTSTATUS CdpJournalQueryTimeRange(
 	_Inout_ PCdp_JOURNAL Journal,

@@ -637,9 +637,6 @@ static NTSTATUS CdpJournalRawIo(
 	{
 		CdpJournalInvalidateHeaderWriteCacheRangeLocked(
 			Journal, Offset, Length);
-#ifndef Cdp_USERMODE
-		InterlockedIncrement(&g_CdpPerfCounters.RawWriteCount);
-#endif
 	}
 
 	if (Journal->Store)
@@ -712,12 +709,6 @@ static NTSTATUS CdpJournalRawIo(
 		IO_STATUS_BLOCK iosb;
 		LARGE_INTEGER byteOffset;
 		PIRP irp;
-		LARGE_INTEGER buildStart;
-		LARGE_INTEGER buildEnd;
-		LARGE_INTEGER callStart;
-		LARGE_INTEGER callEnd;
-		LARGE_INTEGER waitStart;
-		LARGE_INTEGER waitEnd;
 
 		if (!Journal->TargetDevice)
 			return STATUS_DEVICE_NOT_READY;
@@ -729,7 +720,6 @@ static NTSTATUS CdpJournalRawIo(
 		Journal->TargetBaseOffset + Offset);
 	KeInitializeEvent(&event, NotificationEvent, FALSE);
 	RtlZeroMemory(&iosb, sizeof(iosb));
-	buildStart = KeQueryPerformanceCounter(NULL);
 	irp = IoBuildSynchronousFsdRequest(
 		MajorFunction,
 		Journal->TargetDevice,
@@ -738,13 +728,6 @@ static NTSTATUS CdpJournalRawIo(
 		&byteOffset,
 		&event,
 		&iosb);
-	buildEnd = KeQueryPerformanceCounter(NULL);
-	if (MajorFunction == IRP_MJ_WRITE)
-	{
-		InterlockedAdd64(
-			&g_CdpPerfCounters.RawBuildTicks,
-			buildEnd.QuadPart - buildStart.QuadPart);
-	}
 	if (!irp)
 		return STATUS_INSUFFICIENT_RESOURCES;
 
@@ -756,15 +739,7 @@ static NTSTATUS CdpJournalRawIo(
 		(UINT64)byteOffset.QuadPart,
 		Length,
 		irp);
-	callStart = KeQueryPerformanceCounter(NULL);
 	status = IoCallDriver(Journal->TargetDevice, irp);
-	callEnd = KeQueryPerformanceCounter(NULL);
-	if (MajorFunction == IRP_MJ_WRITE)
-	{
-		InterlockedAdd64(
-			&g_CdpPerfCounters.RawCallTicks,
-			callEnd.QuadPart - callStart.QuadPart);
-	}
 	Cdp_DBG("[JOURNAL-RAW] IoCallDriver returned irp=%p "
 		"status=0x%08X iosb=0x%08X bytes=%Iu\n",
 		irp,
@@ -773,19 +748,9 @@ static NTSTATUS CdpJournalRawIo(
 		iosb.Information);
 	if (status == STATUS_PENDING)
 	{
-		if (MajorFunction == IRP_MJ_WRITE)
-			InterlockedIncrement(&g_CdpPerfCounters.RawPendingCount);
 		Cdp_DBG("[JOURNAL-RAW] wait begin irp=%p\n",
 			irp);
-		waitStart = KeQueryPerformanceCounter(NULL);
 		KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
-		waitEnd = KeQueryPerformanceCounter(NULL);
-		if (MajorFunction == IRP_MJ_WRITE)
-		{
-			InterlockedAdd64(
-				&g_CdpPerfCounters.RawWaitTicks,
-				waitEnd.QuadPart - waitStart.QuadPart);
-		}
 		status = iosb.Status;
 		Cdp_DBG("[JOURNAL-RAW] wait end irp=%p "
 			"status=0x%08X bytes=%Iu\n",
@@ -813,159 +778,10 @@ static NTSTATUS CdpJournalRawIo(
 #endif
 }
 
-#ifndef Cdp_USERMODE
-typedef struct _Cdp_ASYNC_JOURNAL_HEADER_WRITE
-{
-	IO_STATUS_BLOCK IoStatus;
-	PVOID AllocationBase;
-} Cdp_ASYNC_JOURNAL_HEADER_WRITE, *PCdp_ASYNC_JOURNAL_HEADER_WRITE;
-
-static NTSTATUS CdpJournalAsyncHeaderWriteCompletion(
-	_In_ PDEVICE_OBJECT DeviceObject,
-	_In_ PIRP Irp,
-	_In_ PVOID Context)
-{
-	PCdp_ASYNC_JOURNAL_HEADER_WRITE write =
-		(PCdp_ASYNC_JOURNAL_HEADER_WRITE)Context;
-
-	UNREFERENCED_PARAMETER(DeviceObject);
-	if (!NT_SUCCESS(Irp->IoStatus.Status))
-	{
-		Cdp_LOG("[JOURNAL] async header write failed status=0x%08X\n",
-			Irp->IoStatus.Status);
-	}
-	if (write)
-	{
-		if (write->AllocationBase)
-			cdpfree(write->AllocationBase);
-		cdpfree(write);
-	}
-	IoFreeIrp(Irp);
-	return STATUS_MORE_PROCESSING_REQUIRED;
-}
-
-// Caller holds Journal->Lock.  The source is copied because the active header
-// cache remains mutable while this IRP is in the storage queue.
-static NTSTATUS CdpJournalSubmitHeaderSectorAsyncLocked(
-	_In_ PCdp_JOURNAL Journal,
-	_In_ UINT64 SectorOffset,
-	_In_reads_bytes_(Journal->SectorSize) const PUCHAR Source)
-{
-	PCdp_ASYNC_JOURNAL_HEADER_WRITE write;
-	PVOID allocationBase = NULL;
-	PUCHAR buffer;
-	PIRP irp;
-	LARGE_INTEGER offset;
-
-	if (!Journal->TargetDevice)
-		return STATUS_DEVICE_NOT_READY;
-	if (Journal->TargetBaseOffset > MAXUINT64 - SectorOffset ||
-		Journal->TargetBaseOffset + SectorOffset > MAXLONGLONG)
-		return STATUS_INTEGER_OVERFLOW;
-	buffer = (PUCHAR)CdpAllocateAligned(Journal, Journal->SectorSize,
-		&allocationBase);
-	if (!buffer)
-		return STATUS_INSUFFICIENT_RESOURCES;
-	write = (PCdp_ASYNC_JOURNAL_HEADER_WRITE)cdpalloc(sizeof(*write));
-	if (!write)
-	{
-		cdpfree(allocationBase);
-		return STATUS_INSUFFICIENT_RESOURCES;
-	}
-	RtlZeroMemory(write, sizeof(*write));
-	RtlCopyMemory(buffer, Source, Journal->SectorSize);
-	write->AllocationBase = allocationBase;
-	offset.QuadPart = (LONGLONG)(
-		Journal->TargetBaseOffset + SectorOffset);
-	irp = IoBuildAsynchronousFsdRequest(
-		IRP_MJ_WRITE,
-		Journal->TargetDevice,
-		buffer,
-		Journal->SectorSize,
-		&offset,
-		&write->IoStatus);
-	if (!irp)
-	{
-		cdpfree(allocationBase);
-		cdpfree(write);
-		return STATUS_INSUFFICIENT_RESOURCES;
-	}
-	IoSetCompletionRoutine(irp, CdpJournalAsyncHeaderWriteCompletion,
-		write, TRUE, TRUE, TRUE);
-	(void)IoCallDriver(Journal->TargetDevice, irp);
-	return STATUS_SUCCESS;
-}
-#endif
-
 // Caller holds Journal->Lock.  Cache the active record-header sector so we do
 // not reread it for every 32-byte header.  Each update is nevertheless copied
 // to an independent buffer and submitted immediately: a partial sector must
 // never remain memory-only until it happens to fill.
-static NTSTATUS CdpJournalCacheRedirectHeaderLocked(
-	_In_ PCdp_JOURNAL Journal,
-	_In_ UINT64 RegionOff,
-	_In_ ULONG Index,
-	_In_ const Cdp_JOURNAL_RECORD_HEADER* Header)
-{
-	UINT64 headerOffset;
-	UINT64 sectorOffset;
-	ULONG sectorByteOffset;
-	NTSTATUS status;
-
-	if (Index >= Cdp_JOURNAL_HEADERS_PER_REGION)
-		return STATUS_INVALID_PARAMETER;
-	headerOffset = RegionOff + (UINT64)Index * sizeof(*Header);
-	sectorOffset = CdpAlignDown64(headerOffset, Journal->SectorSize);
-	sectorByteOffset = (ULONG)(headerOffset - sectorOffset);
-	if (sectorByteOffset + sizeof(*Header) > Journal->SectorSize)
-		return STATUS_DISK_CORRUPT_ERROR;
-	if (!Journal->HeaderWriteBuffer)
-	{
-		Journal->HeaderWriteBuffer = (PUCHAR)CdpAllocateAligned(Journal,
-			Journal->SectorSize, &Journal->HeaderWriteAllocationBase);
-		if (!Journal->HeaderWriteBuffer)
-			return STATUS_INSUFFICIENT_RESOURCES;
-	}
-	if (!Journal->HeaderWriteCacheValid ||
-		Journal->HeaderWriteSectorOffset != sectorOffset)
-	{
-		Journal->HeaderWriteCacheValid = FALSE;
-		Journal->HeaderWriteCacheDirty = FALSE;
-		/* Appends are strictly sequential under Journal->Lock. Reaching byte 0
-		 * of another header sector therefore means that sector has no committed
-		 * record headers to preserve. Zero it instead of issuing a read-before-
-		 * write. After mount, a partially populated sector has a nonzero byte
-		 * offset and is read exactly once before appending resumes. */
-		if (sectorByteOffset == 0)
-		{
-			RtlZeroMemory(Journal->HeaderWriteBuffer, Journal->SectorSize);
-		}
-		else
-		{
-			status = CdpJournalRawIo(Journal, IRP_MJ_READ, sectorOffset,
-				Journal->SectorSize, Journal->HeaderWriteBuffer);
-			if (!NT_SUCCESS(status))
-				return status;
-		}
-		Journal->HeaderWriteSectorOffset = sectorOffset;
-		Journal->HeaderWriteCacheValid = TRUE;
-	}
-	RtlCopyMemory(Journal->HeaderWriteBuffer + sectorByteOffset,
-		Header, sizeof(*Header));
-	Journal->HeaderWriteCacheDirty = TRUE;
-#ifndef Cdp_USERMODE
-	status = CdpJournalSubmitHeaderSectorAsyncLocked(Journal,
-		sectorOffset, Journal->HeaderWriteBuffer);
-#else
-	status = CdpJournalRawIo(Journal, IRP_MJ_WRITE, sectorOffset,
-		Journal->SectorSize, Journal->HeaderWriteBuffer);
-#endif
-	if (!NT_SUCCESS(status))
-		return status;
-	Journal->HeaderWriteCacheDirty = FALSE;
-	return STATUS_SUCCESS;
-}
-
 static NTSTATUS CdpJournalRawWriteSub(
 	_In_ PCdp_JOURNAL Journal,
 	_In_ UINT64 Offset,
@@ -1056,64 +872,6 @@ NTSTATUS CdpJournalFlushBuffers(_Inout_ PCdp_JOURNAL Journal)
 	status = Journal->Mounted ?
 		CdpJournalFlush(Journal) : STATUS_DEVICE_NOT_READY;
 	Cdp_LOCK_RELEASE(&Journal->Lock);
-	return status;
-}
-
-NTSTATUS CdpJournalVerifyRecordPayload(
-	_Inout_ PCdp_JOURNAL Journal,
-	_In_ const Cdp_JOURNAL_RECORD* Record,
-	_In_reads_bytes_(Record->DataLength) const VOID* Expected,
-	_Out_opt_ PULONG FirstMismatch,
-	_Out_opt_ PUCHAR ActualByte)
-{
-	PVOID allocationBase = NULL;
-	PUCHAR payload = NULL;
-	UINT64 alignedSize;
-	ULONG index;
-	NTSTATUS status;
-
-	if (FirstMismatch)
-		*FirstMismatch = MAXULONG;
-	if (ActualByte)
-		*ActualByte = 0;
-	if (!Journal || !Record || !Expected || Record->DataLength == 0 ||
-		Record->DataLength > Cdp_JOURNAL_MAX_RECORD_DATA)
-	{
-		return STATUS_INVALID_PARAMETER;
-	}
-	alignedSize = CdpAlignUp64(Record->DataLength, Journal->SectorSize);
-	if (alignedSize > MAXULONG)
-		return STATUS_INTEGER_OVERFLOW;
-	payload = (PUCHAR)CdpAllocateAligned(
-		Journal, (SIZE_T)alignedSize, &allocationBase);
-	if (!payload)
-		return STATUS_INSUFFICIENT_RESOURCES;
-
-	Cdp_LOCK_ACQUIRE(&Journal->Lock);
-	status = Journal->Mounted ?
-		CdpJournalRawIo(
-			Journal,
-			IRP_MJ_READ,
-			Record->FileOffset,
-			(ULONG)alignedSize,
-			payload) : STATUS_DEVICE_NOT_READY;
-	Cdp_LOCK_RELEASE(&Journal->Lock);
-	if (NT_SUCCESS(status))
-	{
-		for (index = 0; index < Record->DataLength; ++index)
-		{
-			if (payload[index] != ((const UCHAR*)Expected)[index])
-			{
-				if (FirstMismatch)
-					*FirstMismatch = index;
-				if (ActualByte)
-					*ActualByte = payload[index];
-				status = STATUS_UNEXPECTED_IO_ERROR;
-				break;
-			}
-		}
-	}
-	cdpfree(allocationBase);
 	return status;
 }
 
@@ -2952,24 +2710,6 @@ cleanup:
 	return status;
 }
 
-NTSTATUS CdpJournalEnsureInitialBranch(_Inout_ PCdp_JOURNAL Journal)
-{
-	NTSTATUS status;
-	if (!Journal)
-		return STATUS_INVALID_PARAMETER;
-	Cdp_LOCK_ACQUIRE(&Journal->Lock);
-	if (!Journal->Mounted)
-		status = STATUS_DEVICE_NOT_READY;
-	else if (Journal->CurrentBranchNumber != 0)
-		status = STATUS_SUCCESS;
-	else if (Journal->HighestBranchNumber != 0 || Journal->TotalRecords != 0)
-		status = STATUS_DISK_CORRUPT_ERROR;
-	else
-		status = CdpJournalAppendBranchLocked(Journal, 1, 0, 0);
-	Cdp_LOCK_RELEASE(&Journal->Lock);
-	return status;
-}
-
 NTSTATUS CdpJournalSetRecoveryIntent(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 TargetTime100ns)
@@ -3189,12 +2929,6 @@ NTSTATUS CdpJournalAppendEx(
 	UINT64 writeTime;
 	BOOLEAN rotateHeaderRegion;
 	NTSTATUS status = STATUS_SUCCESS;
-#ifndef Cdp_USERMODE
-	LARGE_INTEGER journalLockStart;
-	LARGE_INTEGER journalLockEnd;
-	LARGE_INTEGER payloadWriteStart;
-	LARGE_INTEGER payloadWriteEnd;
-#endif
 
 	if (!Journal->Mounted || !AfterImage || RecordFlags != 0 ||
 		DataLength == 0 || DataLength > Cdp_JOURNAL_MAX_RECORD_DATA)
@@ -3202,16 +2936,7 @@ NTSTATUS CdpJournalAppendEx(
 		return STATUS_INVALID_PARAMETER;
 	}
 
-#ifndef Cdp_USERMODE
-	journalLockStart = KeQueryPerformanceCounter(NULL);
-#endif
 	Cdp_LOCK_ACQUIRE(&Journal->Lock);
-#ifndef Cdp_USERMODE
-	journalLockEnd = KeQueryPerformanceCounter(NULL);
-	InterlockedAdd64(
-		&g_CdpPerfCounters.JournalLockWaitTicks,
-		journalLockEnd.QuadPart - journalLockStart.QuadPart);
-#endif
 	if (!Journal->Mounted)
 	{
 		status = STATUS_DEVICE_NOT_READY;
@@ -3273,18 +2998,9 @@ NTSTATUS CdpJournalAppendEx(
 		CdpJournalBufferMeetsIoAlignment(Journal, AfterImage))
 	{
 		payloadBuffer = (PUCHAR)AfterImage;
-#ifndef Cdp_USERMODE
-		InterlockedIncrement(&g_CdpPerfCounters.ZeroCopyCount);
-#endif
 	}
 	else
 	{
-#ifndef Cdp_USERMODE
-		InterlockedIncrement(&g_CdpPerfCounters.CopyFallbackCount);
-		InterlockedAdd64(
-			&g_CdpPerfCounters.CopyFallbackBytes,
-			(LONGLONG)alignedSize);
-#endif
 		payloadBuffer = (PUCHAR)CdpAllocateAligned(Journal,
 			(SIZE_T)alignedSize,
 			&allocationBase);
@@ -3297,21 +3013,12 @@ NTSTATUS CdpJournalAppendEx(
 		RtlCopyMemory(payloadBuffer, AfterImage, DataLength);
 	}
 
-#ifndef Cdp_USERMODE
-	payloadWriteStart = KeQueryPerformanceCounter(NULL);
-#endif
 	status = CdpJournalRawIo(
 		Journal,
 		IRP_MJ_WRITE,
 		payloadOff,
 		(ULONG)alignedSize,
 		payloadBuffer);
-#ifndef Cdp_USERMODE
-	payloadWriteEnd = KeQueryPerformanceCounter(NULL);
-	InterlockedAdd64(
-		&g_CdpPerfCounters.PayloadWriteTicks,
-		payloadWriteEnd.QuadPart - payloadWriteStart.QuadPart);
-#endif
 	if (!NT_SUCCESS(status))
 		goto cleanup;
 
@@ -3426,164 +3133,6 @@ cleanup:
 	return status;
 }
 
-NTSTATUS CdpJournalReserveRedirectPayload(
-	_Inout_ PCdp_JOURNAL Journal,
-	_In_ UINT64 VolumeOffset,
-	_In_ ULONG DataLength,
-	_Out_ PUINT64 PayloadOffset,
-	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord)
-{
-	Cdp_JOURNAL_RECORD_HEADER header;
-	UINT64 alignedSize;
-	UINT64 payloadOff;
-	UINT64 writeSeq;
-	UINT64 writeTime;
-	BOOLEAN rotateHeaderRegion;
-	NTSTATUS status = STATUS_SUCCESS;
-
-	if (!Journal || !PayloadOffset || DataLength == 0 ||
-		DataLength > Cdp_JOURNAL_MAX_RECORD_DATA)
-	{
-		return STATUS_INVALID_PARAMETER;
-	}
-	*PayloadOffset = 0;
-	Cdp_LOCK_ACQUIRE(&Journal->Lock);
-	if (!Journal->Mounted || Journal->CurrentBranchNumber <= 0)
-	{
-		status = STATUS_DEVICE_NOT_READY;
-		goto cleanup;
-	}
-
-	alignedSize = CdpAlignUp64(DataLength, Journal->SectorSize);
-	rotateHeaderRegion =
-		Journal->CurrentHeaderCount >= Cdp_JOURNAL_HEADERS_PER_REGION;
-	if (!rotateHeaderRegion)
-	{
-		status = CdpJournalPayloadRotationNeededLocked(
-			Journal, alignedSize, &rotateHeaderRegion);
-		if (!NT_SUCCESS(status))
-			goto cleanup;
-	}
-	if (rotateHeaderRegion)
-	{
-		UINT64 newRegion;
-		status = CdpJournalAllocateHeaderRegionLocked(Journal, &newRegion);
-		if (!NT_SUCCESS(status))
-			goto cleanup;
-		status = CdpJournalAppendBranchContinuationLocked(Journal);
-		if (!NT_SUCCESS(status))
-			goto cleanup;
-	}
-	if (Journal->NextSequence == MAXUINT64 ||
-		Journal->CurrentHeaderRegionStartSequence >
-			MAXUINT64 - Journal->CurrentHeaderCount ||
-		Journal->CurrentHeaderRegionStartSequence +
-			Journal->CurrentHeaderCount != Journal->NextSequence)
-	{
-		status = STATUS_INTEGER_OVERFLOW;
-		goto cleanup;
-	}
-	status = CdpJournalEnsureContiguousLocked(Journal, alignedSize);
-	if (!NT_SUCCESS(status))
-		goto cleanup;
-
-	payloadOff = Journal->PayloadRegionOff;
-	writeSeq = Journal->NextSequence;
-	if (Journal->QueryTime100ns)
-		writeTime = Journal->QueryTime100ns(Journal->QueryTimeContext);
-	else
-	{
-#ifdef Cdp_USERMODE
-		FILETIME utcFt;
-		FILETIME localFt;
-		ULARGE_INTEGER u;
-		GetSystemTimeAsFileTime(&utcFt);
-		if (!FileTimeToLocalFileTime(&utcFt, &localFt))
-			localFt = utcFt;
-		u.LowPart = localFt.dwLowDateTime;
-		u.HighPart = localFt.dwHighDateTime;
-		writeTime = u.QuadPart;
-#else
-		LARGE_INTEGER systemTime;
-		LARGE_INTEGER localTime;
-		KeQuerySystemTime(&systemTime);
-		ExSystemTimeToLocalTime(&systemTime, &localTime);
-		writeTime = (UINT64)localTime.QuadPart;
-#endif
-	}
-	if (Journal->Newest100ns != 0 && writeTime <= Journal->Newest100ns)
-		writeTime = Journal->Newest100ns + 1;
-
-	RtlZeroMemory(&header, sizeof(header));
-	header.WallClock100ns = writeTime;
-	header.VolumeOffset = VolumeOffset;
-	header.FileOffset = payloadOff;
-	header.DataLength = DataLength;
-	header.Sequence = Journal->CurrentHeaderCount;
-	status = CdpJournalCacheRedirectHeaderLocked(Journal,
-		Journal->LastHeaderRegionOff, Journal->CurrentHeaderCount, &header);
-	if (!NT_SUCCESS(status))
-		goto cleanup;
-
-	CdpBranchTreeAdvanceLatest(&Journal->BranchTree, writeSeq, writeTime,
-		Journal->LastHeaderRegionOff, Journal->CurrentHeaderCount);
-	Journal->CurrentHeaderCount++;
-	Journal->PayloadRegionOff = payloadOff + alignedSize;
-	Journal->NextSequence = writeSeq + 1;
-	Journal->TotalRecords++;
-	Journal->PayloadBytesUsed += alignedSize;
-	CdpJournalAdvanceRecordGenerationLocked(Journal);
-	Journal->Newest100ns = writeTime;
-	if (Journal->TotalRecords == 1)
-	{
-		Journal->OldestHeaderRegionOff = Journal->LastHeaderRegionOff;
-		Journal->OldestHeaderIndex = Journal->CurrentHeaderCount - 1;
-		Journal->Oldest100ns = writeTime;
-	}
-	*PayloadOffset = payloadOff;
-	if (WrittenRecord)
-	{
-		WrittenRecord->WallClock100ns = writeTime;
-		WrittenRecord->VolumeOffset = VolumeOffset;
-		WrittenRecord->FileOffset = payloadOff;
-		WrittenRecord->Sequence = writeSeq;
-		WrittenRecord->DataLength = DataLength;
-		WrittenRecord->Flags = 0;
-	}
-
-cleanup:
-	Cdp_LOCK_RELEASE(&Journal->Lock);
-	return status;
-}
-
-NTSTATUS CdpJournalWriteReservedPayload(
-	_Inout_ PCdp_JOURNAL Journal,
-	_In_ UINT64 PayloadOffset,
-	_In_ ULONG DataLength,
-	_In_reads_bytes_(DataLength) const VOID* Data)
-{
-	NTSTATUS status;
-
-	if (!Journal || !Data || DataLength == 0 ||
-		PayloadOffset > Journal->PartitionSize ||
-		DataLength > Journal->PartitionSize - PayloadOffset ||
-		(PayloadOffset % Journal->SectorSize) != 0 ||
-		(DataLength % Journal->SectorSize) != 0)
-	{
-		return STATUS_INVALID_PARAMETER;
-	}
-	Cdp_LOCK_ACQUIRE(&Journal->Lock);
-	status = Journal->Mounted ?
-		CdpJournalRawIo(
-			Journal,
-			IRP_MJ_WRITE,
-			PayloadOffset,
-			DataLength,
-			(PVOID)Data) : STATUS_DEVICE_NOT_READY;
-	Cdp_LOCK_RELEASE(&Journal->Lock);
-	return status;
-}
-
 NTSTATUS CdpJournalQueryTimeRange(
 	_Inout_ PCdp_JOURNAL Journal,
 	_Out_ PUINT64 OldestTime100ns,
@@ -3609,40 +3158,6 @@ NTSTATUS CdpJournalQueryTimeRange(
 	}
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	return status;
-}
-
-static NTSTATUS CdpJournalCountActiveHeaderRegionsLocked(
-	_Inout_ PCdp_JOURNAL Journal,
-	_Out_ PUINT64 HeaderRegionCount)
-{
-	UINT64 regionOff;
-	UINT64 count;
-	ULONG guard = 0;
-	Cdp_HEADER_REGION_LINK link;
-	NTSTATUS status;
-
-	if (!HeaderRegionCount)
-		return STATUS_INVALID_PARAMETER;
-
-	regionOff = Journal->OldestHeaderRegionOff;
-	count = 1;
-	while (regionOff != Journal->LastHeaderRegionOff)
-	{
-		status = CdpJournalReadRegionLink(Journal, regionOff, &link);
-		if (!NT_SUCCESS(status))
-			return status;
-		if (!CdpJournalRegionLinkValid(Journal, &link) ||
-			link.NextRegionOff == regionOff)
-		{
-			return STATUS_DISK_CORRUPT_ERROR;
-		}
-		regionOff = link.NextRegionOff;
-		if (++count > 100001ULL || ++guard > 100000UL)
-			return STATUS_DISK_CORRUPT_ERROR;
-	}
-
-	*HeaderRegionCount = count;
-	return STATUS_SUCCESS;
 }
 
 NTSTATUS CdpJournalQueryUsage(
@@ -4793,27 +4308,6 @@ static NTSTATUS CdpPreviewTreeRemoveRangeInPlace(
 // therefore an earlier before-image and must replace newer overlapping bytes.
 // Remove overlaps in-place, preserve their non-overlapping fragments, then
 // insert the complete earlier header.  No header array or tree-wide rebuild.
-static NTSTATUS CdpPreviewTreeOverlayEarlier(
-	_Inout_ PCdp_PREVIEW_TREE Tree,
-	_In_ const Cdp_JOURNAL_RECORD* Record)
-{
-	NTSTATUS status;
-	UINT64 cutEnd;
-
-	if (!Tree || !Record || Record->DataLength == 0 ||
-		Record->VolumeOffset > MAXUINT64 - Record->DataLength)
-	{
-		return STATUS_INVALID_PARAMETER;
-	}
-	cutEnd = Record->VolumeOffset + Record->DataLength;
-	status = CdpPreviewTreeRemoveRangeInPlace(
-		Tree, Record->VolumeOffset, cutEnd);
-	if (!NT_SUCCESS(status))
-		return status;
-
-	return CdpPreviewTreeInsertRaw(Tree, Record);
-}
-
 NTSTATUS CdpPreviewTreeOverlayLatest(
 	_Inout_ PCdp_PREVIEW_TREE Tree,
 	_In_ const Cdp_JOURNAL_RECORD* Record)
@@ -5689,16 +5183,8 @@ NTSTATUS CdpJournalApplyPreviewTree(
 
 	Cdp_LOCK_ACQUIRE(TreeLock);
 	treeLocked = TRUE;
-#if !defined(Cdp_USERMODE) && Cdp_TEST_TRACE_EVERY_IO
-	Cdp_LOG("[META-READ] stage=lookup offset=%llu len=%lu nodes=%lu\n",
-		VolumeOffset, DataLength, Tree->NodeCount);
-#endif
 	if (!Tree->Root || Tree->NodeCount == 0)
 	{
-#if !defined(Cdp_USERMODE) && Cdp_TEST_TRACE_EVERY_IO
-		Cdp_LOG("[META-MISS] offset=%llu len=%lu reason=empty-tree\n",
-			VolumeOffset, DataLength);
-#endif
 		goto cleanup;
 	}
 
@@ -5714,16 +5200,8 @@ NTSTATUS CdpJournalApplyPreviewTree(
 		VolumeOffset + DataLength);
 	if (hitCapacity == 0)
 	{
-#if !defined(Cdp_USERMODE) && Cdp_TEST_TRACE_EVERY_IO
-		Cdp_LOG("[META-MISS] offset=%llu len=%lu reason=no-overlap nodes=%lu\n",
-			VolumeOffset, DataLength, Tree->NodeCount);
-#endif
 		goto cleanup;
 	}
-#if !defined(Cdp_USERMODE) && Cdp_TEST_TRACE_EVERY_IO
-	Cdp_LOG("[META-READ] stage=collect offset=%llu len=%lu hitCapacity=%lu nodes=%lu\n",
-		VolumeOffset, DataLength, hitCapacity, Tree->NodeCount);
-#endif
 	hits = (PCdp_PREVIEW_HIT)cdpalloc(sizeof(Cdp_PREVIEW_HIT) * hitCapacity);
 	if (!hits)
 	{
@@ -5812,20 +5290,6 @@ NTSTATUS CdpJournalApplyPreviewTree(
 
 		outputIndex = (ULONG)(overlapStart - VolumeOffset);
 		copyLength = (ULONG)(overlapEnd - overlapStart);
-#if !defined(Cdp_USERMODE) && Cdp_TEST_TRACE_EVERY_IO
-		Cdp_LOG("[META-HIT] request=[%llu,%llu) node=[%llu,%llu) overlap=[%llu,%llu) seq=%llu payloadOffset=%llu nodeLen=%lu outputIndex=%lu copyLen=%lu\n",
-			VolumeOffset,
-			VolumeOffset + DataLength,
-			node->Start,
-			node->End,
-			overlapStart,
-			overlapEnd,
-			node->Sequence,
-			node->FileOffset,
-			node->DataLength,
-			outputIndex,
-			copyLength);
-#endif
 		RtlCopyMemory(
 			(PUCHAR)Buffer + outputIndex,
 			payload + (ULONG)(overlapStart - node->Start),
@@ -5841,10 +5305,6 @@ NTSTATUS CdpJournalApplyPreviewTree(
 	}
 
 	*CoveredCount = covered;
-#if !defined(Cdp_USERMODE) && Cdp_TEST_TRACE_EVERY_IO
-	Cdp_LOG("[META-READ] stage=overlay-complete offset=%llu len=%lu hits=%lu covered=%lu status=0x%08X\n",
-		VolumeOffset, DataLength, hitCount, covered, status);
-#endif
 	Cdp_JOURNAL_DIAG(
 		"apply end volumeOff=%llu len=%lu hits=%lu covered=%lu "
 		"status=0x%08X\n",

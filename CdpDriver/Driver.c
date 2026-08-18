@@ -3,7 +3,6 @@
 #include "..\CdpCore\include\cdp_core.h"
 
 PDRIVER_OBJECT g_DriverObject = NULL;
-Cdp_PERF_COUNTERS g_CdpPerfCounters = { 0 };
 
 static Cdp_DEVICE_KIND CdpGetAttachedDeviceKind(
 	_In_ PDEVICE_OBJECT PhysicalDeviceObject)
@@ -171,24 +170,14 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 	KeInitializeEvent(&DeviceExtension->MergeThreadDoneEvent,
 		NotificationEvent, TRUE);
 	KeInitializeMutex(&DeviceExtension->HistoryMutex, 0);
-	InitializeListHead(&DeviceExtension->SequentialWriteList);
-	DeviceExtension->SequentialWriteCount = 0;
 	ExInitializeRundownProtection(&DeviceExtension->AutoDiscoveryRundown);
 	InterlockedExchange(
 		&DeviceExtension->AutoDiscoveryGateActive,
-#if Cdp_TEST_BOOT_PASSTHROUGH || Cdp_TEST_BOOT_OPEN_GATES
-		0);
-#else
 		deviceKind == Cdp_DEVICE_KIND_VOLUME ? 1 : 0);
-#endif
 	InterlockedExchange(&DeviceExtension->RebootRecoveryGateRequired, 0);
 	KeInitializeEvent(&DeviceExtension->AutoDiscoveryGateEvent,
 		NotificationEvent,
-#if Cdp_TEST_BOOT_PASSTHROUGH || Cdp_TEST_BOOT_OPEN_GATES
-		TRUE);
-#else
 		deviceKind == Cdp_DEVICE_KIND_VOLUME ? FALSE : TRUE);
-#endif
 	DeviceExtension->SectorSize = Cdp_SECTOR_SIZE_DEFAULT;
 	InterlockedExchange(&DeviceExtension->Phase, Cdp_PHASE_GENERAL);
 
@@ -200,6 +189,12 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 	if (deviceKind == Cdp_DEVICE_KIND_DISK)
 	{
 		Status = CdpStartCaptureWorker(DeviceExtension);
+		if (!NT_SUCCESS(Status))
+			goto cleanup;
+	}
+	else if (deviceKind == Cdp_DEVICE_KIND_VOLUME)
+	{
+		Status = CdpStartRecoveryReadWorker(DeviceExtension);
 		if (!NT_SUCCESS(Status))
 			goto cleanup;
 	}
@@ -323,7 +318,6 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 	DriverObject->MajorFunction[IRP_MJ_POWER] = CdpIrpDispatchPower;
 	DriverObject->MajorFunction[IRP_MJ_READ] = CdpIrpDispatchRead;
 	DriverObject->MajorFunction[IRP_MJ_WRITE] = CdpIrpDispatchWrite;
-	DriverObject->MajorFunction[IRP_MJ_FLUSH_BUFFERS] = CdpIrpDispatchFlush;
 	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = CdpIrpDispatchDeviceControl;
 	DriverObject->MajorFunction[IRP_MJ_CREATE] = CdpIrpDispatchCreateClose;
 	DriverObject->MajorFunction[IRP_MJ_CLOSE] = CdpIrpDispatchCreateClose;

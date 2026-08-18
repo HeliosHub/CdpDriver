@@ -37,6 +37,36 @@ typedef struct _TEST_CTX
 	PCdp_CORE Core;
 } TEST_CTX, *PTEST_CTX;
 
+typedef struct _TEST_DRAIN_WRITER
+{
+	PCdp_STORE Store;
+	UINT64 LastAbsoluteOffset;
+	ULONG LastLength;
+	ULONG Calls;
+	BOOLEAN FailNext;
+} TEST_DRAIN_WRITER, *PTEST_DRAIN_WRITER;
+
+static NTSTATUS TestDrainAbsoluteWriter(
+	_In_opt_ PVOID Context,
+	_In_ UINT64 AbsoluteOffset,
+	_In_ ULONG Length,
+	_In_reads_bytes_(Length) const VOID* Buffer)
+{
+	PTEST_DRAIN_WRITER writer = (PTEST_DRAIN_WRITER)Context;
+	if (!writer || !writer->Store)
+		return STATUS_INVALID_PARAMETER;
+	writer->Calls++;
+	writer->LastAbsoluteOffset = AbsoluteOffset;
+	writer->LastLength = Length;
+	if (writer->FailNext)
+	{
+		writer->FailNext = FALSE;
+		return STATUS_IO_DEVICE_ERROR;
+	}
+	return writer->Store->Write(
+		writer->Store, AbsoluteOffset, Length, Buffer);
+}
+
 static void FillPattern(PUCHAR buf, ULONG len, UCHAR seed)
 {
 	ULONG i;
@@ -1997,6 +2027,7 @@ static int TestAfterImageRecoveryBranchSwitch(void)
 static int TestGracefulDisableDrainsMetaTree(void)
 {
 	TEST_CTX ctx;
+	TEST_DRAIN_WRITER writer;
 	UCHAR journalA[512];
 	UCHAR journalB[512];
 	UCHAR applicationWrite[512];
@@ -2014,6 +2045,8 @@ static int TestGracefulDisableDrainsMetaTree(void)
 	RtlFillMemory(journalA, sizeof(journalA), 0x31);
 	RtlFillMemory(journalB, sizeof(journalB), 0x42);
 	RtlFillMemory(applicationWrite, sizeof(applicationWrite), 0x53);
+	RtlZeroMemory(&writer, sizeof(writer));
+	writer.Store = ctx.Source;
 
 	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
 		ctx.Core, 0, sizeof(journalA), journalA, NULL)),
@@ -2037,10 +2070,24 @@ static int TestGracefulDisableDrainsMetaTree(void)
 		memcmp(output, expected, sizeof(output)) == 0,
 		"reads combine punched source bytes with undrained journal bytes");
 
+	writer.FailNext = TRUE;
+	status = CdpCoreDrainOneMetaRangeWithWriter(
+		ctx.Core, TestDrainAbsoluteWriter, &writer,
+		&complete, NULL, NULL);
+	Expect(status == STATUS_IO_DEVICE_ERROR && !complete &&
+		writer.Calls == 1 && writer.LastAbsoluteOffset == 512 &&
+		writer.LastLength == sizeof(journalB),
+		"failed disk writer receives exact absolute MetaTree range");
+	RtlZeroMemory(output, sizeof(output));
+	Expect(NT_SUCCESS(CdpCoreRead(ctx.Core, 0, sizeof(output), output)) &&
+		memcmp(output, expected, sizeof(output)) == 0,
+		"failed disk backfill does not punch MetaTree coverage");
+
 	while (!complete && iterations++ < 16)
 	{
-		status = CdpCoreDrainOneMetaRange(
-			ctx.Core, &complete, NULL, NULL);
+		status = CdpCoreDrainOneMetaRangeWithWriter(
+			ctx.Core, TestDrainAbsoluteWriter, &writer,
+			&complete, NULL, NULL);
 		if (!NT_SUCCESS(status))
 			break;
 	}

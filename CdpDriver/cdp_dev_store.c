@@ -140,55 +140,18 @@ static NTSTATUS CdpDevStoreWrite(
 		(PVOID)Buffer);
 }
 
-NTSTATUS CdpDevStoreCreate(
-	_In_ PDEVICE_OBJECT Device,
-	_In_ UINT64 Size,
-	_In_ ULONG SectorSize,
-	_Outptr_ PCdp_STORE* OutStore)
+NTSTATUS CdpDevStoreWriteVolumeRelative(
+	_In_ PDEVICE_OBJECT VolumeLowerDevice,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG Length,
+	_In_reads_bytes_(Length) const VOID* Buffer)
 {
-	return CdpDevStoreCreateOffset(
-		Device, 0, Size, SectorSize, OutStore);
-}
-
-NTSTATUS CdpDevStoreCreateOffset(
-	_In_ PDEVICE_OBJECT Device,
-	_In_ UINT64 BaseOffset,
-	_In_ UINT64 Size,
-	_In_ ULONG SectorSize,
-	_Outptr_ PCdp_STORE* OutStore)
-{
-	PCdp_STORE store;
-	PCdp_DEV_STORE_CTX ctx;
-
-	if (!Device || !OutStore || Size == 0 ||
-		BaseOffset > MAXULONGLONG - Size)
-		return STATUS_INVALID_PARAMETER;
-
-	store = (PCdp_STORE)Cdp_ALLOC(sizeof(*store));
-	ctx = (PCdp_DEV_STORE_CTX)Cdp_ALLOC(sizeof(*ctx));
-	if (!store || !ctx)
-	{
-		if (store)
-			Cdp_FREE(store);
-		if (ctx)
-			Cdp_FREE(ctx);
-		return STATUS_INSUFFICIENT_RESOURCES;
-	}
-
-	RtlZeroMemory(store, sizeof(*store));
-	RtlZeroMemory(ctx, sizeof(*ctx));
-	ctx->Device = Device;
-	ctx->BaseOffset = BaseOffset;
-	ctx->LogicalStart = 0;
-	ctx->Size = Size;
-	ctx->SectorSize = SectorSize;
-	store->Read = CdpDevStoreRead;
-	store->Write = CdpDevStoreWrite;
-	store->Size = Size;
-	store->SectorSize = SectorSize;
-	store->Context = ctx;
-	*OutStore = store;
-	return STATUS_SUCCESS;
+	return CdpDevStoreRawIo(
+		VolumeLowerDevice,
+		IRP_MJ_WRITE,
+		VolumeOffset,
+		Length,
+		(PVOID)Buffer);
 }
 
 NTSTATUS CdpDevStoreCreateAbsoluteRange(

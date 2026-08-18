@@ -391,30 +391,6 @@ static NTSTATUS CdpCoreSourceWriteDirect(
 	return Core->Source->Write(Core->Source, Offset, Length, Buffer);
 }
 
-#ifndef Cdp_USERMODE
-NTSTATUS CdpCoreReadSourceForTest(
-	_Inout_ PCdp_CORE Core,
-	_In_ UINT64 Offset,
-	_In_ ULONG Length,
-	_Out_writes_bytes_(Length) PVOID Buffer)
-{
-	if (!Core || !Buffer || Length == 0)
-		return STATUS_INVALID_PARAMETER;
-	return CdpCoreSourceRead(Core, Offset, Length, Buffer);
-}
-
-NTSTATUS CdpCoreWriteSourceForTest(
-	_Inout_ PCdp_CORE Core,
-	_In_ UINT64 Offset,
-	_In_ ULONG Length,
-	_In_reads_bytes_(Length) const VOID* Buffer)
-{
-	if (!Core || !Buffer || Length == 0)
-		return STATUS_INVALID_PARAMETER;
-	return CdpCoreSourceWriteDirect(Core, Offset, Length, Buffer);
-}
-#endif
-
 static VOID CdpCoreInitCommon(_Inout_ PCdp_CORE Core)
 {
 	Core->Time100ns = 1;
@@ -543,22 +519,9 @@ VOID CdpCoreSetTime100ns(_Inout_ PCdp_CORE Core, _In_ UINT64 Time100ns)
 		Core->Time100ns = Time100ns;
 }
 
-UINT64 CdpCoreGetTime100ns(_In_ PCdp_CORE Core)
-{
-	return Core ? Core->Time100ns : 0;
-}
-
 UINT64 CdpCoreGetTargetTime100ns(_In_ PCdp_CORE Core)
 {
 	return Core ? Core->TargetTime100ns : 0;
-}
-
-UINT64 CdpCoreTick(_Inout_ PCdp_CORE Core, _In_ UINT64 Delta100ns)
-{
-	if (!Core)
-		return 0;
-	Core->Time100ns += Delta100ns;
-	return Core->Time100ns;
 }
 
 NTSTATUS CdpCoreFormatJournal(_Inout_ PCdp_CORE Core)
@@ -998,13 +961,6 @@ NTSTATUS CdpCoreAppendAfterImage(
 	ULONG nodeCountBefore = 0;
 	ULONG nodeCountAfter = 0;
 	PCdp_WRITE_LEDGER_RANGE ledgerRange;
-#ifndef Cdp_USERMODE
-	LARGE_INTEGER appendStart;
-	LARGE_INTEGER treeWaitStart;
-	LARGE_INTEGER treeWaitEnd;
-	LARGE_INTEGER treeUpdateStart;
-	LARGE_INTEGER treeUpdateEnd;
-#endif
 	if (!Core || !AfterImage || Length == 0 ||
 		Length > Cdp_JOURNAL_MAX_RECORD_DATA)
 	{
@@ -1020,17 +976,7 @@ NTSTATUS CdpCoreAppendAfterImage(
 	ledgerRange->Start = Offset;
 	ledgerRange->End = Offset + Length;
 
-#ifndef Cdp_USERMODE
-	appendStart = KeQueryPerformanceCounter(NULL);
-	treeWaitStart = appendStart;
-#endif
 	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
-#ifndef Cdp_USERMODE
-	treeWaitEnd = KeQueryPerformanceCounter(NULL);
-	InterlockedAdd64(
-		&g_CdpPerfCounters.TreeLockWaitTicks,
-		treeWaitEnd.QuadPart - treeWaitStart.QuadPart);
-#endif
 	if (!Core->MetaTreeReady)
 	{
 		Cdp_LOCK_RELEASE(&Core->TreeLock);
@@ -1054,16 +1000,7 @@ NTSTATUS CdpCoreAppendAfterImage(
 	}
 	if (NT_SUCCESS(status))
 	{
-#ifndef Cdp_USERMODE
-		treeUpdateStart = KeQueryPerformanceCounter(NULL);
-#endif
 		status = CdpPreviewTreeOverlayLatest(&Core->MetaTree, &record);
-#ifndef Cdp_USERMODE
-		treeUpdateEnd = KeQueryPerformanceCounter(NULL);
-		InterlockedAdd64(
-			&g_CdpPerfCounters.TreeUpdateTicks,
-			treeUpdateEnd.QuadPart - treeUpdateStart.QuadPart);
-#endif
 		if (!NT_SUCCESS(status))
 		{
 #ifndef Cdp_USERMODE
@@ -1093,55 +1030,12 @@ NTSTATUS CdpCoreAppendAfterImage(
 	Cdp_LOCK_RELEASE(&Core->TreeLock);
 	if (ledgerRange)
 		Cdp_FREE(ledgerRange);
-#ifndef Cdp_USERMODE
-	InterlockedIncrement(&g_CdpPerfCounters.AppendCount);
-	InterlockedAdd64(
-		&g_CdpPerfCounters.AppendTicks,
-		KeQueryPerformanceCounter(NULL).QuadPart - appendStart.QuadPart);
-#endif
 	if (NT_SUCCESS(status))
 	{
-#if !defined(Cdp_USERMODE) && Cdp_TEST_TRACE_EVERY_IO
-		Cdp_LOG("[META-WRITE] source=[%llu,%llu) len=%lu seq=%llu payloadOffset=%llu nodesBefore=%lu nodesAfter=%lu\n",
-			Offset,
-			Offset + Length,
-			Length,
-			record.Sequence,
-			record.FileOffset,
-			nodeCountBefore,
-			nodeCountAfter);
-#endif
 		Core->Time100ns += 1;
 		if (WrittenRecord)
 			*WrittenRecord = record;
 	}
-	return status;
-}
-
-NTSTATUS CdpCorePublishRedirectRecord(
-	_Inout_ PCdp_CORE Core,
-	_In_ const Cdp_JOURNAL_RECORD* Record)
-{
-	NTSTATUS status;
-
-	if (!Core || !Record || Record->DataLength == 0 ||
-		Record->DataLength > Cdp_JOURNAL_MAX_RECORD_DATA)
-	{
-		return STATUS_INVALID_PARAMETER;
-	}
-	if (!Core->Journal || !Core->Journal->Mounted)
-		return STATUS_DEVICE_NOT_READY;
-
-	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
-	if (!Core->MetaTreeReady)
-	{
-		Cdp_LOCK_RELEASE(&Core->TreeLock);
-		return STATUS_DEVICE_NOT_READY;
-	}
-	status = CdpPreviewTreeOverlayLatest(&Core->MetaTree, Record);
-	if (!NT_SUCCESS(status))
-		Core->MetaTreeReady = FALSE;
-	Cdp_LOCK_RELEASE(&Core->TreeLock);
 	return status;
 }
 
@@ -1160,8 +1054,10 @@ static PCdp_PREVIEW_TREE_NODE CdpCoreFindFirstValidMetaNode(
 	return CdpCoreFindFirstValidMetaNode(Node->Right);
 }
 
-NTSTATUS CdpCoreDrainOneMetaRange(
+NTSTATUS CdpCoreDrainOneMetaRangeWithWriter(
 	_Inout_ PCdp_CORE Core,
+	_In_ Cdp_CORE_DRAIN_WRITE_ROUTINE WriteRoutine,
+	_In_opt_ PVOID WriteContext,
 	_Out_ PBOOLEAN Complete,
 	_Out_opt_ PUINT64 DrainedOffset,
 	_Out_opt_ PULONG DrainedLength)
@@ -1172,7 +1068,7 @@ NTSTATUS CdpCoreDrainOneMetaRange(
 	ULONG length = 0;
 	NTSTATUS status = STATUS_SUCCESS;
 
-	if (!Core || !Complete)
+	if (!Core || !WriteRoutine || !Complete)
 		return STATUS_INVALID_PARAMETER;
 	*Complete = FALSE;
 	if (DrainedOffset)
@@ -1203,7 +1099,7 @@ NTSTATUS CdpCoreDrainOneMetaRange(
 	status = CdpJournalReadPayload(
 		Core->Journal, node->FileOffset, length, payload);
 	if (NT_SUCCESS(status))
-		status = CdpCoreSourceWriteDirect(Core, offset, length, payload);
+		status = WriteRoutine(WriteContext, offset, length, payload);
 	if (NT_SUCCESS(status))
 	{
 		status = CdpPreviewTreePunchRange(&Core->MetaTree, offset, length);
@@ -1418,11 +1314,6 @@ static NTSTATUS CdpCoreSynthesizeRead(
 #endif
 		}
 	}
-#if !defined(Cdp_USERMODE) && Cdp_TEST_TRACE_EVERY_IO
-	Cdp_LOG("[META-READ] stage=complete offset=%llu len=%lu covered=%lu status=0x%08X\n",
-		Offset, Length, coveredCount, status);
-#endif
-
 done:
 	Cdp_FREE(coveredMask);
 	return status;
@@ -1465,23 +1356,6 @@ static BOOLEAN CdpCoreTreeHasOverlap(
 	return CdpCoreTreeHasOverlap(Node->Right, Start, End);
 }
 
-BOOLEAN CdpCoreCurrentReadHasOverlap(
-	_Inout_ PCdp_CORE Core,
-	_In_ UINT64 Offset,
-	_In_ ULONG Length)
-{
-	BOOLEAN overlap;
-
-	if (!Core || Length == 0 || Offset > MAXUINT64 - Length)
-		return TRUE;
-	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
-	overlap = !Core->MetaTreeReady ||
-		CdpCoreTreeHasOverlap(
-			Core->MetaTree.Root, Offset, Offset + Length);
-	Cdp_LOCK_RELEASE(&Core->TreeLock);
-	return overlap;
-}
-
 static PCdp_PREVIEW_TREE_NODE CdpCoreFindFirstOverlapNode(
 	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
 	_In_ UINT64 Start,
@@ -1499,83 +1373,6 @@ static PCdp_PREVIEW_TREE_NODE CdpCoreFindFirstOverlapNode(
 	if (Node->Start >= End)
 		return NULL;
 	return CdpCoreFindFirstOverlapNode(Node->Right, Start, End);
-}
-
-NTSTATUS CdpCoreQueryFirstJournalOverlap(
-	_Inout_ PCdp_CORE Core,
-	_In_ UINT64 Offset,
-	_In_ ULONG Length,
-	_Out_ PUINT64 SourceIntersectionOffset,
-	_Out_ PUINT64 JournalPayloadOffset,
-	_Out_ PULONG IntersectionLength)
-{
-	PCdp_PREVIEW_TREE_NODE node;
-	UINT64 requestEnd;
-	UINT64 start;
-	UINT64 end;
-	NTSTATUS status = STATUS_NOT_FOUND;
-
-	if (!Core || !SourceIntersectionOffset || !JournalPayloadOffset ||
-		!IntersectionLength || Length == 0 || Offset > MAXUINT64 - Length)
-	{
-		return STATUS_INVALID_PARAMETER;
-	}
-	*SourceIntersectionOffset = 0;
-	*JournalPayloadOffset = 0;
-	*IntersectionLength = 0;
-	requestEnd = Offset + Length;
-	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
-	if (!Core->MetaTreeReady)
-	{
-		status = STATUS_DEVICE_NOT_READY;
-	}
-	else
-	{
-		node = CdpCoreFindFirstOverlapNode(
-			Core->MetaTree.Root, Offset, requestEnd);
-		if (node)
-		{
-			start = node->Start > Offset ? node->Start : Offset;
-			end = node->End < requestEnd ? node->End : requestEnd;
-			if (end > start && end - start <= MAXULONG &&
-				node->FileOffset <= MAXUINT64 - (start - node->Start))
-			{
-				*SourceIntersectionOffset = start;
-				*JournalPayloadOffset =
-					node->FileOffset + (start - node->Start);
-				*IntersectionLength = (ULONG)(end - start);
-				status = STATUS_SUCCESS;
-			}
-			else
-			{
-				status = STATUS_INTEGER_OVERFLOW;
-			}
-		}
-	}
-	Cdp_LOCK_RELEASE(&Core->TreeLock);
-	return status;
-}
-
-NTSTATUS CdpCoreOverlayJournalRead(
-	_Inout_ PCdp_CORE Core,
-	_In_ BOOLEAN Preview,
-	_In_ UINT64 Offset,
-	_In_ ULONG Length,
-	_Inout_updates_bytes_(Length) PVOID Buffer)
-{
-	if (!Core || !Buffer || Length == 0)
-		return STATUS_INVALID_PARAMETER;
-	if (Preview)
-	{
-		if (Core->Phase != Cdp_CORE_PHASE_PREVIEW || Core->Building)
-			return STATUS_INVALID_DEVICE_STATE;
-		return CdpCoreSynthesizeRead(
-			Core, &Core->PreviewTree, Offset, Length, Buffer, FALSE, FALSE);
-	}
-	if (!Core->MetaTreeReady)
-		return STATUS_DEVICE_NOT_READY;
-	return CdpCoreSynthesizeRead(
-		Core, &Core->MetaTree, Offset, Length, Buffer, TRUE, FALSE);
 }
 
 NTSTATUS CdpCorePreviewRead(

@@ -18,48 +18,11 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.5.42-test1"
-
-/* Test-only shutdown mode: do not materialize MetaTree payloads back to the
- * source volume when protection is closed.  Capture is still quiesced and
- * queued DRAINING writes still reach the source before Core teardown. */
-#define Cdp_TEST_SKIP_DISABLE_BACKFILL 0
-#define Cdp_TEST_VERIFY_REDIRECT_DATA 0
-#define Cdp_TEST_TRACE_EVERY_IO 0
-/* Diagnostic boot-isolation build. The driver still attaches as both Volume
- * and DiskDrive UpperFilter, but performs no boot discovery, journal mount,
- * Core bind, I/O gating or protected disk interception. */
-#define Cdp_TEST_BOOT_PASSTHROUGH 0
-/* Stage 2 boot isolation: enumerate disks/volumes and mount journal metadata,
- * but never gate boot I/O or automatically bind/activate a protected source. */
-#define Cdp_TEST_BOOT_OPEN_GATES 0
-#define Cdp_TEST_DISABLE_AUTO_ACTIVATION 0
-/* Stage 3: complete auto layout validation, Core bind and MetaTree rebuild,
- * but leave CaptureEnabled clear so DiskDrive I/O remains pass-through. */
-/* Stage 4: enable protected Core reads and ordered disk mapping, but commit
- * writes to the source and punch MetaTree instead of appending the journal. */
-#define Cdp_TEST_BOOT_SOURCE_WRITE_PUNCH 0
-/* Stage 5: bypass every disk read before protected-source lookup. Keep only
- * ordered source-write + MetaTree punch active to isolate read synthesis. */
-#define Cdp_TEST_BOOT_BYPASS_PROTECTED_READS 0
-/* Stage 6: protected reads with a valid MDL are synthesized normally; only
- * internal disk reads with no MDL bypass Core and reach the source. */
-#define Cdp_TEST_BOOT_BYPASS_MDLLESS_READS 0
-/* Stage 7: preserve full journal/Header/MetaTree semantics but force copied
- * independent journal I/O instead of retargeting the original disk IRP. */
-#define Cdp_TEST_FORCE_COPIED_JOURNAL_WRITE 1
-/* Stage 8: after a complete journal append/publish, write the same immutable
- * snapshot to the source Store. Reads still prefer MetaTree journal data. */
-#define Cdp_TEST_DUAL_WRITE_AFTER_JOURNAL 0
-#define Cdp_TEST_INDEPENDENT_RESERVED_PAYLOAD 0
-#define Cdp_DRIVER_BUILD_STRING   "20260814.42-source-guid-retry"
+#define Cdp_DRIVER_VERSION_STRING "1.5.47-test1"
+#define Cdp_DRIVER_BUILD_STRING   "20260817.47-dead-code-cleanup"
 
 #define Cdp_COW_BATCH_MAX_ITEMS 16UL
 #define Cdp_COW_BATCH_MAX_BYTES (16UL * 1024UL * 1024UL)
-#define Cdp_PERF_TIMING_ENABLED 1
-#define Cdp_PERF_TEST_DISABLE_MERGE 0
-// Correctness-test path: protected READ/WRITE/FLUSH IRPs share CaptureWorker's
-// single FIFO, preserving their arrival order in the virtual volume view.
 
 // Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.
 // Cdp_DBG: Debug builds only — verbose I/O and path tracing.
@@ -81,29 +44,6 @@
 #endif
 
 extern PDRIVER_OBJECT g_DriverObject;
-
-typedef struct _Cdp_PERF_COUNTERS
-{
-	volatile LONGLONG TreeLockWaitTicks;
-	volatile LONGLONG JournalLockWaitTicks;
-	volatile LONGLONG PayloadWriteTicks;
-	volatile LONGLONG RawBuildTicks;
-	volatile LONGLONG RawCallTicks;
-	volatile LONGLONG RawWaitTicks;
-	volatile LONGLONG TreeUpdateTicks;
-	volatile LONGLONG AppendTicks;
-	volatile LONG RawPendingCount;
-	volatile LONG RawWriteCount;
-	volatile LONG ZeroCopyCount;
-	volatile LONG CopyFallbackCount;
-	volatile LONGLONG CopyFallbackBytes;
-	volatile LONG AppendCount;
-	volatile LONGLONG MdlMapTicks;
-	volatile LONGLONG MergeCheckTicks;
-	volatile LONG MergeCheckCount;
-} Cdp_PERF_COUNTERS, *PCdp_PERF_COUNTERS;
-
-extern Cdp_PERF_COUNTERS g_CdpPerfCounters;
 
 static __forceinline NTSTATUS CdpCompleteIrp(
 	_In_ PIRP Irp,
@@ -190,12 +130,6 @@ typedef struct _Cdp_DRIVER_EXTENSION
 	volatile LONG AuthFailureCount;
 	volatile LONGLONG AuthBlockedUntil100ns;
 } Cdp_DRIVER_EXTENSION, *PCdp_DRIVER_EXTENSION;
-
-typedef struct _Cdp_SHADOW_MODIFIED_RANGE
-	Cdp_SHADOW_MODIFIED_RANGE, *PCdp_SHADOW_MODIFIED_RANGE;
-
-typedef struct _Cdp_SEQUENTIAL_WRITE_ITEM
-	Cdp_SEQUENTIAL_WRITE_ITEM, *PCdp_SEQUENTIAL_WRITE_ITEM;
 
 typedef struct _Cdp_CONTROL_FILE_CONTEXT
 {
@@ -295,6 +229,13 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	// First failure observed while graceful disable is writing/punching the
 	// current MetaTree. Zero means the drain may continue.
 	volatile LONG DrainFailureStatus;
+	/* Out-of-band identity for the one synchronous volume-layer backfill write.
+	 * The partition stack may replace the IRP, so identity must never live in
+	 * Tail.Overlay.DriverContext. Disk Upper matches owner thread + range. */
+	volatile LONG BackfillWriteActive;
+	PETHREAD volatile BackfillWriteThread;
+	UINT64 BackfillAbsoluteOffset;
+	ULONG BackfillLength;
 	KSPIN_LOCK RecoveryReadQueueLock;
 	LIST_ENTRY RecoveryReadQueue;
 	KEVENT RecoveryReadEvent;
@@ -306,34 +247,13 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	KEVENT MergeThreadDoneEvent;
 	KMUTEX HistoryMutex;
 	PCdp_CORE Core;
-	/* Test-only current-view index. Items are appended in commit order and
-	 * protected by HistoryMutex. Reads walk backward so newer writes win. */
-	LIST_ENTRY SequentialWriteList;
-	ULONG SequentialWriteCount;
 	// Journal VolumeHandleList entry used while CaptureEnabled is set.
 	UINT64 JournalHandleId;
 	// Direct-redirect test path keeps one reference for the entire protection
 	// session.  Write dispatch must only read this cached entry; acquiring it for
 	// every I/O serializes on VolumeHandleMutex and destroys large-I/O throughput.
 	PCdp_VOLUME_HANDLE_ENTRY RedirectJournalEntry;
-	/* Test-only shadow baseline. While protection is active Core->Source points
-	 * at this volume (same offsets as the real source), never at the source
-	 * volume itself. */
-	UINT64 TestShadowVolumeHandleId;
-	PCdp_VOLUME_HANDLE_ENTRY TestShadowVolumeEntry;
-	PCdp_STORE TestShadowStore;
-	volatile LONG TestShadowFirstReadTraced;
-	volatile LONG TestShadowFirstOverlayTraced;
-	PCdp_SHADOW_MODIFIED_RANGE TestShadowModifiedRanges;
-	ULONG TestShadowModifiedRangeCount;
-	UINT64 PerfWindowStartTicks;
-	UINT64 PerfQueueWaitTicks;
-	UINT64 PerfHistoryLockWaitTicks;
-	UINT64 PerfWorkerTicks;
-	UINT64 PerfBytes;
-	ULONG PerfIrpCount;
 	volatile LONG CaptureQueueDepth;
-	volatile LONG PerfMaxQueueDepth;
 	/* Low-volume protected-read audit. Reset when protection is enabled and
 	 * summarized when it is disabled. All byte counters are monotonic for one
 	 * protection session. */
@@ -351,8 +271,6 @@ typedef struct _Cdp_CAPTURE_ITEM
 {
 	LIST_ENTRY Entry;
 	PIRP Irp;
-	UINT64 EnqueueTicks;
-	BOOLEAN FromDisk;
 	UINT64 OriginalDiskOffset;
 	PDEVICE_OBJECT SourceReference;
 	PDEVICE_OBJECT OriginLowerReference;
@@ -363,19 +281,3 @@ typedef struct _Cdp_RECOVERY_READ_ITEM
 	LIST_ENTRY Entry;
 	PIRP Irp;
 } Cdp_RECOVERY_READ_ITEM, *PCdp_RECOVERY_READ_ITEM;
-
-struct _Cdp_SHADOW_MODIFIED_RANGE
-{
-	UINT64 Start;
-	UINT64 End;
-	struct _Cdp_SHADOW_MODIFIED_RANGE* Next;
-};
-
-struct _Cdp_SEQUENTIAL_WRITE_ITEM
-{
-	LIST_ENTRY Entry;
-	UINT64 VolumeOffset;
-	UINT64 FileOffset;
-	UINT64 Sequence;
-	ULONG DataLength;
-};
