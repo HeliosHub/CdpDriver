@@ -15,6 +15,7 @@ CdpCore 是驱动与用户态单元测试共用的 after-image Journal 引擎。
 - Preview 根据目标时间定位分支，递归包含父分支继承路径并构建 `PreviewTree`；读取命中日志，空缺取源卷。
 - Preview 启动时若合并正在运行则返回忙；合并删除 Preview 目标 Record 所在区域时会停止 Preview。
 - Recovery 根据目标时间定位父分支和继承点，创建新分支并构建新的完整 `MetaTree`，成功后原子替换旧树。
+- 重启 Recovery 在启动挂载阶段只构建并发布目标 `MetaTree`，不执行日志写入；新分支由恢复后的第一笔应用写在追加 Payload 前持久化。待分支存在期间禁止合并。
 - Recovery 不回填源卷。`Commit` 仅保留为无写回的兼容确认接口。
 - Recovery 构建失败会删除刚创建的空分支记录，保留原 `MetaTree` 并返回 General。
 
@@ -36,4 +37,4 @@ msbuild CdpCore\CdpCore.Tests.vcxproj /t:Rebuild /p:Configuration=Release /p:Pla
 x64\Release\CdpCore.Tests.exe
 ```
 
-测试覆盖初始分支、after-image 写失败、最新区间覆盖、分支继承读取、合并与失败重试、分支树重建、Preview 分支路径、Preview/合并协调及 Recovery 分支切换/回滚。
+测试覆盖初始分支、after-image 写失败、最新区间覆盖、分支继承读取、合并与失败重试、分支树重建、Preview 分支路径、Preview/合并协调、Recovery 分支切换/回滚以及重启恢复的延迟分支持久化。

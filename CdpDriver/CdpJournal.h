@@ -9,7 +9,7 @@
 #endif
 
 #define Cdp_JOURNAL_MAGIC            0x4C4E4A51UL /* 'QJNL' */
-#define Cdp_JOURNAL_VERSION          13UL
+#define Cdp_JOURNAL_VERSION          14UL
 #define Cdp_JOURNAL_MAX_RECORD_DATA  (2UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_REGION_SIZE (1UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_LINK_SIZE 32UL
@@ -94,7 +94,7 @@ typedef struct _Cdp_CREDENTIAL_DESCRIPTOR
 	UINT64 AuthEpoch;
 } Cdp_CREDENTIAL_DESCRIPTOR, *PCdp_CREDENTIAL_DESCRIPTOR;
 
-// On-disk layout (v13): VolumeOffset uses the absolute physical-disk address;
+// On-disk layout (v14): VolumeOffset uses the absolute physical-disk address;
 // FileOffset remains relative to the journal partition's own storage backend.
 // One superblock is followed by alternating header/payload areas.
 //   [Superblock]
@@ -117,6 +117,16 @@ typedef struct _Cdp_JOURNAL_SUPERBLOCK
 	Cdp_CREDENTIAL_DESCRIPTOR Credential;
 	LONG CurrentBranchNumber;
 	LONG HighestBranchNumber;
+	/* Stable pre-mount identity.  Volume GUID may not yet be available while
+	 * IRP_MN_START_DEVICE is held, so automatic discovery can instead validate
+	 * the complete physical source/journal layout on the same disk. */
+	ULONG DiskPartitionStyle;
+	ULONG MbrSignature;
+	GUID DiskGuid;
+	UINT64 SourcePartitionStart;
+	UINT64 SourcePartitionSize;
+	UINT64 JournalPartitionStart;
+	UINT64 JournalPartitionSize;
 	ULONG MetadataCrc32c;
 } Cdp_JOURNAL_SUPERBLOCK, *PCdp_JOURNAL_SUPERBLOCK;
 
@@ -248,13 +258,25 @@ typedef struct _Cdp_JOURNAL
 	BOOLEAN CredentialConfigured;
 	Cdp_CREDENTIAL_DESCRIPTOR Credential;
 	GUID SourceVolumeGuid;
+	ULONG DiskPartitionStyle;
+	ULONG MbrSignature;
+	GUID DiskGuid;
+	UINT64 SourcePartitionStart;
+	UINT64 SourcePartitionSize;
+	UINT64 JournalPartitionStart;
+	UINT64 JournalPartitionSize;
 #ifndef Cdp_USERMODE
 	PDEVICE_OBJECT TargetDevice;
+	// Optional volume-stack backend used only for journal metadata. Payload
+	// remains on TargetDevice with an absolute disk offset.
+	PDEVICE_OBJECT MetadataTargetDevice;
 #else
 	PVOID TargetDevice;
+	PVOID MetadataTargetDevice;
 #endif
 	PVOID RawDiskHandle; // kernel HANDLE; physical disk backend when non-NULL
 	UINT64 TargetBaseOffset; // partition start on RawDiskHandle
+	UINT64 MetadataTargetBaseOffset; // normally zero for a partition volume
 	PCdp_STORE Store; // if set, RawIo uses store instead of TargetDevice
 	Cdp_QUERY_TIME_100NS QueryTime100ns;
 	PVOID QueryTimeContext;
@@ -298,6 +320,21 @@ VOID CdpJournalInitializeWithStore(
 	_In_ const GUID* SourceVolumeGuid,
 	_In_opt_ Cdp_QUERY_TIME_100NS QueryTime100ns,
 	_In_opt_ PVOID QueryTimeContext);
+
+VOID CdpJournalSetMetadataDevice(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_opt_ PVOID TargetDevice,
+	_In_ UINT64 TargetBaseOffset);
+
+VOID CdpJournalSetPhysicalLayout(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ ULONG DiskPartitionStyle,
+	_In_ ULONG MbrSignature,
+	_In_ const GUID* DiskGuid,
+	_In_ UINT64 SourcePartitionStart,
+	_In_ UINT64 SourcePartitionSize,
+	_In_ UINT64 JournalPartitionStart,
+	_In_ UINT64 JournalPartitionSize);
 
 NTSTATUS CdpJournalFormat(_Inout_ PCdp_JOURNAL Journal);
 

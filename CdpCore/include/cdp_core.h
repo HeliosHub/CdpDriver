@@ -153,6 +153,15 @@ NTSTATUS CdpCorePreviewEnd(_Inout_ PCdp_CORE Core);
  * its MetaTree, then return to General. No source-volume writeback occurs. */
 NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns);
 
+/* Boot-safe recovery: publish the target MetaTree without writing a new
+ * branch. The first subsequent application append materializes that branch
+ * before its payload is committed. */
+NTSTATUS CdpCorePrepareRebootRecovery(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 TargetTime100ns);
+
+BOOLEAN CdpCoreHasPendingRecoveryBranch(_In_ PCdp_CORE Core);
+
 /* Idempotent compatibility acknowledgement; RecoveryBegin already completed. */
 NTSTATUS CdpCoreRecoveryCommit(_Inout_ PCdp_CORE Core);
 

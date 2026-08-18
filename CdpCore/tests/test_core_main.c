@@ -335,6 +335,71 @@ static int TestAfterImageInitialBranchRecord(void)
 	return g_caseFailed;
 }
 
+static int TestJournalPhysicalLayoutPersistence(void)
+{
+	PCdp_STORE store = NULL;
+	Cdp_JOURNAL formatted;
+	Cdp_JOURNAL mounted;
+	PCdp_JOURNAL_SUPERBLOCK superblock;
+	GUID sourceGuid =
+		{ 0x10203040, 0x5060, 0x7080,
+		  { 0x90, 0xA0, 0xB0, 0xC0, 0xD0, 0xE0, 0xF0, 0x01 } };
+	GUID diskGuid =
+		{ 0x89ABCDEF, 0x1234, 0x5678,
+		  { 0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44 } };
+	const ULONG gptStyle = 1;
+	const UINT64 sourceStart = 1ULL * 1024 * 1024;
+	const UINT64 sourceSize = 32ULL * 1024 * 1024;
+	const UINT64 journalStart = sourceStart + sourceSize;
+
+	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &store)),
+		"create journal for physical-layout persistence test");
+	if (!store)
+		return g_caseFailed;
+
+	CdpJournalInitializeWithStore(
+		&formatted, store, &sourceGuid, TestPointerTime100ns,
+		(PVOID)(ULONG_PTR)90500);
+	CdpJournalSetPhysicalLayout(
+		&formatted,
+		gptStyle,
+		0,
+		&diskGuid,
+		sourceStart,
+		sourceSize,
+		journalStart,
+		JNL_SIZE);
+	Expect(NT_SUCCESS(CdpJournalFormat(&formatted)),
+		"format journal with stable physical identity");
+	superblock = (PCdp_JOURNAL_SUPERBLOCK)CdpMemStoreData(store);
+	Expect(superblock->Version == Cdp_JOURNAL_VERSION &&
+		superblock->DiskPartitionStyle == gptStyle &&
+		memcmp(&superblock->DiskGuid, &diskGuid, sizeof(GUID)) == 0 &&
+		superblock->SourcePartitionStart == sourceStart &&
+		superblock->SourcePartitionSize == sourceSize &&
+		superblock->JournalPartitionStart == journalStart &&
+		superblock->JournalPartitionSize == JNL_SIZE,
+		"superblock stores complete source/journal physical layout");
+	CdpJournalClose(&formatted);
+
+	CdpJournalInitializeWithStore(
+		&mounted, store, &sourceGuid, TestPointerTime100ns,
+		(PVOID)(ULONG_PTR)90600);
+	Expect(NT_SUCCESS(CdpJournalMount(&mounted)),
+		"remount journal with physical identity metadata");
+	Expect(mounted.DiskPartitionStyle == gptStyle &&
+		memcmp(&mounted.DiskGuid, &diskGuid, sizeof(GUID)) == 0 &&
+		mounted.SourcePartitionStart == sourceStart &&
+		mounted.SourcePartitionSize == sourceSize &&
+		mounted.JournalPartitionStart == journalStart &&
+		mounted.JournalPartitionSize == JNL_SIZE,
+		"mount restores complete physical identity metadata");
+
+	CdpJournalClose(&mounted);
+	CdpMemStoreDestroy(store);
+	return g_caseFailed;
+}
+
 static int TestAfterImageAppendDoesNotTouchSource(void)
 {
 	TEST_CTX ctx;
@@ -2024,6 +2089,93 @@ static int TestAfterImageRecoveryBranchSwitch(void)
 	return g_caseFailed;
 }
 
+static int TestDeferredRebootRecoveryBranch(void)
+{
+	TEST_CTX ctx;
+	TEST_FAIL_STORE journalFail;
+	Cdp_JOURNAL_RECORD targetRecord;
+	Cdp_JOURNAL_RECORD writtenRecord;
+	Cdp_JOURNAL_RECORD headers[8];
+	UCHAR source[512];
+	UCHAR target[512];
+	UCHAR latest[512];
+	UCHAR firstWrite[512];
+	UCHAR output[512];
+	UINT64 total = 0;
+	UINT64 generation = 0;
+	ULONG returned = 0;
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(TestCtxCreate(
+		&ctx, SRC_SIZE, JNL_SIZE, 160000)),
+		"setup deferred reboot recovery test");
+	RtlFillMemory(source, sizeof(source), 0x10);
+	RtlFillMemory(target, sizeof(target), 0x20);
+	RtlFillMemory(latest, sizeof(latest), 0x30);
+	RtlFillMemory(firstWrite, sizeof(firstWrite), 0x40);
+	Expect(NT_SUCCESS(ctx.Source->Write(
+		ctx.Source, 0, sizeof(source), source)),
+		"seed deferred recovery source");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(target), target, &targetRecord)),
+		"append deferred recovery target value");
+	CdpCoreSetTime100ns(ctx.Core, 170000);
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(latest), latest, NULL)),
+		"append value newer than deferred target");
+
+	status = CdpCorePrepareRebootRecovery(
+		ctx.Core, targetRecord.WallClock100ns);
+	Expect(NT_SUCCESS(status) &&
+		CdpCoreHasPendingRecoveryBranch(ctx.Core),
+		"boot recovery publishes target view without creating its branch");
+	RtlZeroMemory(output, sizeof(output));
+	Expect(NT_SUCCESS(CdpCoreRead(
+		ctx.Core, 0, sizeof(output), output)) &&
+		memcmp(output, target, sizeof(output)) == 0,
+		"deferred recovery reads expose the historical target immediately");
+	status = CdpCoreQueryRecordHeaders(
+		ctx.Core, 0, 0, headers, RTL_NUMBER_OF(headers),
+		&total, &generation, &returned);
+	Expect(NT_SUCCESS(status) && total == 3 && returned == 3,
+		"boot preparation performs no journal write");
+	ExpectStatus(CdpCoreSetMergeActive(ctx.Core, TRUE),
+		STATUS_DEVICE_BUSY,
+		"merge stays disabled while the recovery branch is pending");
+
+	TestFailStoreInstall(ctx.Journal, &journalFail);
+	journalFail.FailNextWrites = 32;
+	status = CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(firstWrite), firstWrite, NULL);
+	Expect(!NT_SUCCESS(status) &&
+		CdpCoreHasPendingRecoveryBranch(ctx.Core),
+		"failed first-write branch persistence keeps the branch pending");
+	TestFailStoreRemove(ctx.Journal, &journalFail);
+
+	CdpCoreSetTime100ns(ctx.Core, 180000);
+	status = CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(firstWrite), firstWrite, &writtenRecord);
+	Expect(NT_SUCCESS(status) &&
+		!CdpCoreHasPendingRecoveryBranch(ctx.Core),
+		"first application write materializes the pending branch");
+	returned = 0;
+	status = CdpCoreQueryRecordHeaders(
+		ctx.Core, 0, 0, headers, RTL_NUMBER_OF(headers),
+		&total, &generation, &returned);
+	Expect(NT_SUCCESS(status) && total == 5 && returned == 5 &&
+		headers[3].Flags == Cdp_JOURNAL_RECORD_FLAG_BRANCH &&
+		headers[4].Sequence == writtenRecord.Sequence,
+		"pending branch marker is committed immediately before first payload");
+	RtlZeroMemory(output, sizeof(output));
+	Expect(NT_SUCCESS(CdpCoreRead(
+		ctx.Core, 0, sizeof(output), output)) &&
+		memcmp(output, firstWrite, sizeof(output)) == 0,
+		"first write updates the recovered MetaTree on the new branch");
+
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
 static int TestGracefulDisableDrainsMetaTree(void)
 {
 	TEST_CTX ctx;
@@ -2223,6 +2375,8 @@ int main(void)
 
 	failed += RunCase("After-image initial branch record",
 		TestAfterImageInitialBranchRecord);
+	failed += RunCase("Journal physical-layout persistence",
+		TestJournalPhysicalLayoutPersistence);
 	failed += RunCase("After-image append does not touch source",
 		TestAfterImageAppendDoesNotTouchSource);
 	failed += RunCase("After-image journal failure does not bypass source",
@@ -2261,6 +2415,8 @@ int main(void)
 		TestAfterImagePreviewMergeCoordination);
 	failed += RunCase("After-image recovery branch switch",
 		TestAfterImageRecoveryBranchSwitch);
+	failed += RunCase("Deferred reboot recovery branch",
+		TestDeferredRebootRecoveryBranch);
 	failed += RunCase("Graceful disable drains MetaTree",
 		TestGracefulDisableDrainsMetaTree);
 	failed += RunCase("Sibling inheritance point retention",

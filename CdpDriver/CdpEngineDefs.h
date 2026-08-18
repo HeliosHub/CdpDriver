@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.5.47-test1"
-#define Cdp_DRIVER_BUILD_STRING   "20260817.47-dead-code-cleanup"
+#define Cdp_DRIVER_VERSION_STRING "1.5.54-test1"
+#define Cdp_DRIVER_BUILD_STRING   "20260818.54-deferred-recovery-branch"
 
 #define Cdp_COW_BATCH_MAX_ITEMS 16UL
 #define Cdp_COW_BATCH_MAX_BYTES (16UL * 1024UL * 1024UL)
@@ -71,6 +71,9 @@ typedef struct _Cdp_VOLUME_HANDLE_ENTRY
 	// mounted filesystem's DASD write denial (STATUS_ACCESS_DENIED).
 	PDEVICE_OBJECT TargetLowerDevice;
 	PDEVICE_OBJECT VolumeLowerDevice;
+	// Referenced only by the auto-discovered journal. It keeps the volume-lower
+	// object valid while RR/Header/Superblock I/O uses that stack.
+	PDEVICE_OBJECT MetadataLowerDeviceReference;
 	UINT64 TargetBaseOffset;
 	ULONG DiskNumber;
 	ULONG PartitionNumber;
@@ -106,27 +109,6 @@ typedef struct _Cdp_DRIVER_EXTENSION
 	FAST_MUTEX PreviewSessionMutex;
 	volatile LONGLONG PreviewSessionNextId;
 
-	WORK_QUEUE_ITEM AutoDiscoveryWorkItem;
-	volatile LONG AutoDiscoveryQueued;
-	volatile LONG AutoDiscoveryStopping;
-	volatile LONG AutoDiscoverySuppressed;
-	// Set only from the boot-driver reinitialization callback, which the I/O
-	// manager invokes after the boot PnP enumeration/start pass completes.
-	// No volume gate may be opened before this becomes nonzero.
-	volatile LONG BootEnumerationComplete;
-	// 0 until every started volume is classified and no journal is waiting
-	// on a not-yet-started source (or CDP has been enabled).
-	volatile LONG AutoDiscoverySettled;
-	// Boot-driver reinitialization can run before late data/journal volumes
-	// receive START_DEVICE.  Count consecutive quiet discovery passes before
-	// opening unmatched volume gates; every new START_DEVICE resets the count.
-	volatile LONG AutoDiscoveryStablePasses;
-	volatile LONG AutoDiscoveryRunning;
-	/* START_DEVICE can arrive while the single work item is already running.
-	 * Preserve that edge so the current worker loops or queues another pass. */
-	volatile LONG AutoDiscoveryRescanRequested;
-	KEVENT AutoDiscoveryIdle;
-	KEVENT AutoDiscoverySettledEvent;
 	volatile LONG AuthFailureCount;
 	volatile LONGLONG AuthBlockedUntil100ns;
 } Cdp_DRIVER_EXTENSION, *PCdp_DRIVER_EXTENSION;
@@ -185,34 +167,29 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	volatile LONG DiskIoAccepting;
 	volatile LONG DiskIoOutstanding;
 	KEVENT DiskIoDrainedEvent;
+	/* Set permanently once IRP_MJ_SHUTDOWN reaches the disk filter.  No new
+	 * protected write may bypass to the source while the ordered queue and
+	 * journal cache are being drained. */
+	volatile LONG ShutdownInProgress;
 	volatile LONG Phase;
-	// Auto discovery may run concurrently with PnP removal.  Started prevents
-	// raw I/O before IRP_MN_START_DEVICE has completed; rundown keeps the lower
-	// device attachment stable for the duration of a probe.
+	// START_DEVICE publishes this before pre-mount discovery uses the lower
+	// device stack.
 	volatile LONG Started;
-	// Auto-discovery classification: 0=unknown, 1=source, 2=journal.
-	volatile LONG AutoKind;
 	BOOLEAN VolumeGuidValid;
 	// Physical partition identity captured after START_DEVICE.  The complete
-	// disk layout lets discovery wait for the physically adjacent successor
-	// instead of delaying every volume for a global quiet period.
+	// disk layout lets discovery identify the physically adjacent successor.
 	BOOLEAN DiskLayoutValid;
 	BOOLEAN HasNextPartition;
 	ULONG DiskNumber;
 	ULONG PartitionNumber;
+	ULONG DiskPartitionStyle;
+	ULONG MbrSignature;
+	GUID DiskGuid;
 	UINT64 PartitionStart;
 	UINT64 PartitionSize;
+	ULONG NextPartitionNumber;
 	UINT64 NextPartitionStart;
-	EX_RUNDOWN_REF AutoDiscoveryRundown;
-	// Each newly started volume is held until automatic discovery determines
-	// whether it is a recovery source.  This closes the source-identification
-	// window before CaptureEnabled/Recovery Phase can be established.
-	volatile LONG AutoDiscoveryGateActive;
-	// A persisted reboot recovery keeps the discovery gate closed while the
-	// driver synchronously attempts Recovery Begin (e) and Commit (r). Success
-	// or failure ends the attempt; boot is allowed to continue in either case.
-	volatile LONG RebootRecoveryGateRequired;
-	KEVENT AutoDiscoveryGateEvent;
+	UINT64 NextPartitionSize;
 	GUID VolumeGuid;
 	PDEVICE_OBJECT FilterDeviceObject;
 	PDEVICE_OBJECT LowerDeviceObject;
@@ -236,11 +213,6 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	PETHREAD volatile BackfillWriteThread;
 	UINT64 BackfillAbsoluteOffset;
 	ULONG BackfillLength;
-	KSPIN_LOCK RecoveryReadQueueLock;
-	LIST_ENTRY RecoveryReadQueue;
-	KEVENT RecoveryReadEvent;
-	HANDLE RecoveryReadThreadHandle;
-	volatile LONG RecoveryReadStopping;
 	HANDLE MergeThreadHandle;
 	volatile LONG MergeThreadRunning;
 	volatile LONG MergeThreadStopping;
@@ -275,9 +247,3 @@ typedef struct _Cdp_CAPTURE_ITEM
 	PDEVICE_OBJECT SourceReference;
 	PDEVICE_OBJECT OriginLowerReference;
 } Cdp_CAPTURE_ITEM, *PCdp_CAPTURE_ITEM;
-
-typedef struct _Cdp_RECOVERY_READ_ITEM
-{
-	LIST_ENTRY Entry;
-	PIRP Irp;
-} Cdp_RECOVERY_READ_ITEM, *PCdp_RECOVERY_READ_ITEM;

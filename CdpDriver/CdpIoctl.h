@@ -171,6 +171,12 @@ typedef struct _Cdp_PHASE_QUERY_REPLY
 	ULONG Reserved;
 	GUID JournalPartitionGuid; // valid when Status >= 0 and protection is on
 	UINT64 RecoveryTargetTime100ns;
+	/* Always populated for an active protection session, including pre-mount
+	 * automatic discovery where a stable journal Volume GUID is unavailable. */
+	ULONG JournalDiskNumber;
+	ULONG JournalPartitionNumber;
+	UINT64 JournalPartitionOffset;
+	UINT64 JournalPartitionBytes;
 } Cdp_PHASE_QUERY_REPLY, *PCdp_PHASE_QUERY_REPLY;
 
 typedef struct _Cdp_RECOVERY_BEGIN_REQUEST

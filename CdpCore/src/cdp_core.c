@@ -75,6 +75,10 @@ struct _Cdp_CORE
 	LONG Building;
 	LONG MergeActive;
 	BOOLEAN PreviewStoppedByMerge;
+	BOOLEAN PendingRecoveryBranch;
+	LONG PendingRecoveryParentBranch;
+	LONG PendingRecoveryBranchNumber;
+	UINT64 PendingRecoveryInheritedSequence;
 	GUID SourceGuid;
 	struct _Cdp_WRITE_LEDGER_RANGE* WriteLedger;
 	ULONG WriteLedgerRangeCount;
@@ -636,7 +640,7 @@ NTSTATUS CdpCoreSetMergeActive(
 	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
 	if (Active)
 	{
-		if (Core->MergeActive)
+		if (Core->MergeActive || Core->PendingRecoveryBranch)
 			status = STATUS_DEVICE_BUSY;
 		else
 			Core->MergeActive = 1;
@@ -736,6 +740,11 @@ NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
 	if (!Core->MetaTreeReady)
 	{
 		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup;
+	}
+	if (Core->PendingRecoveryBranch)
+	{
+		status = STATUS_DEVICE_BUSY;
 		goto cleanup;
 	}
 	status = CdpJournalGetOldestCompactableRegion(
@@ -949,6 +958,80 @@ Cdp_CORE_PHASE CdpCoreGetPhase(_In_ PCdp_CORE Core)
 	return (Cdp_CORE_PHASE)Core->Phase;
 }
 
+BOOLEAN CdpCoreHasPendingRecoveryBranch(_In_ PCdp_CORE Core)
+{
+	BOOLEAN pending;
+
+	if (!Core)
+		return FALSE;
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	pending = Core->PendingRecoveryBranch;
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	return pending;
+}
+
+/* TreeLock is held by the append path. A previous attempt can have written
+ * and attached the branch marker but failed while publishing/clearing the
+ * superblock. In that case CurrentBranchNumber already identifies the planned
+ * branch, so retry only the recovery-intent completion instead of creating a
+ * duplicate branch. */
+static NTSTATUS CdpCoreMaterializePendingRecoveryBranchLocked(
+	_Inout_ PCdp_CORE Core)
+{
+	NTSTATUS status;
+	LONG currentBranch;
+
+	if (!Core->PendingRecoveryBranch)
+		return STATUS_SUCCESS;
+	currentBranch = Core->Journal->CurrentBranchNumber;
+	if (currentBranch != Core->PendingRecoveryBranchNumber)
+	{
+		if (currentBranch != Core->PendingRecoveryParentBranch ||
+			Core->Journal->HighestBranchNumber + 1 !=
+				Core->PendingRecoveryBranchNumber)
+		{
+			return STATUS_INVALID_DEVICE_STATE;
+		}
+		status = CdpJournalAppendBranch(
+			Core->Journal,
+			Core->PendingRecoveryBranchNumber,
+			Core->PendingRecoveryParentBranch,
+			Core->PendingRecoveryInheritedSequence);
+		if (!NT_SUCCESS(status))
+		{
+#ifndef Cdp_USERMODE
+			Cdp_LOG("[RECOVERY-DEFERRED-FAIL] stage=append-branch status=0x%08X branch=%ld parent=%ld inherit=%llu current=%ld\n",
+				status,
+				Core->PendingRecoveryBranchNumber,
+				Core->PendingRecoveryParentBranch,
+				Core->PendingRecoveryInheritedSequence,
+				Core->Journal->CurrentBranchNumber);
+#endif
+			return status;
+		}
+	}
+	status = CdpJournalCompleteRecoveryIntent(Core->Journal);
+	if (!NT_SUCCESS(status))
+	{
+#ifndef Cdp_USERMODE
+		Cdp_LOG("[RECOVERY-DEFERRED-FAIL] stage=clear-intent status=0x%08X branch=%ld\n",
+			status, Core->PendingRecoveryBranchNumber);
+#endif
+		return status;
+	}
+#ifndef Cdp_USERMODE
+	Cdp_LOG("[RECOVERY-DEFERRED] branch materialized before first write branch=%ld parent=%ld inherit=%llu\n",
+		Core->PendingRecoveryBranchNumber,
+		Core->PendingRecoveryParentBranch,
+		Core->PendingRecoveryInheritedSequence);
+#endif
+	Core->PendingRecoveryBranch = FALSE;
+	Core->PendingRecoveryParentBranch = 0;
+	Core->PendingRecoveryBranchNumber = 0;
+	Core->PendingRecoveryInheritedSequence = 0;
+	return STATUS_SUCCESS;
+}
+
 NTSTATUS CdpCoreAppendAfterImage(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,
@@ -984,6 +1067,13 @@ NTSTATUS CdpCoreAppendAfterImage(
 		return STATUS_DEVICE_NOT_READY;
 	}
 	nodeCountBefore = Core->MetaTree.NodeCount;
+	status = CdpCoreMaterializePendingRecoveryBranchLocked(Core);
+	if (!NT_SUCCESS(status))
+	{
+		Cdp_LOCK_RELEASE(&Core->TreeLock);
+		Cdp_FREE(ledgerRange);
+		return status;
+	}
 	status = CdpJournalAppendEx(
 		Core->Journal,
 		Offset,
@@ -1430,7 +1520,8 @@ NTSTATUS CdpCorePreviewBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns
 		return status;
 
 	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
-	if (Core->Phase != Cdp_CORE_PHASE_GENERAL)
+	if (Core->Phase != Cdp_CORE_PHASE_GENERAL ||
+		Core->PendingRecoveryBranch)
 	{
 		Cdp_LOCK_RELEASE(&Core->TreeLock);
 		return STATUS_INVALID_DEVICE_STATE;
@@ -1514,7 +1605,9 @@ NTSTATUS CdpCoreRecoveryCommitStep(
 	return STATUS_SUCCESS;
 }
 
-NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns)
+NTSTATUS CdpCorePrepareRebootRecovery(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 TargetTime100ns)
 {
 	Cdp_PREVIEW_TREE newTree;
 	Cdp_PREVIEW_TREE oldTree;
@@ -1524,21 +1617,23 @@ NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100n
 	UINT64 effectiveTargetTime100ns;
 	UINT64 previousTargetTime100ns = 0;
 	ULONG publishedNodeCount = 0;
-	BOOLEAN branchCreated = FALSE;
 	BOOLEAN newTreeInitialized = FALSE;
+	const char* failureStage = "entry";
 	NTSTATUS status;
 
 	if (!Core)
 		return STATUS_INVALID_PARAMETER;
 	if (!Core->Journal->Mounted)
 		return STATUS_DEVICE_NOT_READY;
+	failureStage = "resolve-target-time";
 	status = CdpCoreResolveTargetTime(
 		Core, TargetTime100ns, &effectiveTargetTime100ns);
 	if (!NT_SUCCESS(status))
 		return status;
 
 	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
-	if (Core->Phase != Cdp_CORE_PHASE_GENERAL)
+	if (Core->Phase != Cdp_CORE_PHASE_GENERAL || Core->Building ||
+		Core->PendingRecoveryBranch)
 	{
 		Cdp_LOCK_RELEASE(&Core->TreeLock);
 		return STATUS_INVALID_DEVICE_STATE;
@@ -1554,6 +1649,140 @@ NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100n
 	Core->TargetTime100ns = effectiveTargetTime100ns;
 	Cdp_LOCK_RELEASE(&Core->TreeLock);
 
+	failureStage = "resolve-target-branch";
+	status = CdpJournalResolveTargetBranch(
+		Core->Journal,
+		effectiveTargetTime100ns,
+		&parentBranch,
+		&inheritedSequence);
+	if (!NT_SUCCESS(status))
+		goto failure;
+	CdpCoreTraceTargetRecord(
+		"REBOOT-RECOVERY",
+		Core->Journal,
+		TargetTime100ns,
+		effectiveTargetTime100ns,
+		inheritedSequence);
+
+	failureStage = "build-target-metatree";
+	status = CdpJournalBuildPreviewTree(
+		Core->Journal,
+		effectiveTargetTime100ns,
+		Core->Journal->NextSequence,
+		TRUE,
+		&newTree,
+		&inheritedSequence);
+	if (!NT_SUCCESS(status) && status != STATUS_NOT_FOUND)
+		goto failure;
+	if (status == STATUS_NOT_FOUND)
+	{
+		CdpPreviewTreeInitialize(&newTree);
+		status = STATUS_SUCCESS;
+	}
+	newTreeInitialized = TRUE;
+	if (Core->Journal->HighestBranchNumber >= 0x7FFFFFFFL)
+	{
+		status = STATUS_INTEGER_OVERFLOW;
+		failureStage = "reserve-branch-number";
+		goto failure;
+	}
+	newBranch = Core->Journal->HighestBranchNumber + 1;
+
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	oldTree = Core->MetaTree;
+	Core->MetaTree = newTree;
+	Core->MetaTreeReady = TRUE;
+	CdpCoreClearWriteLedger(Core);
+	Core->PendingRecoveryParentBranch = parentBranch;
+	Core->PendingRecoveryBranchNumber = newBranch;
+	Core->PendingRecoveryInheritedSequence = inheritedSequence;
+	Core->PendingRecoveryBranch = TRUE;
+	Core->Building = 0;
+	Core->Phase = Cdp_CORE_PHASE_GENERAL;
+	publishedNodeCount = Core->MetaTree.NodeCount;
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	newTreeInitialized = FALSE;
+	CdpPreviewTreeFree(&oldTree);
+#ifndef Cdp_USERMODE
+	Cdp_LOG("[RECOVERY-DEFERRED] target view published target=%llu parent=%ld inherit=%llu pendingBranch=%ld nodes=%lu; no boot write issued\n",
+		effectiveTargetTime100ns,
+		parentBranch,
+		inheritedSequence,
+		newBranch,
+		publishedNodeCount);
+#endif
+	return STATUS_SUCCESS;
+
+failure:
+#ifndef Cdp_USERMODE
+	Cdp_LOG("[RECOVERY-DEFERRED-FAIL] stage=%s status=0x%08X requested=%llu effective=%llu parent=%ld inherit=%llu\n",
+		failureStage,
+		status,
+		TargetTime100ns,
+		effectiveTargetTime100ns,
+		parentBranch,
+		inheritedSequence);
+#endif
+	if (newTreeInitialized)
+		CdpPreviewTreeFree(&newTree);
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	Core->Building = 0;
+	Core->TargetTime100ns = previousTargetTime100ns;
+	Core->Phase = Cdp_CORE_PHASE_GENERAL;
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	return status;
+}
+
+NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns)
+{
+	Cdp_PREVIEW_TREE newTree;
+	Cdp_PREVIEW_TREE oldTree;
+	LONG parentBranch = 0;
+	LONG newBranch = 0;
+	UINT64 inheritedSequence = 0;
+	UINT64 effectiveTargetTime100ns;
+	UINT64 previousTargetTime100ns = 0;
+	ULONG publishedNodeCount = 0;
+	BOOLEAN branchCreated = FALSE;
+	BOOLEAN newTreeInitialized = FALSE;
+	const char* failureStage = "entry";
+	NTSTATUS status;
+
+	if (!Core)
+		return STATUS_INVALID_PARAMETER;
+	if (!Core->Journal->Mounted)
+		return STATUS_DEVICE_NOT_READY;
+	failureStage = "resolve-target-time";
+	status = CdpCoreResolveTargetTime(
+		Core, TargetTime100ns, &effectiveTargetTime100ns);
+	if (!NT_SUCCESS(status))
+	{
+#ifndef Cdp_USERMODE
+		Cdp_LOG("[RECOVERY-BEGIN-FAIL] stage=%s status=0x%08X requested=%llu\n",
+			failureStage, status, TargetTime100ns);
+#endif
+		return status;
+	}
+
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	if (Core->Phase != Cdp_CORE_PHASE_GENERAL ||
+		Core->PendingRecoveryBranch)
+	{
+		Cdp_LOCK_RELEASE(&Core->TreeLock);
+		return STATUS_INVALID_DEVICE_STATE;
+	}
+	if (Core->MergeActive)
+	{
+		Cdp_LOCK_RELEASE(&Core->TreeLock);
+		return STATUS_DEVICE_BUSY;
+	}
+	Core->Phase = Cdp_CORE_PHASE_RECOVERY;
+	Core->Building = 1;
+	previousTargetTime100ns = Core->TargetTime100ns;
+	Core->TargetTime100ns = effectiveTargetTime100ns;
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+
+	failureStage = "resolve-target-branch";
 	status = CdpJournalResolveTargetBranch(
 		Core->Journal,
 		effectiveTargetTime100ns,
@@ -1572,6 +1801,7 @@ NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100n
 	 * tree is complete before the new branch marker is appended, so Preview
 	 * and Recovery at the same time cannot diverge through different rebuild
 	 * algorithms. */
+	failureStage = "build-target-metatree";
 	status = CdpJournalBuildPreviewTree(
 		Core->Journal,
 		effectiveTargetTime100ns,
@@ -1594,6 +1824,7 @@ NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100n
 		goto failure;
 	}
 	newBranch = Core->Journal->HighestBranchNumber + 1;
+	failureStage = "append-new-branch";
 	status = CdpJournalAppendBranch(
 		Core->Journal,
 		newBranch,
@@ -1648,12 +1879,29 @@ NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100n
 	return STATUS_SUCCESS;
 
 failure:
+#ifndef Cdp_USERMODE
+	Cdp_LOG("[RECOVERY-BEGIN-FAIL] stage=%s status=0x%08X requested=%llu effective=%llu parent=%ld inherit=%llu newBranch=%ld treeInitialized=%u branchCreated=%u\n",
+		failureStage,
+		status,
+		TargetTime100ns,
+		effectiveTargetTime100ns,
+		parentBranch,
+		inheritedSequence,
+		newBranch,
+		newTreeInitialized ? 1u : 0u,
+		branchCreated ? 1u : 0u);
+#endif
 	if (newTreeInitialized)
 		CdpPreviewTreeFree(&newTree);
 	if (branchCreated)
 	{
 		NTSTATUS rollbackStatus = CdpJournalRollbackLatestBranch(
 			Core->Journal, newBranch);
+		#ifndef Cdp_USERMODE
+		if (!NT_SUCCESS(rollbackStatus))
+			Cdp_LOG("[RECOVERY-BEGIN-FAIL] stage=rollback-new-branch status=0x%08X branch=%ld originalStatus=0x%08X\n",
+				rollbackStatus, newBranch, status);
+		#endif
 		if (!NT_SUCCESS(rollbackStatus))
 			status = rollbackStatus;
 	}

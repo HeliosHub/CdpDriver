@@ -642,14 +642,24 @@ static NTSTATUS CdpJournalRawIo(
 	if (Journal->Store)
 	{
 		if (MajorFunction == IRP_MJ_READ)
-			return Journal->Store->Read(Journal->Store, Offset, Length, Buffer);
-		if (MajorFunction == IRP_MJ_WRITE)
-			return Journal->Store->Write(
+			status = Journal->Store->Read(
+				Journal->Store, Offset, Length, Buffer);
+		else if (MajorFunction == IRP_MJ_WRITE)
+			status = Journal->Store->Write(
 				Journal->Store,
 				Offset,
 				Length,
 				Buffer);
-		return STATUS_NOT_IMPLEMENTED;
+		else
+			status = STATUS_NOT_IMPLEMENTED;
+#ifndef Cdp_USERMODE
+		if (!NT_SUCCESS(status))
+		{
+			Cdp_LOG("[JOURNAL-RAW-FAIL] backend=store major=0x%02X status=0x%08X offset=%llu len=%lu\n",
+				MajorFunction, status, Offset, Length);
+		}
+#endif
+		return status;
 	}
 
 #ifndef Cdp_USERMODE
@@ -701,6 +711,15 @@ static NTSTATUS CdpJournalRawIo(
 			iosb.Information);
 		if (NT_SUCCESS(status) && iosb.Information != Length)
 			return STATUS_UNEXPECTED_IO_ERROR;
+		if (!NT_SUCCESS(status))
+		{
+			Cdp_LOG("[JOURNAL-RAW-FAIL] backend=physical major=0x%02X status=0x%08X partitionOffset=%llu diskOffset=%llu len=%lu\n",
+				MajorFunction,
+				status,
+				Offset,
+				(UINT64)byteOffset.QuadPart,
+				Length);
+		}
 		return status;
 	}
 
@@ -765,11 +784,105 @@ static NTSTATUS CdpJournalRawIo(
 
 	if (NT_SUCCESS(status) && iosb.Information != Length)
 		return STATUS_UNEXPECTED_IO_ERROR;
+	if (!NT_SUCCESS(status))
+	{
+		Cdp_LOG("[JOURNAL-RAW-FAIL] backend=device major=0x%02X status=0x%08X partitionOffset=%llu diskOffset=%llu len=%lu target=%p\n",
+			MajorFunction,
+			status,
+			Offset,
+			(UINT64)byteOffset.QuadPart,
+			Length,
+			Journal->TargetDevice);
+	}
 	Cdp_DBG("[JOURNAL-RAW] io end irp=%p status=0x%08X "
 		"bytes=%Iu\n",
 		irp,
 		status,
 		iosb.Information);
+		return status;
+	}
+#else
+	UNREFERENCED_PARAMETER(status);
+	return STATUS_DEVICE_NOT_READY;
+#endif
+}
+
+// Metadata can use the adjacent partition's volume stack while payload I/O
+// continues to use the disk stack and absolute offsets. This matters during
+// boot: the disk lower can already serve reads yet still reject a raw write
+// issued while a partition START_DEVICE is being completed.
+static NTSTATUS CdpJournalMetadataRawIo(
+	_In_ PCdp_JOURNAL Journal,
+	_In_ UCHAR MajorFunction,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_Inout_updates_bytes_(Length) PVOID Buffer)
+{
+	NTSTATUS status;
+
+	if (!Journal->MetadataTargetDevice || Journal->Store)
+		return CdpJournalRawIo(
+			Journal, MajorFunction, Offset, Length, Buffer);
+	if (!Buffer || Length == 0 ||
+		(Offset % Journal->SectorSize) != 0 ||
+		(Length % Journal->SectorSize) != 0 ||
+		Offset > Journal->PartitionSize ||
+		Length > Journal->PartitionSize - Offset ||
+		Journal->MetadataTargetBaseOffset > MAXUINT64 - Offset ||
+		Journal->MetadataTargetBaseOffset + Offset > MAXLONGLONG)
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+	if (MajorFunction == IRP_MJ_WRITE)
+	{
+		CdpJournalInvalidateHeaderWriteCacheRangeLocked(
+			Journal, Offset, Length);
+	}
+
+#ifndef Cdp_USERMODE
+	{
+		KEVENT event;
+		IO_STATUS_BLOCK iosb;
+		LARGE_INTEGER byteOffset;
+		PIRP irp;
+
+		byteOffset.QuadPart = (LONGLONG)(
+			Journal->MetadataTargetBaseOffset + Offset);
+		KeInitializeEvent(&event, NotificationEvent, FALSE);
+		RtlZeroMemory(&iosb, sizeof(iosb));
+		irp = IoBuildSynchronousFsdRequest(
+			MajorFunction,
+			Journal->MetadataTargetDevice,
+			Buffer,
+			Length,
+			&byteOffset,
+			&event,
+			&iosb);
+		if (!irp)
+			return STATUS_INSUFFICIENT_RESOURCES;
+		status = IoCallDriver(Journal->MetadataTargetDevice, irp);
+		if (status == STATUS_PENDING)
+		{
+			KeWaitForSingleObject(
+				&event, Executive, KernelMode, FALSE, NULL);
+			status = iosb.Status;
+		}
+		else if (NT_SUCCESS(status))
+		{
+			status = iosb.Status;
+		}
+		if (NT_SUCCESS(status) && iosb.Information != Length)
+			status = STATUS_UNEXPECTED_IO_ERROR;
+		if (!NT_SUCCESS(status))
+		{
+			Cdp_LOG("[JOURNAL-METADATA-FAIL] major=0x%02X status=0x%08X offset=%llu deviceOffset=%llu len=%lu target=%p\n",
+				MajorFunction,
+				status,
+				Offset,
+				(UINT64)byteOffset.QuadPart,
+				Length,
+				Journal->MetadataTargetDevice);
+		}
 		return status;
 	}
 #else
@@ -797,7 +910,7 @@ static NTSTATUS CdpJournalRawWriteSub(
 	NTSTATUS status;
 
 	if ((Offset % sec) == 0 && (Length % sec) == 0)
-		return CdpJournalRawIo(
+		return CdpJournalMetadataRawIo(
 			Journal,
 			IRP_MJ_WRITE,
 			Offset,
@@ -808,11 +921,13 @@ static NTSTATUS CdpJournalRawWriteSub(
 	if (!buf)
 		return STATUS_INSUFFICIENT_RESOURCES;
 
-	status = CdpJournalRawIo(Journal, IRP_MJ_READ, start, span, buf);
+	status = CdpJournalMetadataRawIo(
+		Journal, IRP_MJ_READ, start, span, buf);
 	if (NT_SUCCESS(status))
 	{
 		RtlCopyMemory(buf + (Offset - start), Data, Length);
-		status = CdpJournalRawIo(Journal, IRP_MJ_WRITE, start, span, buf);
+		status = CdpJournalMetadataRawIo(
+			Journal, IRP_MJ_WRITE, start, span, buf);
 	}
 	cdpfree(allocationBase);
 	return status;
@@ -828,15 +943,17 @@ static NTSTATUS CdpJournalFlush(_In_ PCdp_JOURNAL Journal)
 	KEVENT event;
 	IO_STATUS_BLOCK iosb;
 	PIRP irp;
+	PDEVICE_OBJECT flushDevice = Journal->MetadataTargetDevice ?
+		Journal->MetadataTargetDevice : Journal->TargetDevice;
 	NTSTATUS status;
 
-	if (!Journal->TargetDevice)
+	if (!flushDevice)
 		return STATUS_DEVICE_NOT_READY;
 	KeInitializeEvent(&event, NotificationEvent, FALSE);
 	RtlZeroMemory(&iosb, sizeof(iosb));
 	irp = IoBuildSynchronousFsdRequest(
 		IRP_MJ_FLUSH_BUFFERS,
-		Journal->TargetDevice,
+		flushDevice,
 		NULL,
 		0,
 		NULL,
@@ -844,7 +961,7 @@ static NTSTATUS CdpJournalFlush(_In_ PCdp_JOURNAL Journal)
 		&iosb);
 	if (!irp)
 		return STATUS_INSUFFICIENT_RESOURCES;
-	status = IoCallDriver(Journal->TargetDevice, irp);
+	status = IoCallDriver(flushDevice, irp);
 	if (status == STATUS_PENDING)
 	{
 		KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
@@ -920,6 +1037,13 @@ static NTSTATUS CdpJournalWriteSuperblockLocked(_Inout_ PCdp_JOURNAL Journal)
 		superblock->Credential = Journal->Credential;
 	superblock->CurrentBranchNumber = Journal->CurrentBranchNumber;
 	superblock->HighestBranchNumber = Journal->HighestBranchNumber;
+	superblock->DiskPartitionStyle = Journal->DiskPartitionStyle;
+	superblock->MbrSignature = Journal->MbrSignature;
+	superblock->DiskGuid = Journal->DiskGuid;
+	superblock->SourcePartitionStart = Journal->SourcePartitionStart;
+	superblock->SourcePartitionSize = Journal->SourcePartitionSize;
+	superblock->JournalPartitionStart = Journal->JournalPartitionStart;
+	superblock->JournalPartitionSize = Journal->JournalPartitionSize;
 	superblock->Crc32c = CdpCrc32c(
 		0,
 		superblock,
@@ -933,7 +1057,7 @@ static NTSTATUS CdpJournalWriteSuperblockLocked(_Inout_ PCdp_JOURNAL Journal)
 		superblock,
 		FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, MetadataCrc32c));
 
-	status = CdpJournalRawIo(
+	status = CdpJournalMetadataRawIo(
 		Journal,
 		IRP_MJ_WRITE,
 		0,
@@ -1022,7 +1146,7 @@ static NTSTATUS CdpJournalReadRegionLink(
 	if (!sector)
 		return STATUS_INSUFFICIENT_RESOURCES;
 
-	status = CdpJournalRawIo(
+	status = CdpJournalMetadataRawIo(
 		Journal,
 		IRP_MJ_READ,
 		RegionOff + Cdp_JOURNAL_HEADER_REGION_SIZE - Journal->SectorSize,
@@ -1091,7 +1215,7 @@ static NTSTATUS CdpJournalInitHeaderRegion(
 		ULONG remaining = Cdp_JOURNAL_HEADER_REGION_SIZE - offset;
 		ULONG transfer = chunk < remaining ? chunk : remaining;
 
-		status = CdpJournalRawIo(
+		status = CdpJournalMetadataRawIo(
 			Journal,
 			IRP_MJ_WRITE,
 			RegionOff + offset,
@@ -1195,7 +1319,7 @@ static NTSTATUS CdpJournalReadHeaderAt(
 		&allocationBase);
 	if (!sector)
 		return STATUS_INSUFFICIENT_RESOURCES;
-	status = CdpJournalRawIo(
+	status = CdpJournalMetadataRawIo(
 		Journal,
 		IRP_MJ_READ,
 		RegionOff + sectorOffset,
@@ -1232,7 +1356,7 @@ static NTSTATUS CdpJournalReadHeaderRegion(
 		ULONG remaining = Cdp_JOURNAL_HEADER_REGION_SIZE - offset;
 		ULONG transfer = chunk < remaining ? chunk : remaining;
 
-		status = CdpJournalRawIo(
+		status = CdpJournalMetadataRawIo(
 			Journal,
 			IRP_MJ_READ,
 			RegionOff + offset,
@@ -1291,7 +1415,7 @@ static NTSTATUS CdpJournalWriteHeaderAt(
 		Journal->HeaderWriteSectorOffset != sectorOffset)
 	{
 		Journal->HeaderWriteCacheValid = FALSE;
-		status = CdpJournalRawIo(
+		status = CdpJournalMetadataRawIo(
 			Journal,
 			IRP_MJ_READ,
 			sectorOffset,
@@ -1307,7 +1431,7 @@ static NTSTATUS CdpJournalWriteHeaderAt(
 		Journal->HeaderWriteBuffer + sectorByteOffset,
 		Header,
 		sizeof(*Header));
-	status = CdpJournalRawIo(
+	status = CdpJournalMetadataRawIo(
 		Journal,
 		IRP_MJ_WRITE,
 		sectorOffset,
@@ -2213,6 +2337,41 @@ VOID CdpJournalInitializeWithStore(
 	Cdp_LOCK_INIT(&Journal->Lock);
 }
 
+VOID CdpJournalSetMetadataDevice(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_opt_ PVOID TargetDevice,
+	_In_ UINT64 TargetBaseOffset)
+{
+	if (!Journal || Journal->Mounted)
+		return;
+	Journal->MetadataTargetDevice = TargetDevice;
+	Journal->MetadataTargetBaseOffset = TargetBaseOffset;
+}
+
+VOID CdpJournalSetPhysicalLayout(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ ULONG DiskPartitionStyle,
+	_In_ ULONG MbrSignature,
+	_In_ const GUID* DiskGuid,
+	_In_ UINT64 SourcePartitionStart,
+	_In_ UINT64 SourcePartitionSize,
+	_In_ UINT64 JournalPartitionStart,
+	_In_ UINT64 JournalPartitionSize)
+{
+	if (!Journal)
+		return;
+	Journal->DiskPartitionStyle = DiskPartitionStyle;
+	Journal->MbrSignature = MbrSignature;
+	if (DiskGuid)
+		Journal->DiskGuid = *DiskGuid;
+	else
+		RtlZeroMemory(&Journal->DiskGuid, sizeof(Journal->DiskGuid));
+	Journal->SourcePartitionStart = SourcePartitionStart;
+	Journal->SourcePartitionSize = SourcePartitionSize;
+	Journal->JournalPartitionStart = JournalPartitionStart;
+	Journal->JournalPartitionSize = JournalPartitionSize;
+}
+
 static BOOLEAN CdpJournalHasBackend(_In_ PCdp_JOURNAL Journal)
 {
 	return Journal->Store != NULL ||
@@ -2320,7 +2479,7 @@ NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal)
 		goto cleanup;
 	}
 
-	status = CdpJournalRawIo(
+	status = CdpJournalMetadataRawIo(
 		Journal,
 		IRP_MJ_READ,
 		0,
@@ -2341,6 +2500,13 @@ NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal)
 	Journal->CurrentBranchNumber = persistedCurrentBranch;
 	Journal->HighestBranchNumber = persistedHighestBranch;
 	Journal->SourceVolumeGuid = superblock->SourceVolumeGuid;
+	Journal->DiskPartitionStyle = superblock->DiskPartitionStyle;
+	Journal->MbrSignature = superblock->MbrSignature;
+	Journal->DiskGuid = superblock->DiskGuid;
+	Journal->SourcePartitionStart = superblock->SourcePartitionStart;
+	Journal->SourcePartitionSize = superblock->SourcePartitionSize;
+	Journal->JournalPartitionStart = superblock->JournalPartitionStart;
+	Journal->JournalPartitionSize = superblock->JournalPartitionSize;
 	Journal->RecoveryPending =
 		(superblock->Flags & Cdp_JOURNAL_FLAG_RECOVERY_PENDING) != 0;
 	Journal->RecoveryFsRepairPending =
@@ -2421,7 +2587,18 @@ static NTSTATUS CdpJournalAppendBranchLocked(
 		UINT64 newRegion = 0;
 		status = CdpJournalAllocateHeaderRegionLocked(Journal, &newRegion);
 		if (!NT_SUCCESS(status))
+		{
+#ifndef Cdp_USERMODE
+			Cdp_LOG("[RECOVERY-BRANCH-FAIL] stage=allocate-header-region status=0x%08X branch=%ld parent=%ld inherit=%llu payload=%llu lastRegion=%llu\n",
+				status,
+				BranchNumber,
+				ParentBranchNumber,
+				InheritedRecordSequence,
+				Journal->PayloadRegionOff,
+				Journal->LastHeaderRegionOff);
+#endif
 			return status;
+		}
 		newRegionAllocated = TRUE;
 	}
 	if (Journal->CurrentHeaderCount != 0)
@@ -2485,6 +2662,13 @@ static NTSTATUS CdpJournalAppendBranchLocked(
 	if (!NT_SUCCESS(status))
 	{
 		NTSTATUS discardStatus = STATUS_SUCCESS;
+#ifndef Cdp_USERMODE
+		Cdp_LOG("[RECOVERY-BRANCH-FAIL] stage=write-branch-header status=0x%08X branch=%ld region=%llu index=%lu\n",
+			status,
+			BranchNumber,
+			Journal->LastHeaderRegionOff,
+			Journal->CurrentHeaderCount);
+#endif
 		cdpfree(branchNode);
 		if (newRegionAllocated)
 			discardStatus = CdpJournalDiscardEmptyNewestRegionLocked(Journal);
@@ -2518,14 +2702,46 @@ static NTSTATUS CdpJournalAppendBranchLocked(
 	if (Journal->SuperblockDirty)
 	{
 		status = CdpJournalFlush(Journal);
+		if (!NT_SUCCESS(status))
+		{
+#ifndef Cdp_USERMODE
+			Cdp_LOG("[RECOVERY-BRANCH-FAIL] stage=pre-superblock-flush status=0x%08X branch=%ld\n",
+				status, BranchNumber);
+#endif
+		}
 		if (NT_SUCCESS(status))
+		{
 			status = CdpJournalWriteSuperblockLocked(Journal);
+			if (!NT_SUCCESS(status))
+			{
+#ifndef Cdp_USERMODE
+				Cdp_LOG("[RECOVERY-BRANCH-FAIL] stage=write-superblock status=0x%08X branch=%ld\n",
+					status, BranchNumber);
+#endif
+			}
+		}
 		if (NT_SUCCESS(status))
+		{
 			status = CdpJournalFlush(Journal);
+			if (!NT_SUCCESS(status))
+			{
+#ifndef Cdp_USERMODE
+				Cdp_LOG("[RECOVERY-BRANCH-FAIL] stage=post-superblock-flush status=0x%08X branch=%ld\n",
+					status, BranchNumber);
+#endif
+			}
+		}
 	}
 	else
 	{
 		status = CdpJournalFlush(Journal);
+		if (!NT_SUCCESS(status))
+		{
+#ifndef Cdp_USERMODE
+			Cdp_LOG("[RECOVERY-BRANCH-FAIL] stage=branch-flush status=0x%08X branch=%ld\n",
+				status, BranchNumber);
+#endif
+		}
 	}
 	return status;
 }
@@ -2875,7 +3091,7 @@ NTSTATUS CdpJournalInvalidate(_Inout_ PCdp_JOURNAL Journal)
 	}
 
 	RtlZeroMemory(sector, Journal->SectorSize);
-	status = CdpJournalRawIo(
+	status = CdpJournalMetadataRawIo(
 		Journal,
 		IRP_MJ_WRITE,
 		0,

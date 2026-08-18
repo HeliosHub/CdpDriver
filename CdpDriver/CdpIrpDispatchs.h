@@ -23,6 +23,7 @@ NTSTATUS CdpIrpDispatchCreateClose(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIR
 NTSTATUS CdpIrpDispatchRead(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
 
 NTSTATUS CdpIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
+NTSTATUS CdpIrpDispatchShutdown(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
 
 NTSTATUS CdpIrpDispatchPnp(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp);
 
@@ -36,23 +37,9 @@ VOID CdpCloseAllVolumeHandles(_In_ PCdp_DRIVER_EXTENSION DriverExt);
 
 VOID CdpCloseAllPreviewSessions(_In_ PCdp_DRIVER_EXTENSION DriverExt);
 
-VOID CdpInitializeAutoDiscovery(_Inout_ PCdp_DRIVER_EXTENSION DriverExt);
-
-// Queue an immediate scan (safe at DISPATCH_LEVEL). Prefer calling from
-// IRP_MN_START_DEVICE so CDP arms before volume traffic.
-VOID CdpQueueAutoDiscovery(_Inout_ PCdp_DRIVER_EXTENSION DriverExt);
-
-VOID CdpScheduleAutoDiscovery(_Inout_ PCdp_DRIVER_EXTENSION DriverExt);
-
-VOID CdpStopAutoDiscovery(_Inout_ PCdp_DRIVER_EXTENSION DriverExt);
-
 NTSTATUS CdpStartCaptureWorker(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
 
 VOID CdpStopCaptureWorker(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
-
-NTSTATUS CdpStartRecoveryReadWorker(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
-
-VOID CdpStopRecoveryReadWorker(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
 
 // Disable capture, wait for its worker to leave Core, then release Core.
 // This routine must be used before a filter device is removed or reconfigured.

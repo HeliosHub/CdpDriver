@@ -38,24 +38,6 @@ static Cdp_DEVICE_KIND CdpGetAttachedDeviceKind(
 	return Cdp_DEVICE_KIND_UNKNOWN;
 }
 
-static VOID CdpBootDriverReinitialize(
-	_In_ PDRIVER_OBJECT DriverObject,
-	_In_opt_ PVOID Context,
-	_In_ ULONG Count)
-{
-	PCdp_DRIVER_EXTENSION driverExtension =
-		(PCdp_DRIVER_EXTENSION)Context;
-
-	UNREFERENCED_PARAMETER(DriverObject);
-	UNREFERENCED_PARAMETER(Count);
-	if (!driverExtension)
-		return;
-
-	InterlockedExchange(&driverExtension->BootEnumerationComplete, 1);
-	Cdp_LOG("[AUTO-CDP] boot volume enumeration complete; starting gated full scan\n");
-	CdpQueueAutoDiscovery(driverExtension);
-}
-
 VOID CdpDeleteFilterDevice(_In_ PDEVICE_OBJECT FilterDeviceObject)
 {
 	PCdp_DEVICE_EXTENSION DevExt = FilterDeviceObject->DeviceExtension;
@@ -164,20 +146,10 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 		NotificationEvent, TRUE);
 	InterlockedExchange(&DeviceExtension->DiskIoAccepting, 0);
 	InterlockedExchange(&DeviceExtension->DiskIoOutstanding, 0);
-	KeInitializeSpinLock(&DeviceExtension->RecoveryReadQueueLock);
-	InitializeListHead(&DeviceExtension->RecoveryReadQueue);
-	KeInitializeEvent(&DeviceExtension->RecoveryReadEvent, NotificationEvent, FALSE);
+	InterlockedExchange(&DeviceExtension->ShutdownInProgress, 0);
 	KeInitializeEvent(&DeviceExtension->MergeThreadDoneEvent,
 		NotificationEvent, TRUE);
 	KeInitializeMutex(&DeviceExtension->HistoryMutex, 0);
-	ExInitializeRundownProtection(&DeviceExtension->AutoDiscoveryRundown);
-	InterlockedExchange(
-		&DeviceExtension->AutoDiscoveryGateActive,
-		deviceKind == Cdp_DEVICE_KIND_VOLUME ? 1 : 0);
-	InterlockedExchange(&DeviceExtension->RebootRecoveryGateRequired, 0);
-	KeInitializeEvent(&DeviceExtension->AutoDiscoveryGateEvent,
-		NotificationEvent,
-		deviceKind == Cdp_DEVICE_KIND_VOLUME ? FALSE : TRUE);
 	DeviceExtension->SectorSize = Cdp_SECTOR_SIZE_DEFAULT;
 	InterlockedExchange(&DeviceExtension->Phase, Cdp_PHASE_GENERAL);
 
@@ -189,12 +161,6 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 	if (deviceKind == Cdp_DEVICE_KIND_DISK)
 	{
 		Status = CdpStartCaptureWorker(DeviceExtension);
-		if (!NT_SUCCESS(Status))
-			goto cleanup;
-	}
-	else if (deviceKind == Cdp_DEVICE_KIND_VOLUME)
-	{
-		Status = CdpStartRecoveryReadWorker(DeviceExtension);
 		if (!NT_SUCCESS(Status))
 			goto cleanup;
 	}
@@ -215,13 +181,10 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 		FilterDeviceObject,
 		DeviceExtension->LowerDeviceObject,
 		PhysicalDeviceObject);
-	CdpScheduleAutoDiscovery(DriverExtension);
 
 cleanup:
 	if (!NT_SUCCESS(Status) && FilterDeviceObject)
 	{
-		if (DeviceExtension)
-			CdpStopRecoveryReadWorker(DeviceExtension);
 		if (DeviceExtension)
 			CdpStopCaptureWorker(DeviceExtension);
 		if (DeviceExtension && DeviceExtension->LowerDeviceObject)
@@ -246,7 +209,6 @@ VOID CdpDriverUnload(_In_ PDRIVER_OBJECT DriverObject)
 
 	// Preview sessions own source-volume handles and can call into Core.  Tear
 	// them down before any filter device/Core is removed.
-	CdpStopAutoDiscovery(DriverExtension);
 	CdpCloseAllPreviewSessions(DriverExtension);
 
 	while (TRUE)
@@ -305,7 +267,6 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 	InitializeListHead(&DriverExtension->PreviewSessionList);
 	ExInitializeFastMutex(&DriverExtension->PreviewSessionMutex);
 	DriverExtension->PreviewSessionNextId = 0;
-	CdpInitializeAutoDiscovery(DriverExtension);
 
 	Status = CdpCreateControlDevice(DriverObject);
 	if (!NT_SUCCESS(Status))
@@ -318,18 +279,11 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 	DriverObject->MajorFunction[IRP_MJ_POWER] = CdpIrpDispatchPower;
 	DriverObject->MajorFunction[IRP_MJ_READ] = CdpIrpDispatchRead;
 	DriverObject->MajorFunction[IRP_MJ_WRITE] = CdpIrpDispatchWrite;
+	DriverObject->MajorFunction[IRP_MJ_SHUTDOWN] = CdpIrpDispatchShutdown;
 	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = CdpIrpDispatchDeviceControl;
 	DriverObject->MajorFunction[IRP_MJ_CREATE] = CdpIrpDispatchCreateClose;
 	DriverObject->MajorFunction[IRP_MJ_CLOSE] = CdpIrpDispatchCreateClose;
 	DriverObject->DriverExtension->AddDevice = CdpAddDevice;
-
-	// All volume devices start with their data-I/O gate closed.  Waiting for
-	// this I/O-manager milestone prevents a source that enumerates before its
-	// journal from being mistaken for an ordinary volume and released early.
-	IoRegisterBootDriverReinitialization(
-		DriverObject,
-		CdpBootDriverReinitialize,
-		DriverExtension);
 
 cleanup:
 	if (!NT_SUCCESS(Status))

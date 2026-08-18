@@ -7,16 +7,11 @@
 #include <ntstrsafe.h>
 
 static VOID CdpDisableAllCaptureSources(_In_ PCdp_DRIVER_EXTENSION DriverExt);
-static VOID CdpCloseAutoDiscoveryGate(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
-static VOID CdpOpenAutoDiscoveryGate(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
 static NTSTATUS CdpStartMergeThread(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
 static VOID CdpStopMergeThread(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
 static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
 static NTSTATUS CdpDrainAndDisableCapture(
 	_Inout_ PCdp_DEVICE_EXTENSION DevExt);
-static NTSTATUS CdpQueueVolumeGateIrp(
-	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
-	_Inout_ PIRP Irp);
 static NTSTATUS CdpScatterReadMdlChain(
 	_In_ PIRP Irp,
 	_In_reads_bytes_(Length) const UCHAR* Source,
@@ -44,6 +39,14 @@ static PCdp_DEVICE_EXTENSION CdpFindDiskExtensionByNumber(
 static PCdp_DEVICE_EXTENSION CdpFindSourceExtensionByGuid(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const GUID* VolumeGuid);
+static PCdp_DEVICE_EXTENSION CdpFindVolumeExtensionByLowerDevice(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ PDEVICE_OBJECT LowerDevice);
+static PDEVICE_OBJECT CdpReferenceVolumeLowerByPhysicalRange(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ ULONG DiskNumber,
+	_In_ UINT64 PartitionStart,
+	_In_ UINT64 PartitionSize);
 static UINT64 CdpFindJournalHandleBySourceGuid(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const GUID* SourceVolumeGuid);
@@ -54,7 +57,12 @@ static NTSTATUS CdpQueryPhysicalPartitionLayout(
 	_Out_ PUINT64 PartitionStart,
 	_Out_ PUINT64 PartitionLength,
 	_Out_ PBOOLEAN HasNextPartition,
-	_Out_ PUINT64 NextPartitionStart);
+	_Out_ PUINT64 NextPartitionStart,
+	_Out_opt_ PULONG NextPartitionNumber,
+	_Out_opt_ PUINT64 NextPartitionLength,
+	_Out_opt_ PULONG DiskPartitionStyle,
+	_Out_opt_ PULONG MbrSignature,
+	_Out_opt_ GUID* DiskGuid);
 
 static NTSTATUS CdpValidateProtectionObjectGraph(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
@@ -95,8 +103,7 @@ static NTSTATUS CdpValidateProtectionObjectGraph(
 	else if (InterlockedCompareExchange(
 			&journalEntry->ReferenceCount, 0, 0) <= 0 || journalEntry->Closing)
 		reason = "redirect-entry-lifetime";
-	else if (!journalEntry->TargetLowerDevice ||
-		!journalEntry->VolumeLowerDevice)
+	else if (!journalEntry->TargetLowerDevice)
 		reason = "journal-device";
 	else if (!journalEntry->Journal.Mounted)
 		reason = "journal-not-mounted";
@@ -590,11 +597,6 @@ static NTSTATUS CdpGetSharedCredential(
 	ExReleaseFastMutex(&DriverExt->VolumeHandleMutex);
 	if (JournalCount)
 		*JournalCount = count;
-	if (status == STATUS_NOT_FOUND &&
-		InterlockedCompareExchange(&DriverExt->AutoDiscoverySettled, 0, 0) == 0)
-	{
-		return STATUS_DEVICE_NOT_READY;
-	}
 	return status;
 }
 
@@ -747,6 +749,11 @@ static VOID CdpCloseVolumeHandleEntry(_In_ PCdp_VOLUME_HANDLE_ENTRY Item)
 		CdpJournalClose(&Item->Journal);
 	if (Item->FileHandle)
 		ZwClose(Item->FileHandle);
+	if (Item->MetadataLowerDeviceReference)
+	{
+		ObDereferenceObject(Item->MetadataLowerDeviceReference);
+		Item->MetadataLowerDeviceReference = NULL;
+	}
 	cdpfree(Item);
 }
 
@@ -784,6 +791,11 @@ static NTSTATUS CdpOpenVolumeHandle(
 	UINT64 refreshedPartitionStart = 0;
 	UINT64 refreshedPartitionSize = 0;
 	UINT64 refreshedNextPartitionStart = 0;
+	UINT64 refreshedNextPartitionSize = 0;
+	ULONG refreshedNextPartitionNumber = 0;
+	ULONG refreshedPartitionStyle = PARTITION_STYLE_RAW;
+	ULONG refreshedMbrSignature = 0;
+	GUID refreshedDiskGuid = { 0 };
 	BOOLEAN refreshedHasNextPartition = FALSE;
 
 	*OutHandleId = 0;
@@ -858,7 +870,24 @@ static NTSTATUS CdpOpenVolumeHandle(
 	volumeExt = CdpFindSourceExtensionByGuid(DriverExt, VolumeGuid);
 	if (!volumeExt)
 	{
-		Cdp_LOG("volume physical mapping unavailable\n");
+		/* A volume GUID is not guaranteed to be available while its
+		 * START_DEVICE IRP is held.  CdpResolveTargetLowerDevice already
+		 * resolved this opened volume through our attachment, so the exact
+		 * lower-device pointer is an unambiguous same-boot fallback. */
+		volumeExt = CdpFindVolumeExtensionByLowerDevice(
+			DriverExt, volumeLower);
+		if (volumeExt)
+		{
+			volumeExt->VolumeGuid = *VolumeGuid;
+			volumeExt->VolumeGuidValid = TRUE;
+			Cdp_LOG("[VOLUME-MAP] GUID cache miss recovered by lower-device mapping filter=%p lower=%p\n",
+				volumeExt->FilterDeviceObject, volumeLower);
+		}
+	}
+	if (!volumeExt)
+	{
+		Cdp_LOG("volume physical mapping unavailable guid/lower filter lookup failed lower=%p\n",
+			volumeLower);
 		ZwClose(fileHandle);
 		cdpfree(item);
 		return STATUS_DEVICE_NOT_READY;
@@ -873,7 +902,12 @@ static NTSTATUS CdpOpenVolumeHandle(
 		&refreshedPartitionStart,
 		&refreshedPartitionSize,
 		&refreshedHasNextPartition,
-		&refreshedNextPartitionStart);
+		&refreshedNextPartitionStart,
+		&refreshedNextPartitionNumber,
+		&refreshedNextPartitionSize,
+		&refreshedPartitionStyle,
+		&refreshedMbrSignature,
+		&refreshedDiskGuid);
 	if (!NT_SUCCESS(Status) || refreshedPartitionSize == 0)
 	{
 		Cdp_LOG("[CMD1-LAYOUT] live partition query failed status=0x%08X\n",
@@ -914,6 +948,11 @@ static NTSTATUS CdpOpenVolumeHandle(
 	volumeExt->PartitionSize = item->PartitionSize;
 	volumeExt->HasNextPartition = refreshedHasNextPartition;
 	volumeExt->NextPartitionStart = refreshedNextPartitionStart;
+	volumeExt->NextPartitionNumber = refreshedNextPartitionNumber;
+	volumeExt->NextPartitionSize = refreshedNextPartitionSize;
+	volumeExt->DiskPartitionStyle = refreshedPartitionStyle;
+	volumeExt->MbrSignature = refreshedMbrSignature;
+	volumeExt->DiskGuid = refreshedDiskGuid;
 	volumeExt->DiskLayoutValid = TRUE;
 
 	diskExt = CdpFindDiskExtensionByNumber(DriverExt, refreshedDiskNumber);
@@ -1050,6 +1089,102 @@ static PCdp_DEVICE_EXTENSION CdpFindSourceExtensionByGuid(
 				&ext->VolumeGuid,
 				VolumeGuid,
 				sizeof(GUID)) == sizeof(GUID))
+		{
+			found = ext;
+			break;
+		}
+	}
+	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
+	return found;
+}
+
+static PCdp_DEVICE_EXTENSION CdpFindVolumeExtensionByLowerDevice(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ PDEVICE_OBJECT LowerDevice)
+{
+	KIRQL oldIrql;
+	PLIST_ENTRY entry;
+	PCdp_DEVICE_EXTENSION found = NULL;
+
+	if (!DriverExt || !LowerDevice)
+		return NULL;
+	KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &oldIrql);
+	for (entry = DriverExt->DeviceObjectListHead.Flink;
+		entry != &DriverExt->DeviceObjectListHead;
+		entry = entry->Flink)
+	{
+		PCdp_DEVICE_LIST_NODE node =
+			CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
+		PCdp_DEVICE_EXTENSION ext =
+			(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
+		if (ext && ext->DeviceKind == Cdp_DEVICE_KIND_VOLUME &&
+			ext->LowerDeviceObject == LowerDevice)
+		{
+			found = ext;
+			break;
+		}
+	}
+	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
+	return found;
+}
+
+static PDEVICE_OBJECT CdpReferenceVolumeLowerByPhysicalRange(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ ULONG DiskNumber,
+	_In_ UINT64 PartitionStart,
+	_In_ UINT64 PartitionSize)
+{
+	KIRQL oldIrql;
+	PLIST_ENTRY entry;
+	PDEVICE_OBJECT lower = NULL;
+
+	if (!DriverExt || PartitionSize == 0)
+		return NULL;
+	KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &oldIrql);
+	for (entry = DriverExt->DeviceObjectListHead.Flink;
+		entry != &DriverExt->DeviceObjectListHead;
+		entry = entry->Flink)
+	{
+		PCdp_DEVICE_LIST_NODE node =
+			CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
+		PCdp_DEVICE_EXTENSION ext =
+			(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
+		if (ext && ext->DeviceKind == Cdp_DEVICE_KIND_VOLUME &&
+			InterlockedCompareExchange(&ext->Started, 0, 0) != 0 &&
+			ext->DiskLayoutValid && ext->LowerDeviceObject &&
+			ext->DiskNumber == DiskNumber &&
+			ext->PartitionStart == PartitionStart &&
+			ext->PartitionSize >= PartitionSize)
+		{
+			lower = ext->LowerDeviceObject;
+			ObReferenceObject(lower);
+			break;
+		}
+	}
+	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
+	return lower;
+}
+
+static PCdp_DEVICE_EXTENSION CdpFindDiskExtensionByNumber(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ ULONG DiskNumber)
+{
+	KIRQL oldIrql;
+	PLIST_ENTRY entry;
+	PCdp_DEVICE_EXTENSION found = NULL;
+
+	KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &oldIrql);
+	for (entry = DriverExt->DeviceObjectListHead.Flink;
+		entry != &DriverExt->DeviceObjectListHead;
+		entry = entry->Flink)
+	{
+		PCdp_DEVICE_LIST_NODE node =
+			CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
+		PCdp_DEVICE_EXTENSION ext =
+			(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
+		if (ext && ext->DeviceKind == Cdp_DEVICE_KIND_DISK &&
+			InterlockedCompareExchange(&ext->Started, 0, 0) != 0 &&
+			ext->DiskLayoutValid && ext->DiskNumber == DiskNumber)
 		{
 			found = ext;
 			break;
@@ -1205,14 +1340,12 @@ static NTSTATUS CdpConfigureCaptureInternal(
 		return STATUS_DEVICE_BUSY;
 	}
 	CdpDisableAndDestroyCapture(sourceExt);
-	CdpCloseAutoDiscoveryGate(sourceExt);
 
 	status = CdpOpenVolumeHandle(DriverExt, JournalPartitionGuid, &journalHandleId);
 	if (!NT_SUCCESS(status))
 	{
 		Cdp_LOG("[CMD1-STAGE] journal volume open failed status=0x%08X\n",
 			status);
-		CdpOpenAutoDiscoveryGate(sourceExt);
 		return status;
 	}
 
@@ -1224,7 +1357,6 @@ static NTSTATUS CdpConfigureCaptureInternal(
 	if (!journalEntry)
 	{
 		(void)CdpCloseVolumeHandle(DriverExt, journalHandleId);
-		CdpOpenAutoDiscoveryGate(sourceExt);
 		return STATUS_INVALID_HANDLE;
 	}
 
@@ -1260,7 +1392,6 @@ static NTSTATUS CdpConfigureCaptureInternal(
 			sourceLower == journalEntry->TargetLowerDevice ? 1u : 0u);
 		CdpReleaseVolumeHandleEntry(journalEntry);
 		(void)CdpCloseVolumeHandle(DriverExt, journalHandleId);
-		CdpOpenAutoDiscoveryGate(sourceExt);
 		return STATUS_DEVICE_CONFIGURATION_ERROR;
 	}
 	Cdp_LOG("[CMD1-LAYOUT] accepted source disk=%lu part=%lu start=%llu size=%llu end=%llu; journal part=%lu start=%llu size=%llu\n",
@@ -1284,13 +1415,21 @@ static NTSTATUS CdpConfigureCaptureInternal(
 		journalEntry->PartitionSize,
 		journalEntry->SectorSize,
 		SourceVolumeGuid);
+	CdpJournalSetPhysicalLayout(
+		&journalEntry->Journal,
+		sourceExt->DiskPartitionStyle,
+		sourceExt->MbrSignature,
+		&sourceExt->DiskGuid,
+		sourcePartitionStart,
+		sourcePartitionSize,
+		journalEntry->TargetBaseOffset,
+		journalEntry->PartitionSize);
 	if (FormatJournal)
 	{
 		if (!Credential)
 		{
 			CdpReleaseVolumeHandleEntry(journalEntry);
 			(void)CdpCloseVolumeHandle(DriverExt, journalHandleId);
-			CdpOpenAutoDiscoveryGate(sourceExt);
 			return STATUS_PASSWORD_RESTRICTION;
 		}
 		status = CdpJournalSetCredential(&journalEntry->Journal, Credential);
@@ -1298,7 +1437,6 @@ static NTSTATUS CdpConfigureCaptureInternal(
 		{
 			CdpReleaseVolumeHandleEntry(journalEntry);
 			(void)CdpCloseVolumeHandle(DriverExt, journalHandleId);
-			CdpOpenAutoDiscoveryGate(sourceExt);
 			return status;
 		}
 	}
@@ -1324,7 +1462,6 @@ static NTSTATUS CdpConfigureCaptureInternal(
 			journalEntry->PartitionSize);
 		CdpReleaseVolumeHandleEntry(journalEntry);
 		(void)CdpCloseVolumeHandle(DriverExt, journalHandleId);
-		CdpOpenAutoDiscoveryGate(sourceExt);
 		return status;
 	}
 
@@ -1368,7 +1505,6 @@ static NTSTATUS CdpConfigureCaptureInternal(
 				CdpDevStoreDestroy(sourceStore);
 			CdpReleaseVolumeHandleEntry(journalEntry);
 			(void)CdpCloseVolumeHandle(DriverExt, journalHandleId);
-			CdpOpenAutoDiscoveryGate(sourceExt);
 			return status;
 		}
 	}
@@ -1383,7 +1519,6 @@ static NTSTATUS CdpConfigureCaptureInternal(
 		sourceExt->JournalHandleId = 0;
 		CdpDisableAndDestroyCapture(sourceExt);
 		(void)CdpCloseVolumeHandle(DriverExt, journalHandleId);
-		CdpOpenAutoDiscoveryGate(sourceExt);
 		return status;
 	}
 
@@ -1394,7 +1529,6 @@ static NTSTATUS CdpConfigureCaptureInternal(
 	Cdp_LOG("[PROTECTED-READ-AUDIT] reset protection enabled sourceExt=%p\n",
 		sourceExt);
 	Cdp_LOG("[DISK-UPPER] protection enabled: writes redirect to journal; MetaTree current-view reads active\n");
-	CdpOpenAutoDiscoveryGate(sourceExt);
 
 	*JournalHandleId = journalHandleId;
 	Cdp_LOG("[COW] configured journalHandle=%llu size=%llu sector=%lu sourceExt=%p\n",
@@ -1487,7 +1621,12 @@ static NTSTATUS CdpActivateAutoJournal(
 		&livePartitionStart,
 		&livePartitionSize,
 		&liveHasNextPartition,
-		&liveNextPartitionStart);
+		&liveNextPartitionStart,
+		&sourceExt->NextPartitionNumber,
+		&sourceExt->NextPartitionSize,
+		&sourceExt->DiskPartitionStyle,
+		&sourceExt->MbrSignature,
+		&sourceExt->DiskGuid);
 	if (!NT_SUCCESS(status) || livePartitionSize == 0)
 	{
 		Cdp_LOG("[AUTO-LAYOUT] source refresh failed status=0x%08X\n",
@@ -1627,14 +1766,7 @@ static BOOLEAN CdpGuidIsEqual(_In_ const GUID* A, _In_ const GUID* B)
 	return RtlCompareMemory(A, B, sizeof(GUID)) == sizeof(GUID);
 }
 
-#define Cdp_AUTO_KIND_UNKNOWN 0
-#define Cdp_AUTO_KIND_SOURCE  1
-#define Cdp_AUTO_KIND_JOURNAL 2
-
-// One pass is scheduled every 100 ms.  A three-second quiet window prevents
-// a source from being mounted raw while its journal volume is still starting.
-#define Cdp_AUTO_DISCOVERY_STABLE_PASSES_REQUIRED 30
-#define Cdp_AUTO_DISCOVERY_LAYOUT_MAX_PARTITIONS 256
+#define Cdp_PARTITION_LAYOUT_MAX_PARTITIONS 256
 
 static NTSTATUS CdpQueryPhysicalPartitionLayout(
 	_In_ PDEVICE_OBJECT PartitionDevice,
@@ -1643,7 +1775,12 @@ static NTSTATUS CdpQueryPhysicalPartitionLayout(
 	_Out_ PUINT64 PartitionStart,
 	_Out_ PUINT64 PartitionLength,
 	_Out_ PBOOLEAN HasNextPartition,
-	_Out_ PUINT64 NextPartitionStart)
+	_Out_ PUINT64 NextPartitionStart,
+	_Out_opt_ PULONG NextPartitionNumber,
+	_Out_opt_ PUINT64 NextPartitionLength,
+	_Out_opt_ PULONG DiskPartitionStyle,
+	_Out_opt_ PULONG MbrSignature,
+	_Out_opt_ GUID* DiskGuid)
 {
 	STORAGE_DEVICE_NUMBER deviceNumber;
 	PARTITION_INFORMATION_EX partitionInfo;
@@ -1656,6 +1793,8 @@ static NTSTATUS CdpQueryPhysicalPartitionLayout(
 	NTSTATUS status;
 	ULONG index;
 	UINT64 nextStart = MAXULONGLONG;
+	UINT64 nextLength = 0;
+	ULONG nextNumber = 0;
 	UINT64 layoutPartitionLength = 0;
 	BOOLEAN exactPartitionFound = FALSE;
 
@@ -1665,6 +1804,16 @@ static NTSTATUS CdpQueryPhysicalPartitionLayout(
 	*PartitionLength = 0;
 	*HasNextPartition = FALSE;
 	*NextPartitionStart = 0;
+	if (NextPartitionNumber)
+		*NextPartitionNumber = 0;
+	if (NextPartitionLength)
+		*NextPartitionLength = 0;
+	if (DiskPartitionStyle)
+		*DiskPartitionStyle = PARTITION_STYLE_RAW;
+	if (MbrSignature)
+		*MbrSignature = 0;
+	if (DiskGuid)
+		RtlZeroMemory(DiskGuid, sizeof(*DiskGuid));
 	RtlZeroMemory(&deviceNumber, sizeof(deviceNumber));
 	RtlZeroMemory(&partitionInfo, sizeof(partitionInfo));
 
@@ -1685,7 +1834,7 @@ static NTSTATUS CdpQueryPhysicalPartitionLayout(
 		return NT_SUCCESS(status) ? STATUS_DATA_ERROR : status;
 
 	layoutBytes = FIELD_OFFSET(DRIVE_LAYOUT_INFORMATION_EX, PartitionEntry) +
-		Cdp_AUTO_DISCOVERY_LAYOUT_MAX_PARTITIONS * sizeof(PARTITION_INFORMATION_EX);
+		Cdp_PARTITION_LAYOUT_MAX_PARTITIONS * sizeof(PARTITION_INFORMATION_EX);
 	layout = (PDRIVE_LAYOUT_INFORMATION_EX)cdpalloc(layoutBytes);
 	if (!layout)
 		return STATUS_INSUFFICIENT_RESOURCES;
@@ -1725,8 +1874,14 @@ static NTSTATUS CdpQueryPhysicalPartitionLayout(
 	if (NT_SUCCESS(status))
 	{
 		ULONG count = layout->PartitionCount;
-		if (count > Cdp_AUTO_DISCOVERY_LAYOUT_MAX_PARTITIONS)
-			count = Cdp_AUTO_DISCOVERY_LAYOUT_MAX_PARTITIONS;
+		if (DiskPartitionStyle)
+			*DiskPartitionStyle = layout->PartitionStyle;
+		if (layout->PartitionStyle == PARTITION_STYLE_MBR && MbrSignature)
+			*MbrSignature = layout->Mbr.Signature;
+		if (layout->PartitionStyle == PARTITION_STYLE_GPT && DiskGuid)
+			*DiskGuid = layout->Gpt.DiskId;
+		if (count > Cdp_PARTITION_LAYOUT_MAX_PARTITIONS)
+			count = Cdp_PARTITION_LAYOUT_MAX_PARTITIONS;
 		for (index = 0; index < count; ++index)
 		{
 			PPARTITION_INFORMATION_EX candidate = &layout->PartitionEntry[index];
@@ -1753,6 +1908,8 @@ static NTSTATUS CdpQueryPhysicalPartitionLayout(
 				candidateStart < nextStart)
 			{
 				nextStart = candidateStart;
+				nextLength = (UINT64)candidate->PartitionLength.QuadPart;
+				nextNumber = candidate->PartitionNumber;
 			}
 		}
 	}
@@ -1775,998 +1932,262 @@ static NTSTATUS CdpQueryPhysicalPartitionLayout(
 	{
 		*HasNextPartition = TRUE;
 		*NextPartitionStart = nextStart;
+		if (NextPartitionNumber)
+			*NextPartitionNumber = nextNumber;
+		if (NextPartitionLength)
+			*NextPartitionLength = nextLength;
 	}
 	return STATUS_SUCCESS;
 }
 
-static VOID CdpMarkAutoDiscoverySettled(_Inout_ PCdp_DRIVER_EXTENSION DriverExt)
+static BOOLEAN CdpAutoDiskIdentityMatches(
+	_In_ PCdp_DEVICE_EXTENSION SourceExt,
+	_In_ PCdp_JOURNAL Journal)
 {
-	InterlockedExchange(&DriverExt->AutoDiscoverySettled, 1);
-	KeSetEvent(&DriverExt->AutoDiscoverySettledEvent, IO_NO_INCREMENT, FALSE);
-}
-
-static VOID CdpCloseAutoDiscoveryGate(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
-{
-	if (!DevExt)
-		return;
-	InterlockedExchange(&DevExt->AutoDiscoveryGateActive, 1);
-	KeClearEvent(&DevExt->AutoDiscoveryGateEvent);
-}
-
-static VOID CdpOpenAutoDiscoveryGate(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
-{
-	LONG wasActive;
-
-	if (!DevExt)
-		return;
-	wasActive = InterlockedExchange(&DevExt->AutoDiscoveryGateActive, 0);
-	KeSetEvent(&DevExt->AutoDiscoveryGateEvent, IO_NO_INCREMENT, FALSE);
-	if (wasActive != 0 && DevExt->DeviceKind == Cdp_DEVICE_KIND_VOLUME)
+	if (Journal->DiskPartitionStyle != SourceExt->DiskPartitionStyle)
+		return FALSE;
+	if (SourceExt->DiskPartitionStyle == PARTITION_STYLE_GPT)
 	{
-		Cdp_LOG("[AUTO-CDP] volume I/O gate opened filter=%p disk=%lu part=%lu capture=%ld core=%p\n",
-			DevExt->FilterDeviceObject,
-			DevExt->DiskNumber,
-			DevExt->PartitionNumber,
-			InterlockedCompareExchange(&DevExt->CaptureEnabled, 0, 0),
-			DevExt->Core);
+		return !CdpGuidIsZero(&Journal->DiskGuid) &&
+			CdpGuidIsEqual(&Journal->DiskGuid, &SourceExt->DiskGuid);
 	}
-}
-
-static VOID CdpOpenAllAutoDiscoveryGates(_Inout_ PCdp_DRIVER_EXTENSION DriverExt)
-{
-	KIRQL oldIrql;
-	PLIST_ENTRY entry;
-
-	KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &oldIrql);
-	for (entry = DriverExt->DeviceObjectListHead.Flink;
-		entry != &DriverExt->DeviceObjectListHead;
-		entry = entry->Flink)
+	if (SourceExt->DiskPartitionStyle == PARTITION_STYLE_MBR)
 	{
-		PCdp_DEVICE_LIST_NODE node =
-			CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
-		PCdp_DEVICE_EXTENSION ext =
-			(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
-		if (ext && ext->DeviceKind == Cdp_DEVICE_KIND_VOLUME &&
-			InterlockedCompareExchange(
-				&ext->RebootRecoveryGateRequired, 0, 0) == 0)
-			CdpOpenAutoDiscoveryGate(ext);
+		return Journal->MbrSignature != 0 &&
+			Journal->MbrSignature == SourceExt->MbrSignature;
 	}
-	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
+	return FALSE;
 }
 
-static VOID CdpClearAutoDiscoverySettled(_Inout_ PCdp_DRIVER_EXTENSION DriverExt)
+static BOOLEAN CdpAutoPhysicalLayoutMatches(
+	_In_ PCdp_DEVICE_EXTENSION SourceExt,
+	_In_ PCdp_JOURNAL Journal)
 {
-	InterlockedExchange(&DriverExt->AutoDiscoverySettled, 0);
-	KeClearEvent(&DriverExt->AutoDiscoverySettledEvent);
+	if (!SourceExt->DiskLayoutValid || !SourceExt->HasNextPartition ||
+		SourceExt->PartitionSize == 0 || SourceExt->NextPartitionSize == 0)
+	{
+		return FALSE;
+	}
+	return CdpAutoDiskIdentityMatches(SourceExt, Journal) &&
+		Journal->SourcePartitionStart == SourceExt->PartitionStart &&
+		Journal->SourcePartitionSize == SourceExt->PartitionSize &&
+		Journal->JournalPartitionStart == SourceExt->NextPartitionStart &&
+		Journal->JournalPartitionSize == SourceExt->NextPartitionSize &&
+		SourceExt->PartitionStart <= MAXUINT64 - SourceExt->PartitionSize &&
+		SourceExt->PartitionStart + SourceExt->PartitionSize <=
+			SourceExt->NextPartitionStart;
 }
 
-static PCdp_DEVICE_EXTENSION CdpFindStartedSourceByGuid(
+/* START_DEVICE remains owned by this filter while this routine runs. Thus
+ * Journal/Core/MetaTree are ready before the filesystem can mount the source,
+ * and ordinary READ/WRITE IRPs never need a discovery gate. */
+static NTSTATUS CdpDiscoverAdjacentJournalForStartedVolume(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
-	_In_ const GUID* SourceGuid)
+	_Inout_ PCdp_DEVICE_EXTENSION SourceExt)
 {
-	KIRQL oldIrql;
-	PLIST_ENTRY entry;
-	PCdp_DEVICE_EXTENSION found = NULL;
-
-	if (!SourceGuid || CdpGuidIsZero(SourceGuid))
-		return NULL;
-
-	KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &oldIrql);
-	for (entry = DriverExt->DeviceObjectListHead.Flink;
-		entry != &DriverExt->DeviceObjectListHead;
-		entry = entry->Flink)
-	{
-		PCdp_DEVICE_LIST_NODE node =
-			CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
-		PCdp_DEVICE_EXTENSION ext =
-			(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
-		if (!ext || ext->DeviceKind != Cdp_DEVICE_KIND_VOLUME)
-			continue;
-		if (InterlockedCompareExchange(&ext->Started, 0, 0) == 0)
-			continue;
-		if (InterlockedCompareExchange(&ext->AutoKind, 0, 0) != Cdp_AUTO_KIND_SOURCE)
-			continue;
-		if (!ext->VolumeGuidValid)
-			continue;
-		if (CdpGuidIsEqual(&ext->VolumeGuid, SourceGuid))
-		{
-			found = ext;
-			break;
-		}
-	}
-	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
-	return found;
-}
-
-static BOOLEAN CdpAutoDiscoveryHasUnclassified(
-	_In_ PCdp_DRIVER_EXTENSION DriverExt)
-{
-	KIRQL oldIrql;
-	PLIST_ENTRY entry;
-	BOOLEAN found = FALSE;
-
-	KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &oldIrql);
-	for (entry = DriverExt->DeviceObjectListHead.Flink;
-		entry != &DriverExt->DeviceObjectListHead;
-		entry = entry->Flink)
-	{
-		PCdp_DEVICE_LIST_NODE node =
-			CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
-		PCdp_DEVICE_EXTENSION ext =
-			(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
-		if (ext && ext->DeviceKind == Cdp_DEVICE_KIND_VOLUME &&
-			InterlockedCompareExchange(&ext->Started, 0, 0) != 0 &&
-			InterlockedCompareExchange(&ext->AutoKind, 0, 0) == Cdp_AUTO_KIND_UNKNOWN)
-		{
-			found = TRUE;
-			break;
-		}
-	}
-	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
-	return found;
-}
-
-static PCdp_DEVICE_EXTENSION CdpFindDiskExtensionByNumber(
-	_In_ PCdp_DRIVER_EXTENSION DriverExt,
-	_In_ ULONG DiskNumber)
-{
-	KIRQL oldIrql;
-	PLIST_ENTRY entry;
-	PCdp_DEVICE_EXTENSION found = NULL;
-
-	KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &oldIrql);
-	for (entry = DriverExt->DeviceObjectListHead.Flink;
-		entry != &DriverExt->DeviceObjectListHead;
-		entry = entry->Flink)
-	{
-		PCdp_DEVICE_LIST_NODE node =
-			CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
-		PCdp_DEVICE_EXTENSION ext =
-			(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
-		if (ext && ext->DeviceKind == Cdp_DEVICE_KIND_DISK &&
-			InterlockedCompareExchange(&ext->Started, 0, 0) != 0 &&
-			ext->DiskLayoutValid && ext->DiskNumber == DiskNumber)
-		{
-			found = ext;
-			break;
-		}
-	}
-	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
-	return found;
-}
-
-static VOID CdpRefreshStartedDiskIdentities(
-	_In_ PCdp_DRIVER_EXTENSION DriverExt)
-{
-	PDEVICE_OBJECT devices[64];
-	ULONG count = 0;
-	ULONG i;
-	KIRQL oldIrql;
-
-	KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &oldIrql);
-	{
-		PLIST_ENTRY entry;
-		for (entry = DriverExt->DeviceObjectListHead.Flink;
-			entry != &DriverExt->DeviceObjectListHead &&
-			count < RTL_NUMBER_OF(devices);
-			entry = entry->Flink)
-		{
-			PCdp_DEVICE_LIST_NODE node =
-				CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
-			PCdp_DEVICE_EXTENSION ext =
-				(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
-			if (ext && ext->DeviceKind == Cdp_DEVICE_KIND_DISK &&
-				InterlockedCompareExchange(&ext->Started, 0, 0) != 0 &&
-				!ext->DiskLayoutValid)
-			{
-				devices[count] = node->DeviceObject;
-				ObReferenceObject(devices[count++]);
-			}
-		}
-	}
-	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
-
-	for (i = 0; i < count; ++i)
-	{
-		PCdp_DEVICE_EXTENSION ext =
-			(PCdp_DEVICE_EXTENSION)devices[i]->DeviceExtension;
-		STORAGE_DEVICE_NUMBER number;
-		UINT64 diskSize = 0;
-		ULONG sectorSize = 0;
-		NTSTATUS numberStatus;
-		NTSTATUS geometryStatus;
-
-		RtlZeroMemory(&number, sizeof(number));
-		numberStatus = CdpSendDeviceControlSynchronously(
-			ext->LowerDeviceObject,
-			IOCTL_STORAGE_GET_DEVICE_NUMBER,
-			&number,
-			sizeof(number));
-		geometryStatus = CdpQueryDeviceGeometry(
-			ext->LowerDeviceObject, &diskSize, &sectorSize);
-		if (NT_SUCCESS(numberStatus) && NT_SUCCESS(geometryStatus))
-		{
-			ext->DiskNumber = number.DeviceNumber;
-			ext->PartitionSize = diskSize;
-			ext->SectorSize = sectorSize;
-			ext->DiskLayoutValid = TRUE;
-			Cdp_LOG("[DISK-UPPER] ready disk=%lu size=%llu sector=%lu lower=%p\n",
-				ext->DiskNumber, diskSize, sectorSize, ext->LowerDeviceObject);
-		}
-		else
-		{
-			Cdp_LOG("[DISK-UPPER] identity retry number=0x%08X geometry=0x%08X filter=%p\n",
-				numberStatus, geometryStatus, devices[i]);
-		}
-		ObDereferenceObject(devices[i]);
-	}
-}
-
-static BOOLEAN CdpAutoDiscoveryHasPendingJournal(
-	_In_ PCdp_DRIVER_EXTENSION DriverExt)
-{
-	BOOLEAN pending = FALSE;
-	PLIST_ENTRY entry;
-
-	ExAcquireFastMutex(&DriverExt->VolumeHandleMutex);
-	for (entry = DriverExt->VolumeHandleList.Flink;
-		entry != &DriverExt->VolumeHandleList;
-		entry = entry->Flink)
-	{
-		PCdp_VOLUME_HANDLE_ENTRY item =
-			CONTAINING_RECORD(entry, Cdp_VOLUME_HANDLE_ENTRY, Entry);
-		PCdp_DEVICE_EXTENSION sourceExt;
-
-		if (item->Closing || !item->Journal.Mounted)
-			continue;
-		sourceExt = CdpFindStartedSourceByGuid(
-			DriverExt,
-			&item->Journal.SourceVolumeGuid);
-		if (sourceExt == NULL)
-		{
-			pending = TRUE;
-			break;
-		}
-		if (InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) == 0 &&
-			sourceExt->JournalHandleId == 0)
-		{
-			// Source is up but not paired yet — not "pending", ready to activate.
-			continue;
-		}
-	}
-	ExReleaseFastMutex(&DriverExt->VolumeHandleMutex);
-	return pending;
-}
-
-static BOOLEAN CdpResolveAdjacentPartitionGates(
-	_Inout_ PCdp_DRIVER_EXTENSION DriverExt)
-{
-	KIRQL oldIrql;
-	PLIST_ENTRY entry;
-	BOOLEAN pending = FALSE;
-
-	KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &oldIrql);
-	for (entry = DriverExt->DeviceObjectListHead.Flink;
-		entry != &DriverExt->DeviceObjectListHead;
-		entry = entry->Flink)
-	{
-		PCdp_DEVICE_LIST_NODE node =
-			CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
-		PCdp_DEVICE_EXTENSION sourceExt =
-			(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
-		LONG kind;
-
-		if (!sourceExt ||
-			sourceExt->DeviceKind != Cdp_DEVICE_KIND_VOLUME ||
-			InterlockedCompareExchange(&sourceExt->Started, 0, 0) == 0)
-			continue;
-		kind = InterlockedCompareExchange(&sourceExt->AutoKind, 0, 0);
-		if (kind == Cdp_AUTO_KIND_JOURNAL)
-		{
-			// Journal metadata has already been probed. It cannot be a source
-			// waiting for a later adjacent journal.
-			CdpOpenAutoDiscoveryGate(sourceExt);
-			continue;
-		}
-		if (kind != Cdp_AUTO_KIND_SOURCE ||
-			InterlockedCompareExchange(
-				&sourceExt->AutoDiscoveryGateActive, 0, 0) == 0 ||
-			InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) != 0 ||
-			InterlockedCompareExchange(
-				&sourceExt->RebootRecoveryGateRequired, 0, 0) != 0)
-		{
-			continue;
-		}
-
-		if (!sourceExt->DiskLayoutValid)
-		{
-			pending = TRUE;
-			continue;
-		}
-		if (!sourceExt->HasNextPartition)
-		{
-			CdpOpenAutoDiscoveryGate(sourceExt);
-			continue;
-		}
-
-		{
-			PLIST_ENTRY successorEntry;
-			PCdp_DEVICE_EXTENSION successor = NULL;
-			for (successorEntry = DriverExt->DeviceObjectListHead.Flink;
-				successorEntry != &DriverExt->DeviceObjectListHead;
-				successorEntry = successorEntry->Flink)
-			{
-				PCdp_DEVICE_LIST_NODE successorNode =
-					CONTAINING_RECORD(
-						successorEntry, Cdp_DEVICE_LIST_NODE, Entry);
-				PCdp_DEVICE_EXTENSION candidate =
-					(PCdp_DEVICE_EXTENSION)
-						successorNode->DeviceObject->DeviceExtension;
-				if (candidate && candidate != sourceExt &&
-					InterlockedCompareExchange(&candidate->Started, 0, 0) != 0 &&
-					candidate->DiskLayoutValid &&
-					candidate->DiskNumber == sourceExt->DiskNumber &&
-					candidate->PartitionStart == sourceExt->NextPartitionStart)
-				{
-					successor = candidate;
-					break;
-				}
-			}
-
-			if (!successor || InterlockedCompareExchange(
-					&successor->AutoKind, 0, 0) == Cdp_AUTO_KIND_UNKNOWN)
-			{
-				pending = TRUE;
-				continue;
-			}
-
-			// The physical successor has been fully classified. If it were this
-			// source's journal, CdpTryActivateReadyPairs already enabled the source
-			// (and performed any reboot recovery). Otherwise this source is not
-			// protected and can be released immediately.
-			CdpOpenAutoDiscoveryGate(sourceExt);
-		}
-	}
-	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
-	return pending;
-}
-
-static VOID CdpAutoDiscoveryRefreshSettled(
-	_Inout_ PCdp_DRIVER_EXTENSION DriverExt)
-{
-	LONG stablePasses;
-	BOOLEAN adjacentPending;
-
-	if (InterlockedCompareExchange(&DriverExt->AutoDiscoverySuppressed, 0, 0) != 0 ||
-		InterlockedCompareExchange(&DriverExt->AutoDiscoveryStopping, 0, 0) != 0)
-	{
-		CdpMarkAutoDiscoverySettled(DriverExt);
-		return;
-	}
-	if (CdpAutoDiscoveryHasUnclassified(DriverExt) ||
-		CdpAutoDiscoveryHasPendingJournal(DriverExt))
-	{
-		InterlockedExchange(&DriverExt->AutoDiscoveryStablePasses, 0);
-		CdpClearAutoDiscoverySettled(DriverExt);
-		return;
-	}
-
-	adjacentPending = CdpResolveAdjacentPartitionGates(DriverExt);
-	if (InterlockedCompareExchange(
-			&DriverExt->BootEnumerationComplete, 0, 0) == 0)
-	{
-		// Definite adjacency decisions are safe immediately after START_DEVICE.
-		// Boot reinitialization is needed only to begin the failure timeout for
-		// a successor that never starts or a storage stack without layout IOCTLs.
-		InterlockedExchange(&DriverExt->AutoDiscoveryStablePasses, 0);
-		CdpClearAutoDiscoverySettled(DriverExt);
-		return;
-	}
-	if (!adjacentPending)
-	{
-		InterlockedExchange(&DriverExt->AutoDiscoveryStablePasses, 0);
-		CdpMarkAutoDiscoverySettled(DriverExt);
-		return;
-	}
-
-	stablePasses = InterlockedIncrement(
-		&DriverExt->AutoDiscoveryStablePasses);
-	if (stablePasses < Cdp_AUTO_DISCOVERY_STABLE_PASSES_REQUIRED)
-	{
-		CdpClearAutoDiscoverySettled(DriverExt);
-		return;
-	}
-
-	if (stablePasses == Cdp_AUTO_DISCOVERY_STABLE_PASSES_REQUIRED)
-	{
-		Cdp_LOG("[AUTO-CDP] adjacent partition did not start/layout unavailable for 3 seconds; failure allowed, releasing unmatched boot I/O\n");
-	}
-	CdpMarkAutoDiscoverySettled(DriverExt);
-	CdpOpenAllAutoDiscoveryGates(DriverExt);
-}
-
-static BOOLEAN CdpAutoDiscoveryNeedsStableRetry(
-	_In_ PCdp_DRIVER_EXTENSION DriverExt)
-{
-	if (InterlockedCompareExchange(
-			&DriverExt->BootEnumerationComplete, 0, 0) == 0)
-		return FALSE;
-	if (CdpAutoDiscoveryHasUnclassified(DriverExt) ||
-		CdpAutoDiscoveryHasPendingJournal(DriverExt))
-		return FALSE;
-	if (!CdpResolveAdjacentPartitionGates(DriverExt))
-		return FALSE;
-	return InterlockedCompareExchange(
-		&DriverExt->AutoDiscoveryStablePasses, 0, 0) <
-		Cdp_AUTO_DISCOVERY_STABLE_PASSES_REQUIRED;
-}
-
-static NTSTATUS CdpClassifyStartedVolume(
-	_Inout_ PCdp_DRIVER_EXTENSION DriverExt,
-	_In_ PDEVICE_OBJECT FilterDevice)
-{
-	PCdp_DEVICE_EXTENSION ext;
-	PCdp_VOLUME_HANDLE_ENTRY journalEntry = NULL;
-	UINT64 partitionSize = 0;
-	UINT64 layoutPartitionSize = 0;
-	ULONG sectorSize = 0;
+	PCdp_DEVICE_EXTENSION diskExt;
+	PCdp_VOLUME_HANDLE_ENTRY journalEntry;
+	PDEVICE_OBJECT metadataLower = NULL;
+	GUID queriedSourceGuid = { 0 };
+	BOOLEAN guidAvailable;
+	BOOLEAN guidMatches;
+	BOOLEAN physicalMatches;
+	UINT64 sourceGeometrySize = 0;
+	UINT64 handleId;
 	NTSTATUS status;
-	NTSTATUS layoutStatus;
-	GUID volumeGuid;
-	GUID zeroGuid = { 0 };
-	PCdp_DEVICE_EXTENSION diskExt = NULL;
 
-	ext = (PCdp_DEVICE_EXTENSION)FilterDevice->DeviceExtension;
-	if (!ext || ext->DeviceKind != Cdp_DEVICE_KIND_VOLUME ||
-		InterlockedCompareExchange(&ext->Started, 0, 0) == 0)
+	if (!DriverExt || !SourceExt ||
+		SourceExt->DeviceKind != Cdp_DEVICE_KIND_VOLUME ||
+		!SourceExt->LowerDeviceObject)
 	{
-		return STATUS_INVALID_DEVICE_STATE;
+		return STATUS_INVALID_PARAMETER;
 	}
-	if (InterlockedCompareExchange(&ext->AutoKind, 0, 0) != Cdp_AUTO_KIND_UNKNOWN)
-		return STATUS_SUCCESS;
-	if (!ExAcquireRundownProtection(&ext->AutoDiscoveryRundown))
-		return STATUS_DEVICE_NOT_READY;
-	if (!ext->LowerDeviceObject)
-	{
-		ExReleaseRundownProtection(&ext->AutoDiscoveryRundown);
-		return STATUS_DEVICE_NOT_READY;
-	}
-
-	status = CdpQueryDeviceGeometry(
-		ext->LowerDeviceObject,
-		&partitionSize,
-		&sectorSize);
+	/* Cache the stable volume identity independently of the physical-layout
+	 * query. Some stacks expose the GUID here but transiently reject a drive
+	 * layout request; CMD1 must still be able to find this filter object. */
+	status = IoVolumeDeviceToGuid(
+		SourceExt->PhysicalDeviceObject ?
+			SourceExt->PhysicalDeviceObject : SourceExt->FilterDeviceObject,
+		&queriedSourceGuid);
 	if (!NT_SUCCESS(status))
+		status = IoVolumeDeviceToGuid(
+			SourceExt->LowerDeviceObject, &queriedSourceGuid);
+	guidAvailable = NT_SUCCESS(status) && !CdpGuidIsZero(&queriedSourceGuid);
+	if (guidAvailable)
 	{
-		ExReleaseRundownProtection(&ext->AutoDiscoveryRundown);
+		SourceExt->VolumeGuid = queriedSourceGuid;
+		SourceExt->VolumeGuidValid = TRUE;
+	}
+	status = CdpQueryPhysicalPartitionLayout(
+		SourceExt->LowerDeviceObject,
+		&SourceExt->DiskNumber,
+		&SourceExt->PartitionNumber,
+		&SourceExt->PartitionStart,
+		&SourceExt->PartitionSize,
+		&SourceExt->HasNextPartition,
+		&SourceExt->NextPartitionStart,
+		&SourceExt->NextPartitionNumber,
+		&SourceExt->NextPartitionSize,
+		&SourceExt->DiskPartitionStyle,
+		&SourceExt->MbrSignature,
+		&SourceExt->DiskGuid);
+	SourceExt->DiskLayoutValid = NT_SUCCESS(status) ? TRUE : FALSE;
+	if (!NT_SUCCESS(status))
 		return status;
-	}
+	if (!SourceExt->HasNextPartition || SourceExt->NextPartitionSize == 0)
+		return STATUS_NOT_FOUND;
+	status = CdpQueryDeviceGeometry(
+		SourceExt->LowerDeviceObject,
+		&sourceGeometrySize,
+		&SourceExt->SectorSize);
+	if (!NT_SUCCESS(status))
+		return status;
+	if (sourceGeometrySize < SourceExt->PartitionSize)
+		SourceExt->PartitionSize = sourceGeometrySize;
 
-	layoutStatus = CdpQueryPhysicalPartitionLayout(
-		ext->LowerDeviceObject,
-		&ext->DiskNumber,
-		&ext->PartitionNumber,
-		&ext->PartitionStart,
-		&layoutPartitionSize,
-		&ext->HasNextPartition,
-		&ext->NextPartitionStart);
-	ext->DiskLayoutValid = NT_SUCCESS(layoutStatus) ? TRUE : FALSE;
-	if (!NT_SUCCESS(layoutStatus))
+	diskExt = CdpFindDiskExtensionByNumber(
+		DriverExt, SourceExt->DiskNumber);
+	if (!diskExt || !diskExt->LowerDeviceObject ||
+		InterlockedCompareExchange(&diskExt->Started, 0, 0) == 0)
 	{
-		Cdp_LOG("[AUTO-CDP] physical layout unavailable status=0x%08X filter=%p; using timeout fallback\n",
-			layoutStatus, FilterDevice);
+		return STATUS_DEVICE_NOT_READY;
 	}
-	else
-	{
-		Cdp_LOG("[AUTO-CDP] partition disk=%lu part=%lu start=%llu length=%llu geometryLength=%llu next=%llu hasNext=%u\n",
-			ext->DiskNumber,
-			ext->PartitionNumber,
-			ext->PartitionStart,
-			layoutPartitionSize,
-			partitionSize,
-			ext->NextPartitionStart,
-			ext->HasNextPartition ? 1u : 0u);
-	}
-	if (NT_SUCCESS(layoutStatus))
-	{
-		diskExt = CdpFindDiskExtensionByNumber(DriverExt, ext->DiskNumber);
-		if (!diskExt || !diskExt->LowerDeviceObject)
-		{
-			Cdp_LOG("[AUTO-CDP] disk upper not ready disk=%lu part=%lu; retry\n",
-				ext->DiskNumber, ext->PartitionNumber);
-			ExReleaseRundownProtection(&ext->AutoDiscoveryRundown);
-			return STATUS_DEVICE_NOT_READY;
-		}
-	}
-	else
-	{
-		ExReleaseRundownProtection(&ext->AutoDiscoveryRundown);
-		return layoutStatus;
-	}
-	partitionSize = layoutPartitionSize;
-	ext->PartitionSize = layoutPartitionSize;
-
 	journalEntry = (PCdp_VOLUME_HANDLE_ENTRY)cdpalloc(sizeof(*journalEntry));
 	if (!journalEntry)
-	{
-		ExReleaseRundownProtection(&ext->AutoDiscoveryRundown);
 		return STATUS_INSUFFICIENT_RESOURCES;
-	}
 	RtlZeroMemory(journalEntry, sizeof(*journalEntry));
 	journalEntry->TargetLowerDevice = diskExt->LowerDeviceObject;
-	journalEntry->VolumeLowerDevice = ext->LowerDeviceObject;
-	journalEntry->TargetBaseOffset = ext->PartitionStart;
-	journalEntry->DiskNumber = ext->DiskNumber;
-	journalEntry->PartitionNumber = ext->PartitionNumber;
-	journalEntry->PartitionSize = partitionSize;
-	journalEntry->SectorSize = sectorSize;
+	journalEntry->TargetBaseOffset = SourceExt->NextPartitionStart;
+	journalEntry->DiskNumber = SourceExt->DiskNumber;
+	journalEntry->PartitionNumber = SourceExt->NextPartitionNumber;
+	journalEntry->PartitionSize = SourceExt->NextPartitionSize;
+	journalEntry->SectorSize = SourceExt->SectorSize;
 	journalEntry->ReferenceCount = 1;
 	KeInitializeEvent(&journalEntry->NoReferences, NotificationEvent, FALSE);
+	metadataLower = CdpReferenceVolumeLowerByPhysicalRange(
+		DriverExt,
+		SourceExt->DiskNumber,
+		SourceExt->NextPartitionStart,
+		SourceExt->NextPartitionSize);
+	if (metadataLower)
+	{
+		journalEntry->VolumeLowerDevice = metadataLower;
+		journalEntry->MetadataLowerDeviceReference = metadataLower;
+		Cdp_LOG("[AUTO-METADATA] bound volume lower=%p disk=%lu part=%lu start=%llu size=%llu; payload remains disk-absolute\n",
+			metadataLower,
+			SourceExt->DiskNumber,
+			SourceExt->NextPartitionNumber,
+			SourceExt->NextPartitionStart,
+			SourceExt->NextPartitionSize);
+	}
+	else
+	{
+		Cdp_LOG("[AUTO-METADATA] adjacent volume lower unavailable disk=%lu part=%lu start=%llu size=%llu; retaining disk metadata backend\n",
+			SourceExt->DiskNumber,
+			SourceExt->NextPartitionNumber,
+			SourceExt->NextPartitionStart,
+			SourceExt->NextPartitionSize);
+	}
 	CdpJournalInitialize(
 		&journalEntry->Journal,
 		journalEntry->TargetLowerDevice,
 		NULL,
-		ext->PartitionStart,
-		partitionSize,
-		sectorSize,
-		&zeroGuid);
+		journalEntry->TargetBaseOffset,
+		journalEntry->PartitionSize,
+		journalEntry->SectorSize,
+		&queriedSourceGuid);
+	if (metadataLower)
+		CdpJournalSetMetadataDevice(&journalEntry->Journal, metadataLower, 0);
 	status = CdpJournalMount(&journalEntry->Journal);
-	if (NT_SUCCESS(status) && journalEntry->Journal.CredentialConfigured &&
-		!CdpGuidIsZero(&journalEntry->Journal.SourceVolumeGuid))
+	if (!NT_SUCCESS(status))
 	{
-		GUID journalGuid = { 0 };
-
-		status = IoVolumeDeviceToGuid(
-			ext->PhysicalDeviceObject ?
-				ext->PhysicalDeviceObject :
-				FilterDevice,
-			&journalGuid);
-		if (!NT_SUCCESS(status))
-			status = IoVolumeDeviceToGuid(ext->LowerDeviceObject, &journalGuid);
-		if (NT_SUCCESS(status) && !CdpGuidIsZero(&journalGuid))
+		CdpJournalClose(&journalEntry->Journal);
+		if (journalEntry->MetadataLowerDeviceReference)
 		{
-			journalEntry->VolumeGuid = journalGuid;
-			journalEntry->VolumeGuidValid = TRUE;
+			ObDereferenceObject(
+				journalEntry->MetadataLowerDeviceReference);
+			journalEntry->MetadataLowerDeviceReference = NULL;
 		}
-		journalEntry->HandleId =
-			(UINT64)InterlockedIncrement64(&DriverExt->VolumeHandleNextId);
-		ExAcquireFastMutex(&DriverExt->VolumeHandleMutex);
-		InsertTailList(&DriverExt->VolumeHandleList, &journalEntry->Entry);
-		ExReleaseFastMutex(&DriverExt->VolumeHandleMutex);
-		InterlockedExchange(&ext->AutoKind, Cdp_AUTO_KIND_JOURNAL);
-		ext->SectorSize = sectorSize;
-		Cdp_LOG("[AUTO-CDP] classified JOURNAL disk=%lu part=%lu filter=%p handle=%llu\n",
-			ext->DiskNumber,
-			ext->PartitionNumber,
-			FilterDevice,
-			journalEntry->HandleId);
-		CdpDbgGuid("[AUTO-CDP] journal sourceGuid",
-			&journalEntry->Journal.SourceVolumeGuid);
-		ExReleaseRundownProtection(&ext->AutoDiscoveryRundown);
-		return STATUS_SUCCESS;
+		cdpfree(journalEntry);
+		return status == STATUS_DISK_CORRUPT_ERROR ? STATUS_NOT_FOUND : status;
 	}
 
-	// Probe I/O / resource failures: keep UNKNOWN and retry later.
-	// STATUS_DISK_CORRUPT_ERROR means readable but no valid journal magic.
-	if (!NT_SUCCESS(status) && status != STATUS_DISK_CORRUPT_ERROR)
+	guidMatches = guidAvailable && CdpGuidIsEqual(
+		&queriedSourceGuid, &journalEntry->Journal.SourceVolumeGuid);
+	physicalMatches = CdpAutoPhysicalLayoutMatches(
+		SourceExt, &journalEntry->Journal);
+	if ((guidAvailable && !guidMatches) ||
+		(!guidAvailable && !physicalMatches) ||
+		(guidMatches && journalEntry->Journal.SourcePartitionSize != 0 &&
+		 !physicalMatches))
 	{
-		Cdp_DBG("[AUTO-CDP] classify probe failed status=0x%08X filter=%p; retry\n",
-			status, FilterDevice);
+		Cdp_LOG("[AUTO-ADJACENT] identity mismatch disk=%lu sourcePart=%lu journalPart=%lu guidAvailable=%u guidMatch=%u physicalMatch=%u\n",
+			SourceExt->DiskNumber,
+			SourceExt->PartitionNumber,
+			SourceExt->NextPartitionNumber,
+			guidAvailable ? 1u : 0u,
+			guidMatches ? 1u : 0u,
+			physicalMatches ? 1u : 0u);
 		CdpJournalClose(&journalEntry->Journal);
 		cdpfree(journalEntry);
-		ExReleaseRundownProtection(&ext->AutoDiscoveryRundown);
-		return status;
+		return STATUS_OBJECT_TYPE_MISMATCH;
 	}
 
-	CdpJournalClose(&journalEntry->Journal);
-	cdpfree(journalEntry);
+	SourceExt->VolumeGuid = journalEntry->Journal.SourceVolumeGuid;
+	SourceExt->VolumeGuidValid = TRUE;
+	handleId = (UINT64)InterlockedIncrement64(
+		&DriverExt->VolumeHandleNextId);
+	journalEntry->HandleId = handleId;
+	ExAcquireFastMutex(&DriverExt->VolumeHandleMutex);
+	InsertTailList(&DriverExt->VolumeHandleList, &journalEntry->Entry);
+	InterlockedIncrement(&journalEntry->ReferenceCount);
+	ExReleaseFastMutex(&DriverExt->VolumeHandleMutex);
 
-	RtlZeroMemory(&volumeGuid, sizeof(volumeGuid));
-	status = IoVolumeDeviceToGuid(
-		ext->PhysicalDeviceObject ?
-			ext->PhysicalDeviceObject :
-			FilterDevice,
-		&volumeGuid);
-	if (!NT_SUCCESS(status))
-		status = IoVolumeDeviceToGuid(ext->LowerDeviceObject, &volumeGuid);
-	if (NT_SUCCESS(status) && !CdpGuidIsZero(&volumeGuid))
+	status = CdpActivateAutoJournal(DriverExt, handleId, journalEntry);
+	if (NT_SUCCESS(status) && journalEntry->Journal.RecoveryPending)
 	{
-		ext->VolumeGuid = volumeGuid;
-		ext->VolumeGuidValid = TRUE;
-	}
-	else
-	{
-		ext->VolumeGuidValid = FALSE;
-		/* A volume can reach START_DEVICE before MountMgr can resolve its
-		 * persistent GUID.  Do not permanently classify it as SOURCE yet:
-		 * doing so leaves a subsequently mounted journal waiting forever for
-		 * a source GUID match when no further PnP START edge is generated. */
-		Cdp_LOG("[AUTO-CDP] source guid not ready status=0x%08X disk=%lu part=%lu filter=%p; keep UNKNOWN and retry\n",
-			status,
-			ext->DiskNumber,
-			ext->PartitionNumber,
-			FilterDevice);
-		ExReleaseRundownProtection(&ext->AutoDiscoveryRundown);
-		return NT_SUCCESS(status) ? STATUS_DEVICE_NOT_READY : status;
-	}
-	ext->SectorSize = sectorSize;
-	InterlockedExchange(&ext->AutoKind, Cdp_AUTO_KIND_SOURCE);
-	Cdp_LOG("[AUTO-CDP] classified SOURCE disk=%lu part=%lu filter=%p\n",
-		ext->DiskNumber, ext->PartitionNumber, FilterDevice);
-	if (ext->VolumeGuidValid)
-		CdpDbgGuid("[AUTO-CDP] source Guid", &ext->VolumeGuid);
-	ExReleaseRundownProtection(&ext->AutoDiscoveryRundown);
-	return STATUS_SUCCESS;
-}
+		UINT64 recoveryTarget =
+			journalEntry->Journal.RecoveryTargetTime100ns;
 
-static NTSTATUS CdpTryActivateReadyPairs(
-	_Inout_ PCdp_DRIVER_EXTENSION DriverExt)
-{
-	NTSTATUS result = STATUS_NOT_FOUND;
-	ULONG activated = 0;
-
-	for (;;)
-	{
-		PCdp_VOLUME_HANDLE_ENTRY journalEntry = NULL;
-		UINT64 journalHandleId = 0;
-		PLIST_ENTRY entry;
-		NTSTATUS status;
-
-		ExAcquireFastMutex(&DriverExt->VolumeHandleMutex);
-		for (entry = DriverExt->VolumeHandleList.Flink;
-			entry != &DriverExt->VolumeHandleList;
-			entry = entry->Flink)
-		{
-			PCdp_VOLUME_HANDLE_ENTRY item =
-				CONTAINING_RECORD(entry, Cdp_VOLUME_HANDLE_ENTRY, Entry);
-			PCdp_DEVICE_EXTENSION sourceExt;
-
-			if (item->Closing || !item->Journal.Mounted)
-				continue;
-			sourceExt = CdpFindStartedSourceByGuid(
-				DriverExt,
-				&item->Journal.SourceVolumeGuid);
-			if (sourceExt == NULL)
-				continue;
-			if (InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) != 0 ||
-				sourceExt->JournalHandleId != 0)
-			{
-				continue;
-			}
-			journalEntry = item;
-			journalHandleId = item->HandleId;
-			if (item->Journal.RecoveryPending)
-			{
-				InterlockedExchange(
-					&sourceExt->RebootRecoveryGateRequired, 1);
-				CdpCloseAutoDiscoveryGate(sourceExt);
-			}
-			InterlockedIncrement(&item->ReferenceCount);
-			break;
-		}
-		ExReleaseFastMutex(&DriverExt->VolumeHandleMutex);
-
-		if (!journalEntry)
-			break;
-
-		status = CdpActivateAutoJournal(
-			DriverExt,
-			journalHandleId,
-			journalEntry);
-		if (NT_SUCCESS(status))
-		{
-			PCdp_DEVICE_EXTENSION recoverySource =
-				CdpFindStartedSourceByGuid(
-					DriverExt,
-					&journalEntry->Journal.SourceVolumeGuid);
-			BOOLEAN recoveryRequired = recoverySource &&
-				InterlockedCompareExchange(
-					&recoverySource->RebootRecoveryGateRequired, 0, 0) != 0;
-
-			if (recoveryRequired)
-			{
-				Cdp_RECOVERY_BEGIN_REQUEST beginRequest;
-				Cdp_RECOVERY_BEGIN_REPLY beginReply;
-				Cdp_RECOVERY_CONTROL_REQUEST commitRequest;
-				Cdp_RECOVERY_COMMIT_REPLY commitReply;
-
-				if (journalEntry->Journal.RecoveryPending)
-				{
-					RtlZeroMemory(&beginRequest, sizeof(beginRequest));
-					beginRequest.SourceVolumeGuid =
-						journalEntry->Journal.SourceVolumeGuid;
-					beginRequest.TargetTime100ns =
-						journalEntry->Journal.RecoveryTargetTime100ns;
-					beginRequest.Flags = 0;
-					Cdp_LOG("[RECOVERY] reboot intent found target=%llu; running Begin(e)\n",
-						beginRequest.TargetTime100ns);
-					status = CdpBeginRecovery(
-						DriverExt, &beginRequest, &beginReply);
-				}
-				if (NT_SUCCESS(status))
-				{
-					RtlZeroMemory(&commitRequest, sizeof(commitRequest));
-					commitRequest.SourceVolumeGuid =
-						journalEntry->Journal.SourceVolumeGuid;
-					RtlZeroMemory(&commitReply, sizeof(commitReply));
-					Cdp_LOG("[RECOVERY] reboot Begin(e) complete; running Commit(r)\n");
-					status = CdpCommitRecovery(
-						DriverExt, &commitRequest, &commitReply);
-				}
-				if (!NT_SUCCESS(status))
-				{
-					Cdp_LOG("[RECOVERY] reboot Begin(e)/Commit(r) failed status=0x%08X; failure allowed, releasing boot I/O\n",
-						status);
-				}
-				if (journalEntry->Journal.RecoveryFsRepairPending)
-				{
-					/* Compatibility cleanup for journals written by the temporary
-					 * AutoChk implementation. Filesystem repair is intentionally not
-					 * part of reboot recovery now. */
-					(void)CdpJournalClearRecoveryFsRepairPending(
-						&journalEntry->Journal);
-				}
-				InterlockedExchange(
-					&recoverySource->RebootRecoveryGateRequired, 0);
-				CdpOpenAutoDiscoveryGate(recoverySource);
-				if (NT_SUCCESS(status))
-					Cdp_LOG("[RECOVERY] reboot Begin(e)+Commit(r) complete; boot I/O released\n");
-				/* Recovery failure is non-fatal for boot. The persisted Begin
-				 * intent remains available for a later reboot when Begin failed. */
-				status = STATUS_SUCCESS;
-			}
-			else
-			{
-				CdpOpenAutoDiscoveryGate(recoverySource);
-			}
-
-			if (!NT_SUCCESS(status))
-			{
-				CdpReleaseVolumeHandleEntry(journalEntry);
-				if (result == STATUS_NOT_FOUND)
-					result = status;
-				break;
-			}
-			Cdp_DBG("[AUTO-CDP] pair activated journalHandle=%llu\n",
-				journalHandleId);
-			++activated;
-			result = STATUS_SUCCESS;
-			CdpReleaseVolumeHandleEntry(journalEntry);
-			continue;
-		}
-		{
-			PCdp_DEVICE_EXTENSION failedSource =
-				CdpFindStartedSourceByGuid(
-					DriverExt,
-					&journalEntry->Journal.SourceVolumeGuid);
-			if (failedSource)
-			{
-				BOOLEAN recoveryWasRequired =
-					InterlockedExchange(
-						&failedSource->RebootRecoveryGateRequired, 0) != 0;
-				/* Fail open for boot availability. A normal persisted protection
-				 * session used to leave this gate closed forever when strict live
-				 * layout validation or Core binding failed. On a system volume that
-				 * deadlocks boot and surfaces as 0xc0000225. */
-				CdpOpenAutoDiscoveryGate(failedSource);
-				Cdp_LOG("[AUTO-CDP] auto activation failed status=0x%08X recoveryRequired=%u; protection disabled for this boot and source I/O released\n",
-					status,
-					recoveryWasRequired ? 1u : 0u);
-			}
-		}
-		CdpReleaseVolumeHandleEntry(journalEntry);
-		Cdp_LOG("[AUTO-CDP] pair activate failed status=0x%08X\n", status);
-		if (result == STATUS_NOT_FOUND)
-			result = status;
-		break;
-	}
-	UNREFERENCED_PARAMETER(activated);
-	return result;
-}
-
-static VOID CdpClassifyAllUnknownVolumes(
-	_Inout_ PCdp_DRIVER_EXTENSION DriverExt)
-{
-	PDEVICE_OBJECT devices[128];
-	ULONG deviceCount = 0;
-	ULONG i;
-	KIRQL oldIrql;
-
-	KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &oldIrql);
-	{
-		PLIST_ENTRY entry;
-		for (entry = DriverExt->DeviceObjectListHead.Flink;
-			entry != &DriverExt->DeviceObjectListHead &&
-			deviceCount < RTL_NUMBER_OF(devices);
-			entry = entry->Flink)
-		{
-			PCdp_DEVICE_LIST_NODE node =
-				CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
-			PCdp_DEVICE_EXTENSION ext =
-				(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
-			if (ext && ext->DeviceKind == Cdp_DEVICE_KIND_VOLUME &&
-				InterlockedCompareExchange(&ext->Started, 0, 0) != 0 &&
-				InterlockedCompareExchange(&ext->AutoKind, 0, 0) ==
-					Cdp_AUTO_KIND_UNKNOWN)
-			{
-				devices[deviceCount] = node->DeviceObject;
-				ObReferenceObject(devices[deviceCount]);
-				++deviceCount;
-			}
-		}
-	}
-	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
-
-	for (i = 0; i < deviceCount; ++i)
-	{
-		if (InterlockedCompareExchange(&DriverExt->AutoDiscoveryStopping, 0, 0) != 0)
-			break;
-		(void)CdpClassifyStartedVolume(DriverExt, devices[i]);
-		ObDereferenceObject(devices[i]);
-	}
-	for (; i < deviceCount; ++i)
-		ObDereferenceObject(devices[i]);
-}
-
-static VOID CdpAutoDiscoveryWorker(_In_ PVOID Context)
-{
-	PCdp_DRIVER_EXTENSION driverExt = (PCdp_DRIVER_EXTENSION)Context;
-	NTSTATUS status;
-	BOOLEAN runAgain;
-
-	InterlockedExchange(&driverExt->AutoDiscoveryRunning, 1);
-	status = KeWaitForSingleObject(
-		&driverExt->CaptureConfigMutex,
-		Executive,
-		KernelMode,
-		FALSE,
-		NULL);
-	if (NT_SUCCESS(status) &&
-		InterlockedCompareExchange(&driverExt->AutoDiscoveryStopping, 0, 0) == 0 &&
-		InterlockedCompareExchange(&driverExt->AutoDiscoverySuppressed, 0, 0) == 0)
-	{
-		do
-		{
-			/* Consume requests known at the beginning of this pass.  Any
-			 * START_DEVICE during probing sets the flag again. */
-			InterlockedExchange(
-				&driverExt->AutoDiscoveryRescanRequested, 0);
-			Cdp_DBG("[AUTO-CDP] classify+pair begin\n");
-			CdpRefreshStartedDiskIdentities(driverExt);
-			CdpClassifyAllUnknownVolumes(driverExt);
-			status = CdpTryActivateReadyPairs(driverExt);
-			if (NT_SUCCESS(status))
-				Cdp_LOG("[AUTO-CDP] discovery activation stage complete\n");
-			else
-				Cdp_DBG("[AUTO-CDP] no ready pair status=0x%08X\n", status);
-			CdpAutoDiscoveryRefreshSettled(driverExt);
-			runAgain = InterlockedCompareExchange(
-				&driverExt->AutoDiscoveryRescanRequested, 0, 0) != 0 &&
-				InterlockedCompareExchange(
-					&driverExt->AutoDiscoveryStopping, 0, 0) == 0 &&
-				InterlockedCompareExchange(
-					&driverExt->AutoDiscoverySuppressed, 0, 0) == 0;
-			if (runAgain)
-				Cdp_LOG("[AUTO-CDP] device arrived during discovery; running another pass\n");
-		} while (runAgain);
-		KeReleaseMutex(&driverExt->CaptureConfigMutex, FALSE);
-	}
-	else if (NT_SUCCESS(status))
-	{
-		CdpAutoDiscoveryRefreshSettled(driverExt);
-		KeReleaseMutex(&driverExt->CaptureConfigMutex, FALSE);
-	}
-
-	InterlockedExchange(&driverExt->AutoDiscoveryRunning, 0);
-	InterlockedExchange(&driverExt->AutoDiscoveryQueued, 0);
-	KeSetEvent(&driverExt->AutoDiscoveryIdle, IO_NO_INCREMENT, FALSE);
-	KeMemoryBarrier();
-	if (InterlockedCompareExchange(
-			&driverExt->AutoDiscoveryRescanRequested, 0, 0) != 0 &&
-		InterlockedCompareExchange(
-			&driverExt->AutoDiscoveryStopping, 0, 0) == 0 &&
-		InterlockedCompareExchange(
-			&driverExt->AutoDiscoverySuppressed, 0, 0) == 0)
-	{
-		Cdp_LOG("[AUTO-CDP] late rescan request observed after worker release\n");
-		CdpQueueAutoDiscovery(driverExt);
-		return;
-	}
-
-	if (InterlockedCompareExchange(&driverExt->AutoDiscoveryStopping, 0, 0) == 0 &&
-		InterlockedCompareExchange(&driverExt->AutoDiscoverySuppressed, 0, 0) == 0 &&
-		(CdpAutoDiscoveryHasUnclassified(driverExt) ||
-		 CdpAutoDiscoveryNeedsStableRetry(driverExt)))
-	{
-		LARGE_INTEGER delay;
-
-		// Probe/open I/O may fail right after START.  The same cadence also
-		// provides the quiet window for late-starting journal volumes.
-		Cdp_DBG("[AUTO-CDP] discovery not stable; retry after delay\n");
-		CdpClearAutoDiscoverySettled(driverExt);
-		delay.QuadPart = -1000000LL; // 100ms
-		KeDelayExecutionThread(KernelMode, FALSE, &delay);
-		if (InterlockedCompareExchange(&driverExt->AutoDiscoveryStopping, 0, 0) == 0 &&
-			InterlockedCompareExchange(&driverExt->AutoDiscoverySuppressed, 0, 0) == 0 &&
-			(CdpAutoDiscoveryHasUnclassified(driverExt) ||
-			 CdpAutoDiscoveryNeedsStableRetry(driverExt)))
-		{
-			CdpQueueAutoDiscovery(driverExt);
-		}
-	}
-	else if (
-		InterlockedCompareExchange(&driverExt->AutoDiscoveryStopping, 0, 0) == 0 &&
-		InterlockedCompareExchange(&driverExt->AutoDiscoverySuppressed, 0, 0) == 0 &&
-		CdpAutoDiscoveryHasPendingJournal(driverExt))
-	{
-		// Journal waits on a source START; do not spin — next START re-queues.
-		Cdp_DBG("[AUTO-CDP] journal pending source; wait for START\n");
-		CdpClearAutoDiscoverySettled(driverExt);
-	}
-}
-
-VOID CdpInitializeAutoDiscovery(_Inout_ PCdp_DRIVER_EXTENSION DriverExt)
-{
-	KeInitializeEvent(&DriverExt->AutoDiscoveryIdle, NotificationEvent, TRUE);
-	KeInitializeEvent(
-		&DriverExt->AutoDiscoverySettledEvent,
-		NotificationEvent,
-		FALSE);
-	InterlockedExchange(&DriverExt->AutoDiscoverySettled, 0);
-	InterlockedExchange(&DriverExt->AutoDiscoveryStablePasses, 0);
-	InterlockedExchange(&DriverExt->AutoDiscoveryRunning, 0);
-	InterlockedExchange(&DriverExt->AutoDiscoveryRescanRequested, 0);
-	InterlockedExchange(&DriverExt->BootEnumerationComplete, 0);
-	ExInitializeWorkItem(
-		&DriverExt->AutoDiscoveryWorkItem,
-		CdpAutoDiscoveryWorker,
-		DriverExt);
-}
-
-VOID CdpQueueAutoDiscovery(_Inout_ PCdp_DRIVER_EXTENSION DriverExt)
-{
-	if (!DriverExt)
-		return;
-	if (InterlockedCompareExchange(&DriverExt->AutoDiscoveryStopping, 0, 0) != 0)
-		return;
-	if (InterlockedCompareExchange(&DriverExt->AutoDiscoverySuppressed, 0, 0) != 0)
-	{
-		CdpMarkAutoDiscoverySettled(DriverExt);
-		return;
-	}
-	/* Record the edge before looking at AutoDiscoveryQueued.  If a pass is
-	 * already running it will consume this flag and rescan after its current
-	 * snapshot, instead of silently losing the new device. */
-	InterlockedExchange(&DriverExt->AutoDiscoveryRescanRequested, 1);
-	if (InterlockedCompareExchange(&DriverExt->AutoDiscoveryQueued, 1, 0) != 0)
-	{
-		Cdp_DBG("[AUTO-CDP] worker already queued/running\n");
-		return;
-	}
-	Cdp_DBG("[AUTO-CDP] queueing classify+pair worker\n");
-	KeClearEvent(&DriverExt->AutoDiscoveryIdle);
-	ExQueueWorkItem(&DriverExt->AutoDiscoveryWorkItem, CriticalWorkQueue);
-}
-
-VOID CdpScheduleAutoDiscovery(_Inout_ PCdp_DRIVER_EXTENSION DriverExt)
-{
-	CdpQueueAutoDiscovery(DriverExt);
-}
-
-VOID CdpStopAutoDiscovery(_Inout_ PCdp_DRIVER_EXTENSION DriverExt)
-{
-	InterlockedExchange(&DriverExt->AutoDiscoveryStopping, 1);
-	Cdp_DBG("[AUTO-CDP] stopping worker\n");
-	CdpMarkAutoDiscoverySettled(DriverExt);
-	if (InterlockedCompareExchange(&DriverExt->AutoDiscoveryQueued, 0, 0) != 0)
-	{
+		/* Boot discovery is deliberately read-only. Publish the target view now,
+		 * but defer the new branch RR/Superblock write until the first protected
+		 * source write arrives after START_DEVICE has completed. */
+		CdpStopMergeThread(SourceExt);
 		KeWaitForSingleObject(
-			&DriverExt->AutoDiscoveryIdle,
+			&SourceExt->HistoryMutex,
 			Executive,
 			KernelMode,
 			FALSE,
 			NULL);
+		status = CdpCorePrepareRebootRecovery(
+			SourceExt->Core, recoveryTarget);
+		KeReleaseMutex(&SourceExt->HistoryMutex, FALSE);
+		if (!NT_SUCCESS(status))
+		{
+			Cdp_LOG("[RECOVERY] pre-mount deferred prepare failed status=0x%08X target=%llu; boot continues with protection mounted\n",
+				status,
+				recoveryTarget);
+			status = STATUS_SUCCESS;
+		}
+		else
+		{
+			Cdp_LOG("[RECOVERY] pre-mount target view ready target=%llu; branch persistence deferred to first source write\n",
+				recoveryTarget);
+		}
 	}
+	CdpReleaseVolumeHandleEntry(journalEntry);
+	if (!NT_SUCCESS(status))
+	{
+		(void)CdpCloseVolumeHandle(DriverExt, handleId);
+		return status;
+	}
+	Cdp_LOG("[AUTO-ADJACENT] protection armed before mount disk=%lu sourcePart=%lu journalPart=%lu guidMatch=%u physicalMatch=%u\n",
+		SourceExt->DiskNumber,
+		SourceExt->PartitionNumber,
+		SourceExt->NextPartitionNumber,
+		guidMatches ? 1u : 0u,
+		physicalMatches ? 1u : 0u);
+	return STATUS_SUCCESS;
 }
 
 static PCdp_PREVIEW_SESSION CdpLookupPreviewSessionLocked(
@@ -3590,6 +3011,13 @@ static NTSTATUS CdpQueryPhase(
 		journalEntry = CdpLookupVolumeHandleLocked(DriverExt, journalHandleId);
 	if (journalEntry && journalEntry->VolumeGuidValid)
 		Reply->JournalPartitionGuid = journalEntry->VolumeGuid;
+	if (journalEntry)
+	{
+		Reply->JournalDiskNumber = journalEntry->DiskNumber;
+		Reply->JournalPartitionNumber = journalEntry->PartitionNumber;
+		Reply->JournalPartitionOffset = journalEntry->TargetBaseOffset;
+		Reply->JournalPartitionBytes = journalEntry->PartitionSize;
+	}
 	ExReleaseFastMutex(&DriverExt->VolumeHandleMutex);
 	return STATUS_SUCCESS;
 }
@@ -3847,6 +3275,14 @@ static NTSTATUS CdpQueueDiskCaptureIrp(
 		return CdpSendToNextDevice(DiskExt->LowerDeviceObject, Irp);
 	}
 	if (irpSp->MajorFunction == IRP_MJ_WRITE &&
+		InterlockedCompareExchange(&DiskExt->ShutdownInProgress, 0, 0) != 0)
+	{
+		/* Shutdown has closed the source-write admission gate.  Never let a
+		 * late protected write fall through to the original partition. */
+		ObDereferenceObject(sourceReference);
+		return CdpCompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
+	}
+	if (irpSp->MajorFunction == IRP_MJ_WRITE &&
 		InterlockedCompareExchange(
 			&sourceExt->BackfillWriteActive, 0, 0) != 0 &&
 		absoluteOffset >= sourceExt->BackfillAbsoluteOffset &&
@@ -3919,6 +3355,7 @@ static NTSTATUS CdpQueueDiskCaptureIrp(
 
 	KeAcquireSpinLock(&DiskExt->CaptureQueueLock, &oldIrql);
 	if (InterlockedCompareExchange(&DiskExt->CaptureStopping, 0, 0) == 0 &&
+		InterlockedCompareExchange(&DiskExt->ShutdownInProgress, 0, 0) == 0 &&
 		InterlockedCompareExchange(&sourceExt->DiskIoAccepting, 0, 0) != 0 &&
 		InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) != 0)
 	{
@@ -3934,6 +3371,11 @@ static NTSTATUS CdpQueueDiskCaptureIrp(
 	ObDereferenceObject(item->OriginLowerReference);
 	cdpfree(item);
 	CdpReleaseDiskIoOutstanding(sourceExt);
+	if (irpSp->MajorFunction == IRP_MJ_WRITE &&
+		InterlockedCompareExchange(&DiskExt->ShutdownInProgress, 0, 0) != 0)
+	{
+		return CdpCompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
+	}
 	return CdpSendToNextDevice(DiskExt->LowerDeviceObject, Irp);
 }
 
@@ -3947,14 +3389,7 @@ NTSTATUS CdpIrpDispatchRead(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 	if (deviceExt->DeviceKind == Cdp_DEVICE_KIND_DISK)
 		return CdpQueueDiskCaptureIrp(deviceExt, Irp);
 	if (deviceExt->DeviceKind == Cdp_DEVICE_KIND_VOLUME)
-	{
-		if (InterlockedCompareExchange(
-				&deviceExt->AutoDiscoveryGateActive, 0, 0) != 0)
-		{
-			return CdpQueueVolumeGateIrp(deviceExt, Irp);
-		}
 		return CdpSendToNextDevice(deviceExt->LowerDeviceObject, Irp);
-	}
 	return CdpCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);
 }
 
@@ -3976,143 +3411,6 @@ static VOID CdpFailQueuedProtectedRead(
 		InterlockedCompareExchange(&DevExt->Phase, 0, 0),
 		DevExt->Core);
 	CdpCompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
-}
-
-static NTSTATUS CdpQueueVolumeGateIrp(
-	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
-	_Inout_ PIRP Irp)
-{
-	PCdp_RECOVERY_READ_ITEM item;
-	KIRQL oldIrql;
-
-	item = (PCdp_RECOVERY_READ_ITEM)cdpalloc(sizeof(*item));
-	if (!item)
-		return CdpCompleteIrp(Irp, STATUS_INSUFFICIENT_RESOURCES, 0);
-	item->Irp = Irp;
-	KeAcquireSpinLock(&DevExt->RecoveryReadQueueLock, &oldIrql);
-	if (InterlockedCompareExchange(
-			&DevExt->RecoveryReadStopping, 0, 0) == 0 &&
-		InterlockedCompareExchange(
-			&DevExt->AutoDiscoveryGateActive, 0, 0) != 0)
-	{
-		IoMarkIrpPending(Irp);
-		InsertTailList(&DevExt->RecoveryReadQueue, &item->Entry);
-		KeSetEvent(&DevExt->RecoveryReadEvent, IO_NO_INCREMENT, FALSE);
-		KeReleaseSpinLock(&DevExt->RecoveryReadQueueLock, oldIrql);
-		return STATUS_PENDING;
-	}
-	KeReleaseSpinLock(&DevExt->RecoveryReadQueueLock, oldIrql);
-	cdpfree(item);
-	return CdpSendToNextDevice(DevExt->LowerDeviceObject, Irp);
-}
-
-static VOID CdpRecoveryReadWorker(_In_ PVOID Context)
-{
-	PCdp_DEVICE_EXTENSION devExt = (PCdp_DEVICE_EXTENSION)Context;
-
-	for (;;)
-	{
-		PLIST_ENTRY entry = NULL;
-		KIRQL oldIrql;
-
-		KeWaitForSingleObject(
-			&devExt->RecoveryReadEvent,
-			Executive,
-			KernelMode,
-			FALSE,
-			NULL);
-		for (;;)
-		{
-			KeAcquireSpinLock(&devExt->RecoveryReadQueueLock, &oldIrql);
-			if (!IsListEmpty(&devExt->RecoveryReadQueue))
-				entry = RemoveHeadList(&devExt->RecoveryReadQueue);
-			else
-			{
-				KeClearEvent(&devExt->RecoveryReadEvent);
-				entry = NULL;
-			}
-			KeReleaseSpinLock(&devExt->RecoveryReadQueueLock, oldIrql);
-			if (!entry)
-				break;
-
-			{
-				PCdp_RECOVERY_READ_ITEM item = CONTAINING_RECORD(
-					entry,
-					Cdp_RECOVERY_READ_ITEM,
-					Entry);
-				PIRP irp = item->Irp;
-				PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(irp);
-				UNREFERENCED_PARAMETER(irpSp);
-				while (InterlockedCompareExchange(
-						&devExt->AutoDiscoveryGateActive, 0, 0) != 0 &&
-					InterlockedCompareExchange(
-						&devExt->RecoveryReadStopping, 0, 0) == 0)
-				{
-					Cdp_DBG("[AUTO-CDP] volume I/O held until discovery/begin major=0x%02X irp=%p\n",
-						irpSp->MajorFunction, irp);
-					KeWaitForSingleObject(
-						&devExt->AutoDiscoveryGateEvent,
-						Executive,
-						KernelMode,
-						FALSE,
-						NULL);
-				}
-
-				/* This queue is only a boot-discovery gate. Forward the original
-				 * request unchanged after the gate opens; protected I/O is then
-				 * intercepted exactly once at Disk Upper. */
-				IoSkipCurrentIrpStackLocation(irp);
-				(void)IoCallDriver(devExt->LowerDeviceObject, irp);
-				cdpfree(item);
-			}
-		}
-		if (InterlockedCompareExchange(
-				&devExt->RecoveryReadStopping, 0, 0) != 0)
-		{
-			break;
-		}
-	}
-	PsTerminateSystemThread(STATUS_SUCCESS);
-}
-
-NTSTATUS CdpStartRecoveryReadWorker(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
-{
-	InterlockedExchange(&DevExt->RecoveryReadStopping, 0);
-	return PsCreateSystemThread(
-		&DevExt->RecoveryReadThreadHandle,
-		THREAD_ALL_ACCESS,
-		NULL,
-		NULL,
-		NULL,
-		CdpRecoveryReadWorker,
-		DevExt);
-}
-
-VOID CdpStopRecoveryReadWorker(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
-{
-	HANDLE threadHandle = DevExt->RecoveryReadThreadHandle;
-	PVOID threadObject = NULL;
-
-	if (!threadHandle)
-		return;
-	InterlockedExchange(&DevExt->RecoveryReadStopping, 1);
-	KeSetEvent(&DevExt->RecoveryReadEvent, IO_NO_INCREMENT, FALSE);
-	KeSetEvent(&DevExt->AutoDiscoveryGateEvent, IO_NO_INCREMENT, FALSE);
-
-	if (NT_SUCCESS(ObReferenceObjectByHandle(
-		threadHandle,
-		THREAD_ALL_ACCESS,
-		*PsThreadType,
-		KernelMode,
-		&threadObject,
-		NULL)))
-	{
-		KeWaitForSingleObject(threadObject, Executive, KernelMode, FALSE, NULL);
-		ObDereferenceObject(threadObject);
-	}
-
-	ZwClose(threadHandle);
-	DevExt->RecoveryReadThreadHandle = NULL;
 }
 
 static VOID CdpStopPreviewSessionForSource(
@@ -4738,19 +4036,6 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 					goto capture_item_release;
 				}
 
-				while (InterlockedCompareExchange(
-						&devExt->AutoDiscoveryGateActive, 0, 0) != 0)
-				{
-					Cdp_LOG("[AUTO-CDP] ordered I/O held until source discovery/begin major=0x%02X irp=%p\n",
-						majorFunction,
-						item->Irp);
-					KeWaitForSingleObject(
-						&devExt->AutoDiscoveryGateEvent,
-						Executive,
-						KernelMode,
-						FALSE,
-						NULL);
-				}
 				captureActive =
 					!devExt->CaptureStopping &&
 					InterlockedCompareExchange(&devExt->CaptureEnabled, 0, 0) != 0;
@@ -5175,8 +4460,6 @@ VOID CdpDisableAndDestroyCapture(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	InterlockedExchange(&DevExt->DiskIoAccepting, 0);
 	InterlockedExchange(&DevExt->ProtectionStateValidated, 0);
 	CdpAuditProtectedReadSummary(DevExt, "protection-disable");
-	InterlockedExchange(&DevExt->RebootRecoveryGateRequired, 0);
-	CdpOpenAutoDiscoveryGate(DevExt);
 
 	while (InterlockedCompareExchange(
 			&DevExt->DiskIoOutstanding, 0, 0) != 0)
@@ -5204,7 +4487,6 @@ VOID CdpDisableAndDestroyCapture(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	/* Finish writes queued during DRAINING before queued reads are converted to
 	 * source pass-through, preserving the final source view at close return. */
 	CdpStopCaptureWorker(DevExt);
-	CdpStopRecoveryReadWorker(DevExt);
 
 	/* This is the matching release for the protection-session reference stored
 	 * when capture was enabled.  Redirect writes never acquire/release it. */
@@ -5226,6 +4508,158 @@ VOID CdpDisableAndDestroyCapture(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 		CdpCoreDestroy(core);
 }
 
+static NTSTATUS CdpFlushProtectedJournalsForShutdown(
+	_Inout_ PCdp_DEVICE_EXTENSION DiskExt)
+{
+	PCdp_DRIVER_EXTENSION driverExt;
+	PDEVICE_OBJECT* sources = NULL;
+	ULONG sourceCount = 0;
+	ULONG capturedCount = 0;
+	ULONG index;
+	KIRQL oldIrql;
+	PLIST_ENTRY entry;
+	NTSTATUS firstFailure = STATUS_SUCCESS;
+
+	driverExt = IoGetDriverObjectExtension(g_DriverObject, &g_DriverObject);
+	if (!driverExt || !DiskExt)
+		return STATUS_INVALID_PARAMETER;
+
+	/* Snapshot referenced source filter objects.  The list lock protects the
+	 * nodes; object references keep every device extension alive while the
+	 * shutdown drain waits outside the spin lock. */
+	KeAcquireSpinLock(&driverExt->DeviceObjectListLock, &oldIrql);
+	for (entry = driverExt->DeviceObjectListHead.Flink;
+		entry != &driverExt->DeviceObjectListHead;
+		entry = entry->Flink)
+	{
+		PCdp_DEVICE_LIST_NODE node =
+			CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
+		PCdp_DEVICE_EXTENSION ext =
+			(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
+		if (ext && ext->DeviceKind == Cdp_DEVICE_KIND_VOLUME &&
+			ext->DiskNumber == DiskExt->DiskNumber &&
+			InterlockedCompareExchange(&ext->CaptureEnabled, 0, 0) != 0)
+		{
+			sourceCount++;
+		}
+	}
+	KeReleaseSpinLock(&driverExt->DeviceObjectListLock, oldIrql);
+
+	if (sourceCount == 0)
+		return STATUS_SUCCESS;
+	if (sourceCount > MAXULONG / sizeof(*sources))
+		return STATUS_INTEGER_OVERFLOW;
+	sources = (PDEVICE_OBJECT*)cdpalloc(
+		(SIZE_T)sourceCount * sizeof(*sources));
+	if (!sources)
+		return STATUS_INSUFFICIENT_RESOURCES;
+
+	KeAcquireSpinLock(&driverExt->DeviceObjectListLock, &oldIrql);
+	for (entry = driverExt->DeviceObjectListHead.Flink;
+		entry != &driverExt->DeviceObjectListHead && capturedCount < sourceCount;
+		entry = entry->Flink)
+	{
+		PCdp_DEVICE_LIST_NODE node =
+			CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
+		PCdp_DEVICE_EXTENSION ext =
+			(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
+		if (ext && ext->DeviceKind == Cdp_DEVICE_KIND_VOLUME &&
+			ext->DiskNumber == DiskExt->DiskNumber &&
+			InterlockedCompareExchange(&ext->CaptureEnabled, 0, 0) != 0)
+		{
+			ObReferenceObject(node->DeviceObject);
+			sources[capturedCount++] = node->DeviceObject;
+		}
+	}
+	KeReleaseSpinLock(&driverExt->DeviceObjectListLock, oldIrql);
+
+	for (index = 0; index < capturedCount; ++index)
+	{
+		PCdp_DEVICE_EXTENSION sourceExt =
+			(PCdp_DEVICE_EXTENSION)sources[index]->DeviceExtension;
+		NTSTATUS status = STATUS_SUCCESS;
+
+		while (InterlockedCompareExchange(
+				&sourceExt->DiskIoOutstanding, 0, 0) != 0)
+		{
+			KeWaitForSingleObject(&sourceExt->DiskIoDrainedEvent,
+				Executive, KernelMode, FALSE, NULL);
+		}
+		while (InterlockedCompareExchange(
+				&sourceExt->RedirectWritesInFlight, 0, 0) != 0)
+		{
+			KeWaitForSingleObject(&sourceExt->RedirectWritesDrainedEvent,
+				Executive, KernelMode, FALSE, NULL);
+		}
+		/* An already-admitted direct write can request a merge as its final
+		 * action.  Drain those writes first, then stop the merge owner so no
+		 * journal metadata can become dirty after the final flush. */
+		CdpStopMergeThread(sourceExt);
+
+		KeWaitForSingleObject(&sourceExt->HistoryMutex,
+			Executive, KernelMode, FALSE, NULL);
+		if (InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) != 0 &&
+			sourceExt->RedirectJournalEntry)
+		{
+			status = CdpJournalFlushBuffers(
+				&sourceExt->RedirectJournalEntry->Journal);
+		}
+		KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
+
+		if (!NT_SUCCESS(status))
+		{
+			if (NT_SUCCESS(firstFailure))
+				firstFailure = status;
+			Cdp_LOG("[SHUTDOWN-DRAIN] journal flush failed disk=%lu sourceStart=%llu status=0x%08X\n",
+				DiskExt->DiskNumber, sourceExt->PartitionStart, status);
+		}
+		else
+		{
+			Cdp_LOG("[SHUTDOWN-DRAIN] journal flush complete disk=%lu sourceStart=%llu\n",
+				DiskExt->DiskNumber, sourceExt->PartitionStart);
+		}
+		ObDereferenceObject(sources[index]);
+	}
+	cdpfree(sources);
+	return firstFailure;
+}
+
+NTSTATUS CdpIrpDispatchShutdown(
+	_In_ PDEVICE_OBJECT DeviceObject,
+	_Inout_ PIRP Irp)
+{
+	PCdp_DEVICE_EXTENSION deviceExt =
+		(PCdp_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
+	NTSTATUS flushStatus;
+
+	if (!deviceExt || !deviceExt->LowerDeviceObject)
+		return CdpCompleteIrp(Irp, STATUS_SUCCESS, 0);
+	if (deviceExt->DeviceKind != Cdp_DEVICE_KIND_DISK)
+		return CdpSendToNextDevice(deviceExt->LowerDeviceObject, Irp);
+
+	InterlockedExchange(&deviceExt->ShutdownInProgress, 1);
+	Cdp_LOG("[SHUTDOWN-DRAIN] begin disk=%lu queued=%ld\n",
+		deviceExt->DiskNumber,
+		InterlockedCompareExchange(&deviceExt->CaptureQueueDepth, 0, 0));
+
+	/* The worker drains its FIFO before observing CaptureStopping and exiting.
+	 * Existing protected writes therefore finish payload/header publication in
+	 * order; the persistent ShutdownInProgress gate rejects later source writes. */
+	CdpStopCaptureWorker(deviceExt);
+	flushStatus = CdpFlushProtectedJournalsForShutdown(deviceExt);
+	if (!NT_SUCCESS(flushStatus))
+	{
+		Cdp_LOG("[SHUTDOWN-DRAIN] completed with flush failure disk=%lu status=0x%08X; forwarding shutdown\n",
+			deviceExt->DiskNumber, flushStatus);
+	}
+	else
+	{
+		Cdp_LOG("[SHUTDOWN-DRAIN] complete disk=%lu; forwarding shutdown\n",
+			deviceExt->DiskNumber);
+	}
+	return CdpSendToNextDevice(deviceExt->LowerDeviceObject, Irp);
+}
+
 NTSTATUS CdpIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 {
 	PCdp_DEVICE_EXTENSION deviceExt = (PCdp_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
@@ -5235,14 +4669,7 @@ NTSTATUS CdpIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 	if (deviceExt->DeviceKind == Cdp_DEVICE_KIND_DISK)
 		return CdpQueueDiskCaptureIrp(deviceExt, Irp);
 	if (deviceExt->DeviceKind == Cdp_DEVICE_KIND_VOLUME)
-	{
-		if (InterlockedCompareExchange(
-				&deviceExt->AutoDiscoveryGateActive, 0, 0) != 0)
-		{
-			return CdpQueueVolumeGateIrp(deviceExt, Irp);
-		}
 		return CdpSendToNextDevice(deviceExt->LowerDeviceObject, Irp);
-	}
 	return CdpCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);
 }
 
@@ -5252,52 +4679,6 @@ static NTSTATUS PnpCompletionRoutine(PDEVICE_OBJECT DeviceObject, PIRP Irp, PVOI
 	UNREFERENCED_PARAMETER(Irp);
 	KeSetEvent((PKEVENT)Context, IO_NO_INCREMENT, FALSE);
 	return STATUS_MORE_PROCESSING_REQUIRED;
-}
-
-static NTSTATUS CdpStartDeviceCompletionRoutine(
-	_In_ PDEVICE_OBJECT DeviceObject,
-	_In_ PIRP Irp,
-	_In_ PVOID Context)
-{
-	PCdp_DEVICE_EXTENSION devExt = (PCdp_DEVICE_EXTENSION)Context;
-	PCdp_DRIVER_EXTENSION driverExt;
-
-	if (devExt && NT_SUCCESS(Irp->IoStatus.Status))
-	{
-		InterlockedExchange(&devExt->Started, 1);
-		InterlockedExchange(&devExt->AutoKind, 0);
-		devExt->VolumeGuidValid = FALSE;
-		devExt->DiskLayoutValid = FALSE;
-		devExt->HasNextPartition = FALSE;
-		devExt->DiskNumber = 0;
-		devExt->PartitionNumber = 0;
-		devExt->PartitionStart = 0;
-		devExt->NextPartitionStart = 0;
-#if DBG
-		Cdp_DBG("[AUTO-CDP] volume started filter=%p lower=%p\n",
-			DeviceObject,
-			devExt->LowerDeviceObject);
-#else
-		UNREFERENCED_PARAMETER(DeviceObject);
-#endif
-		driverExt = IoGetDriverObjectExtension(g_DriverObject, &g_DriverObject);
-		// Completion may run at DISPATCH_LEVEL: no FastMutex / waits here.
-		if (driverExt &&
-			InterlockedCompareExchange(
-				&driverExt->AutoDiscoverySuppressed, 0, 0) == 0)
-		{
-			// A newly started volume invalidates the quiet observation window.
-			InterlockedExchange(
-				&driverExt->AutoDiscoveryStablePasses, 0);
-			if (InterlockedCompareExchange(
-				&driverExt->AutoDiscoverySettled, 0, 1) == 1)
-			{
-				KeClearEvent(&driverExt->AutoDiscoverySettledEvent);
-			}
-			CdpQueueAutoDiscovery(driverExt);
-		}
-	}
-	return STATUS_CONTINUE_COMPLETION;
 }
 
 NTSTATUS CdpIrpDispatchPnp(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
@@ -5316,15 +4697,65 @@ NTSTATUS CdpIrpDispatchPnp(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 	switch (IrpSp->MinorFunction)
 	{
 	case IRP_MN_START_DEVICE:
+	{
+		KEVENT event;
+		NTSTATUS status;
+
+		KeInitializeEvent(&event, NotificationEvent, FALSE);
 		IoCopyCurrentIrpStackLocationToNext(Irp);
 		IoSetCompletionRoutine(
 			Irp,
-			CdpStartDeviceCompletionRoutine,
-			DevExt,
+			PnpCompletionRoutine,
+			&event,
 			TRUE,
 			TRUE,
 			TRUE);
-		return IoCallDriver(DevExt->LowerDeviceObject, Irp);
+		status = IoCallDriver(DevExt->LowerDeviceObject, Irp);
+		if (status == STATUS_PENDING)
+			KeWaitForSingleObject(
+				&event, Executive, KernelMode, FALSE, NULL);
+		status = Irp->IoStatus.Status;
+		if (NT_SUCCESS(status))
+		{
+			InterlockedExchange(&DevExt->Started, 1);
+			if (DevExt->DeviceKind == Cdp_DEVICE_KIND_DISK)
+			{
+				STORAGE_DEVICE_NUMBER number;
+				RtlZeroMemory(&number, sizeof(number));
+				if (NT_SUCCESS(CdpSendDeviceControlSynchronously(
+						DevExt->LowerDeviceObject,
+						IOCTL_STORAGE_GET_DEVICE_NUMBER,
+						&number,
+						sizeof(number))))
+				{
+					DevExt->DiskNumber = number.DeviceNumber;
+					DevExt->DiskLayoutValid = TRUE;
+				}
+			}
+			else if (DevExt->DeviceKind == Cdp_DEVICE_KIND_VOLUME)
+			{
+				NTSTATUS discoveryStatus = KeWaitForSingleObject(
+					&DriverExt->CaptureConfigMutex,
+					Executive, KernelMode, FALSE, NULL);
+				if (NT_SUCCESS(discoveryStatus))
+				{
+					discoveryStatus =
+						CdpDiscoverAdjacentJournalForStartedVolume(
+							DriverExt, DevExt);
+					KeReleaseMutex(
+						&DriverExt->CaptureConfigMutex, FALSE);
+				}
+				if (!NT_SUCCESS(discoveryStatus) &&
+					discoveryStatus != STATUS_NOT_FOUND)
+				{
+					Cdp_LOG("[AUTO-ADJACENT] pre-mount discovery failed status=0x%08X filter=%p; volume released without protection\n",
+						discoveryStatus, DeviceObject);
+				}
+			}
+		}
+		IoCompleteRequest(Irp, IO_NO_INCREMENT);
+		return status;
+	}
 
 	case IRP_MN_REMOVE_DEVICE:
 	{
@@ -5352,9 +4783,6 @@ NTSTATUS CdpIrpDispatchPnp(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 			cdpfree(NodeToFree);
 
 		InterlockedExchange(&DevExt->Started, 0);
-		// No new probe can acquire rundown after the node has left the list.
-		// Wait for a probe already using LowerDeviceObject before detaching it.
-		ExWaitForRundownProtectionRelease(&DevExt->AutoDiscoveryRundown);
 		CdpDisableAndDestroyCapture(DevExt);
 		LowerDevice = DevExt->LowerDeviceObject;
 
@@ -5763,7 +5191,6 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 						L"ERROR: capture configuration failed");
 					return CdpCompleteIrp(Irp, Status, sizeof(Cdp_COMMAND_REPLY));
 				}
-				InterlockedExchange(&DriverExt->AutoDiscoverySuppressed, 0);
 				CdpFillReply(reply, Cdp_CMD_1, 0, handleId,
 					L"OK: capture configured");
 				return CdpCompleteIrp(Irp, STATUS_SUCCESS, sizeof(Cdp_COMMAND_REPLY));
