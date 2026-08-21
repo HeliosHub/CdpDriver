@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.5.54-test1"
-#define Cdp_DRIVER_BUILD_STRING   "20260818.54-deferred-recovery-branch"
+#define Cdp_DRIVER_VERSION_STRING "1.5.69-test1"
+#define Cdp_DRIVER_BUILD_STRING   "20260821.69-immediate-protection"
 
 #define Cdp_COW_BATCH_MAX_ITEMS 16UL
 #define Cdp_COW_BATCH_MAX_BYTES (16UL * 1024UL * 1024UL)

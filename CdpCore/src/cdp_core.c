@@ -1430,6 +1430,26 @@ NTSTATUS CdpCoreRead(
 		Core, &Core->MetaTree, Offset, Length, Buffer, TRUE, TRUE);
 }
 
+NTSTATUS CdpCoreOverlayCurrentRead(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_Inout_updates_bytes_(Length) PVOID Buffer)
+{
+	if (!Core || !Buffer || Length == 0)
+		return STATUS_INVALID_PARAMETER;
+	if (Core->Phase == Cdp_CORE_PHASE_PREVIEW)
+		return CdpCoreSynthesizeRead(
+			Core, &Core->PreviewTree, Offset, Length, Buffer, FALSE, FALSE);
+	if (!Core->MetaTreeReady)
+		return STATUS_DEVICE_NOT_READY;
+
+	/* Buffer already contains the source-disk baseline. Apply only journal
+	 * ranges; holes deliberately retain the bytes returned by Disk Lower. */
+	return CdpCoreSynthesizeRead(
+		Core, &Core->MetaTree, Offset, Length, Buffer, TRUE, FALSE);
+}
+
 static BOOLEAN CdpCoreTreeHasOverlap(
 	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
 	_In_ UINT64 Start,

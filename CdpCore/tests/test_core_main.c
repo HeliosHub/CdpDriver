@@ -802,6 +802,15 @@ static int TestAfterImageAllOverlapShapes(void)
 		memcmp(output, expected, sizeof(output)) == 0,
 		"live MetaTree read resolves all four overlap shapes and source gaps");
 
+	/* Disk Upper now obtains the baseline from the original lower read and
+	 * asks Core to replace only journal-covered bytes. */
+	RtlCopyMemory(output, source, sizeof(output));
+	status = CdpCoreOverlayCurrentRead(
+		ctx.Core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(output, expected, sizeof(output)) == 0,
+		"overlay-only read preserves source gaps and replaces MetaTree hits");
+
 	// Each read crosses a fragment boundary, so correctness cannot be achieved
 	// by merely selecting one covering node for the request.
 	RtlZeroMemory(output, 2048);

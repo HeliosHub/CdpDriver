@@ -140,6 +140,15 @@ NTSTATUS CdpCoreRead(
 	_In_ ULONG Length,
 	_Out_writes_bytes_(Length) PVOID Buffer);
 
+// Overlay only the byte ranges present in the current MetaTree. Bytes not
+// covered by the tree are left unchanged. Disk Upper uses this after the
+// original source read has completed, avoiding a second/recursive source I/O.
+NTSTATUS CdpCoreOverlayCurrentRead(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_Inout_updates_bytes_(Length) PVOID Buffer);
+
 NTSTATUS CdpCorePreviewRead(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,

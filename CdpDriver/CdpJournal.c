@@ -32,7 +32,8 @@ static NTSTATUS CdpJournalAppendBranchContinuationLocked(
 	_Inout_ PCdp_JOURNAL Journal);
 
 static NTSTATUS CdpJournalRebuildRuntimeLocked(
-	_Inout_ PCdp_JOURNAL Journal);
+	_Inout_ PCdp_JOURNAL Journal,
+	_Out_opt_ PUINT64 ScannedRecords);
 
 static PCdp_BRANCH_INFO_NODE CdpBranchTreeFindBySequence(
 	_In_ PCdp_BRANCH_INFO_TREE BranchTree,
@@ -1864,7 +1865,9 @@ static NTSTATUS CdpJournalDiscardEmptyNewestRegionLocked(
 	return STATUS_SUCCESS;
 }
 
-static NTSTATUS CdpJournalRebuildRuntimeLocked(_Inout_ PCdp_JOURNAL Journal)
+static NTSTATUS CdpJournalRebuildRuntimeLocked(
+	_Inout_ PCdp_JOURNAL Journal,
+	_Out_opt_ PUINT64 ScannedRecords)
 {
 	UINT64 regionOff;
 	UINT64 oldestOff;
@@ -1880,6 +1883,10 @@ static NTSTATUS CdpJournalRebuildRuntimeLocked(_Inout_ PCdp_JOURNAL Journal)
 	LONG discoveredHighestBranch = 0;
 	NTSTATUS status = STATUS_SUCCESS;
 	PUCHAR region = NULL;
+	UINT64 scannedRecords = 0;
+
+	if (ScannedRecords)
+		*ScannedRecords = 0;
 
 	Journal->TotalRecords = 0;
 	Journal->ActiveHeaderRegionCount = 1;
@@ -1988,6 +1995,7 @@ static NTSTATUS CdpJournalRebuildRuntimeLocked(_Inout_ PCdp_JOURNAL Journal)
 				Journal->CurrentHeaderCount = index;
 				break;
 			}
+			scannedRecords++;
 			isBranch = CdpJournalHeaderIsBranch(&header);
 			isDeleted = CdpJournalHeaderIsDeleted(&header);
 			recordFlags = header.Sequence & Cdp_JOURNAL_RECORD_FLAGS_MASK;
@@ -2294,6 +2302,8 @@ static NTSTATUS CdpJournalRebuildRuntimeLocked(_Inout_ PCdp_JOURNAL Journal)
 	Journal->HighestBranchNumber = persistedHighestBranch;
 
 cleanup:
+	if (ScannedRecords)
+		*ScannedRecords = scannedRecords;
 	if (!NT_SUCCESS(status))
 		CdpBranchTreeFree(&Journal->BranchTree);
 	return status;
@@ -2459,6 +2469,11 @@ NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal)
 	LONG persistedCurrentBranch;
 	LONG persistedHighestBranch;
 	NTSTATUS status;
+	UINT64 scannedRecords = 0;
+#ifndef Cdp_USERMODE
+	UINT64 mountStart100ns;
+	UINT64 mountElapsed100ns;
+#endif
 
 	minSize = (UINT64)Journal->SectorSize +
 		Cdp_JOURNAL_HEADER_REGION_SIZE + (UINT64)Journal->SectorSize;
@@ -2470,6 +2485,9 @@ NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal)
 	}
 
 	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+#ifndef Cdp_USERMODE
+	mountStart100ns = KeQueryInterruptTime();
+#endif
 	sector = (PUCHAR)CdpAllocateAligned(Journal,
 		Journal->SectorSize,
 		&allocationBase);
@@ -2522,7 +2540,7 @@ NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal)
 		RtlZeroMemory(&Journal->Credential, sizeof(Journal->Credential));
 	Journal->SuperblockDirty = FALSE;
 
-	status = CdpJournalRebuildRuntimeLocked(Journal);
+	status = CdpJournalRebuildRuntimeLocked(Journal, &scannedRecords);
 	if (!NT_SUCCESS(status))
 		goto cleanup;
 	if (Journal->CurrentBranchNumber != persistedCurrentBranch ||
@@ -2545,6 +2563,15 @@ NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal)
 	status = STATUS_SUCCESS;
 
 cleanup:
+#ifndef Cdp_USERMODE
+	mountElapsed100ns = KeQueryInterruptTime() - mountStart100ns;
+	Cdp_LOG("[JOURNAL-MOUNT-SCAN] status=0x%08X scannedRecords=%llu activeRecords=%llu headerRegions=%llu elapsedUs=%llu\n",
+		status,
+		scannedRecords,
+		Journal->TotalRecords,
+		Journal->ActiveHeaderRegionCount,
+		mountElapsed100ns / 10ULL);
+#endif
 	if (allocationBase)
 		cdpfree(allocationBase);
 	if (!NT_SUCCESS(status))
@@ -3817,7 +3844,7 @@ NTSTATUS CdpJournalPruneUnreachableForCompaction(
 		NTSTATUS rebuildStatus;
 		NTSTATUS flushStatus = CdpJournalFlush(Journal);
 		CdpJournalAdvanceRecordGenerationLocked(Journal);
-		rebuildStatus = CdpJournalRebuildRuntimeLocked(Journal);
+		rebuildStatus = CdpJournalRebuildRuntimeLocked(Journal, NULL);
 		if (NT_SUCCESS(status) && !NT_SUCCESS(flushStatus))
 			status = flushStatus;
 		if (NT_SUCCESS(status) && !NT_SUCCESS(rebuildStatus))
