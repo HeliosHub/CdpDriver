@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.6.5-test1"
-#define Cdp_DRIVER_BUILD_STRING   "20260824.85-remove-flush-test"
+#define Cdp_DRIVER_VERSION_STRING "1.6.6-test1"
+#define Cdp_DRIVER_BUILD_STRING   "20260824.86-multi-source-per-disk"
 
 #define Cdp_COW_BATCH_MAX_ITEMS 16UL
 #define Cdp_COW_BATCH_MAX_BYTES (16UL * 1024UL * 1024UL)
@@ -140,7 +140,10 @@ typedef enum _Cdp_DEVICE_KIND
 {
 	Cdp_DEVICE_KIND_UNKNOWN = 0,
 	Cdp_DEVICE_KIND_VOLUME = 1,
-	Cdp_DEVICE_KIND_DISK = 2
+	Cdp_DEVICE_KIND_DISK = 2,
+	/* Unattached per-partition protection context created during disk START.
+	 * A disk can own any number of these contexts. */
+	Cdp_DEVICE_KIND_SOURCE = 3
 } Cdp_DEVICE_KIND;
 
 typedef struct _Cdp_DEVICE_EXTENSION

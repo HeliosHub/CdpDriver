@@ -2529,6 +2529,67 @@ static int TestSiblingInheritancePointRetention(void)
 	return g_caseFailed;
 }
 
+static int TestMultipleProtectedPartitionIsolation(void)
+{
+	TEST_CTX first;
+	TEST_CTX second;
+	UCHAR firstSource[2048];
+	UCHAR secondSource[2048];
+	UCHAR firstWrite[512];
+	UCHAR secondWrite[512];
+	UCHAR firstRead[2048];
+	UCHAR secondRead[2048];
+	UCHAR firstExpected[2048];
+	UCHAR secondExpected[2048];
+	NTSTATUS firstStatus;
+	NTSTATUS secondStatus;
+
+	RtlZeroMemory(&first, sizeof(first));
+	RtlZeroMemory(&second, sizeof(second));
+	firstStatus = TestCtxCreate(&first, SRC_SIZE, JNL_SIZE, 200000);
+	secondStatus = TestCtxCreate(&second, SRC_SIZE, JNL_SIZE, 300000);
+	Expect(NT_SUCCESS(firstStatus) && NT_SUCCESS(secondStatus),
+		"create two independent protected partition contexts");
+	if (!NT_SUCCESS(firstStatus) || !NT_SUCCESS(secondStatus))
+	{
+		TestCtxDestroy(&first);
+		TestCtxDestroy(&second);
+		return g_caseFailed;
+	}
+
+	FillPattern(firstSource, sizeof(firstSource), 0x10);
+	FillPattern(secondSource, sizeof(secondSource), 0x70);
+	RtlFillMemory(firstWrite, sizeof(firstWrite), 0xA1);
+	RtlFillMemory(secondWrite, sizeof(secondWrite), 0xB2);
+	Expect(NT_SUCCESS(first.Source->Write(
+		first.Source, 0, sizeof(firstSource), firstSource)) &&
+		NT_SUCCESS(second.Source->Write(
+			second.Source, 0, sizeof(secondSource), secondSource)),
+		"seed distinct source baselines for both partitions");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		first.Core, 512, sizeof(firstWrite), firstWrite, NULL)) &&
+		NT_SUCCESS(CdpCoreAppendAfterImage(
+			second.Core, 512, sizeof(secondWrite), secondWrite, NULL)),
+		"append the same logical range to two independent journals");
+
+	RtlCopyMemory(firstExpected, firstSource, sizeof(firstExpected));
+	RtlCopyMemory(secondExpected, secondSource, sizeof(secondExpected));
+	RtlCopyMemory(firstExpected + 512, firstWrite, sizeof(firstWrite));
+	RtlCopyMemory(secondExpected + 512, secondWrite, sizeof(secondWrite));
+	firstStatus = CdpCoreRead(first.Core, 0, sizeof(firstRead), firstRead);
+	secondStatus = CdpCoreRead(second.Core, 0, sizeof(secondRead), secondRead);
+	Expect(NT_SUCCESS(firstStatus) && NT_SUCCESS(secondStatus) &&
+		memcmp(firstRead, firstExpected, sizeof(firstRead)) == 0 &&
+		memcmp(secondRead, secondExpected, sizeof(secondRead)) == 0,
+		"each partition read resolves only its own MetaTree and journal");
+	Expect(memcmp(firstRead + 512, secondRead + 512, sizeof(firstWrite)) != 0,
+		"overlapping logical offsets do not cross between protected partitions");
+
+	TestCtxDestroy(&first);
+	TestCtxDestroy(&second);
+	return g_caseFailed;
+}
+
 int main(void)
 {
 	int failed = 0;
@@ -2584,6 +2645,8 @@ int main(void)
 		TestGracefulDisableDrainsMetaTree);
 	failed += RunCase("Sibling inheritance point retention",
 		TestSiblingInheritancePointRetention);
+	failed += RunCase("Multiple protected partition isolation",
+		TestMultipleProtectedPartitionIsolation);
 
 	printf("\n%s (%d failures)\n", failed ? "FAILED" : "ALL PASSED", failed);
 	return failed ? 1 : 0;

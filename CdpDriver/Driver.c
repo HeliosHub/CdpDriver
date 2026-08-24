@@ -49,11 +49,154 @@ VOID CdpDeleteFilterDevice(_In_ PDEVICE_OBJECT FilterDeviceObject)
 
 	if (DevExt->LowerDeviceObject)
 	{
-		IoDetachDevice(DevExt->LowerDeviceObject);
+		if (DevExt->DeviceKind == Cdp_DEVICE_KIND_SOURCE)
+			ObDereferenceObject(DevExt->LowerDeviceObject);
+		else
+			IoDetachDevice(DevExt->LowerDeviceObject);
 		DevExt->LowerDeviceObject = NULL;
 	}
 
 	IoDeleteDevice(FilterDeviceObject);
+}
+
+NTSTATUS CdpCreateInternalSourceDevice(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ PCdp_DEVICE_EXTENSION DiskExt,
+	_Out_ PDEVICE_OBJECT* SourceDeviceObject,
+	_Out_ PCdp_DEVICE_EXTENSION* SourceExt)
+{
+	PDEVICE_OBJECT deviceObject = NULL;
+	PCdp_DEVICE_EXTENSION ext;
+	PCdp_DEVICE_LIST_NODE node = NULL;
+	NTSTATUS status;
+
+	if (!DriverExt || !DiskExt || !SourceDeviceObject || !SourceExt ||
+		DiskExt->DeviceKind != Cdp_DEVICE_KIND_DISK ||
+		!DiskExt->LowerDeviceObject)
+		return STATUS_INVALID_PARAMETER;
+	*SourceDeviceObject = NULL;
+	*SourceExt = NULL;
+
+	status = IoCreateDevice(
+		g_DriverObject,
+		sizeof(Cdp_DEVICE_EXTENSION),
+		NULL,
+		FILE_DEVICE_DISK,
+		FILE_DEVICE_SECURE_OPEN,
+		FALSE,
+		&deviceObject);
+	if (!NT_SUCCESS(status))
+		return status;
+
+	ext = (PCdp_DEVICE_EXTENSION)deviceObject->DeviceExtension;
+	RtlZeroMemory(ext, sizeof(*ext));
+	ext->DeviceKind = Cdp_DEVICE_KIND_SOURCE;
+	ext->FilterDeviceObject = deviceObject;
+	ext->PhysicalDeviceObject = DiskExt->PhysicalDeviceObject;
+	ext->LowerDeviceObject = DiskExt->LowerDeviceObject;
+	ObReferenceObject(ext->LowerDeviceObject);
+	ext->DiskNumber = DiskExt->DiskNumber;
+	ext->SectorSize = DiskExt->SectorSize;
+	KeInitializeSpinLock(&ext->CaptureQueueLock);
+	InitializeListHead(&ext->CaptureQueue);
+	KeInitializeEvent(&ext->CaptureEvent, NotificationEvent, FALSE);
+	KeInitializeEvent(
+		&ext->RedirectWritesDrainedEvent, NotificationEvent, TRUE);
+	KeInitializeEvent(&ext->DiskIoDrainedEvent, NotificationEvent, TRUE);
+	KeInitializeEvent(&ext->MergeThreadDoneEvent, NotificationEvent, TRUE);
+	KeInitializeMutex(&ext->HistoryMutex, 0);
+	InterlockedExchange(&ext->Phase, Cdp_PHASE_GENERAL);
+	InterlockedExchange(&ext->Started, 1);
+
+	node = (PCdp_DEVICE_LIST_NODE)cdpalloc(sizeof(*node));
+	if (!node)
+	{
+		ObDereferenceObject(ext->LowerDeviceObject);
+		ext->LowerDeviceObject = NULL;
+		IoDeleteDevice(deviceObject);
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+	node->DeviceObject = deviceObject;
+	ExInterlockedInsertHeadList(
+		&DriverExt->DeviceObjectListHead,
+		&node->Entry,
+		&DriverExt->DeviceObjectListLock);
+	deviceObject->Flags =
+		DiskExt->FilterDeviceObject->Flags | DO_DIRECT_IO;
+	deviceObject->Flags &= ~DO_DEVICE_INITIALIZING;
+	*SourceDeviceObject = deviceObject;
+	*SourceExt = ext;
+	return STATUS_SUCCESS;
+}
+
+VOID CdpDeleteInternalSourceDevice(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ PDEVICE_OBJECT SourceDeviceObject)
+{
+	KIRQL oldIrql;
+	PLIST_ENTRY entry;
+	PCdp_DEVICE_LIST_NODE nodeToFree = NULL;
+	PCdp_DEVICE_EXTENSION ext;
+
+	if (!DriverExt || !SourceDeviceObject)
+		return;
+	ext = (PCdp_DEVICE_EXTENSION)SourceDeviceObject->DeviceExtension;
+	if (!ext || ext->DeviceKind != Cdp_DEVICE_KIND_SOURCE)
+		return;
+
+	KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &oldIrql);
+	for (entry = DriverExt->DeviceObjectListHead.Flink;
+		entry != &DriverExt->DeviceObjectListHead;
+		entry = entry->Flink)
+	{
+		PCdp_DEVICE_LIST_NODE node =
+			CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
+		if (node->DeviceObject == SourceDeviceObject)
+		{
+			RemoveEntryList(&node->Entry);
+			nodeToFree = node;
+			break;
+		}
+	}
+	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
+	if (nodeToFree)
+		cdpfree(nodeToFree);
+	CdpDeleteFilterDevice(SourceDeviceObject);
+}
+
+VOID CdpDeleteInternalSourceDevicesForDisk(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ ULONG DiskNumber)
+{
+	for (;;)
+	{
+		KIRQL oldIrql;
+		PLIST_ENTRY entry;
+		PDEVICE_OBJECT sourceDevice = NULL;
+
+		KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &oldIrql);
+		for (entry = DriverExt->DeviceObjectListHead.Flink;
+			entry != &DriverExt->DeviceObjectListHead;
+			entry = entry->Flink)
+		{
+			PCdp_DEVICE_LIST_NODE node =
+				CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
+			PCdp_DEVICE_EXTENSION ext =
+				(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
+			if (ext && ext->DeviceKind == Cdp_DEVICE_KIND_SOURCE &&
+				ext->DiskNumber == DiskNumber)
+			{
+				sourceDevice = node->DeviceObject;
+				ObReferenceObject(sourceDevice);
+				break;
+			}
+		}
+		KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
+		if (!sourceDevice)
+			break;
+		CdpDeleteInternalSourceDevice(DriverExt, sourceDevice);
+		ObDereferenceObject(sourceDevice);
+	}
 }
 
 NTSTATUS CdpCreateControlDevice(_In_ PDRIVER_OBJECT DriverObject)
