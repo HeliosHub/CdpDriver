@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.6.6-test1"
-#define Cdp_DRIVER_BUILD_STRING   "20260824.86-multi-source-per-disk"
+#define Cdp_DRIVER_VERSION_STRING "1.6.8-test1"
+#define Cdp_DRIVER_BUILD_STRING   "20260824.88-volume-read-worker"
 
 #define Cdp_COW_BATCH_MAX_ITEMS 16UL
 #define Cdp_COW_BATCH_MAX_BYTES (16UL * 1024UL * 1024UL)
@@ -197,6 +197,14 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	PDEVICE_OBJECT FilterDeviceObject;
 	PDEVICE_OBJECT LowerDeviceObject;
 	PDEVICE_OBJECT PhysicalDeviceObject;
+	/* A real volume filter binds directly to the protection owner for its
+	 * partition.  The owner is either this volume object (manual activation)
+	 * or an unattached SOURCE object created by disk pre-start discovery.
+	 * The binding owns an object reference and is protected independently of
+	 * the global device list, so ordinary volume I/O selects its context in
+	 * O(1) without scanning every protected partition. */
+	KSPIN_LOCK ProtectionBindingLock;
+	PDEVICE_OBJECT ProtectionSourceDevice;
 	volatile LONG PagingPathCount;
 	ULONG SectorSize;
 	KSPIN_LOCK CaptureQueueLock;
@@ -247,6 +255,10 @@ typedef struct _Cdp_CAPTURE_ITEM
 	LIST_ENTRY Entry;
 	PIRP Irp;
 	UINT64 OriginalDiskOffset;
+	/* Offset understood by OriginLowerReference.  Disk-originated items use
+	 * the same absolute value as OriginalDiskOffset; volume-originated items
+	 * retain their volume-relative offset here. */
+	UINT64 OriginLowerOffset;
 	PDEVICE_OBJECT SourceReference;
 	PDEVICE_OBJECT OriginLowerReference;
 } Cdp_CAPTURE_ITEM, *PCdp_CAPTURE_ITEM;

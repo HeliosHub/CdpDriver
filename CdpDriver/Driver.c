@@ -41,9 +41,15 @@ static Cdp_DEVICE_KIND CdpGetAttachedDeviceKind(
 VOID CdpDeleteFilterDevice(_In_ PDEVICE_OBJECT FilterDeviceObject)
 {
 	PCdp_DEVICE_EXTENSION DevExt = FilterDeviceObject->DeviceExtension;
+	PCdp_DRIVER_EXTENSION driverExt;
 
 	if (!DevExt)
 		return;
+	driverExt = IoGetDriverObjectExtension(g_DriverObject, &g_DriverObject);
+	if (DevExt->DeviceKind == Cdp_DEVICE_KIND_VOLUME)
+		CdpUnbindVolumeProtectionContext(DevExt);
+	else if (DevExt->DeviceKind == Cdp_DEVICE_KIND_SOURCE && driverExt)
+		CdpUnbindVolumesFromSource(driverExt, FilterDeviceObject);
 
 	CdpDisableAndDestroyCapture(DevExt);
 
@@ -98,6 +104,7 @@ NTSTATUS CdpCreateInternalSourceDevice(
 	ext->DiskNumber = DiskExt->DiskNumber;
 	ext->SectorSize = DiskExt->SectorSize;
 	KeInitializeSpinLock(&ext->CaptureQueueLock);
+	KeInitializeSpinLock(&ext->ProtectionBindingLock);
 	InitializeListHead(&ext->CaptureQueue);
 	KeInitializeEvent(&ext->CaptureEvent, NotificationEvent, FALSE);
 	KeInitializeEvent(
@@ -127,6 +134,91 @@ NTSTATUS CdpCreateInternalSourceDevice(
 	*SourceDeviceObject = deviceObject;
 	*SourceExt = ext;
 	return STATUS_SUCCESS;
+}
+
+NTSTATUS CdpBindVolumeProtectionContext(
+	_Inout_ PCdp_DEVICE_EXTENSION VolumeExt,
+	_In_ PDEVICE_OBJECT SourceDeviceObject)
+{
+	PDEVICE_OBJECT oldSource;
+	PCdp_DEVICE_EXTENSION sourceExt;
+	KIRQL oldIrql;
+
+	if (!VolumeExt || VolumeExt->DeviceKind != Cdp_DEVICE_KIND_VOLUME ||
+		!SourceDeviceObject)
+		return STATUS_INVALID_PARAMETER;
+	sourceExt = (PCdp_DEVICE_EXTENSION)SourceDeviceObject->DeviceExtension;
+	if (!sourceExt || (sourceExt->DeviceKind != Cdp_DEVICE_KIND_VOLUME &&
+		sourceExt->DeviceKind != Cdp_DEVICE_KIND_DISK &&
+		sourceExt->DeviceKind != Cdp_DEVICE_KIND_SOURCE) ||
+		sourceExt->DiskNumber != VolumeExt->DiskNumber ||
+		sourceExt->PartitionStart != VolumeExt->PartitionStart)
+	{
+		return STATUS_OBJECT_TYPE_MISMATCH;
+	}
+
+	ObReferenceObject(SourceDeviceObject);
+	KeAcquireSpinLock(&VolumeExt->ProtectionBindingLock, &oldIrql);
+	oldSource = VolumeExt->ProtectionSourceDevice;
+	VolumeExt->ProtectionSourceDevice = SourceDeviceObject;
+	KeReleaseSpinLock(&VolumeExt->ProtectionBindingLock, oldIrql);
+	if (oldSource)
+		ObDereferenceObject(oldSource);
+	return STATUS_SUCCESS;
+}
+
+VOID CdpUnbindVolumeProtectionContext(
+	_Inout_ PCdp_DEVICE_EXTENSION VolumeExt)
+{
+	PDEVICE_OBJECT oldSource;
+	KIRQL oldIrql;
+
+	if (!VolumeExt || VolumeExt->DeviceKind != Cdp_DEVICE_KIND_VOLUME)
+		return;
+	KeAcquireSpinLock(&VolumeExt->ProtectionBindingLock, &oldIrql);
+	oldSource = VolumeExt->ProtectionSourceDevice;
+	VolumeExt->ProtectionSourceDevice = NULL;
+	KeReleaseSpinLock(&VolumeExt->ProtectionBindingLock, oldIrql);
+	if (oldSource)
+		ObDereferenceObject(oldSource);
+}
+
+VOID CdpUnbindVolumesFromSource(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ PDEVICE_OBJECT SourceDeviceObject)
+{
+	KIRQL listIrql;
+	PLIST_ENTRY entry;
+	ULONG releasedBindings = 0;
+
+	if (!DriverExt || !SourceDeviceObject)
+		return;
+	KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &listIrql);
+	for (entry = DriverExt->DeviceObjectListHead.Flink;
+		entry != &DriverExt->DeviceObjectListHead;
+		entry = entry->Flink)
+	{
+		PCdp_DEVICE_LIST_NODE node =
+			CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
+		PCdp_DEVICE_EXTENSION ext =
+			(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
+
+		if (!ext || ext->DeviceKind != Cdp_DEVICE_KIND_VOLUME)
+			continue;
+		KeAcquireSpinLockAtDpcLevel(&ext->ProtectionBindingLock);
+		if (ext->ProtectionSourceDevice == SourceDeviceObject)
+		{
+			ext->ProtectionSourceDevice = NULL;
+			releasedBindings++;
+		}
+		KeReleaseSpinLockFromDpcLevel(&ext->ProtectionBindingLock);
+	}
+	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, listIrql);
+	while (releasedBindings != 0)
+	{
+		releasedBindings--;
+		ObDereferenceObject(SourceDeviceObject);
+	}
 }
 
 VOID CdpDeleteInternalSourceDevice(
@@ -280,6 +372,7 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 	DeviceExtension->FilterDeviceObject = FilterDeviceObject;
 	DeviceExtension->PhysicalDeviceObject = PhysicalDeviceObject;
 	KeInitializeSpinLock(&DeviceExtension->CaptureQueueLock);
+	KeInitializeSpinLock(&DeviceExtension->ProtectionBindingLock);
 	InitializeListHead(&DeviceExtension->CaptureQueue);
 	KeInitializeEvent(&DeviceExtension->CaptureEvent, NotificationEvent, FALSE);
 	KeInitializeEvent(&DeviceExtension->RedirectWritesDrainedEvent,

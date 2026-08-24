@@ -47,6 +47,14 @@ VOID CdpDeleteInternalSourceDevice(
 VOID CdpDeleteInternalSourceDevicesForDisk(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ ULONG DiskNumber);
+NTSTATUS CdpBindVolumeProtectionContext(
+	_Inout_ PCdp_DEVICE_EXTENSION VolumeExt,
+	_In_ PDEVICE_OBJECT SourceDeviceObject);
+VOID CdpUnbindVolumeProtectionContext(
+	_Inout_ PCdp_DEVICE_EXTENSION VolumeExt);
+VOID CdpUnbindVolumesFromSource(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ PDEVICE_OBJECT SourceDeviceObject);
 
 VOID CdpCloseAllVolumeHandles(_In_ PCdp_DRIVER_EXTENSION DriverExt);
 
