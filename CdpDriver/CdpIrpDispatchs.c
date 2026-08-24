@@ -12,6 +12,11 @@ static VOID CdpStopMergeThread(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
 static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
 static NTSTATUS CdpDrainAndDisableCapture(
 	_Inout_ PCdp_DEVICE_EXTENSION DevExt);
+static NTSTATUS CdpVolumeBackfillWriteAbsolute(
+	_In_opt_ PVOID Context,
+	_In_ UINT64 AbsoluteOffset,
+	_In_ ULONG Length,
+	_In_reads_bytes_(Length) const VOID* Buffer);
 static NTSTATUS CdpScatterReadMdlChain(
 	_In_ PIRP Irp,
 	_In_reads_bytes_(Length) const UCHAR* Source,
@@ -299,7 +304,6 @@ cleanup:
 
 static volatile LONG g_CdpMdllessSystemBufferReported;
 static volatile LONG g_CdpMdllessUserBufferReported;
-static volatile LONG64 g_CdpDirectWriteTraceSequence;
 
 static VOID CdpAuditProtectedReadReset(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 {
@@ -1766,6 +1770,32 @@ static NTSTATUS CdpActivateAutoJournal(
 		CdpDisableAndDestroyCapture(sourceExt);
 		return status;
 	}
+	/* Publish any boot-time view before CaptureEnabled becomes visible. No
+	 * journal write is issued here: both recovery branch creation and restore
+	 * history reset are deferred until the first protected source write. */
+	if (JournalEntry->Journal.RecoveryPending)
+	{
+		UINT64 recoveryTarget =
+			JournalEntry->Journal.RecoveryTargetTime100ns;
+		status = CdpCorePrepareRebootRecovery(
+			sourceExt->Core, recoveryTarget);
+		if (!NT_SUCCESS(status))
+		{
+			Cdp_LOG("[RECOVERY] auto prepare failed status=0x%08X target=%llu; current history remains active\n",
+				status, recoveryTarget);
+			status = STATUS_SUCCESS;
+		}
+	}
+	else if (JournalEntry->Journal.RestorePointSet)
+	{
+		status = CdpCorePreparePersistentRestoreBoot(sourceExt->Core);
+		if (!NT_SUCCESS(status))
+		{
+			Cdp_LOG("[RESTORE-POINT-FAIL] stage=auto-prepare status=0x%08X target=%llu; current history remains active\n",
+				status, JournalEntry->Journal.RestorePointTime100ns);
+			status = STATUS_SUCCESS;
+		}
+	}
 	CdpAuditProtectedReadReset(sourceExt);
 	InterlockedExchange(&sourceExt->DiskIoAccepting, 1);
 	InterlockedExchange(&sourceExt->ProtectionStateValidated, 1);
@@ -2231,10 +2261,6 @@ static NTSTATUS CdpDiscoverJournalForStartedDisk(
 			goto done;
 		}
 
-		CdpAuditProtectedReadReset(DiskExt);
-		InterlockedExchange(&DiskExt->DiskIoAccepting, 1);
-		InterlockedExchange(&DiskExt->ProtectionStateValidated, 1);
-		InterlockedExchange(&DiskExt->CaptureEnabled, 1);
 		if (journalEntry->Journal.RecoveryPending)
 		{
 			UINT64 recoveryTarget =
@@ -2252,6 +2278,21 @@ static NTSTATUS CdpDiscoverJournalForStartedDisk(
 				status = STATUS_SUCCESS;
 			}
 		}
+		else if (journalEntry->Journal.RestorePointSet)
+		{
+			status = CdpCorePreparePersistentRestoreBoot(DiskExt->Core);
+			if (!NT_SUCCESS(status))
+			{
+				Cdp_LOG("[RESTORE-POINT-FAIL] stage=disk-prestart-prepare status=0x%08X target=%llu; current history remains active\n",
+					status,
+					journalEntry->Journal.RestorePointTime100ns);
+				status = STATUS_SUCCESS;
+			}
+		}
+		CdpAuditProtectedReadReset(DiskExt);
+		InterlockedExchange(&DiskExt->DiskIoAccepting, 1);
+		InterlockedExchange(&DiskExt->ProtectionStateValidated, 1);
+		InterlockedExchange(&DiskExt->CaptureEnabled, 1);
 		CdpReleaseVolumeHandleEntry(journalEntry);
 		Cdp_LOG("[DISK-PRESTART] protection enabled before disk START completion disk=%lu sourcePart=%lu source=[%llu,%llu) journalPart=%lu journal=[%llu,%llu) records=%llu\n",
 			DiskExt->DiskNumber,
@@ -2462,37 +2503,6 @@ static NTSTATUS CdpDiscoverAdjacentJournalForStartedVolume(
 	ExReleaseFastMutex(&DriverExt->VolumeHandleMutex);
 
 	status = CdpActivateAutoJournal(DriverExt, handleId, journalEntry);
-	if (NT_SUCCESS(status) && journalEntry->Journal.RecoveryPending)
-	{
-		UINT64 recoveryTarget =
-			journalEntry->Journal.RecoveryTargetTime100ns;
-
-		/* Boot discovery is deliberately read-only. Publish the target view now,
-		 * but defer the new branch RR/Superblock write until the first protected
-		 * source write arrives after START_DEVICE has completed. */
-		CdpStopMergeThread(SourceExt);
-		KeWaitForSingleObject(
-			&SourceExt->HistoryMutex,
-			Executive,
-			KernelMode,
-			FALSE,
-			NULL);
-		status = CdpCorePrepareRebootRecovery(
-			SourceExt->Core, recoveryTarget);
-		KeReleaseMutex(&SourceExt->HistoryMutex, FALSE);
-		if (!NT_SUCCESS(status))
-		{
-			Cdp_LOG("[RECOVERY] pre-mount deferred prepare failed status=0x%08X target=%llu; boot continues with protection mounted\n",
-				status,
-				recoveryTarget);
-			status = STATUS_SUCCESS;
-		}
-		else
-		{
-			Cdp_LOG("[RECOVERY] pre-mount target view ready target=%llu; branch persistence deferred to first source write\n",
-				recoveryTarget);
-		}
-	}
 	CdpReleaseVolumeHandleEntry(journalEntry);
 	if (!NT_SUCCESS(status))
 	{
@@ -3149,6 +3159,149 @@ static NTSTATUS CdpCancelRecovery(
 	// RecoveryBegin is now a synchronous branch switch. There is no prepared
 	// history state that can be cancelled while Phase is Recovery.
 	return STATUS_DEVICE_BUSY;
+}
+
+static NTSTATUS CdpSetRestorePoint(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ const Cdp_RESTORE_POINT_SET_REQUEST* Request,
+	_Out_ PCdp_RESTORE_POINT_SET_REPLY Reply)
+{
+	PCdp_DEVICE_EXTENSION sourceExt;
+	PCdp_VOLUME_HANDLE_ENTRY journalEntry = NULL;
+	UINT64 oldest = 0;
+	UINT64 newest = 0;
+	UINT64 effective = 0;
+	UINT64 targetSequence = 0;
+	ULONG ranges = 0;
+	UINT64 bytes = 0;
+	LONG previousPhase;
+	NTSTATUS status;
+
+	RtlZeroMemory(Reply, sizeof(*Reply));
+	if (!DriverExt || !Request || Request->TargetTime100ns == 0)
+		return STATUS_INVALID_PARAMETER;
+	sourceExt = CdpFindSourceExtensionByGuid(
+		DriverExt, &Request->SourceVolumeGuid);
+	if (!sourceExt || !sourceExt->Core ||
+		InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) == 0)
+	{
+		return STATUS_DEVICE_NOT_READY;
+	}
+	if (CdpAnyPreviewSessionActive(DriverExt))
+		return STATUS_INVALID_DEVICE_STATE;
+	previousPhase = InterlockedCompareExchange(
+		&sourceExt->Phase,
+		(LONG)Cdp_PHASE_RECOVERY,
+		(LONG)Cdp_PHASE_GENERAL);
+	if (previousPhase != (LONG)Cdp_PHASE_GENERAL)
+		return STATUS_INVALID_DEVICE_STATE;
+	status = CdpCoreQueryTimeRange(sourceExt->Core, &oldest, &newest);
+	if (!NT_SUCCESS(status))
+		goto phase_cleanup;
+	if (Request->TargetTime100ns < oldest ||
+		Request->TargetTime100ns > newest)
+	{
+		status = STATUS_NOT_FOUND;
+		goto phase_cleanup;
+	}
+
+	CdpStopMergeThread(sourceExt);
+	KeWaitForSingleObject(
+		&sourceExt->HistoryMutex, Executive, KernelMode, FALSE, NULL);
+	journalEntry = CdpAcquireJournalForSource(DriverExt, sourceExt);
+	if (!journalEntry)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup;
+	}
+	status = CdpCoreMaterializeTimeWithWriter(
+		sourceExt->Core,
+		Request->TargetTime100ns,
+		CdpVolumeBackfillWriteAbsolute,
+		sourceExt,
+		&effective,
+		&targetSequence,
+		&ranges,
+		&bytes);
+	if (!NT_SUCCESS(status))
+	{
+		Cdp_LOG("[RESTORE-POINT-FAIL] stage=source-materialize status=0x%08X target=%llu ranges=%lu bytes=%llu\n",
+			status, Request->TargetTime100ns, ranges, bytes);
+		goto cleanup;
+	}
+	status = CdpJournalSetRestorePoint(
+		&journalEntry->Journal, effective);
+	if (!NT_SUCCESS(status))
+	{
+		Cdp_LOG("[RESTORE-POINT-FAIL] stage=persist-superblock status=0x%08X target=%llu ranges=%lu bytes=%llu\n",
+			status, effective, ranges, bytes);
+		goto cleanup;
+	}
+	Reply->TargetTime100ns = effective;
+	Reply->OldestRecoverable100ns = oldest;
+	Reply->NewestRecoverable100ns = newest;
+	Reply->WrittenRanges = ranges;
+	Reply->WrittenBytes = bytes;
+	Cdp_LOG("[RESTORE-POINT] set target=%llu sequence=%llu sourceRanges=%lu sourceBytes=%llu persistent=1\n",
+		effective, targetSequence, ranges, bytes);
+
+cleanup:
+	if (journalEntry)
+		CdpReleaseVolumeHandleEntry(journalEntry);
+	KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
+
+phase_cleanup:
+	InterlockedExchange(&sourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
+	if (!NT_SUCCESS(status))
+		CdpStartMergeIfNeeded(sourceExt);
+	return status;
+}
+
+static NTSTATUS CdpDeleteRestorePoint(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ const Cdp_RESTORE_POINT_DELETE_REQUEST* Request)
+{
+	PCdp_DEVICE_EXTENSION sourceExt;
+	PCdp_VOLUME_HANDLE_ENTRY journalEntry;
+	LONG previousPhase;
+	NTSTATUS status;
+
+	if (!DriverExt || !Request)
+		return STATUS_INVALID_PARAMETER;
+	sourceExt = CdpFindSourceExtensionByGuid(
+		DriverExt, &Request->SourceVolumeGuid);
+	if (!sourceExt || !sourceExt->Core ||
+		InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) == 0)
+		return STATUS_DEVICE_NOT_READY;
+	if (CdpAnyPreviewSessionActive(DriverExt))
+		return STATUS_INVALID_DEVICE_STATE;
+	previousPhase = InterlockedCompareExchange(
+		&sourceExt->Phase,
+		(LONG)Cdp_PHASE_RECOVERY,
+		(LONG)Cdp_PHASE_GENERAL);
+	if (previousPhase != (LONG)Cdp_PHASE_GENERAL)
+		return STATUS_INVALID_DEVICE_STATE;
+	CdpStopMergeThread(sourceExt);
+	KeWaitForSingleObject(
+		&sourceExt->HistoryMutex, Executive, KernelMode, FALSE, NULL);
+	journalEntry = CdpAcquireJournalForSource(DriverExt, sourceExt);
+	if (!journalEntry)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup;
+	}
+	status = CdpCoreCancelPersistentRestoreBoot(sourceExt->Core);
+	if (NT_SUCCESS(status))
+		status = CdpJournalClearRestorePoint(&journalEntry->Journal);
+	CdpReleaseVolumeHandleEntry(journalEntry);
+
+cleanup:
+	KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
+	InterlockedExchange(&sourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
+	CdpStartMergeIfNeeded(sourceExt);
+	if (NT_SUCCESS(status))
+		Cdp_LOG("[RESTORE-POINT] deleted; no automatic expiration\n");
+	return status;
 }
 
 static NTSTATUS CdpQueryTimeRange(
@@ -3971,6 +4124,14 @@ static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	{
 		return;
 	}
+	/* The source contains the persistent restore baseline. Compaction would
+	 * overwrite it with newer after-images and make the next boot unable to
+	 * return to the selected point. */
+	if (DevExt->RedirectJournalEntry &&
+		DevExt->RedirectJournalEntry->Journal.RestorePointSet)
+	{
+		return;
+	}
 	status = CdpCoreJournalUsageAtLeast(DevExt->Core, 90, &atLeast);
 	if (!NT_SUCCESS(status))
 	{
@@ -4386,7 +4547,6 @@ static NTSTATUS CdpDispatchProtectedDiskWrite(
 	Cdp_CAPTURE_ITEM directItem;
 	NTSTATUS status;
 	LONG phase;
-	LONG64 traceSequence;
 
 	if (irpSp->Parameters.Write.ByteOffset.QuadPart < 0 ||
 		irpSp->Parameters.Write.Length == 0)
@@ -4425,10 +4585,6 @@ static NTSTATUS CdpDispatchProtectedDiskWrite(
 		ObDereferenceObject(sourceReference);
 		return CdpSendToNextDevice(DiskExt->LowerDeviceObject, Irp);
 	}
-	traceSequence = InterlockedIncrement64(&g_CdpDirectWriteTraceSequence);
-	Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=begin disk=%lu offset=%llu len=%lu irp=%p outstanding=%ld\n",
-		traceSequence, DiskExt->DiskNumber, absoluteOffset, length, Irp,
-		InterlockedCompareExchange(&sourceExt->DiskIoOutstanding, 0, 0));
 	if (KeGetCurrentIrql() > APC_LEVEL)
 	{
 		Cdp_LOG("[DIRECT-WRITE-FAIL] reason=irql irql=%lu offset=%llu len=%lu\n",
@@ -4453,22 +4609,10 @@ static NTSTATUS CdpDispatchProtectedDiskWrite(
 	if (InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) != 0 &&
 		CdpTryAcquireRedirectWrite(sourceExt))
 	{
-		Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=history-wait source=%p\n",
-			traceSequence, sourceExt);
 		KeWaitForSingleObject(&sourceExt->HistoryMutex,
 			Executive, KernelMode, FALSE, NULL);
-		Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=history-acquired source=%p\n",
-			traceSequence, sourceExt);
-		Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=redirect-begin core=%p journal=%p\n",
-			traceSequence, sourceExt->Core,
-			sourceExt->RedirectJournalEntry ?
-				&sourceExt->RedirectJournalEntry->Journal : NULL);
 		status = CdpRedirectJournalWrite(sourceExt, &directItem);
-		Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=redirect-end status=0x%08X\n",
-			traceSequence, status);
 		KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
-		Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=complete status=0x%08X drain=0\n",
-			traceSequence, status);
 		CdpReleaseDiskIoOutstanding(sourceExt);
 		ObDereferenceObject(sourceReference);
 		return status;
@@ -4488,22 +4632,12 @@ static NTSTATUS CdpDispatchProtectedDiskWrite(
 		phase);
 	CdpReleaseDiskIoOutstanding(sourceExt);
 	ObDereferenceObject(sourceReference);
-	Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=complete status=0x%08X reason=state-change\n",
-		traceSequence, STATUS_DEVICE_NOT_READY);
 	return CdpCompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
 
 drain_write:
-	Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=drain-history-wait source=%p\n",
-		traceSequence, sourceExt);
 	KeWaitForSingleObject(&sourceExt->HistoryMutex,
 		Executive, KernelMode, FALSE, NULL);
-	Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=drain-history-acquired source=%p\n",
-		traceSequence, sourceExt);
-	Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=drain-source-write-begin lower=%p\n",
-		traceSequence, directItem.OriginLowerReference);
 	status = CdpForwardQueuedDiskIrpSynchronously(&directItem);
-	Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=drain-source-write-end status=0x%08X information=%Iu\n",
-		traceSequence, status, Irp->IoStatus.Information);
 	if (NT_SUCCESS(status) && sourceExt->Core)
 	{
 		NTSTATUS punchStatus = CdpCorePunchMetaRange(
@@ -4517,8 +4651,6 @@ drain_write:
 		}
 	}
 	KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
-	Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=complete status=0x%08X drain=1\n",
-		traceSequence, status);
 	CdpReleaseDiskIoOutstanding(sourceExt);
 	ObDereferenceObject(sourceReference);
 	IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -4727,8 +4859,6 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 						coverage == Cdp_CORE_READ_COVERAGE_NONE)
 					{
 						KeReleaseMutex(&devExt->HistoryMutex, FALSE);
-						Cdp_LOG("[QUEUED-READ-ROUTE] stage=passthrough coverage=NONE offset=%llu len=%lu\n",
-							readOffset, ioLength);
 						(void)CdpForwardQueuedDiskIrpSynchronously(item);
 						IoCompleteRequest(item->Irp, IO_NO_INCREMENT);
 						goto capture_item_done;
@@ -4748,24 +4878,11 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 					}
 					if (NT_SUCCESS(readStatus) && sourceReadLength != 0)
 					{
-						Cdp_LOG("[QUEUED-READ-ROUTE] stage=source-read-begin coverage=PARTIAL request=[%llu,%llu) source=[%llu,%llu) lower=%p\n",
-							readOffset, readOffset + ioLength,
-							sourceReadOffset, sourceReadOffset + sourceReadLength,
-							item->OriginLowerReference);
 						readStatus = CdpReadDiskLowerSynchronously(
 							item->OriginLowerReference,
 							sourceReadOffset,
 							sourceReadLength,
 							buffer + (ULONG)(sourceReadOffset - readOffset));
-						Cdp_LOG("[QUEUED-READ-ROUTE] stage=source-read-end coverage=PARTIAL source=[%llu,%llu) status=0x%08X\n",
-							sourceReadOffset,
-							sourceReadOffset + sourceReadLength, readStatus);
-					}
-					else if (NT_SUCCESS(readStatus) &&
-						coverage == Cdp_CORE_READ_COVERAGE_FULL)
-					{
-						Cdp_LOG("[QUEUED-READ-ROUTE] stage=source-read-skip coverage=FULL request=[%llu,%llu)\n",
-							readOffset, readOffset + ioLength);
 					}
 					if (NT_SUCCESS(readStatus))
 					{
@@ -5205,6 +5322,19 @@ VOID CdpDisableAndDestroyCapture(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 
 	if (core)
 		CdpCoreDestroy(core);
+}
+
+NTSTATUS CdpIrpDispatchFlush(
+	_In_ PDEVICE_OBJECT DeviceObject,
+	_Inout_ PIRP Irp)
+{
+	PCdp_DEVICE_EXTENSION deviceExt =
+		(PCdp_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
+
+	if (!deviceExt || !deviceExt->LowerDeviceObject)
+		return CdpCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);
+
+	return CdpSendToNextDevice(deviceExt->LowerDeviceObject, Irp);
 }
 
 NTSTATUS CdpIrpDispatchShutdown(
@@ -6315,6 +6445,59 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 						(ULONG_PTR)reply->BranchCount *
 							sizeof(Cdp_JOURNAL_BRANCH_INFO) :
 					0);
+		}
+
+		case IOCTL_Cdp_SET_RESTORE_POINT:
+		{
+			Cdp_RESTORE_POINT_SET_REQUEST request;
+			PCdp_RESTORE_POINT_SET_REPLY reply;
+			ULONG inLen =
+				IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+			ULONG outLen =
+				IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
+			NTSTATUS status;
+
+			if (!DriverExt || !Irp->AssociatedIrp.SystemBuffer ||
+				inLen < sizeof(request) ||
+				outLen < sizeof(Cdp_RESTORE_POINT_SET_REPLY))
+			{
+				return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+			}
+			request = *(PCdp_RESTORE_POINT_SET_REQUEST)
+				Irp->AssociatedIrp.SystemBuffer;
+			if (!CdpControlHandleAuthorized(
+				Irp, DriverExt, &request.SourceVolumeGuid))
+			{
+				return CdpCompleteIrp(Irp, STATUS_ACCESS_DENIED, 0);
+			}
+			reply = (PCdp_RESTORE_POINT_SET_REPLY)
+				Irp->AssociatedIrp.SystemBuffer;
+			status = CdpSetRestorePoint(DriverExt, &request, reply);
+			return CdpCompleteIrp(
+				Irp, status, NT_SUCCESS(status) ? sizeof(*reply) : 0);
+		}
+
+		case IOCTL_Cdp_DELETE_RESTORE_POINT:
+		{
+			Cdp_RESTORE_POINT_DELETE_REQUEST request;
+			ULONG inLen =
+				IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+			NTSTATUS status;
+
+			if (!DriverExt || !Irp->AssociatedIrp.SystemBuffer ||
+				inLen < sizeof(request))
+			{
+				return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+			}
+			request = *(PCdp_RESTORE_POINT_DELETE_REQUEST)
+				Irp->AssociatedIrp.SystemBuffer;
+			if (!CdpControlHandleAuthorized(
+				Irp, DriverExt, &request.SourceVolumeGuid))
+			{
+				return CdpCompleteIrp(Irp, STATUS_ACCESS_DENIED, 0);
+			}
+			status = CdpDeleteRestorePoint(DriverExt, &request);
+			return CdpCompleteIrp(Irp, status, 0);
 		}
 
 		case IOCTL_Cdp_QUERY_VERSION:

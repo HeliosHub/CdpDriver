@@ -2224,6 +2224,119 @@ static int TestDeferredRebootRecoveryBranch(void)
 	return g_caseFailed;
 }
 
+static int TestPersistentRestorePoint(void)
+{
+	TEST_CTX ctx;
+	TEST_DRAIN_WRITER writer;
+	PCdp_JOURNAL_SUPERBLOCK superblock;
+	Cdp_JOURNAL_RECORD targetRecord;
+	Cdp_JOURNAL_RECORD records[8];
+	UCHAR baseline[512];
+	UCHAR target[512];
+	UCHAR latest[512];
+	UCHAR fresh[512];
+	UCHAR output[512];
+	UINT64 effective = 0;
+	UINT64 targetSequence = 0;
+	UINT64 writtenBytes = 0;
+	UINT64 total = 0;
+	UINT64 generation = 0;
+	ULONG writtenRanges = 0;
+	ULONG returned = 0;
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(TestCtxCreate(
+		&ctx, SRC_SIZE, JNL_SIZE, 250000)),
+		"setup persistent restore-point test");
+	if (!ctx.Core)
+		return g_caseFailed;
+	RtlFillMemory(baseline, sizeof(baseline), 0x11);
+	RtlFillMemory(target, sizeof(target), 0x22);
+	RtlFillMemory(latest, sizeof(latest), 0x33);
+	RtlFillMemory(fresh, sizeof(fresh), 0x44);
+	Expect(NT_SUCCESS(ctx.Source->Write(
+		ctx.Source, 0, sizeof(baseline), baseline)),
+		"seed source before restore-point history");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(target), target, &targetRecord)),
+		"append restore-point target value");
+	CdpCoreSetTime100ns(ctx.Core, 260000);
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(latest), latest, NULL)),
+		"append value newer than restore point");
+
+	RtlZeroMemory(&writer, sizeof(writer));
+	writer.Store = ctx.Source;
+	status = CdpCoreMaterializeTimeWithWriter(
+		ctx.Core, targetRecord.WallClock100ns,
+		TestDrainAbsoluteWriter, &writer,
+		&effective, &targetSequence, &writtenRanges, &writtenBytes);
+	RtlZeroMemory(output, sizeof(output));
+	Expect(NT_SUCCESS(status) && effective == targetRecord.WallClock100ns &&
+		targetSequence == targetRecord.Sequence && writtenRanges == 1 &&
+		writtenBytes == sizeof(target) &&
+		NT_SUCCESS(ctx.Source->Read(ctx.Source, 0, sizeof(output), output)) &&
+		memcmp(output, target, sizeof(output)) == 0,
+		"setting point materializes exact target view into source");
+	Expect(NT_SUCCESS(CdpCoreSetRestorePointMarker(
+		ctx.Core, targetRecord.WallClock100ns)),
+		"persist restore-point marker in superblock");
+	superblock = (PCdp_JOURNAL_SUPERBLOCK)CdpMemStoreData(ctx.Journal);
+	Expect((superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_POINT_SET) != 0 &&
+		superblock->RestorePointTime100ns == targetRecord.WallClock100ns,
+		"superblock contains persistent restore-point time");
+
+	Expect(NT_SUCCESS(CdpCorePrepareRebootRecovery(
+		ctx.Core, targetRecord.WallClock100ns)),
+		"prepare higher-priority recovery view");
+	ExpectStatus(CdpCorePreparePersistentRestoreBoot(ctx.Core),
+		STATUS_INVALID_DEVICE_STATE,
+		"recovery preparation prevents restore-point boot handling");
+
+	CdpCoreDestroy(ctx.Core);
+	ctx.Core = NULL;
+	status = CdpCoreCreate(ctx.Source, ctx.Journal, &ctx.Core);
+	if (NT_SUCCESS(status))
+		status = CdpCoreMountJournal(ctx.Core);
+	Expect(NT_SUCCESS(status), "remount persistent restore-point journal");
+	Expect(NT_SUCCESS(CdpCorePreparePersistentRestoreBoot(ctx.Core)),
+		"boot publishes empty MetaTree without writing journal");
+	status = CdpCoreQueryRecordHeaders(
+		ctx.Core, 0, 0, records, RTL_NUMBER_OF(records),
+		&total, &generation, &returned);
+	Expect(NT_SUCCESS(status) && total == 3,
+		"restore boot preparation leaves old history physically untouched");
+	RtlZeroMemory(output, sizeof(output));
+	Expect(NT_SUCCESS(CdpCoreRead(
+		ctx.Core, 0, sizeof(output), output)) &&
+		memcmp(output, target, sizeof(output)) == 0,
+		"empty boot MetaTree exposes materialized restore baseline");
+
+	CdpCoreSetTime100ns(ctx.Core, 270000);
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(fresh), fresh, NULL)),
+		"first new write resets history and starts fresh branch");
+	returned = 0;
+	status = CdpCoreQueryRecordHeaders(
+		ctx.Core, 0, 0, records, RTL_NUMBER_OF(records),
+		&total, &generation, &returned);
+	Expect(NT_SUCCESS(status) && total == 2 && returned == 2 &&
+		records[0].Flags == Cdp_JOURNAL_RECORD_FLAG_BRANCH &&
+		records[1].Flags == 0,
+		"old history is replaced by root marker and first fresh record");
+	superblock = (PCdp_JOURNAL_SUPERBLOCK)CdpMemStoreData(ctx.Journal);
+	Expect((superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_POINT_SET) != 0,
+		"history reset preserves restore-point marker");
+	Expect(NT_SUCCESS(CdpCoreClearRestorePointMarker(ctx.Core)),
+		"explicit delete clears persistent restore point");
+	Expect((superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_POINT_SET) == 0 &&
+		superblock->RestorePointTime100ns == 0,
+		"deleted restore point is absent from superblock");
+
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
 static int TestGracefulDisableDrainsMetaTree(void)
 {
 	TEST_CTX ctx;
@@ -2465,6 +2578,8 @@ int main(void)
 		TestAfterImageRecoveryBranchSwitch);
 	failed += RunCase("Deferred reboot recovery branch",
 		TestDeferredRebootRecoveryBranch);
+	failed += RunCase("Persistent restore point",
+		TestPersistentRestorePoint);
 	failed += RunCase("Graceful disable drains MetaTree",
 		TestGracefulDisableDrainsMetaTree);
 	failed += RunCase("Sibling inheritance point retention",

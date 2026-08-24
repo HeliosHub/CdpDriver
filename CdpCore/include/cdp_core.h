@@ -190,6 +190,28 @@ NTSTATUS CdpCorePrepareRebootRecovery(
 
 BOOLEAN CdpCoreHasPendingRecoveryBranch(_In_ PCdp_CORE Core);
 
+/* Persistent restore-point boot handling. Discovery publishes an empty
+ * MetaTree without issuing boot-time journal writes; the first protected
+ * append durably resets history before recording its payload. */
+NTSTATUS CdpCorePreparePersistentRestoreBoot(_Inout_ PCdp_CORE Core);
+NTSTATUS CdpCoreCancelPersistentRestoreBoot(_Inout_ PCdp_CORE Core);
+NTSTATUS CdpCoreSetRestorePointMarker(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 TargetTime100ns);
+NTSTATUS CdpCoreClearRestorePointMarker(_Inout_ PCdp_CORE Core);
+
+/* Build the exact target view and write each latest interval through the
+ * caller's source-volume writer. The live MetaTree/branch is not changed. */
+NTSTATUS CdpCoreMaterializeTimeWithWriter(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 TargetTime100ns,
+	_In_ Cdp_CORE_DRAIN_WRITE_ROUTINE WriteRoutine,
+	_In_opt_ PVOID WriteContext,
+	_Out_opt_ PUINT64 EffectiveTime100ns,
+	_Out_opt_ PUINT64 TargetSequence,
+	_Out_opt_ PULONG WrittenRanges,
+	_Out_opt_ PUINT64 WrittenBytes);
+
 /* Idempotent compatibility acknowledgement; RecoveryBegin already completed. */
 NTSTATUS CdpCoreRecoveryCommit(_Inout_ PCdp_CORE Core);
 

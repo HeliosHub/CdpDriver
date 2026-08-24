@@ -76,6 +76,7 @@ struct _Cdp_CORE
 	LONG MergeActive;
 	BOOLEAN PreviewStoppedByMerge;
 	BOOLEAN PendingRecoveryBranch;
+	BOOLEAN PendingRestoreReset;
 	LONG PendingRecoveryParentBranch;
 	LONG PendingRecoveryBranchNumber;
 	UINT64 PendingRecoveryInheritedSequence;
@@ -1032,6 +1033,33 @@ static NTSTATUS CdpCoreMaterializePendingRecoveryBranchLocked(
 	return STATUS_SUCCESS;
 }
 
+static NTSTATUS CdpCoreMaterializePendingRestoreResetLocked(
+	_Inout_ PCdp_CORE Core)
+{
+	NTSTATUS status;
+
+	if (!Core->PendingRestoreReset)
+		return STATUS_SUCCESS;
+	/* A recovery intent always wins. This state combination indicates an
+	 * activation ordering bug, so fail closed instead of deleting history. */
+	if (Core->PendingRecoveryBranch || Core->Journal->RecoveryPending)
+		return STATUS_INVALID_DEVICE_STATE;
+	status = CdpJournalResetHistoryPreserveRestorePoint(Core->Journal);
+	if (!NT_SUCCESS(status))
+	{
+#ifndef Cdp_USERMODE
+		Cdp_LOG("[RESTORE-POINT-FAIL] stage=reset-before-first-write status=0x%08X\n",
+			status);
+#endif
+		return status;
+	}
+	Core->PendingRestoreReset = FALSE;
+#ifndef Cdp_USERMODE
+	Cdp_LOG("[RESTORE-POINT] old history discarded; fresh root branch persisted before first write\n");
+#endif
+	return STATUS_SUCCESS;
+}
+
 NTSTATUS CdpCoreAppendAfterImage(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,
@@ -1067,6 +1095,13 @@ NTSTATUS CdpCoreAppendAfterImage(
 		return STATUS_DEVICE_NOT_READY;
 	}
 	nodeCountBefore = Core->MetaTree.NodeCount;
+	status = CdpCoreMaterializePendingRestoreResetLocked(Core);
+	if (!NT_SUCCESS(status))
+	{
+		Cdp_LOCK_RELEASE(&Core->TreeLock);
+		Cdp_FREE(ledgerRange);
+		return status;
+	}
 	status = CdpCoreMaterializePendingRecoveryBranchLocked(Core);
 	if (!NT_SUCCESS(status))
 	{
@@ -1862,6 +1897,157 @@ failure:
 	Core->TargetTime100ns = previousTargetTime100ns;
 	Core->Phase = Cdp_CORE_PHASE_GENERAL;
 	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	return status;
+}
+
+NTSTATUS CdpCorePreparePersistentRestoreBoot(_Inout_ PCdp_CORE Core)
+{
+	Cdp_PREVIEW_TREE oldTree;
+
+	if (!Core || !Core->Journal || !Core->Journal->Mounted)
+		return STATUS_DEVICE_NOT_READY;
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	if (Core->Phase != Cdp_CORE_PHASE_GENERAL || Core->Building ||
+		Core->MergeActive || Core->PendingRecoveryBranch ||
+		Core->Journal->RecoveryPending ||
+		!Core->Journal->RestorePointSet)
+	{
+		Cdp_LOCK_RELEASE(&Core->TreeLock);
+		return STATUS_INVALID_DEVICE_STATE;
+	}
+	oldTree = Core->MetaTree;
+	CdpPreviewTreeInitialize(&Core->MetaTree);
+	CdpCoreClearWriteLedger(Core);
+	Core->MetaTreeReady = TRUE;
+	Core->PendingRestoreReset = TRUE;
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	CdpPreviewTreeFree(&oldTree);
+#ifndef Cdp_USERMODE
+	Cdp_LOG("[RESTORE-POINT] boot baseline published target=%llu; history reset deferred to first write\n",
+		Core->Journal->RestorePointTime100ns);
+#endif
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS CdpCoreCancelPersistentRestoreBoot(_Inout_ PCdp_CORE Core)
+{
+	BOOLEAN pending;
+
+	if (!Core)
+		return STATUS_INVALID_PARAMETER;
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	pending = Core->PendingRestoreReset;
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	if (!pending)
+		return STATUS_SUCCESS;
+	/* Until the first append, the old journal is intact, so deletion can
+	 * restore the ordinary current view by rebuilding from it. */
+	if (!NT_SUCCESS(CdpCoreBuildMetaTree(Core)))
+		return STATUS_UNSUCCESSFUL;
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	Core->PendingRestoreReset = FALSE;
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS CdpCoreSetRestorePointMarker(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 TargetTime100ns)
+{
+	if (!Core)
+		return STATUS_INVALID_PARAMETER;
+	return CdpJournalSetRestorePoint(Core->Journal, TargetTime100ns);
+}
+
+NTSTATUS CdpCoreClearRestorePointMarker(_Inout_ PCdp_CORE Core)
+{
+	if (!Core)
+		return STATUS_INVALID_PARAMETER;
+	return CdpJournalClearRestorePoint(Core->Journal);
+}
+
+static NTSTATUS CdpCoreMaterializeTreeWithWriter(
+	_Inout_ PCdp_CORE Core,
+	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
+	_In_ Cdp_CORE_DRAIN_WRITE_ROUTINE WriteRoutine,
+	_In_opt_ PVOID WriteContext,
+	_Inout_ PULONG WrittenRanges,
+	_Inout_ PUINT64 WrittenBytes)
+{
+	PVOID payload;
+	NTSTATUS status;
+
+	if (!Node)
+		return STATUS_SUCCESS;
+	status = CdpCoreMaterializeTreeWithWriter(
+		Core, Node->Left, WriteRoutine, WriteContext,
+		WrittenRanges, WrittenBytes);
+	if (!NT_SUCCESS(status))
+		return status;
+	if (!Node->Invalid)
+	{
+		payload = Cdp_ALLOC(Node->DataLength);
+		if (!payload)
+			return STATUS_INSUFFICIENT_RESOURCES;
+		status = CdpJournalReadPayload(
+			Core->Journal, Node->FileOffset, Node->DataLength, payload);
+		if (NT_SUCCESS(status))
+			status = WriteRoutine(
+				WriteContext, Node->Start, Node->DataLength, payload);
+		Cdp_FREE(payload);
+		if (!NT_SUCCESS(status))
+			return status;
+		(*WrittenRanges)++;
+		*WrittenBytes += Node->DataLength;
+	}
+	return CdpCoreMaterializeTreeWithWriter(
+		Core, Node->Right, WriteRoutine, WriteContext,
+		WrittenRanges, WrittenBytes);
+}
+
+NTSTATUS CdpCoreMaterializeTimeWithWriter(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 TargetTime100ns,
+	_In_ Cdp_CORE_DRAIN_WRITE_ROUTINE WriteRoutine,
+	_In_opt_ PVOID WriteContext,
+	_Out_opt_ PUINT64 EffectiveTime100ns,
+	_Out_opt_ PUINT64 TargetSequence,
+	_Out_opt_ PULONG WrittenRanges,
+	_Out_opt_ PUINT64 WrittenBytes)
+{
+	Cdp_PREVIEW_TREE tree;
+	UINT64 effective = TargetTime100ns;
+	UINT64 targetSequence = 0;
+	ULONG ranges = 0;
+	UINT64 bytes = 0;
+	NTSTATUS status;
+
+	if (!Core || !WriteRoutine || TargetTime100ns == 0)
+		return STATUS_INVALID_PARAMETER;
+	if (!Core->Journal || !Core->Journal->Mounted)
+		return STATUS_DEVICE_NOT_READY;
+	CdpPreviewTreeInitialize(&tree);
+	status = CdpCoreResolveTargetTime(Core, TargetTime100ns, &effective);
+	if (!NT_SUCCESS(status))
+		goto done;
+	status = CdpJournalBuildPreviewTree(
+		Core->Journal, effective, Core->Journal->NextSequence,
+		TRUE, &tree, &targetSequence);
+	if (status == STATUS_NOT_FOUND)
+		status = STATUS_SUCCESS;
+	if (NT_SUCCESS(status))
+		status = CdpCoreMaterializeTreeWithWriter(
+			Core, tree.Root, WriteRoutine, WriteContext, &ranges, &bytes);
+done:
+	CdpPreviewTreeFree(&tree);
+	if (EffectiveTime100ns)
+		*EffectiveTime100ns = effective;
+	if (TargetSequence)
+		*TargetSequence = targetSequence;
+	if (WrittenRanges)
+		*WrittenRanges = ranges;
+	if (WrittenBytes)
+		*WrittenBytes = bytes;
 	return status;
 }
 

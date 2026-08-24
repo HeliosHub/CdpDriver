@@ -787,6 +787,67 @@ static BOOL DoRecoveryCancel(HANDLE hDevice)
 	return TRUE;
 }
 
+static BOOL DoSetRestorePoint(HANDLE hDevice)
+{
+	Cdp_RESTORE_POINT_SET_REQUEST req = { 0 };
+	Cdp_RESTORE_POINT_SET_REPLY reply = { 0 };
+	DWORD bytesReturned = 0;
+	wchar_t line[64];
+
+	ListVolumes();
+	if (!PromptGuid(L"Protected source volume GUID: ", &req.SourceVolumeGuid))
+		return FALSE;
+	if (!AuthenticatePassword(hDevice))
+		return FALSE;
+	ConOut(L"Restore-point TargetTime100ns: ");
+	if (!ReadLine(line, _countof(line)))
+		return FALSE;
+	req.TargetTime100ns = _wcstoui64(line, NULL, 10);
+	if (!req.TargetTime100ns)
+	{
+		ConOut(L"Invalid target time.\n");
+		return FALSE;
+	}
+	ConOut(L"Materializing the selected view to the source volume...\n");
+	if (!DeviceIoControl(
+		hDevice, IOCTL_Cdp_SET_RESTORE_POINT,
+		&req, sizeof(req), &reply, sizeof(reply),
+		&bytesReturned, NULL))
+	{
+		ConOutFmt(L"Set restore point failed (err=%lu).\n", GetLastError());
+		return FALSE;
+	}
+	ConOutFmt(L"Restore point saved. target=%llu range=[%llu, %llu] writtenRanges=%lu writtenBytes=%llu\n",
+		reply.TargetTime100ns,
+		reply.OldestRecoverable100ns,
+		reply.NewestRecoverable100ns,
+		reply.WrittenRanges,
+		reply.WrittenBytes);
+	ConOut(L"It remains active until explicitly deleted. Recovery intent takes priority at boot.\n");
+	return TRUE;
+}
+
+static BOOL DoDeleteRestorePoint(HANDLE hDevice)
+{
+	Cdp_RESTORE_POINT_DELETE_REQUEST req = { 0 };
+	DWORD bytesReturned = 0;
+
+	ListVolumes();
+	if (!PromptGuid(L"Protected source volume GUID: ", &req.SourceVolumeGuid))
+		return FALSE;
+	if (!AuthenticatePassword(hDevice))
+		return FALSE;
+	if (!DeviceIoControl(
+		hDevice, IOCTL_Cdp_DELETE_RESTORE_POINT,
+		&req, sizeof(req), NULL, 0, &bytesReturned, NULL))
+	{
+		ConOutFmt(L"Delete restore point failed (err=%lu).\n", GetLastError());
+		return FALSE;
+	}
+	ConOut(L"Persistent restore point deleted.\n");
+	return TRUE;
+}
+
 static void PrintGuidLine(_In_ const wchar_t* label, _In_ const GUID* Guid)
 {
 	ConOutFmt(
@@ -1397,6 +1458,8 @@ static void PrintHelp(void)
 	ConOut(L"  e  - enter prepared recovery (source GUID + time; no writeback)\n");
 	ConOut(L"  r  - commit prepared recovery synchronously (writeback to source)\n");
 	ConOut(L"  c  - cancel prepared recovery without writeback\n");
+	ConOut(L"  o  - set persistent restore point (source GUID + time)\n");
+	ConOut(L"  x  - delete persistent restore point\n");
 	ConOut(L"  p  - set / verify / change the shared protection password\n");
 	ConOut(L"  v  - list volumes\n");
 	ConOut(L"  d  - query driver version / build / journal version\n");
@@ -1522,6 +1585,18 @@ int wmain(void)
 			hDevice = EnsureControlDevice(hDevice);
 			if (hDevice != INVALID_HANDLE_VALUE)
 				DoRecoveryCancel(hDevice);
+			break;
+		case L'o':
+		case L'O':
+			hDevice = EnsureControlDevice(hDevice);
+			if (hDevice != INVALID_HANDLE_VALUE)
+				DoSetRestorePoint(hDevice);
+			break;
+		case L'x':
+		case L'X':
+			hDevice = EnsureControlDevice(hDevice);
+			if (hDevice != INVALID_HANDLE_VALUE)
+				DoDeleteRestorePoint(hDevice);
 			break;
 		case L'p':
 		case L'P':

@@ -9,7 +9,8 @@
 #endif
 
 #define Cdp_JOURNAL_MAGIC            0x4C4E4A51UL /* 'QJNL' */
-#define Cdp_JOURNAL_VERSION          14UL
+#define Cdp_JOURNAL_VERSION          15UL
+#define Cdp_JOURNAL_VERSION_PREVIOUS 14UL
 #define Cdp_JOURNAL_MAX_RECORD_DATA  (2UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_REGION_SIZE (1UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_LINK_SIZE 32UL
@@ -20,6 +21,7 @@
 // recovery intents do not set it and reboot recovery performs no filesystem
 // repair.
 #define Cdp_JOURNAL_FLAG_RECOVERY_FS_REPAIR_PENDING 0x00000004UL
+#define Cdp_JOURNAL_FLAG_RESTORE_POINT_SET 0x00000008UL
 #define Cdp_JOURNAL_RECORD_INDEX_MASK     0x0000FFFFUL
 #define Cdp_JOURNAL_RECORD_FLAGS_MASK     0xFFFF0000UL
 // Highest Sequence bit selects the branch-record interpretation.
@@ -94,7 +96,7 @@ typedef struct _Cdp_CREDENTIAL_DESCRIPTOR
 	UINT64 AuthEpoch;
 } Cdp_CREDENTIAL_DESCRIPTOR, *PCdp_CREDENTIAL_DESCRIPTOR;
 
-// On-disk layout (v14): VolumeOffset uses the absolute physical-disk address;
+// On-disk layout (v15): VolumeOffset uses the absolute physical-disk address;
 // FileOffset remains relative to the journal partition's own storage backend.
 // One superblock is followed by alternating header/payload areas.
 //   [Superblock]
@@ -128,6 +130,9 @@ typedef struct _Cdp_JOURNAL_SUPERBLOCK
 	UINT64 JournalPartitionStart;
 	UINT64 JournalPartitionSize;
 	ULONG MetadataCrc32c;
+	/* Appended in v15 so every v14 field and CRC retains its old offset. */
+	UINT64 RestorePointTime100ns;
+	ULONG RestorePointCrc32c;
 } Cdp_JOURNAL_SUPERBLOCK, *PCdp_JOURNAL_SUPERBLOCK;
 
 #pragma pack(pop)
@@ -251,10 +256,12 @@ typedef struct _Cdp_JOURNAL
 	LONG HighestBranchNumber;
 	Cdp_BRANCH_INFO_TREE BranchTree;
 	BOOLEAN RecoveryPending;
+	BOOLEAN RestorePointSet;
 	BOOLEAN RecoveryFsRepairPending;
 	volatile LONG RecoveryFsRepairAttempts;
 	BOOLEAN SuperblockDirty;
 	UINT64 RecoveryTargetTime100ns;
+	UINT64 RestorePointTime100ns;
 	BOOLEAN CredentialConfigured;
 	Cdp_CREDENTIAL_DESCRIPTOR Credential;
 	GUID SourceVolumeGuid;
@@ -374,6 +381,17 @@ NTSTATUS CdpJournalClearRecoveryIntent(_Inout_ PCdp_JOURNAL Journal);
 NTSTATUS CdpJournalCompleteRecoveryIntent(_Inout_ PCdp_JOURNAL Journal);
 
 NTSTATUS CdpJournalClearRecoveryFsRepairPending(_Inout_ PCdp_JOURNAL Journal);
+
+NTSTATUS CdpJournalSetRestorePoint(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 TargetTime100ns);
+
+NTSTATUS CdpJournalClearRestorePoint(_Inout_ PCdp_JOURNAL Journal);
+
+// Discard every retained record and create a new root branch while retaining
+// the persistent restore-point marker itself.
+NTSTATUS CdpJournalResetHistoryPreserveRestorePoint(
+	_Inout_ PCdp_JOURNAL Journal);
 
 NTSTATUS CdpJournalSetCredential(
 	_Inout_ PCdp_JOURNAL Journal,

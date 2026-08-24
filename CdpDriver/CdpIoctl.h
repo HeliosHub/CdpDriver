@@ -54,6 +54,8 @@
 // Return the Journal runtime BranchTree; this is not derived by scanning
 // record headers and contains only retained, currently valid branches.
 #define IOCTL_Cdp_QUERY_JOURNAL_BRANCHES CTL_CODE(Cdp_IOCTL_TYPE, 0x812, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_Cdp_SET_RESTORE_POINT       CTL_CODE(Cdp_IOCTL_TYPE, 0x813, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_Cdp_DELETE_RESTORE_POINT    CTL_CODE(Cdp_IOCTL_TYPE, 0x814, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define Cdp_PHASE_GENERAL  0UL
 #define Cdp_PHASE_PREVIEW  1UL
@@ -302,6 +304,27 @@ typedef struct _Cdp_VERSION_REPLY
 	CHAR Version[Cdp_VERSION_STRING_CHARS];
 	CHAR Build[Cdp_BUILD_STRING_CHARS];
 } Cdp_VERSION_REPLY, *PCdp_VERSION_REPLY;
+
+typedef struct _Cdp_RESTORE_POINT_SET_REQUEST
+{
+	GUID SourceVolumeGuid;
+	UINT64 TargetTime100ns;
+} Cdp_RESTORE_POINT_SET_REQUEST, *PCdp_RESTORE_POINT_SET_REQUEST;
+
+typedef struct _Cdp_RESTORE_POINT_SET_REPLY
+{
+	UINT64 TargetTime100ns;
+	UINT64 OldestRecoverable100ns;
+	UINT64 NewestRecoverable100ns;
+	UINT64 WrittenBytes;
+	ULONG WrittenRanges;
+	ULONG Reserved;
+} Cdp_RESTORE_POINT_SET_REPLY, *PCdp_RESTORE_POINT_SET_REPLY;
+
+typedef struct _Cdp_RESTORE_POINT_DELETE_REQUEST
+{
+	GUID SourceVolumeGuid;
+} Cdp_RESTORE_POINT_DELETE_REQUEST, *PCdp_RESTORE_POINT_DELETE_REQUEST;
 
 #pragma pack(pop)
 // Persist this recovery request in the journal.  After a system restart the

@@ -279,6 +279,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 	DriverObject->MajorFunction[IRP_MJ_POWER] = CdpIrpDispatchPower;
 	DriverObject->MajorFunction[IRP_MJ_READ] = CdpIrpDispatchRead;
 	DriverObject->MajorFunction[IRP_MJ_WRITE] = CdpIrpDispatchWrite;
+	DriverObject->MajorFunction[IRP_MJ_FLUSH_BUFFERS] = CdpIrpDispatchFlush;
 	DriverObject->MajorFunction[IRP_MJ_SHUTDOWN] = CdpIrpDispatchShutdown;
 	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = CdpIrpDispatchDeviceControl;
 	DriverObject->MajorFunction[IRP_MJ_CREATE] = CdpIrpDispatchCreateClose;
