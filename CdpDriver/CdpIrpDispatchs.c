@@ -110,7 +110,7 @@ static NTSTATUS CdpValidateProtectionObjectGraph(
 	else if (!SourceExt->Core)
 		reason = "core-null";
 	else if (!diskExt || !diskExt->CaptureThreadHandle)
-		reason = "worker-handle";
+		reason = "read-worker-handle";
 	else if (SourceExt->JournalHandleId == 0)
 		reason = "journal-handle-id";
 	else if (!journalEntry)
@@ -151,7 +151,7 @@ static NTSTATUS CdpValidateProtectionObjectGraph(
 
 	if (!reason)
 	{
-		Cdp_LOG("[ACTIVATE-CHECK-OK] stage=%s source=%p core=%p disk=%lu part=%lu start=%llu size=%llu lower=%p journal=%p ref=%ld handle=%llu part=%lu base=%llu size=%llu lower=%p mounted=%u workers=%p/%p\n",
+		Cdp_LOG("[ACTIVATE-CHECK-OK] stage=%s source=%p core=%p disk=%lu part=%lu start=%llu size=%llu lower=%p journal=%p ref=%ld handle=%llu part=%lu base=%llu size=%llu lower=%p mounted=%u directWrite=1 queuedRead=1 worker=%p\n",
 			Stage, SourceExt, SourceExt->Core,
 			SourceExt->DiskNumber, SourceExt->PartitionNumber,
 			SourceExt->PartitionStart, SourceExt->PartitionSize,
@@ -161,8 +161,7 @@ static NTSTATUS CdpValidateProtectionObjectGraph(
 			journalEntry->TargetBaseOffset, journalEntry->PartitionSize,
 			journalEntry->TargetLowerDevice,
 			journalEntry->Journal.Mounted ? 1u : 0u,
-			diskExt->CaptureThreadHandle,
-			NULL);
+			diskExt->CaptureThreadHandle);
 		return STATUS_SUCCESS;
 	}
 
@@ -300,6 +299,7 @@ cleanup:
 
 static volatile LONG g_CdpMdllessSystemBufferReported;
 static volatile LONG g_CdpMdllessUserBufferReported;
+static volatile LONG64 g_CdpDirectWriteTraceSequence;
 
 static VOID CdpAuditProtectedReadReset(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 {
@@ -3528,16 +3528,6 @@ static VOID CdpReleaseDiskIoOutstanding(
 	}
 }
 
-typedef struct _Cdp_DISK_READ_OVERLAY_CONTEXT
-{
-	PIRP Irp;
-	PIO_WORKITEM WorkItem;
-	PDEVICE_OBJECT SourceReference;
-	PDEVICE_OBJECT LowerReference;
-	UINT64 AbsoluteOffset;
-	ULONG Length;
-} Cdp_DISK_READ_OVERLAY_CONTEXT, *PCdp_DISK_READ_OVERLAY_CONTEXT;
-
 static NTSTATUS CdpReadDiskLowerSynchronously(
 	_In_ PDEVICE_OBJECT LowerDevice,
 	_In_ UINT64 AbsoluteOffset,
@@ -3584,161 +3574,6 @@ static NTSTATUS CdpReadDiskLowerSynchronously(
 	return status;
 }
 
-static VOID CdpDiskReadOverlayWorker(
-	_In_ PDEVICE_OBJECT DeviceObject,
-	_In_opt_ PVOID Context)
-{
-	PCdp_DISK_READ_OVERLAY_CONTEXT readContext =
-		(PCdp_DISK_READ_OVERLAY_CONTEXT)Context;
-	PCdp_DEVICE_EXTENSION sourceExt = NULL;
-	PIRP irp = NULL;
-	PUCHAR buffer = NULL;
-	ULONG mdlCount = 0;
-	UINT64 mdlBytes = 0;
-	ULONG copiedBytes = 0;
-	NTSTATUS status;
-
-	UNREFERENCED_PARAMETER(DeviceObject);
-	if (!readContext)
-		return;
-	irp = readContext->Irp;
-	if (readContext->SourceReference)
-		sourceExt = (PCdp_DEVICE_EXTENSION)
-			readContext->SourceReference->DeviceExtension;
-	status = irp ? STATUS_SUCCESS : STATUS_INVALID_PARAMETER;
-
-	/* The application IRP never enters Disk Lower. Read the baseline with a
-	 * private synchronous IRP, overlay journal hits, then touch the original
-	 * MDL exactly once immediately before completing it. */
-	if (NT_SUCCESS(status))
-	{
-		if (!sourceExt || !sourceExt->Core || !readContext->LowerReference)
-		{
-			status = STATUS_DEVICE_NOT_READY;
-		}
-		else
-		{
-			buffer = (PUCHAR)cdpalloc(readContext->Length);
-			status = buffer ? CdpReadDiskLowerSynchronously(
-				readContext->LowerReference,
-				readContext->AbsoluteOffset,
-				readContext->Length,
-				buffer) : STATUS_INSUFFICIENT_RESOURCES;
-			if (NT_SUCCESS(status))
-			{
-				KeWaitForSingleObject(
-					&sourceExt->HistoryMutex,
-					Executive, KernelMode, FALSE, NULL);
-				status = CdpCoreOverlayCurrentRead(
-					sourceExt->Core,
-					readContext->AbsoluteOffset,
-					readContext->Length,
-					buffer);
-				CdpAuditProtectedReadCoreResult(
-					sourceExt, readContext->Length, status);
-				KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
-			}
-			if (NT_SUCCESS(status))
-			{
-				status = CdpScatterReadMdlChain(
-					irp, buffer, readContext->Length,
-					&mdlCount, &mdlBytes, &copiedBytes);
-			}
-		}
-	}
-	if (!NT_SUCCESS(status))
-	{
-		Cdp_LOG("[DISK-READ-OVERLAY-FAIL] status=0x%08X absoluteOffset=%llu len=%lu mdl=%p mdlCount=%lu mdlBytes=%llu copied=%lu flags=0x%08lX\n",
-			status,
-			readContext->AbsoluteOffset,
-			readContext->Length,
-			irp ? irp->MdlAddress : NULL,
-			mdlCount,
-			mdlBytes,
-			copiedBytes,
-			irp ? irp->Flags : 0);
-	}
-	if (buffer)
-		cdpfree(buffer);
-	if (irp)
-	{
-		irp->IoStatus.Status = status;
-		irp->IoStatus.Information = NT_SUCCESS(status) ?
-			readContext->Length : 0;
-		IoCompleteRequest(irp, IO_DISK_INCREMENT);
-	}
-	if (sourceExt)
-		CdpReleaseDiskIoOutstanding(sourceExt);
-	if (readContext->SourceReference)
-		ObDereferenceObject(readContext->SourceReference);
-	if (readContext->LowerReference)
-		ObDereferenceObject(readContext->LowerReference);
-	if (readContext->WorkItem)
-		IoFreeWorkItem(readContext->WorkItem);
-	cdpfree(readContext);
-}
-
-static NTSTATUS CdpDispatchProtectedDiskRead(
-	_Inout_ PCdp_DEVICE_EXTENSION DiskExt,
-	_Inout_ PIRP Irp)
-{
-	PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
-	UINT64 absoluteOffset;
-	ULONG length;
-	PDEVICE_OBJECT sourceReference = NULL;
-	PCdp_DEVICE_EXTENSION sourceExt;
-	PCdp_DISK_READ_OVERLAY_CONTEXT context;
-
-	if (irpSp->Parameters.Read.ByteOffset.QuadPart < 0 ||
-		irpSp->Parameters.Read.Length == 0)
-	{
-		return CdpSendToNextDevice(DiskExt->LowerDeviceObject, Irp);
-	}
-	absoluteOffset = (UINT64)irpSp->Parameters.Read.ByteOffset.QuadPart;
-	length = irpSp->Parameters.Read.Length;
-	sourceExt = CdpReferenceProtectedSourceForDiskIo(
-		DiskExt, absoluteOffset, length, &sourceReference);
-	if (!sourceExt)
-		return CdpSendToNextDevice(DiskExt->LowerDeviceObject, Irp);
-
-	if (!CdpAcquireDiskIoOutstanding(sourceExt))
-	{
-		ObDereferenceObject(sourceReference);
-		return CdpSendToNextDevice(DiskExt->LowerDeviceObject, Irp);
-	}
-
-	context = (PCdp_DISK_READ_OVERLAY_CONTEXT)cdpalloc(sizeof(*context));
-	if (!context)
-	{
-		CdpReleaseDiskIoOutstanding(sourceExt);
-		ObDereferenceObject(sourceReference);
-		return CdpCompleteIrp(Irp, STATUS_INSUFFICIENT_RESOURCES, 0);
-	}
-	RtlZeroMemory(context, sizeof(*context));
-	context->WorkItem = IoAllocateWorkItem(DiskExt->FilterDeviceObject);
-	if (!context->WorkItem)
-	{
-		cdpfree(context);
-		CdpReleaseDiskIoOutstanding(sourceExt);
-		ObDereferenceObject(sourceReference);
-		return CdpCompleteIrp(Irp, STATUS_INSUFFICIENT_RESOURCES, 0);
-	}
-	context->Irp = Irp;
-	context->SourceReference = sourceReference;
-	context->LowerReference = DiskExt->LowerDeviceObject;
-	ObReferenceObject(context->LowerReference);
-	context->AbsoluteOffset = absoluteOffset;
-	context->Length = length;
-
-	IoMarkIrpPending(Irp);
-	IoQueueWorkItem(
-		context->WorkItem,
-		CdpDiskReadOverlayWorker,
-		DelayedWorkQueue,
-		context);
-	return STATUS_PENDING;
-}
-
 static NTSTATUS CdpQueueDiskCaptureIrp(
 	_Inout_ PCdp_DEVICE_EXTENSION DiskExt,
 	_Inout_ PIRP Irp)
@@ -3751,6 +3586,7 @@ static NTSTATUS CdpQueueDiskCaptureIrp(
 	PCdp_CAPTURE_ITEM item;
 	KIRQL oldIrql;
 	LONG64 auditSequence = 0;
+	BOOLEAN failProtectedRead;
 
 	if (irpSp->MajorFunction == IRP_MJ_READ)
 	{
@@ -3900,10 +3736,26 @@ static NTSTATUS CdpQueueDiskCaptureIrp(
 		return STATUS_PENDING;
 	}
 	KeReleaseSpinLock(&DiskExt->CaptureQueueLock, oldIrql);
+	failProtectedRead = irpSp->MajorFunction == IRP_MJ_READ &&
+		InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) != 0 &&
+		InterlockedCompareExchange(&sourceExt->Phase, 0, 0) !=
+			(LONG)Cdp_PHASE_DRAINING;
+	if (failProtectedRead)
+	{
+		Cdp_LOG("[QUEUED-READ-FAIL] reason=queue-admission offset=%llu len=%lu stopping=%ld shutdown=%ld accepting=%ld\n",
+			absoluteOffset, length,
+			InterlockedCompareExchange(&DiskExt->CaptureStopping, 0, 0),
+			InterlockedCompareExchange(&DiskExt->ShutdownInProgress, 0, 0),
+			InterlockedCompareExchange(&sourceExt->DiskIoAccepting, 0, 0));
+	}
+	CdpReleaseDiskIoOutstanding(sourceExt);
 	ObDereferenceObject(sourceReference);
 	ObDereferenceObject(item->OriginLowerReference);
 	cdpfree(item);
-	CdpReleaseDiskIoOutstanding(sourceExt);
+	if (failProtectedRead)
+	{
+		return CdpCompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
+	}
 	if (irpSp->MajorFunction == IRP_MJ_WRITE &&
 		InterlockedCompareExchange(&DiskExt->ShutdownInProgress, 0, 0) != 0)
 	{
@@ -3920,12 +3772,7 @@ NTSTATUS CdpIrpDispatchRead(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 	if (!deviceExt || !deviceExt->LowerDeviceObject)
 		return CdpCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);
 	if (deviceExt->DeviceKind == Cdp_DEVICE_KIND_DISK)
-	{
-		/* Retain the private-read implementation for comparison while this test
-		 * routes protected READ and WRITE through one ordered FIFO. */
-		(void)&CdpDispatchProtectedDiskRead;
 		return CdpQueueDiskCaptureIrp(deviceExt, Irp);
-	}
 	if (deviceExt->DeviceKind == Cdp_DEVICE_KIND_VOLUME)
 		return CdpSendToNextDevice(deviceExt->LowerDeviceObject, Irp);
 	return CdpCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);
@@ -4527,6 +4374,157 @@ static NTSTATUS CdpForwardQueuedDiskIrpSynchronously(
 	return Item->Irp->IoStatus.Status;
 }
 
+static NTSTATUS CdpDispatchProtectedDiskWrite(
+	_Inout_ PCdp_DEVICE_EXTENSION DiskExt,
+	_Inout_ PIRP Irp)
+{
+	PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
+	UINT64 absoluteOffset;
+	ULONG length;
+	PDEVICE_OBJECT sourceReference = NULL;
+	PCdp_DEVICE_EXTENSION sourceExt;
+	Cdp_CAPTURE_ITEM directItem;
+	NTSTATUS status;
+	LONG phase;
+	LONG64 traceSequence;
+
+	if (irpSp->Parameters.Write.ByteOffset.QuadPart < 0 ||
+		irpSp->Parameters.Write.Length == 0)
+	{
+		return CdpSendToNextDevice(DiskExt->LowerDeviceObject, Irp);
+	}
+	absoluteOffset = (UINT64)irpSp->Parameters.Write.ByteOffset.QuadPart;
+	length = irpSp->Parameters.Write.Length;
+	sourceExt = CdpReferenceProtectedSourceForDiskIo(
+		DiskExt, absoluteOffset, length, &sourceReference);
+	if (!sourceExt)
+		return CdpSendToNextDevice(DiskExt->LowerDeviceObject, Irp);
+
+	if (InterlockedCompareExchange(
+			&sourceExt->BackfillWriteActive, 0, 0) != 0 &&
+		absoluteOffset >= sourceExt->BackfillAbsoluteOffset &&
+		length <= sourceExt->BackfillLength &&
+		absoluteOffset - sourceExt->BackfillAbsoluteOffset <=
+			sourceExt->BackfillLength - length)
+	{
+		PETHREAD owner = (PETHREAD)InterlockedCompareExchangePointer(
+			(PVOID volatile*)&sourceExt->BackfillWriteThread, NULL, NULL);
+		if (owner == PsGetCurrentThread())
+		{
+			ObDereferenceObject(sourceReference);
+			return CdpSendToNextDevice(DiskExt->LowerDeviceObject, Irp);
+		}
+		Cdp_LOG("[DRAIN-VOLUME-BYPASS-MISS] direct disk=%lu offset=%llu len=%lu owner=%p current=%p\n",
+			DiskExt->DiskNumber, absoluteOffset, length, owner,
+			PsGetCurrentThread());
+		ObDereferenceObject(sourceReference);
+		return CdpCompleteIrp(Irp, STATUS_DEVICE_BUSY, 0);
+	}
+	if (!CdpAcquireDiskIoOutstanding(sourceExt))
+	{
+		ObDereferenceObject(sourceReference);
+		return CdpSendToNextDevice(DiskExt->LowerDeviceObject, Irp);
+	}
+	traceSequence = InterlockedIncrement64(&g_CdpDirectWriteTraceSequence);
+	Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=begin disk=%lu offset=%llu len=%lu irp=%p outstanding=%ld\n",
+		traceSequence, DiskExt->DiskNumber, absoluteOffset, length, Irp,
+		InterlockedCompareExchange(&sourceExt->DiskIoOutstanding, 0, 0));
+	if (KeGetCurrentIrql() > APC_LEVEL)
+	{
+		Cdp_LOG("[DIRECT-WRITE-FAIL] reason=irql irql=%lu offset=%llu len=%lu\n",
+			(ULONG)KeGetCurrentIrql(), absoluteOffset, length);
+		CdpReleaseDiskIoOutstanding(sourceExt);
+		ObDereferenceObject(sourceReference);
+		return CdpCompleteIrp(Irp, STATUS_INVALID_DEVICE_STATE, 0);
+	}
+
+	RtlZeroMemory(&directItem, sizeof(directItem));
+	directItem.Irp = Irp;
+	directItem.OriginalDiskOffset = absoluteOffset;
+	directItem.SourceReference = sourceReference;
+	directItem.OriginLowerReference = DiskExt->LowerDeviceObject;
+
+	phase = InterlockedCompareExchange(&sourceExt->Phase, 0, 0);
+	if (InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) != 0 &&
+		phase == (LONG)Cdp_PHASE_DRAINING)
+	{
+		goto drain_write;
+	}
+	if (InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) != 0 &&
+		CdpTryAcquireRedirectWrite(sourceExt))
+	{
+		Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=history-wait source=%p\n",
+			traceSequence, sourceExt);
+		KeWaitForSingleObject(&sourceExt->HistoryMutex,
+			Executive, KernelMode, FALSE, NULL);
+		Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=history-acquired source=%p\n",
+			traceSequence, sourceExt);
+		Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=redirect-begin core=%p journal=%p\n",
+			traceSequence, sourceExt->Core,
+			sourceExt->RedirectJournalEntry ?
+				&sourceExt->RedirectJournalEntry->Journal : NULL);
+		status = CdpRedirectJournalWrite(sourceExt, &directItem);
+		Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=redirect-end status=0x%08X\n",
+			traceSequence, status);
+		KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
+		Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=complete status=0x%08X drain=0\n",
+			traceSequence, status);
+		CdpReleaseDiskIoOutstanding(sourceExt);
+		ObDereferenceObject(sourceReference);
+		return status;
+	}
+
+	phase = InterlockedCompareExchange(&sourceExt->Phase, 0, 0);
+	if (InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) != 0 &&
+		phase == (LONG)Cdp_PHASE_DRAINING)
+	{
+		goto drain_write;
+	}
+
+	Cdp_LOG("[DIRECT-WRITE-FAIL] reason=state-change offset=%llu len=%lu enabled=%ld stopping=%ld phase=%ld\n",
+		absoluteOffset, length,
+		InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0),
+		InterlockedCompareExchange(&sourceExt->CaptureStopping, 0, 0),
+		phase);
+	CdpReleaseDiskIoOutstanding(sourceExt);
+	ObDereferenceObject(sourceReference);
+	Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=complete status=0x%08X reason=state-change\n",
+		traceSequence, STATUS_DEVICE_NOT_READY);
+	return CdpCompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
+
+drain_write:
+	Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=drain-history-wait source=%p\n",
+		traceSequence, sourceExt);
+	KeWaitForSingleObject(&sourceExt->HistoryMutex,
+		Executive, KernelMode, FALSE, NULL);
+	Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=drain-history-acquired source=%p\n",
+		traceSequence, sourceExt);
+	Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=drain-source-write-begin lower=%p\n",
+		traceSequence, directItem.OriginLowerReference);
+	status = CdpForwardQueuedDiskIrpSynchronously(&directItem);
+	Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=drain-source-write-end status=0x%08X information=%Iu\n",
+		traceSequence, status, Irp->IoStatus.Information);
+	if (NT_SUCCESS(status) && sourceExt->Core)
+	{
+		NTSTATUS punchStatus = CdpCorePunchMetaRange(
+			sourceExt->Core, absoluteOffset, length);
+		if (!NT_SUCCESS(punchStatus))
+		{
+			InterlockedCompareExchange(
+				&sourceExt->DrainFailureStatus, (LONG)punchStatus, 0);
+			Cdp_LOG("[DRAIN] direct application write punch failed status=0x%08X offset=%llu len=%lu\n",
+				punchStatus, absoluteOffset, length);
+		}
+	}
+	KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
+	Cdp_LOG("[DIRECT-WRITE-TRACE] seq=%lld stage=complete status=0x%08X drain=1\n",
+		traceSequence, status);
+	CdpReleaseDiskIoOutstanding(sourceExt);
+	ObDereferenceObject(sourceReference);
+	IoCompleteRequest(Irp, IO_NO_INCREMENT);
+	return status;
+}
+
 static NTSTATUS CdpFlushProtectedJournalsForDisk(
 	_In_ PCdp_DEVICE_EXTENSION DiskExt)
 {
@@ -4571,12 +4569,19 @@ static NTSTATUS CdpFlushProtectedJournalsForDisk(
 			(PCdp_DEVICE_EXTENSION)sources[index]->DeviceExtension;
 		NTSTATUS status;
 
+		Cdp_LOG("[SHUTDOWN-FLUSH] stage=source-begin disk=%lu index=%lu source=%p journal=%p\n",
+			DiskExt->DiskNumber, index, sourceExt,
+			sourceExt ? sourceExt->RedirectJournalEntry : NULL);
 		KeWaitForSingleObject(&sourceExt->HistoryMutex,
 			Executive, KernelMode, FALSE, NULL);
+		Cdp_LOG("[SHUTDOWN-FLUSH] stage=history-acquired disk=%lu index=%lu source=%p\n",
+			DiskExt->DiskNumber, index, sourceExt);
 		status = sourceExt->RedirectJournalEntry ?
 			CdpJournalFlushBuffers(
 				&sourceExt->RedirectJournalEntry->Journal) :
 			STATUS_DEVICE_NOT_READY;
+		Cdp_LOG("[SHUTDOWN-FLUSH] stage=journal-flush-end disk=%lu index=%lu source=%p status=0x%08X\n",
+			DiskExt->DiskNumber, index, sourceExt, status);
 		KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
 		if (!NT_SUCCESS(status) && NT_SUCCESS(firstFailure))
 			firstFailure = status;
@@ -4687,6 +4692,10 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 					ULONG mdlCount = 0;
 					UINT64 mdlBytes = 0;
 					ULONG copiedBytes = 0;
+					Cdp_CORE_READ_COVERAGE coverage =
+						Cdp_CORE_READ_COVERAGE_NONE;
+					UINT64 sourceReadOffset = readOffset;
+					ULONG sourceReadLength = ioLength;
 					NTSTATUS readStatus;
 					if (readOffset < devExt->PartitionStart ||
 						devExt->PartitionStart >
@@ -4705,26 +4714,70 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 						IoCompleteRequest(item->Irp, IO_NO_INCREMENT);
 						goto capture_item_done;
 					}
-					buffer = (PUCHAR)cdpalloc(ioLength);
-					readStatus = buffer ? CdpReadDiskLowerSynchronously(
-						item->OriginLowerReference,
-						readOffset,
-						ioLength,
-						buffer) : STATUS_INSUFFICIENT_RESOURCES;
+					/* Determine routing exactly once in the worker. A miss forwards
+					 * the original IRP; only a hit uses a private baseline read. */
+					KeWaitForSingleObject(&devExt->HistoryMutex,
+						Executive, KernelMode, FALSE, NULL);
+					readStatus = devExt->Core ?
+						CdpCoreQueryCurrentReadCoverage(
+							devExt->Core, readOffset, ioLength, &coverage,
+							&sourceReadOffset, &sourceReadLength) :
+						STATUS_DEVICE_NOT_READY;
+					if (NT_SUCCESS(readStatus) &&
+						coverage == Cdp_CORE_READ_COVERAGE_NONE)
+					{
+						KeReleaseMutex(&devExt->HistoryMutex, FALSE);
+						Cdp_LOG("[QUEUED-READ-ROUTE] stage=passthrough coverage=NONE offset=%llu len=%lu\n",
+							readOffset, ioLength);
+						(void)CdpForwardQueuedDiskIrpSynchronously(item);
+						IoCompleteRequest(item->Irp, IO_NO_INCREMENT);
+						goto capture_item_done;
+					}
+					buffer = NT_SUCCESS(readStatus) ?
+						(PUCHAR)cdpalloc(ioLength) : NULL;
+					if (NT_SUCCESS(readStatus) && !buffer)
+						readStatus = STATUS_INSUFFICIENT_RESOURCES;
+					if (NT_SUCCESS(readStatus) &&
+						coverage == Cdp_CORE_READ_COVERAGE_PARTIAL &&
+						(sourceReadOffset < readOffset ||
+						sourceReadOffset - readOffset > ioLength ||
+						sourceReadLength > ioLength -
+							(ULONG)(sourceReadOffset - readOffset)))
+					{
+						readStatus = STATUS_INVALID_PARAMETER;
+					}
+					if (NT_SUCCESS(readStatus) && sourceReadLength != 0)
+					{
+						Cdp_LOG("[QUEUED-READ-ROUTE] stage=source-read-begin coverage=PARTIAL request=[%llu,%llu) source=[%llu,%llu) lower=%p\n",
+							readOffset, readOffset + ioLength,
+							sourceReadOffset, sourceReadOffset + sourceReadLength,
+							item->OriginLowerReference);
+						readStatus = CdpReadDiskLowerSynchronously(
+							item->OriginLowerReference,
+							sourceReadOffset,
+							sourceReadLength,
+							buffer + (ULONG)(sourceReadOffset - readOffset));
+						Cdp_LOG("[QUEUED-READ-ROUTE] stage=source-read-end coverage=PARTIAL source=[%llu,%llu) status=0x%08X\n",
+							sourceReadOffset,
+							sourceReadOffset + sourceReadLength, readStatus);
+					}
+					else if (NT_SUCCESS(readStatus) &&
+						coverage == Cdp_CORE_READ_COVERAGE_FULL)
+					{
+						Cdp_LOG("[QUEUED-READ-ROUTE] stage=source-read-skip coverage=FULL request=[%llu,%llu)\n",
+							readOffset, readOffset + ioLength);
+					}
 					if (NT_SUCCESS(readStatus))
 					{
-						KeWaitForSingleObject(&devExt->HistoryMutex,
-							Executive, KernelMode, FALSE, NULL);
-						readStatus = devExt->Core ?
-							CdpCoreOverlayCurrentRead(
-								devExt->Core,
-								readOffset,
-								ioLength,
-								buffer) : STATUS_DEVICE_NOT_READY;
+						readStatus = CdpCoreOverlayCurrentRead(
+							devExt->Core,
+							readOffset,
+							ioLength,
+							buffer);
 						CdpAuditProtectedReadCoreResult(
 							devExt, ioLength, readStatus);
-						KeReleaseMutex(&devExt->HistoryMutex, FALSE);
 					}
+					KeReleaseMutex(&devExt->HistoryMutex, FALSE);
 					if (NT_SUCCESS(readStatus))
 					{
 						readStatus = CdpScatterReadMdlChain(
@@ -5160,12 +5213,33 @@ NTSTATUS CdpIrpDispatchShutdown(
 {
 	PCdp_DEVICE_EXTENSION deviceExt =
 		(PCdp_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
+	NTSTATUS flushStatus = STATUS_SUCCESS;
 
 	if (!deviceExt || !deviceExt->LowerDeviceObject)
 		return CdpCompleteIrp(Irp, STATUS_SUCCESS, 0);
 
+	Cdp_LOG("[SHUTDOWN-DIRECT] stage=entry kind=%lu disk=%lu filter=%p lower=%p irql=%lu\n",
+		(ULONG)deviceExt->DeviceKind, deviceExt->DiskNumber,
+		DeviceObject, deviceExt->LowerDeviceObject,
+		(ULONG)KeGetCurrentIrql());
 	if (deviceExt->DeviceKind == Cdp_DEVICE_KIND_DISK)
-		return CdpQueueDiskCaptureIrp(deviceExt, Irp);
+	{
+		if (KeGetCurrentIrql() <= APC_LEVEL)
+		{
+			Cdp_LOG("[SHUTDOWN-DIRECT] stage=flush-begin disk=%lu\n",
+				deviceExt->DiskNumber);
+			flushStatus = CdpFlushProtectedJournalsForDisk(deviceExt);
+			Cdp_LOG("[SHUTDOWN-DIRECT] stage=flush-end disk=%lu status=0x%08X\n",
+				deviceExt->DiskNumber, flushStatus);
+		}
+		else
+			flushStatus = STATUS_INVALID_DEVICE_STATE;
+		Cdp_LOG("[SHUTDOWN-DIRECT] stage=forward-lower disk=%lu flushStatus=0x%08X irql=%lu\n",
+			deviceExt->DiskNumber, flushStatus, (ULONG)KeGetCurrentIrql());
+		return CdpSendToNextDevice(deviceExt->LowerDeviceObject, Irp);
+	}
+	Cdp_LOG("[SHUTDOWN-DIRECT] stage=forward-volume disk=%lu lower=%p\n",
+		deviceExt->DiskNumber, deviceExt->LowerDeviceObject);
 	return CdpSendToNextDevice(deviceExt->LowerDeviceObject, Irp);
 }
 
@@ -5176,7 +5250,7 @@ NTSTATUS CdpIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 	if (!deviceExt || !deviceExt->LowerDeviceObject)
 		return CdpCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);
 	if (deviceExt->DeviceKind == Cdp_DEVICE_KIND_DISK)
-		return CdpQueueDiskCaptureIrp(deviceExt, Irp);
+		return CdpDispatchProtectedDiskWrite(deviceExt, Irp);
 	if (deviceExt->DeviceKind == Cdp_DEVICE_KIND_VOLUME)
 		return CdpSendToNextDevice(deviceExt->LowerDeviceObject, Irp);
 	return CdpCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);

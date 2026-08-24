@@ -734,6 +734,9 @@ static int TestAfterImageAllOverlapShapes(void)
 	UCHAR newContains[1536];
 	UCHAR oldSplit[1536];
 	UCHAR newMiddle[512];
+	Cdp_CORE_READ_COVERAGE coverage = Cdp_CORE_READ_COVERAGE_NONE;
+	UINT64 sourceOffset = 0;
+	ULONG sourceLength = 0;
 	NTSTATUS status;
 
 	Expect(NT_SUCCESS(TestCtxCreate(
@@ -795,6 +798,42 @@ static int TestAfterImageAllOverlapShapes(void)
 		"append newer middle range that splits the old range");
 	RtlCopyMemory(expected + 12288, oldSplit, sizeof(oldSplit));
 	RtlCopyMemory(expected + 12800, newMiddle, sizeof(newMiddle));
+
+	status = CdpCoreQueryCurrentReadCoverage(
+		ctx.Core, 2048, 512, &coverage, &sourceOffset, &sourceLength);
+	Expect(NT_SUCCESS(status) &&
+		coverage == Cdp_CORE_READ_COVERAGE_NONE &&
+		sourceOffset == 2048 && sourceLength == 512,
+		"pure memory coverage query reports a MetaTree gap");
+	status = CdpCoreQueryCurrentReadCoverage(
+		ctx.Core, 1535, 2, &coverage, &sourceOffset, &sourceLength);
+	Expect(NT_SUCCESS(status) &&
+		coverage == Cdp_CORE_READ_COVERAGE_PARTIAL &&
+		sourceOffset == 1536 && sourceLength == 1,
+		"pure memory coverage query detects a one-byte overlap");
+	status = CdpCoreQueryCurrentReadCoverage(
+		ctx.Core, 0, 1536, &coverage, &sourceOffset, &sourceLength);
+	Expect(NT_SUCCESS(status) &&
+		coverage == Cdp_CORE_READ_COVERAGE_FULL && sourceLength == 0,
+		"full MetaTree coverage requires no source read");
+	status = CdpCoreQueryCurrentReadCoverage(
+		ctx.Core, 0, 2048, &coverage, &sourceOffset, &sourceLength);
+	Expect(NT_SUCCESS(status) &&
+		coverage == Cdp_CORE_READ_COVERAGE_PARTIAL &&
+		sourceOffset == 1536 && sourceLength == 512,
+		"left-side coverage trims the beginning of the source read");
+	status = CdpCoreQueryCurrentReadCoverage(
+		ctx.Core, 3584, 2048, &coverage, &sourceOffset, &sourceLength);
+	Expect(NT_SUCCESS(status) &&
+		coverage == Cdp_CORE_READ_COVERAGE_PARTIAL &&
+		sourceOffset == 3584 && sourceLength == 512,
+		"right-side coverage trims the end of the source read");
+	status = CdpCoreQueryCurrentReadCoverage(
+		ctx.Core, 0, 14336, &coverage, &sourceOffset, &sourceLength);
+	Expect(NT_SUCCESS(status) &&
+		coverage == Cdp_CORE_READ_COVERAGE_PARTIAL &&
+		sourceOffset == 0 && sourceLength == 14336,
+		"multiple source holes use one full original-range source read");
 
 	RtlZeroMemory(output, sizeof(output));
 	status = CdpCoreRead(ctx.Core, 0, sizeof(output), output);

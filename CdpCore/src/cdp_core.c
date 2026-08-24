@@ -1450,20 +1450,132 @@ NTSTATUS CdpCoreOverlayCurrentRead(
 		Core, &Core->MetaTree, Offset, Length, Buffer, TRUE, FALSE);
 }
 
-static BOOLEAN CdpCoreTreeHasOverlap(
-	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
+typedef struct _Cdp_CORE_COVERAGE_SCAN
+{
+	UINT64 Start;
+	UINT64 End;
+	UINT64 Cursor;
+	UINT64 FirstGap;
+	UINT64 LastGapEnd;
+	ULONG GapCount;
+	BOOLEAN HasGap;
+	BOOLEAN HasCoverage;
+} Cdp_CORE_COVERAGE_SCAN, *PCdp_CORE_COVERAGE_SCAN;
+
+static VOID CdpCoreRecordCoverageGap(
+	_Inout_ PCdp_CORE_COVERAGE_SCAN Scan,
 	_In_ UINT64 Start,
 	_In_ UINT64 End)
 {
-	if (!Node || Node->MaxEnd <= Start)
-		return FALSE;
-	if (CdpCoreTreeHasOverlap(Node->Left, Start, End))
-		return TRUE;
-	if (!Node->Invalid && Node->Start < End && Start < Node->End)
-		return TRUE;
-	if (Node->Start >= End)
-		return FALSE;
-	return CdpCoreTreeHasOverlap(Node->Right, Start, End);
+	if (Start >= End)
+		return;
+	if (!Scan->HasGap)
+	{
+		Scan->FirstGap = Start;
+		Scan->HasGap = TRUE;
+	}
+	Scan->LastGapEnd = End;
+	Scan->GapCount += 1;
+}
+
+static VOID CdpCoreScanTreeCoverage(
+	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
+	_Inout_ PCdp_CORE_COVERAGE_SCAN Scan)
+{
+	UINT64 nodeStart;
+	UINT64 nodeEnd;
+
+	if (!Node || Node->MaxEnd <= Scan->Start || Scan->Cursor >= Scan->End)
+		return;
+	CdpCoreScanTreeCoverage(Node->Left, Scan);
+	if (Scan->Cursor >= Scan->End || Node->Start >= Scan->End)
+		return;
+	if (!Node->Invalid && Node->End > Scan->Start)
+	{
+		nodeStart = Node->Start > Scan->Start ? Node->Start : Scan->Start;
+		nodeEnd = Node->End < Scan->End ? Node->End : Scan->End;
+		if (nodeStart < nodeEnd)
+		{
+			Scan->HasCoverage = TRUE;
+			if (nodeStart > Scan->Cursor)
+				CdpCoreRecordCoverageGap(Scan, Scan->Cursor, nodeStart);
+			if (nodeEnd > Scan->Cursor)
+				Scan->Cursor = nodeEnd;
+		}
+	}
+	CdpCoreScanTreeCoverage(Node->Right, Scan);
+}
+
+NTSTATUS CdpCoreQueryCurrentReadCoverage(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_Out_ Cdp_CORE_READ_COVERAGE* Coverage,
+	_Out_ PUINT64 SourceOffset,
+	_Out_ PULONG SourceLength)
+{
+	PCdp_PREVIEW_TREE tree;
+	Cdp_CORE_COVERAGE_SCAN scan;
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Core || !Coverage || !SourceOffset || !SourceLength || Length == 0 ||
+		Offset > MAXUINT64 - Length)
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+	*Coverage = Cdp_CORE_READ_COVERAGE_NONE;
+	*SourceOffset = Offset;
+	*SourceLength = Length;
+	RtlZeroMemory(&scan, sizeof(scan));
+	scan.Start = Offset;
+	scan.End = Offset + Length;
+	scan.Cursor = Offset;
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	if (Core->Phase == Cdp_CORE_PHASE_PREVIEW)
+	{
+		tree = &Core->PreviewTree;
+	}
+	else if (!Core->MetaTreeReady)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		tree = NULL;
+	}
+	else
+	{
+		tree = &Core->MetaTree;
+	}
+	if (tree)
+	{
+		CdpCoreScanTreeCoverage(tree->Root, &scan);
+		if (scan.Cursor < scan.End)
+			CdpCoreRecordCoverageGap(&scan, scan.Cursor, scan.End);
+		if (!scan.HasCoverage)
+		{
+			*Coverage = Cdp_CORE_READ_COVERAGE_NONE;
+		}
+		else if (!scan.HasGap)
+		{
+			*Coverage = Cdp_CORE_READ_COVERAGE_FULL;
+			*SourceOffset = Offset;
+			*SourceLength = 0;
+		}
+		else
+		{
+			*Coverage = Cdp_CORE_READ_COVERAGE_PARTIAL;
+			if (scan.GapCount == 1)
+			{
+				*SourceOffset = scan.FirstGap;
+				*SourceLength = (ULONG)(scan.LastGapEnd - scan.FirstGap);
+			}
+			else
+			{
+				*SourceOffset = Offset;
+				*SourceLength = Length;
+			}
+		}
+	}
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	return status;
 }
 
 static PCdp_PREVIEW_TREE_NODE CdpCoreFindFirstOverlapNode(

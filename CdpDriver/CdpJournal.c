@@ -21,6 +21,9 @@
 
 static ULONG g_CdpCrc32cTable[256];
 static volatile LONG g_CdpCrc32cReady;
+#ifndef Cdp_USERMODE
+static volatile LONG64 g_CdpJournalRawTraceSequence;
+#endif
 
 static NTSTATUS CdpJournalAppendBranchLocked(
 	_Inout_ PCdp_JOURNAL Journal,
@@ -729,6 +732,7 @@ static NTSTATUS CdpJournalRawIo(
 		IO_STATUS_BLOCK iosb;
 		LARGE_INTEGER byteOffset;
 		PIRP irp;
+		LONG64 traceSequence;
 
 		if (!Journal->TargetDevice)
 			return STATUS_DEVICE_NOT_READY;
@@ -750,6 +754,10 @@ static NTSTATUS CdpJournalRawIo(
 		&iosb);
 	if (!irp)
 		return STATUS_INSUFFICIENT_RESOURCES;
+	traceSequence = InterlockedIncrement64(&g_CdpJournalRawTraceSequence);
+	Cdp_LOG("[JOURNAL-RAW-TRACE] seq=%lld stage=submit-begin target=%p major=0x%02X partitionOffset=%llu diskOffset=%llu len=%lu irp=%p\n",
+		traceSequence, Journal->TargetDevice, MajorFunction, Offset,
+		(UINT64)byteOffset.QuadPart, Length, irp);
 
 	Cdp_DBG("[JOURNAL-RAW] io begin target=%p major=0x%02X "
 		"partitionOffset=%llu diskOffset=%llu len=%lu irp=%p\n",
@@ -760,6 +768,8 @@ static NTSTATUS CdpJournalRawIo(
 		Length,
 		irp);
 	status = IoCallDriver(Journal->TargetDevice, irp);
+	Cdp_LOG("[JOURNAL-RAW-TRACE] seq=%lld stage=submit-return status=0x%08X iosb=0x%08X bytes=%Iu\n",
+		traceSequence, status, iosb.Status, iosb.Information);
 	Cdp_DBG("[JOURNAL-RAW] IoCallDriver returned irp=%p "
 		"status=0x%08X iosb=0x%08X bytes=%Iu\n",
 		irp,
@@ -768,10 +778,14 @@ static NTSTATUS CdpJournalRawIo(
 		iosb.Information);
 	if (status == STATUS_PENDING)
 	{
+		Cdp_LOG("[JOURNAL-RAW-TRACE] seq=%lld stage=wait-begin irp=%p\n",
+			traceSequence, irp);
 		Cdp_DBG("[JOURNAL-RAW] wait begin irp=%p\n",
 			irp);
 		KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
 		status = iosb.Status;
+		Cdp_LOG("[JOURNAL-RAW-TRACE] seq=%lld stage=wait-end status=0x%08X bytes=%Iu\n",
+			traceSequence, status, iosb.Information);
 		Cdp_DBG("[JOURNAL-RAW] wait end irp=%p "
 			"status=0x%08X bytes=%Iu\n",
 			irp,
@@ -782,6 +796,8 @@ static NTSTATUS CdpJournalRawIo(
 	{
 		status = iosb.Status;
 	}
+	Cdp_LOG("[JOURNAL-RAW-TRACE] seq=%lld stage=complete status=0x%08X bytes=%Iu\n",
+		traceSequence, status, iosb.Information);
 
 	if (NT_SUCCESS(status) && iosb.Information != Length)
 		return STATUS_UNEXPECTED_IO_ERROR;

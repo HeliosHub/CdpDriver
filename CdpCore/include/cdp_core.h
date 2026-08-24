@@ -149,6 +149,25 @@ NTSTATUS CdpCoreOverlayCurrentRead(
 	_In_ ULONG Length,
 	_Inout_updates_bytes_(Length) PVOID Buffer);
 
+typedef enum _Cdp_CORE_READ_COVERAGE
+{
+	Cdp_CORE_READ_COVERAGE_NONE = 0,
+	Cdp_CORE_READ_COVERAGE_PARTIAL = 1,
+	Cdp_CORE_READ_COVERAGE_FULL = 2
+} Cdp_CORE_READ_COVERAGE;
+
+// Pure in-memory routing query. For PARTIAL coverage with one source hole,
+// SourceOffset/Length describes that hole. With multiple separated holes it
+// returns the original request range, keeping source I/O to one simple read.
+// FULL returns SourceLength == 0.
+NTSTATUS CdpCoreQueryCurrentReadCoverage(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_Out_ Cdp_CORE_READ_COVERAGE* Coverage,
+	_Out_ PUINT64 SourceOffset,
+	_Out_ PULONG SourceLength);
+
 NTSTATUS CdpCorePreviewRead(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,

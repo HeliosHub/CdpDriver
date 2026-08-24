@@ -1,0 +1,5 @@
+使能引导错误检测：
+bcdedit /set {current} bootstatuspolicy displayallfailures
+
+禁能：
+bcdedit /set {current} bootstatuspolicy ignoreallfailures
