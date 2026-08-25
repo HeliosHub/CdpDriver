@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.6.8-test1"
-#define Cdp_DRIVER_BUILD_STRING   "20260824.88-volume-read-worker"
+#define Cdp_DRIVER_VERSION_STRING "1.6.8-test2"
+#define Cdp_DRIVER_BUILD_STRING   "20260825.89-restore-fast-mount"
 
 #define Cdp_COW_BATCH_MAX_ITEMS 16UL
 #define Cdp_COW_BATCH_MAX_BYTES (16UL * 1024UL * 1024UL)

@@ -257,6 +257,10 @@ typedef struct _Cdp_JOURNAL
 	Cdp_BRANCH_INFO_TREE BranchTree;
 	BOOLEAN RecoveryPending;
 	BOOLEAN RestorePointSet;
+	// Auto discovery may intentionally leave the old history opaque when a
+	// persistent restore point makes it irrelevant to the boot view.  The
+	// first protected write resets that history before appending anything.
+	BOOLEAN HistoryScanSkipped;
 	BOOLEAN RecoveryFsRepairPending;
 	volatile LONG RecoveryFsRepairAttempts;
 	BOOLEAN SuperblockDirty;
@@ -346,6 +350,11 @@ VOID CdpJournalSetPhysicalLayout(
 NTSTATUS CdpJournalFormat(_Inout_ PCdp_JOURNAL Journal);
 
 NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal);
+
+// Auto discovery only: when a restore point is present (and no recovery
+// intent takes precedence), mount from the superblock without walking Record
+// headers.  The journal remains reset-only until the restore boot is prepared.
+NTSTATUS CdpJournalMountForAutoDiscovery(_Inout_ PCdp_JOURNAL Journal);
 
 // Append a branch marker. BranchNumber must be the next monotonically
 // increasing number. Parent 0 means no parent and requires inherit sequence 0.

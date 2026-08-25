@@ -2,7 +2,7 @@
 
 CdpDriver 是一个 Windows 卷 Upper Filter 驱动。当前开发版本采用 after-image：受保护卷的应用写持久化到独立 Journal 后直接完成，不再提交到源卷；读取由当前分支的日志数据和源卷基础数据合成。
 
-当前版本：**1.4.1**（Build `20260805.1`），Journal 磁盘格式：**v12**。
+当前版本：**1.6.8-test2**（Build `20260825.89-restore-fast-mount`），Journal 磁盘格式：**v15**。
 
 主要功能：
 
@@ -106,7 +106,7 @@ Recovery Begin 会排队该源卷读写，根据目标时间确定父分支和�
 
 ## Journal 空间与磁盘格式
 
-当前开发格式为 v12：一个 Superblock，随后是若干 `1 MiB HeaderRegion + PayloadRegion`。单条磁盘 Record Header 为 32 字节，HeaderRegion 末尾 32 字节是 RegionLink。
+当前开发格式为 v15：一个 Superblock，随后是若干 `1 MiB HeaderRegion + PayloadRegion`。单条磁盘 Record Header 为 32 字节，HeaderRegion 末尾 32 字节是 RegionLink。
 
 - 单个 PayloadRegion 的跨度达到 Journal 容量的 `1/10` 时，即使 HeaderRegion 未写满也会切换新区域。
 - 日志使用率达到90%时启动唯一合并线程。删除最旧 HeaderRegion 前，先把其中当前分支仍有效的最新值写入源卷；兄弟分支记录直接丢弃。
@@ -138,7 +138,7 @@ Release 构建仍保留关键生命周期、失败和恢复诊断日志。高频
 
 ## 已知限制
 
-- 当前只兼容 Journal v12；开发阶段不兼容旧 Journal，需要重新格式化。
+- 当前可挂载 Journal v15 和上一版 v14；更早格式需要重新格式化。
 - 全局同时只允许一个 Preview 会话，Preview 与 Recovery 互斥。
 - 可恢复时间窗口取决于 Journal 容量；淘汰以 HeaderRegion 为粒度。
 - Recovery Begin 扫描期间会排队源卷应用层读写，历史较多时可能产生可感知延迟。

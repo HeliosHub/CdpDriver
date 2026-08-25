@@ -485,7 +485,18 @@ NTSTATUS CdpCoreBind(
 	CdpCoreInitCommon(core);
 	if (Journal->Mounted)
 	{
-		NTSTATUS status = CdpCoreBuildMetaTree(core);
+		NTSTATUS status;
+		if (Journal->HistoryScanSkipped)
+		{
+			/* Auto restore boot reads the already-materialized source baseline.
+			 * No Record-derived MetaTree is needed before the reset. */
+			core->MetaTreeReady = TRUE;
+			status = STATUS_SUCCESS;
+		}
+		else
+		{
+			status = CdpCoreBuildMetaTree(core);
+		}
 		if (!NT_SUCCESS(status))
 		{
 			CdpPreviewTreeFree(&core->MetaTree);
@@ -1940,14 +1951,10 @@ NTSTATUS CdpCoreCancelPersistentRestoreBoot(_Inout_ PCdp_CORE Core)
 	Cdp_LOCK_RELEASE(&Core->TreeLock);
 	if (!pending)
 		return STATUS_SUCCESS;
-	/* Until the first append, the old journal is intact, so deletion can
-	 * restore the ordinary current view by rebuilding from it. */
-	if (!NT_SUCCESS(CdpCoreBuildMetaTree(Core)))
-		return STATUS_UNSUCCESSFUL;
-	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
-	Core->PendingRestoreReset = FALSE;
-	Cdp_LOCK_RELEASE(&Core->TreeLock);
-	return STATUS_SUCCESS;
+	/* Deleting the restore point before its first protected write is not a
+	 * supported transition.  In particular, never scan the preserved old
+	 * Record history to reconstruct a view for that case. */
+	return STATUS_INVALID_DEVICE_STATE;
 }
 
 NTSTATUS CdpCoreSetRestorePointMarker(

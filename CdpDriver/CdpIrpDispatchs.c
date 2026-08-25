@@ -202,116 +202,6 @@ failed:
 	return STATUS_DEVICE_CONFIGURATION_ERROR;
 }
 
-/* Validate every persisted data record before CaptureEnabled can expose the
- * rebuilt MetaTree to boot I/O.  Branch records overlay VolumeOffset with
- * branch metadata and therefore are intentionally excluded. */
-static NTSTATUS CdpValidateMountedSourceRecordRanges(
-	_In_ PCdp_DEVICE_EXTENSION SourceExt,
-	_In_ PCSTR Stage)
-{
-	PCdp_JOURNAL_RECORD records;
-	UINT64 sourceEnd;
-	UINT64 startIndex = 0;
-	UINT64 totalRecords = 0;
-	UINT64 generation = 0;
-	UINT64 dataRecords = 0;
-	UINT64 lowestOffset = 0;
-	UINT64 highestEndOffset = 0;
-	ULONG metaNodes = 0;
-	ULONG returned;
-	ULONG index;
-	NTSTATUS status = STATUS_SUCCESS;
-
-	if (!SourceExt || !SourceExt->Core || SourceExt->PartitionSize == 0 ||
-		SourceExt->PartitionStart > MAXUINT64 - SourceExt->PartitionSize ||
-		(SourceExt->SectorSize != 512 && SourceExt->SectorSize != 4096))
-	{
-		return STATUS_INVALID_DEVICE_STATE;
-	}
-	sourceEnd = SourceExt->PartitionStart + SourceExt->PartitionSize;
-	records = (PCdp_JOURNAL_RECORD)cdpalloc(
-		sizeof(*records) * Cdp_JOURNAL_RECORD_QUERY_MAX_PER_CALL);
-	if (!records)
-		return STATUS_INSUFFICIENT_RESOURCES;
-
-	for (;;)
-	{
-		returned = 0;
-		status = CdpCoreQueryRecordHeaders(
-			SourceExt->Core,
-			startIndex,
-			generation,
-			records,
-			Cdp_JOURNAL_RECORD_QUERY_MAX_PER_CALL,
-			&totalRecords,
-			&generation,
-			&returned);
-		if (!NT_SUCCESS(status))
-			break;
-		for (index = 0; index < returned; ++index)
-		{
-			PCdp_JOURNAL_RECORD record = &records[index];
-			if ((record->Flags & Cdp_JOURNAL_RECORD_FLAG_BRANCH) != 0)
-				continue;
-			dataRecords++;
-			if (record->DataLength == 0 ||
-				record->VolumeOffset < SourceExt->PartitionStart ||
-				record->VolumeOffset >= sourceEnd ||
-				record->DataLength > sourceEnd - record->VolumeOffset ||
-				(record->VolumeOffset % SourceExt->SectorSize) != 0 ||
-				(record->DataLength % SourceExt->SectorSize) != 0)
-			{
-				Cdp_LOG("[MOUNT-RANGE-FAIL] stage=%s recordIndex=%llu sequence=%llu source=[%llu,%llu) recordOffset=%llu len=%lu flags=0x%08lX\n",
-					Stage ? Stage : "null",
-					startIndex + index,
-					record->Sequence,
-					SourceExt->PartitionStart,
-					sourceEnd,
-					record->VolumeOffset,
-					record->DataLength,
-					record->Flags);
-				status = STATUS_DISK_CORRUPT_ERROR;
-				goto cleanup;
-			}
-		}
-		startIndex += returned;
-		if (startIndex >= totalRecords)
-			break;
-		if (returned == 0)
-		{
-			status = STATUS_DISK_CORRUPT_ERROR;
-			break;
-		}
-	}
-	if (NT_SUCCESS(status))
-	{
-		status = CdpCoreQueryMetaTreeStats(
-			SourceExt->Core, &metaNodes, &lowestOffset, &highestEndOffset);
-		if (NT_SUCCESS(status) && metaNodes != 0 &&
-			(lowestOffset < SourceExt->PartitionStart ||
-			 highestEndOffset > sourceEnd ||
-			 lowestOffset >= highestEndOffset))
-		{
-			Cdp_LOG("[MOUNT-METATREE-FAIL] stage=%s nodes=%lu tree=[%llu,%llu) source=[%llu,%llu)\n",
-				Stage ? Stage : "null", metaNodes,
-				lowestOffset, highestEndOffset,
-				SourceExt->PartitionStart, sourceEnd);
-			status = STATUS_DISK_CORRUPT_ERROR;
-		}
-	}
-	if (NT_SUCCESS(status))
-	{
-		Cdp_LOG("[MOUNT-RANGE-OK] stage=%s records=%llu dataRecords=%llu metaNodes=%lu tree=[%llu,%llu) source=[%llu,%llu)\n",
-			Stage ? Stage : "null", totalRecords, dataRecords, metaNodes,
-			lowestOffset, highestEndOffset,
-			SourceExt->PartitionStart, sourceEnd);
-	}
-
-cleanup:
-	cdpfree(records);
-	return status;
-}
-
 static volatile LONG g_CdpMdllessSystemBufferReported;
 static volatile LONG g_CdpMdllessUserBufferReported;
 
@@ -1580,9 +1470,6 @@ static NTSTATUS CdpConfigureCaptureInternal(
 				SourceVolumeGuid,
 				&sourceExt->Core);
 		}
-		if (NT_SUCCESS(status))
-			status = CdpValidateMountedSourceRecordRanges(
-				sourceExt, FormatJournal ? "manual-format" : "manual-mount");
 		if (NT_SUCCESS(status) && !sourceExt->CaptureThreadHandle)
 			status = CdpStartCaptureWorker(sourceExt);
 		if (!NT_SUCCESS(status))
@@ -1811,9 +1698,6 @@ static NTSTATUS CdpActivateAutoJournal(
 			&sourceGuid,
 			&sourceExt->Core);
 	}
-	if (NT_SUCCESS(status))
-		status = CdpValidateMountedSourceRecordRanges(
-			sourceExt, "auto-mount");
 	if (NT_SUCCESS(status) && !sourceExt->CaptureThreadHandle)
 		status = CdpStartCaptureWorker(sourceExt);
 	if (!NT_SUCCESS(status))
@@ -2196,7 +2080,7 @@ static NTSTATUS CdpDiscoverJournalForStartedDisk(
 			journalSize,
 			sectorSize,
 			&journalEntry->VolumeGuid);
-		status = CdpJournalMount(&journalEntry->Journal);
+		status = CdpJournalMountForAutoDiscovery(&journalEntry->Journal);
 		if (!NT_SUCCESS(status))
 		{
 			CdpJournalClose(&journalEntry->Journal);
@@ -2292,9 +2176,6 @@ static NTSTATUS CdpDiscoverJournalForStartedDisk(
 				&journalEntry->Journal,
 				&sourceExt->VolumeGuid,
 				&sourceExt->Core);
-		if (NT_SUCCESS(status))
-			status = CdpValidateMountedSourceRecordRanges(
-				sourceExt, "disk-start-preactivate");
 		if (NT_SUCCESS(status) && !sourceExt->CaptureThreadHandle)
 			status = CdpStartCaptureWorker(sourceExt);
 		if (!NT_SUCCESS(status))
@@ -2586,7 +2467,7 @@ static NTSTATUS CdpDiscoverAdjacentJournalForStartedVolume(
 		&queriedSourceGuid);
 	if (metadataLower)
 		CdpJournalSetMetadataDevice(&journalEntry->Journal, metadataLower, 0);
-	status = CdpJournalMount(&journalEntry->Journal);
+	status = CdpJournalMountForAutoDiscovery(&journalEntry->Journal);
 	if (!NT_SUCCESS(status))
 	{
 		CdpJournalClose(&journalEntry->Journal);

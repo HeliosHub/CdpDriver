@@ -2337,6 +2337,63 @@ static int TestPersistentRestorePoint(void)
 	return g_caseFailed;
 }
 
+static int TestAutoDiscoverySkipsRestorePointRecords(void)
+{
+	TEST_CTX ctx;
+	Cdp_JOURNAL autoJournal;
+	Cdp_JOURNAL_RECORD record;
+	GUID zeroGuid = { 0 };
+	UCHAR oldValue[512];
+	UCHAR freshValue[512];
+	UINT64 total = 0;
+	UINT64 generation = 0;
+	ULONG returned = 0;
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(TestCtxCreate(
+		&ctx, SRC_SIZE, JNL_SIZE, 280000)),
+		"setup auto-discovery restore-point scan test");
+	if (!ctx.Core)
+		return g_caseFailed;
+	RtlFillMemory(oldValue, sizeof(oldValue), 0x61);
+	RtlFillMemory(freshValue, sizeof(freshValue), 0x62);
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(oldValue), oldValue, NULL)),
+		"append history hidden by auto restore boot");
+	Expect(NT_SUCCESS(CdpCoreSetRestorePointMarker(ctx.Core, 280000)),
+		"persist marker for auto-discovery mount");
+
+	CdpCoreDestroy(ctx.Core);
+	ctx.Core = NULL;
+	CdpJournalInitializeWithStore(
+		&autoJournal, ctx.Journal, &zeroGuid, NULL, NULL);
+	status = CdpJournalMountForAutoDiscovery(&autoJournal);
+	Expect(NT_SUCCESS(status) && autoJournal.Mounted &&
+		autoJournal.RestorePointSet && autoJournal.HistoryScanSkipped &&
+		autoJournal.TotalRecords == 0 &&
+		autoJournal.HeaderScanBuffer == NULL,
+		"auto discovery detects restore point without allocating or scanning Record headers");
+	if (NT_SUCCESS(status))
+	{
+		Expect(NT_SUCCESS(CdpJournalResetHistoryPreserveRestorePoint(
+			&autoJournal)),
+			"materialize deferred reset after scan-free auto discovery");
+		Expect(NT_SUCCESS(CdpJournalAppend(
+			&autoJournal, 0, sizeof(freshValue), freshValue, NULL)),
+			"first write resets skipped history before append");
+		status = CdpJournalQueryRecordHeaders(
+			&autoJournal, 0, 0, &record, 1,
+			&total, &generation, &returned);
+		Expect(NT_SUCCESS(status) && !autoJournal.HistoryScanSkipped &&
+			total == 2 && returned == 1 &&
+			record.Flags == Cdp_JOURNAL_RECORD_FLAG_BRANCH,
+			"scan-free mount transitions to fresh root history");
+		CdpJournalClose(&autoJournal);
+	}
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
 static int TestGracefulDisableDrainsMetaTree(void)
 {
 	TEST_CTX ctx;
@@ -2641,6 +2698,8 @@ int main(void)
 		TestDeferredRebootRecoveryBranch);
 	failed += RunCase("Persistent restore point",
 		TestPersistentRestorePoint);
+	failed += RunCase("Auto discovery skips restore-point records",
+		TestAutoDiscoverySkipsRestorePointRecords);
 	failed += RunCase("Graceful disable drains MetaTree",
 		TestGracefulDisableDrainsMetaTree);
 	failed += RunCase("Sibling inheritance point retention",

@@ -2466,6 +2466,7 @@ NTSTATUS CdpJournalFormat(_Inout_ PCdp_JOURNAL Journal)
 	Journal->RecoveryTargetTime100ns = 0;
 	Journal->RestorePointSet = FALSE;
 	Journal->RestorePointTime100ns = 0;
+	Journal->HistoryScanSkipped = FALSE;
 	Journal->HeaderWriteCacheValid = FALSE;
 	Journal->HeaderWriteCacheDirty = FALSE;
 	CdpBranchTreeFree(&Journal->BranchTree);
@@ -2554,6 +2555,7 @@ NTSTATUS CdpJournalResetHistoryPreserveRestorePoint(
 	Journal->RecoveryFsRepairPending = FALSE;
 	Journal->RecoveryTargetTime100ns = 0;
 	InterlockedExchange(&Journal->RecoveryFsRepairAttempts, 0);
+	Journal->HistoryScanSkipped = FALSE;
 	CdpJournalAdvanceRecordGenerationLocked(Journal);
 	Journal->SuperblockDirty = TRUE;
 	/* AppendBranch persists the initialized RR and the valid branch-1
@@ -2565,7 +2567,9 @@ cleanup:
 	return status;
 }
 
-NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal)
+static NTSTATUS CdpJournalMountInternal(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ BOOLEAN AutoDiscovery)
 {
 	PVOID allocationBase = NULL;
 	PUCHAR sector;
@@ -2650,11 +2654,39 @@ NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal)
 		RtlZeroMemory(&Journal->Credential, sizeof(Journal->Credential));
 	Journal->SuperblockDirty = FALSE;
 
-	status = CdpJournalRebuildRuntimeLocked(Journal, &scannedRecords);
-	if (!NT_SUCCESS(status))
-		goto cleanup;
-	if (Journal->CurrentBranchNumber != persistedCurrentBranch ||
-		Journal->HighestBranchNumber != persistedHighestBranch)
+	/* A persistent restore point means the source already contains the boot
+	 * baseline and the old journal will be reset before the first new write.
+	 * Auto discovery therefore must not spend boot time reading Record headers.
+	 * Recovery retains precedence because it needs the historical branch tree. */
+	if (AutoDiscovery && Journal->RestorePointSet &&
+		!Journal->RecoveryPending)
+	{
+		Journal->TotalRecords = 0;
+		Journal->ActiveHeaderRegionCount = 0;
+		Journal->PayloadBytesUsed = 0;
+		Journal->CurrentHeaderCount = 0;
+		Journal->NextSequence = 1;
+		Journal->Oldest100ns = 0;
+		Journal->Newest100ns = 0;
+		Journal->OldestHeaderRegionOff = 0;
+		Journal->CurrentHeaderRegionStartSequence = 0;
+		Journal->OldestHeaderIndex = 0;
+		Journal->PayloadRegionOff = 0;
+		Journal->HeaderWriteCacheValid = FALSE;
+		Journal->HeaderWriteCacheDirty = FALSE;
+		CdpBranchTreeFree(&Journal->BranchTree);
+		Journal->HistoryScanSkipped = TRUE;
+	}
+	else
+	{
+		status = CdpJournalRebuildRuntimeLocked(Journal, &scannedRecords);
+		if (!NT_SUCCESS(status))
+			goto cleanup;
+		Journal->HistoryScanSkipped = FALSE;
+	}
+	if (!Journal->HistoryScanSkipped &&
+		(Journal->CurrentBranchNumber != persistedCurrentBranch ||
+		 Journal->HighestBranchNumber != persistedHighestBranch))
 	{
 		status = STATUS_DISK_CORRUPT_ERROR;
 		goto cleanup;
@@ -2675,8 +2707,9 @@ NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal)
 cleanup:
 #ifndef Cdp_USERMODE
 	mountElapsed100ns = KeQueryInterruptTime() - mountStart100ns;
-	Cdp_LOG("[JOURNAL-MOUNT-SCAN] status=0x%08X scannedRecords=%llu activeRecords=%llu headerRegions=%llu elapsedUs=%llu\n",
+	Cdp_LOG("[JOURNAL-MOUNT-SCAN] status=0x%08X skipped=%u scannedRecords=%llu activeRecords=%llu headerRegions=%llu elapsedUs=%llu\n",
 		status,
+		Journal->HistoryScanSkipped ? 1u : 0u,
 		scannedRecords,
 		Journal->TotalRecords,
 		Journal->ActiveHeaderRegionCount,
@@ -3157,6 +3190,16 @@ NTSTATUS CdpJournalClearRecoveryFsRepairPending(_Inout_ PCdp_JOURNAL Journal)
 done:
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	return status;
+}
+
+NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal)
+{
+	return CdpJournalMountInternal(Journal, FALSE);
+}
+
+NTSTATUS CdpJournalMountForAutoDiscovery(_Inout_ PCdp_JOURNAL Journal)
+{
+	return CdpJournalMountInternal(Journal, TRUE);
 }
 
 NTSTATUS CdpJournalSetRestorePoint(

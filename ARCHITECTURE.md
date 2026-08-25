@@ -6,7 +6,7 @@ CdpDriver 是 Volume Upper Filter。受保护卷的写 IRP 被送入 PASSIVE_LEV
 
 - `CdpDriver`：IRP/IOCTL、启动卷发现、I/O Gate、Worker、合并线程。
 - `CdpCore`：当前视图、Preview、Recovery、合并协调。
-- `CdpJournal`：v12 磁盘格式、Record 扫描、分支树和区间树构建。
+- `CdpJournal`：v15 磁盘格式、Record 扫描、分支树和区间树构建。
 - `CdpConsole`：配置、查询、Preview/Recovery 和安装管理。
 
 ## 2. 写入与读取
@@ -27,7 +27,7 @@ CdpDriver 是 Volume Upper Filter。受保护卷的写 IRP 被送入 PASSIVE_LEV
 
 保护开启时抑制 `DeviceDsmAction_Trim`，避免底层回收源卷基础数据；停止保护后直接转发。
 
-## 3. Journal v12
+## 3. Journal v15
 
 磁盘布局为一个 Superblock，随后循环排列 `1 MiB HeaderRegion + PayloadRegion`。HeaderRegion 最后32字节为 `Cdp_HEADER_REGION_LINK`，其余共有32767个32字节 Record 槽。
 
