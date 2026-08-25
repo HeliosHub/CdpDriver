@@ -719,7 +719,8 @@ static BOOL DoRecoveryBegin(HANDLE hDevice)
 			reply.TargetTime100ns,
 			reply.OldestRecoverable100ns,
 			reply.NewestRecoverable100ns);
-		ConOut(L"No writeback has occurred. Bring the source online, then use r to commit.\n");
+		ConOut(L"The recovery branch switch is complete with no source writeback. "
+			L"Bring the source online, then use r to acknowledge completion.\n");
 	}
 	return TRUE;
 }
@@ -754,7 +755,7 @@ static BOOL DoRecoveryCommit(HANDLE hDevice)
 		L"Recovery committed. Phase=%lu target=%llu\n",
 		reply.Phase,
 		reply.TargetTime100ns);
-	ConOut(L"Writeback completed and the source volume is back in General phase.\n");
+	ConOut(L"Recovery branch switch acknowledged; no source writeback was performed.\n");
 	return TRUE;
 }
 
@@ -1455,8 +1456,8 @@ static void PrintHelp(void)
 	ConOut(L"  l  - list current journal record metadata (source GUID; no payload)\n");
 	ConOut(L"  b  - print retained journal branch topology and inheritance points (source GUID)\n");
 	ConOut(L"  s  - query protect status (source GUID -> status + journal GUID)\n");
-	ConOut(L"  e  - enter prepared recovery (source GUID + time; no writeback)\n");
-	ConOut(L"  r  - commit prepared recovery synchronously (writeback to source)\n");
+	ConOut(L"  e  - switch to a recovery branch (source GUID + time; no writeback)\n");
+	ConOut(L"  r  - acknowledge the completed recovery branch switch (no writeback)\n");
 	ConOut(L"  c  - cancel prepared recovery without writeback\n");
 	ConOut(L"  o  - set persistent restore point (source GUID + time)\n");
 	ConOut(L"  x  - delete persistent restore point\n");

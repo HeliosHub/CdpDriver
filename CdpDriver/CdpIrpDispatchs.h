@@ -64,6 +64,8 @@ NTSTATUS CdpStartCaptureWorker(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
 
 VOID CdpStopCaptureWorker(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
 
+VOID CdpDestroyDiskProtectionIndex(_Inout_ PCdp_DEVICE_EXTENSION DiskExt);
+
 // Disable capture, wait for its worker to leave Core, then release Core.
 // This routine must be used before a filter device is removed or reconfigured.
 VOID CdpDisableAndDestroyCapture(_Inout_ PCdp_DEVICE_EXTENSION DevExt);

@@ -23,6 +23,8 @@ static NTSTATUS CdpDevStoreRawIo(
 	LARGE_INTEGER byteOffset;
 	PIRP irp;
 	NTSTATUS status;
+	NTSTATUS waitStatus;
+	LARGE_INTEGER diagnosticTimeout;
 
 	if (!Device || !Buffer || Length == 0)
 	{
@@ -64,9 +66,18 @@ static NTSTATUS CdpDevStoreRawIo(
 		iosb.Information);
 	if (status == STATUS_PENDING)
 	{
-		Cdp_DBG("[DEVSTORE] wait begin irp=%p\n",
-			irp);
-		KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+		diagnosticTimeout.QuadPart = -10LL * 1000LL * 1000LL * 10LL;
+		Cdp_DBG("[DEVSTORE] wait begin irp=%p\n", irp);
+		do
+		{
+			waitStatus = KeWaitForSingleObject(&event,
+				Executive, KernelMode, FALSE, &diagnosticTimeout);
+			if (waitStatus == STATUS_TIMEOUT)
+			{
+				Cdp_LOG("[DRAIN-DIAG] stage=devstore-io-wait-still-blocked device=%p major=0x%02X offset=%llu len=%lu irp=%p iosb=0x%08X\n",
+					Device, MajorFunction, Offset, Length, irp, iosb.Status);
+			}
+		} while (waitStatus == STATUS_TIMEOUT);
 		status = iosb.Status;
 		Cdp_DBG("[DEVSTORE] wait end irp=%p "
 			"status=0x%08X bytes=%Iu\n",

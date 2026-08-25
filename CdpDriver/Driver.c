@@ -52,6 +52,8 @@ VOID CdpDeleteFilterDevice(_In_ PDEVICE_OBJECT FilterDeviceObject)
 		CdpUnbindVolumesFromSource(driverExt, FilterDeviceObject);
 
 	CdpDisableAndDestroyCapture(DevExt);
+	if (DevExt->DeviceKind == Cdp_DEVICE_KIND_DISK)
+		CdpDestroyDiskProtectionIndex(DevExt);
 
 	if (DevExt->LowerDeviceObject)
 	{
@@ -388,6 +390,23 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 	KeInitializeMutex(&DeviceExtension->HistoryMutex, 0);
 	DeviceExtension->SectorSize = Cdp_SECTOR_SIZE_DEFAULT;
 	InterlockedExchange(&DeviceExtension->Phase, Cdp_PHASE_GENERAL);
+	if (deviceKind == Cdp_DEVICE_KIND_DISK)
+	{
+		DeviceExtension->DiskProtectionIndex =
+			(PCdp_DISK_PROTECTION_INDEX)cdpalloc(
+				sizeof(Cdp_DISK_PROTECTION_INDEX));
+		if (!DeviceExtension->DiskProtectionIndex)
+		{
+			Status = STATUS_INSUFFICIENT_RESOURCES;
+			goto cleanup;
+		}
+		RtlZeroMemory(
+			DeviceExtension->DiskProtectionIndex,
+			sizeof(Cdp_DISK_PROTECTION_INDEX));
+		KeInitializeSpinLock(
+			&DeviceExtension->DiskProtectionIndex->Lock);
+		DeviceExtension->DiskProtectionIndex->RecentIndex = -1;
+	}
 
 	Status = IoAttachDeviceToDeviceStackSafe(FilterDeviceObject, PhysicalDeviceObject, &DeviceExtension->LowerDeviceObject);
 	if (!NT_SUCCESS(Status))
@@ -423,6 +442,8 @@ cleanup:
 	{
 		if (DeviceExtension)
 			CdpStopCaptureWorker(DeviceExtension);
+		if (DeviceExtension && DeviceExtension->DeviceKind == Cdp_DEVICE_KIND_DISK)
+			CdpDestroyDiskProtectionIndex(DeviceExtension);
 		if (DeviceExtension && DeviceExtension->LowerDeviceObject)
 		{
 			IoDetachDevice(DeviceExtension->LowerDeviceObject);

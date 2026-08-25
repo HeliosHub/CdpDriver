@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.6.8-test2"
-#define Cdp_DRIVER_BUILD_STRING   "20260825.89-restore-fast-mount"
+#define Cdp_DRIVER_VERSION_STRING "1.6.8-test13"
+#define Cdp_DRIVER_BUILD_STRING   "20260825.100-thread-drain-bypass"
 
 #define Cdp_COW_BATCH_MAX_ITEMS 16UL
 #define Cdp_COW_BATCH_MAX_BYTES (16UL * 1024UL * 1024UL)
@@ -146,6 +146,26 @@ typedef enum _Cdp_DEVICE_KIND
 	Cdp_DEVICE_KIND_SOURCE = 3
 } Cdp_DEVICE_KIND;
 
+#define Cdp_MAX_DISK_PROTECTION_ROUTES 128
+
+typedef struct _Cdp_DISK_PROTECTION_ROUTE
+{
+	UINT64 Start;
+	UINT64 End;
+	/* The route owns one reference for as long as it is cached. */
+	PDEVICE_OBJECT SourceDevice;
+} Cdp_DISK_PROTECTION_ROUTE, *PCdp_DISK_PROTECTION_ROUTE;
+
+typedef struct _Cdp_DISK_PROTECTION_INDEX
+{
+	KSPIN_LOCK Lock;
+	ULONG Count;
+	LONG RecentIndex;
+	/* Set only if an active route could not be represented in Routes. */
+	volatile LONG FallbackRequired;
+	Cdp_DISK_PROTECTION_ROUTE Routes[Cdp_MAX_DISK_PROTECTION_ROUTES];
+} Cdp_DISK_PROTECTION_INDEX, *PCdp_DISK_PROTECTION_INDEX;
+
 typedef struct _Cdp_DEVICE_EXTENSION
 {
 	Cdp_DEVICE_KIND DeviceKind;
@@ -197,6 +217,9 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	PDEVICE_OBJECT FilterDeviceObject;
 	PDEVICE_OBJECT LowerDeviceObject;
 	PDEVICE_OBJECT PhysicalDeviceObject;
+	/* DISK objects only: sorted protected-partition routes. The most recently
+	 * matched entry covers sequential I/O (including the one-partition case). */
+	PCdp_DISK_PROTECTION_INDEX DiskProtectionIndex;
 	/* A real volume filter binds directly to the protection owner for its
 	 * partition.  The owner is either this volume object (manual activation)
 	 * or an unattached SOURCE object created by disk pre-start discovery.
@@ -222,8 +245,6 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	 * Tail.Overlay.DriverContext. Disk Upper matches owner thread + range. */
 	volatile LONG BackfillWriteActive;
 	PETHREAD volatile BackfillWriteThread;
-	UINT64 BackfillAbsoluteOffset;
-	ULONG BackfillLength;
 	HANDLE MergeThreadHandle;
 	volatile LONG MergeThreadRunning;
 	volatile LONG MergeThreadStopping;

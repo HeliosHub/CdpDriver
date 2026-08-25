@@ -731,6 +731,8 @@ static NTSTATUS CdpJournalRawIo(
 		IO_STATUS_BLOCK iosb;
 		LARGE_INTEGER byteOffset;
 		PIRP irp;
+		NTSTATUS waitStatus;
+		LARGE_INTEGER diagnosticTimeout;
 
 		if (!Journal->TargetDevice)
 			return STATUS_DEVICE_NOT_READY;
@@ -771,7 +773,18 @@ static NTSTATUS CdpJournalRawIo(
 	{
 		Cdp_DBG("[JOURNAL-RAW] wait begin irp=%p\n",
 			irp);
-		KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+		diagnosticTimeout.QuadPart = -10LL * 1000LL * 1000LL * 10LL;
+		do
+		{
+			waitStatus = KeWaitForSingleObject(&event,
+				Executive, KernelMode, FALSE, &diagnosticTimeout);
+			if (waitStatus == STATUS_TIMEOUT)
+			{
+				Cdp_LOG("[DRAIN-DIAG] stage=journal-io-wait-still-blocked target=%p major=0x%02X partitionOffset=%llu diskOffset=%llu len=%lu irp=%p iosb=0x%08X\n",
+					Journal->TargetDevice, MajorFunction, Offset,
+					(UINT64)byteOffset.QuadPart, Length, irp, iosb.Status);
+			}
+		} while (waitStatus == STATUS_TIMEOUT);
 		status = iosb.Status;
 		Cdp_DBG("[JOURNAL-RAW] wait end irp=%p "
 			"status=0x%08X bytes=%Iu\n",
