@@ -2,7 +2,7 @@
 
 CdpDriver 是一个同时工作在 Windows `Volume` 与 `DiskDrive` 类的 Upper Filter 驱动。当前开发版本采用 after-image：受保护分区的应用写在磁盘层持久化到独立 Journal 后直接完成，不再提交到源分区；卷层优先合成读取，磁盘层为旁路读取兜底。
 
-当前版本：**1.6.8-test16**（Build `20260826.103-code-cleanup`），Journal 磁盘格式：**v15**。
+当前版本：**1.6.8-test27**（Build `20260826.114-preview-read-auto-close`），Journal 磁盘格式：**v15**。
 
 主要功能：
 
@@ -74,6 +74,7 @@ msbuild CdpDriver.sln /m /p:Configuration=Release /p:Platform=x64
 | `c` | 取消 Recovery；也可清除尚未执行的重启恢复标记 |
 | `o` | 把指定时间视图物化到源分区并设置持久还原点 |
 | `x` | 删除持久还原点；启动后首次受保护写入前不允许删除 |
+| `m` | 手动合并一个最旧 RR，并回收该操作导致失效分支的连续 RR |
 | `p` | 设置、验证或更换共享保护密码 |
 | `v` | 列出卷 |
 | `d` | 查询驱动版本、Build 和 Journal 版本 |
@@ -116,12 +117,18 @@ Recovery Begin 根据目标时间确定父分支和继承点，追加一个新�
 
 `2` 进入 `DRAINING` 后，把当前 `MetaTree` 覆盖逐段写回源分区。写回 IRP 直接发送给物理磁盘过滤设备的下层对象，使用绝对磁盘偏移，并设置 `SL_FORCE_DIRECT_WRITE`。该路径不使用 volume gate、线程识别或 IRP 私有标记，也不会重新进入本驱动的卷层或磁盘层。只有全部范围成功写回后才关闭保护；失败时保留保护状态。
 
+## 手动合并
+
+`m` 会异步合并一个最旧的可合并 HeaderRegion，忽略自动合并要求的 90% Journal 使用率。若该次回收使某些分支失效，Core 会在同一回收事务中标记并继续删除连续的 tombstone RR；但不会因此再进入下一个普通 RR，后者仍由自动合并在空间使用率达到阈值时处理。命令需要认证，并且仅在保护处于 General 阶段、没有 Preview、没有持久还原点、也没有正在运行的合并线程时可接受。合并期间，开始 Preview 的返回数据直接带 `MERGING` 状态和空句柄；GUI 据此提示等待合并完成，无需额外查询。完成结果记录在驱动 `[MERGE]` 日志中。
+
+自动合并在 General 阶段的阈值为 90%。若存在 Preview，则仅在使用率达到 95% 时紧急中止该 Preview 并开始合并；预览读取会返回“预览已因 Journal 使用率达到 95% 而被自动合并中止”的明确错误，CdpGui 检测到该读取错误后会立即结束对应 Preview 会话。
+
 ## Journal 空间与磁盘格式
 
 当前开发格式为 v15：一个 Superblock，随后是若干 `1 MiB HeaderRegion + PayloadRegion`。单条磁盘 Record Header 为 32 字节，HeaderRegion 末尾 32 字节是 RegionLink。
 
 - 单个 PayloadRegion 的跨度达到 Journal 容量的 `1/10` 时，即使 HeaderRegion 未写满也会切换新区域。
-- 日志使用率达到90%时启动唯一合并线程。删除最旧 HeaderRegion 前，先把其中当前分支仍有效的最新值写入源卷；兄弟分支记录直接丢弃。
+- 日志使用率达到90%时启动唯一合并线程。删除最旧 HeaderRegion 前，先把其中当前分支仍有效的最新值通过磁盘下层的 `SL_FORCE_DIRECT_WRITE` 写入源卷；兄弟分支记录直接丢弃。合并日志会输出模式、RR 偏移和序号范围。
 - 淘汰空间通过相邻 RegionLink 和最后一条 Record 的 `FileOffset + DataLength` 计算，不扫描整个 1 MiB HeaderRegion。
 - 普通 Append 持久化 payload 和 Record Header；只有切换 HeaderRegion、Recovery 标记、凭据、Format/Close 等元数据变化时才更新 Superblock，避免每次 Append 的写放大。
 - Record Header 的 `Sequence` 低16位是区域内索引，最高位 `0x80000000` 为 `BRANCH`。分支记录保存分支号、父分支号和继承 Record 序号；普通 Record 的全局序号为 `RegionLink.StartSequence + (Header.Sequence & 0xFFFF)`。

@@ -146,10 +146,13 @@ static NTSTATUS CdpDevStoreWrite(
 	if (!ctx || Offset < ctx->LogicalStart || Offset > ctx->Size ||
 		Length > ctx->Size - Offset)
 		return STATUS_INVALID_PARAMETER;
+	/* Source stores are attached below the Disk upper filter.  Core uses this
+	 * writer only to materialize a reclaimed HeaderRegion into the source
+	 * baseline, so the write must be explicitly accepted by the disk stack. */
 	return CdpDevStoreRawIo(
 		ctx->Device,
 		IRP_MJ_WRITE,
-		0,
+		SL_FORCE_DIRECT_WRITE,
 		ctx->BaseOffset + Offset,
 		Length,
 		(PVOID)Buffer);

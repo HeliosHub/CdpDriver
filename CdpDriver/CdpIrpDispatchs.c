@@ -7,9 +7,14 @@
 #include <ntstrsafe.h>
 
 static VOID CdpDisableAllCaptureSources(_In_ PCdp_DRIVER_EXTENSION DriverExt);
-static NTSTATUS CdpStartMergeThread(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
+static NTSTATUS CdpStartMergeThread(
+	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
+	_In_ BOOLEAN IgnoreUsageThreshold);
 static VOID CdpStopMergeThread(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
 static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
+static NTSTATUS CdpStartManualMerge(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ const Cdp_MANUAL_MERGE_REQUEST* Request);
 static NTSTATUS CdpDrainAndDisableCapture(
 	_Inout_ PCdp_DEVICE_EXTENSION DevExt);
 static NTSTATUS CdpDiskBackfillWriteAbsolute(
@@ -67,6 +72,11 @@ static VOID CdpRemoveProtectionRouteForSource(
 static PCdp_DEVICE_EXTENSION CdpFindSourceExtensionByGuid(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const GUID* VolumeGuid);
+static PDEVICE_OBJECT CdpReferenceActiveSourceByPhysicalRange(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ ULONG DiskNumber,
+	_In_ UINT64 PartitionStart,
+	_In_ UINT64 PartitionSize);
 static PCdp_DEVICE_EXTENSION CdpFindVolumeExtensionByLowerDevice(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ PDEVICE_OBJECT LowerDevice);
@@ -214,7 +224,10 @@ static volatile LONG64 g_CdpVolumeReadPassThroughCount;
 
 static BOOLEAN CdpShouldTraceRead(_In_ LONG64 Sequence)
 {
-	return Sequence <= 64 || (Sequence & 0xFFF) == 1;
+	UNREFERENCED_PARAMETER(Sequence);
+	/* Read-path tracing is intentionally disabled in normal builds.  Preserve
+	 * the guard so it can be selectively re-enabled during I/O diagnosis. */
+	return FALSE;
 }
 
 static VOID CdpAuditProtectedReadReset(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
@@ -1057,6 +1070,50 @@ static PCdp_DEVICE_EXTENSION CdpFindSourceExtensionByGuid(
 	}
 	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
 	return found;
+}
+
+/* A disk-start discovery can publish an internal SOURCE context before the
+ * real Volume object has a usable GUID. Match its immutable physical range so
+ * the later volume START binds to that context rather than rescanning the
+ * same Journal. */
+static PDEVICE_OBJECT CdpReferenceActiveSourceByPhysicalRange(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ ULONG DiskNumber,
+	_In_ UINT64 PartitionStart,
+	_In_ UINT64 PartitionSize)
+{
+	KIRQL oldIrql;
+	PLIST_ENTRY entry;
+	PDEVICE_OBJECT sourceDevice = NULL;
+
+	if (!DriverExt || PartitionSize == 0)
+		return NULL;
+	KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &oldIrql);
+	for (entry = DriverExt->DeviceObjectListHead.Flink;
+		entry != &DriverExt->DeviceObjectListHead; entry = entry->Flink)
+	{
+		PCdp_DEVICE_LIST_NODE node =
+			CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
+		PCdp_DEVICE_EXTENSION ext =
+			(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
+		if (!ext || (ext->DeviceKind != Cdp_DEVICE_KIND_SOURCE &&
+			ext->DeviceKind != Cdp_DEVICE_KIND_VOLUME &&
+			ext->DeviceKind != Cdp_DEVICE_KIND_DISK) ||
+			ext->DiskNumber != DiskNumber ||
+			ext->PartitionStart != PartitionStart ||
+			ext->PartitionSize != PartitionSize || !ext->Core ||
+			InterlockedCompareExchange(&ext->CaptureEnabled, 0, 0) == 0 ||
+			InterlockedCompareExchange(
+				&ext->ProtectionStateValidated, 0, 0) == 0)
+		{
+			continue;
+		}
+		sourceDevice = node->DeviceObject;
+		ObReferenceObject(sourceDevice);
+		break;
+	}
+	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
+	return sourceDevice;
 }
 
 static PCdp_DEVICE_EXTENSION CdpFindVolumeExtensionByLowerDevice(
@@ -2341,6 +2398,7 @@ static NTSTATUS CdpDiscoverAdjacentJournalForStartedVolume(
 	PCdp_DEVICE_EXTENSION diskExt;
 	PCdp_DEVICE_EXTENSION existingSource;
 	PCdp_VOLUME_HANDLE_ENTRY journalEntry;
+	PDEVICE_OBJECT existingSourceDevice = NULL;
 	PDEVICE_OBJECT metadataLower = NULL;
 	GUID queriedSourceGuid = { 0 };
 	BOOLEAN guidAvailable;
@@ -2401,8 +2459,17 @@ static NTSTATUS CdpDiscoverAdjacentJournalForStartedVolume(
 	if (sourceGeometrySize < SourceExt->PartitionSize)
 		SourceExt->PartitionSize = sourceGeometrySize;
 
-	existingSource = CdpFindSourceExtensionByGuid(
-		DriverExt, &SourceExt->VolumeGuid);
+	/* Prefer physical identity: disk-start discovery may have activated a
+	 * SOURCE context before this Volume GUID lookup settles. This check is
+	 * deliberately before Journal mount, enforcing one scan per Journal. */
+	existingSourceDevice = CdpReferenceActiveSourceByPhysicalRange(
+		DriverExt,
+		SourceExt->DiskNumber,
+		SourceExt->PartitionStart,
+		SourceExt->PartitionSize);
+	existingSource = existingSourceDevice ?
+		(PCdp_DEVICE_EXTENSION)existingSourceDevice->DeviceExtension :
+		CdpFindSourceExtensionByGuid(DriverExt, &SourceExt->VolumeGuid);
 	if (existingSource &&
 		InterlockedCompareExchange(&existingSource->CaptureEnabled, 0, 0) != 0 &&
 		InterlockedCompareExchange(
@@ -2412,7 +2479,13 @@ static NTSTATUS CdpDiscoverAdjacentJournalForStartedVolume(
 		existingSource->PartitionStart == SourceExt->PartitionStart)
 	{
 		status = CdpBindVolumeProtectionContext(
-			SourceExt, existingSource->FilterDeviceObject);
+			SourceExt, existingSourceDevice ? existingSourceDevice :
+			existingSource->FilterDeviceObject);
+		if (existingSourceDevice)
+		{
+			ObDereferenceObject(existingSourceDevice);
+			existingSourceDevice = NULL;
+		}
 		if (!NT_SUCCESS(status))
 		{
 			Cdp_LOG("[VOLUME-FASTPATH] existing source bind failed disk=%lu part=%lu status=0x%08X\n",
@@ -2421,13 +2494,18 @@ static NTSTATUS CdpDiscoverAdjacentJournalForStartedVolume(
 				status);
 			return status;
 		}
-		Cdp_LOG("[DISK-PRESTART] volume associated with existing source context kind=%lu disk=%lu part=%lu source=[%llu,%llu)\n",
+		Cdp_LOG("[VOLUME-FASTPATH] existing source bound; Journal scan skipped kind=%lu disk=%lu part=%lu source=[%llu,%llu)\n",
 			(ULONG)existingSource->DeviceKind,
 			SourceExt->DiskNumber,
 			SourceExt->PartitionNumber,
 			SourceExt->PartitionStart,
 			SourceExt->PartitionStart + SourceExt->PartitionSize);
 		return STATUS_SUCCESS;
+	}
+	if (existingSourceDevice)
+	{
+		ObDereferenceObject(existingSourceDevice);
+		existingSourceDevice = NULL;
 	}
 
 	diskExt = CdpFindDiskExtensionByNumber(
@@ -2638,6 +2716,27 @@ static VOID CdpDestroyPreviewSession(
 	cdpfree(Session);
 }
 
+static VOID CdpApplyRestorePointTimeLowerBound(
+	_In_ PCdp_VOLUME_HANDLE_ENTRY JournalEntry,
+	_Inout_ PUINT64 OldestTime,
+	_Inout_ PUINT64 NewestTime)
+{
+	UINT64 restorePointTime = 0;
+
+	if (!JournalEntry || !OldestTime || !NewestTime)
+		return;
+	Cdp_LOCK_ACQUIRE(&JournalEntry->Journal.Lock);
+	if (JournalEntry->Journal.RestorePointSet)
+		restorePointTime = JournalEntry->Journal.RestorePointTime100ns;
+	Cdp_LOCK_RELEASE(&JournalEntry->Journal.Lock);
+	if (restorePointTime == 0)
+		return;
+	if (*OldestTime == 0 || *OldestTime < restorePointTime)
+		*OldestTime = restorePointTime;
+	if (*NewestTime == 0 || *NewestTime < *OldestTime)
+		*NewestTime = *OldestTime;
+}
+
 static NTSTATUS CdpBeginPreviewSession(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const Cdp_PREVIEW_BEGIN_REQUEST* Request,
@@ -2653,7 +2752,8 @@ static NTSTATUS CdpBeginPreviewSession(
 	BOOLEAN phaseTransitioned = FALSE;
 	NTSTATUS status;
 
-		RtlZeroMemory(Reply, sizeof(*Reply));
+	RtlZeroMemory(Reply, sizeof(*Reply));
+	Reply->Status = Cdp_STATUS_UNPROTECTED;
 	sourceExt = CdpFindSourceExtensionByGuid(
 		DriverExt,
 		&Request->SourceVolumeGuid);
@@ -2662,7 +2762,8 @@ static NTSTATUS CdpBeginPreviewSession(
 	if (InterlockedCompareExchange(
 		&sourceExt->MergeThreadRunning, 0, 0) != 0)
 	{
-		return STATUS_DEVICE_BUSY;
+		Reply->Status = (LONG)Cdp_PHASE_MERGING;
+		return STATUS_SUCCESS;
 	}
 	journalEntry = CdpAcquireJournalForSource(DriverExt, sourceExt);
 	if (!journalEntry)
@@ -2670,13 +2771,16 @@ static NTSTATUS CdpBeginPreviewSession(
 	if (InterlockedCompareExchange(&sourceExt->Phase, 0, 0) !=
 		(LONG)Cdp_PHASE_GENERAL)
 	{
+		Reply->Status = (LONG)InterlockedCompareExchange(
+			&sourceExt->Phase, 0, 0);
 		CdpReleaseVolumeHandleEntry(journalEntry);
-		return STATUS_INVALID_DEVICE_STATE;
+		return STATUS_SUCCESS;
 	}
 	if (CdpAnyPreviewSessionActive(DriverExt))
 	{
+		Reply->Status = (LONG)Cdp_PHASE_PREVIEW;
 		CdpReleaseVolumeHandleEntry(journalEntry);
-		return STATUS_INVALID_DEVICE_STATE;
+		return STATUS_SUCCESS;
 	}
 	if (!sourceExt->Core)
 	{
@@ -2708,7 +2812,9 @@ static NTSTATUS CdpBeginPreviewSession(
 	{
 		goto cleanup;
 	}
-	else if (targetTime < oldestTime)
+	CdpApplyRestorePointTimeLowerBound(
+		journalEntry, &oldestTime, &newestTime);
+	if (targetTime < oldestTime)
 		targetTime = oldestTime;
 
 	status = CdpOpenVolumeHandle(
@@ -2766,13 +2872,19 @@ static NTSTATUS CdpBeginPreviewSession(
 	if (InterlockedCompareExchange(
 		&sourceExt->MergeThreadRunning, 0, 0) != 0)
 	{
-		status = STATUS_DEVICE_BUSY;
+		Reply->Status = (LONG)Cdp_PHASE_MERGING;
+		status = STATUS_SUCCESS;
 		ExAcquireFastMutex(&DriverExt->PreviewSessionMutex);
 		RemoveEntryList(&session->Entry);
 		ExReleaseFastMutex(&DriverExt->PreviewSessionMutex);
 		goto cleanup;
 	}
 	status = CdpCorePreviewBegin(sourceExt->Core, targetTime);
+	if (status == STATUS_DEVICE_BUSY)
+	{
+		Reply->Status = (LONG)Cdp_PHASE_MERGING;
+		status = STATUS_SUCCESS;
+	}
 	if (!NT_SUCCESS(status))
 	{
 		ExAcquireFastMutex(&DriverExt->PreviewSessionMutex);
@@ -2781,6 +2893,7 @@ static NTSTATUS CdpBeginPreviewSession(
 		goto cleanup;
 	}
 	session->TargetTime100ns = CdpCoreGetTargetTime100ns(sourceExt->Core);
+	Reply->Status = (LONG)Cdp_PHASE_PREVIEW;
 	Reply->PreviewHandle = session->HandleId;
 	Reply->TargetTime100ns = session->TargetTime100ns;
 	Reply->OldestRecoverable100ns = oldestTime;
@@ -2921,6 +3034,13 @@ static NTSTATUS CdpReadPreviewSession(
 		status = STATUS_DEVICE_NOT_READY;
 		goto cleanup;
 	}
+	if (session->StoppedByMerge)
+	{
+		/* Keep the handle valid for END_PREVIEW, while refusing reads from the
+		 * view that automatic compaction intentionally invalidated. */
+		status = STATUS_DEVICE_BUSY;
+		goto cleanup;
+	}
 
 	KeWaitForSingleObject(
 		&sourceExt->HistoryMutex,
@@ -3044,11 +3164,13 @@ static NTSTATUS CdpBeginRecovery(
 		}
 		if (!NT_SUCCESS(status))
 			return status;
-		if (oldestTime != 0 && targetTime < oldestTime)
-			targetTime = oldestTime;
 		journalEntry = CdpAcquireJournalForSource(DriverExt, sourceExt);
 		if (!journalEntry)
 			return STATUS_DEVICE_NOT_READY;
+		CdpApplyRestorePointTimeLowerBound(
+			journalEntry, &oldestTime, &newestTime);
+		if (oldestTime != 0 && targetTime < oldestTime)
+			targetTime = oldestTime;
 		status = CdpJournalSetRecoveryIntent(
 			&journalEntry->Journal, targetTime);
 		CdpReleaseVolumeHandleEntry(journalEntry);
@@ -3092,7 +3214,17 @@ static NTSTATUS CdpBeginRecovery(
 		InterlockedExchange(&sourceExt->Phase, previousPhase);
 		return status;
 	}
-	else if (targetTime < oldestTime)
+	journalEntry = CdpAcquireJournalForSource(DriverExt, sourceExt);
+	if (!journalEntry)
+	{
+		InterlockedExchange(&sourceExt->Phase, previousPhase);
+		return STATUS_DEVICE_NOT_READY;
+	}
+	CdpApplyRestorePointTimeLowerBound(
+		journalEntry, &oldestTime, &newestTime);
+	CdpReleaseVolumeHandleEntry(journalEntry);
+	journalEntry = NULL;
+	if (targetTime < oldestTime)
 		targetTime = oldestTime;
 
 	KeWaitForSingleObject(
@@ -3221,6 +3353,8 @@ static NTSTATUS CdpSetRestorePoint(
 	PCdp_VOLUME_HANDLE_ENTRY journalEntry = NULL;
 	UINT64 oldest = 0;
 	UINT64 newest = 0;
+	UINT64 requestedTarget = 0;
+	UINT64 materializeTarget = 0;
 	UINT64 effective = 0;
 	UINT64 targetSequence = 0;
 	ULONG ranges = 0;
@@ -3249,11 +3383,17 @@ static NTSTATUS CdpSetRestorePoint(
 	status = CdpCoreQueryTimeRange(sourceExt->Core, &oldest, &newest);
 	if (!NT_SUCCESS(status))
 		goto phase_cleanup;
-	if (Request->TargetTime100ns < oldest ||
-		Request->TargetTime100ns > newest)
+	requestedTarget = Request->TargetTime100ns;
+	materializeTarget = requestedTarget < oldest ? oldest : requestedTarget;
+	if (materializeTarget > newest)
 	{
 		status = STATUS_NOT_FOUND;
 		goto phase_cleanup;
+	}
+	if (materializeTarget != requestedTarget)
+	{
+		Cdp_LOG("[RESTORE-POINT] clamp target to oldest requested=%llu oldest=%llu newest=%llu\n",
+			requestedTarget, oldest, newest);
 	}
 
 	CdpStopMergeThread(sourceExt);
@@ -3267,7 +3407,7 @@ static NTSTATUS CdpSetRestorePoint(
 	}
 	status = CdpCoreMaterializeTimeWithWriter(
 		sourceExt->Core,
-		Request->TargetTime100ns,
+		materializeTarget,
 		CdpDiskBackfillWriteAbsolute,
 		sourceExt,
 		&effective,
@@ -3277,7 +3417,7 @@ static NTSTATUS CdpSetRestorePoint(
 	if (!NT_SUCCESS(status))
 	{
 		Cdp_LOG("[RESTORE-POINT-FAIL] stage=source-materialize status=0x%08X target=%llu ranges=%lu bytes=%llu\n",
-			status, Request->TargetTime100ns, ranges, bytes);
+			status, materializeTarget, ranges, bytes);
 		goto cleanup;
 	}
 	status = CdpJournalSetRestorePoint(
@@ -3355,12 +3495,44 @@ cleanup:
 	return status;
 }
 
+static NTSTATUS CdpQueryRestorePoint(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ const Cdp_RESTORE_POINT_QUERY_REQUEST* Request,
+	_Out_ PCdp_RESTORE_POINT_QUERY_REPLY Reply)
+{
+	PCdp_DEVICE_EXTENSION sourceExt;
+	PCdp_VOLUME_HANDLE_ENTRY journalEntry;
+
+	if (!DriverExt || !Request || !Reply)
+		return STATUS_INVALID_PARAMETER;
+	RtlZeroMemory(Reply, sizeof(*Reply));
+	sourceExt = CdpFindSourceExtensionByGuid(
+		DriverExt, &Request->SourceVolumeGuid);
+	if (!sourceExt || !sourceExt->Core ||
+		InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) == 0)
+	{
+		return STATUS_DEVICE_NOT_READY;
+	}
+	journalEntry = CdpAcquireJournalForSource(DriverExt, sourceExt);
+	if (!journalEntry)
+		return STATUS_DEVICE_NOT_READY;
+
+	Cdp_LOCK_ACQUIRE(&journalEntry->Journal.Lock);
+	Reply->IsSet = journalEntry->Journal.RestorePointSet ? 1UL : 0UL;
+	Reply->TargetTime100ns = Reply->IsSet ?
+		journalEntry->Journal.RestorePointTime100ns : 0;
+	Cdp_LOCK_RELEASE(&journalEntry->Journal.Lock);
+	CdpReleaseVolumeHandleEntry(journalEntry);
+	return STATUS_SUCCESS;
+}
+
 static NTSTATUS CdpQueryTimeRange(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const Cdp_TIME_RANGE_QUERY_REQUEST* Request,
 	_Out_ PCdp_TIME_RANGE_QUERY_REPLY Reply)
 {
 	PCdp_DEVICE_EXTENSION sourceExt;
+	PCdp_VOLUME_HANDLE_ENTRY journalEntry;
 	NTSTATUS status;
 
 	RtlZeroMemory(Reply, sizeof(*Reply));
@@ -3380,15 +3552,23 @@ static NTSTATUS CdpQueryTimeRange(
 		&Reply->NewestRecord100ns);
 	if (status == STATUS_NOT_FOUND)
 	{
-		Reply->HasRecords = 0;
 		Reply->OldestRecord100ns = 0;
 		Reply->NewestRecord100ns = 0;
-		return STATUS_SUCCESS;
+		status = STATUS_SUCCESS;
 	}
 	if (!NT_SUCCESS(status))
 		return status;
 
-	Reply->HasRecords = 1;
+	journalEntry = CdpAcquireJournalForSource(DriverExt, sourceExt);
+	if (!journalEntry)
+		return STATUS_DEVICE_NOT_READY;
+	CdpApplyRestorePointTimeLowerBound(
+		journalEntry,
+		&Reply->OldestRecord100ns,
+		&Reply->NewestRecord100ns);
+	CdpReleaseVolumeHandleEntry(journalEntry);
+	Reply->HasRecords =
+		Reply->OldestRecord100ns != 0 && Reply->NewestRecord100ns != 0;
 	return STATUS_SUCCESS;
 }
 
@@ -3523,6 +3703,14 @@ static NTSTATUS CdpQueryPhase(
 	}
 
 	Reply->Status = (LONG)InterlockedCompareExchange(&sourceExt->Phase, 0, 0);
+	/* Merging is not a write-path phase: capture continues in General while
+	 * the worker materializes one old RR.  Surface it as a distinct query
+	 * state so clients can explain a rejected Preview request precisely. */
+	if (Reply->Status == (LONG)Cdp_PHASE_GENERAL &&
+		InterlockedCompareExchange(&sourceExt->MergeThreadRunning, 0, 0) != 0)
+	{
+		Reply->Status = (LONG)Cdp_PHASE_MERGING;
+	}
 	if (sourceExt->Core)
 		Reply->RecoveryTargetTime100ns =
 			CdpCoreGetTargetTime100ns(sourceExt->Core);
@@ -4379,19 +4567,19 @@ static VOID CdpStopPreviewSessionForSource(
 			sizeof(GUID)) == sizeof(GUID))
 		{
 			session = candidate;
-			session->Closing = TRUE;
-			RemoveEntryList(&session->Entry);
+			session->StoppedByMerge = TRUE;
 			break;
 		}
 	}
 	ExReleaseFastMutex(&DriverExt->PreviewSessionMutex);
 
+	if (SourceExt->Core)
+		(void)CdpCorePreviewEnd(SourceExt->Core);
 	InterlockedExchange(&SourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
 	if (session)
 	{
-		Cdp_LOG("[MERGE] preview stopped at reclaimed target record handle=%llu\n",
+		Cdp_LOG("[MERGE] preview stopped by compaction handle=%llu; END_PREVIEW remains valid\n",
 			session->HandleId);
-		CdpDestroyPreviewSession(DriverExt, session);
 	}
 }
 
@@ -4402,11 +4590,19 @@ static VOID CdpMergeWorker(_In_ PVOID Context)
 		IoGetDriverObjectExtension(g_DriverObject, &g_DriverObject);
 	NTSTATUS status = STATUS_SUCCESS;
 	BOOLEAN coreMergeActive = FALSE;
+	BOOLEAN ignoreUsageThreshold = InterlockedExchange(
+		&devExt->MergeIgnoreUsageThreshold, 0) != 0;
 
 	status = CdpCoreSetMergeActive(devExt->Core, TRUE);
 	if (!NT_SUCCESS(status))
 		goto done;
 	coreMergeActive = TRUE;
+	Cdp_LOG("[MERGE] start mode=%s source=%p disk=%lu part=%lu threshold=%s\n",
+		ignoreUsageThreshold ? "manual" : "automatic",
+		devExt,
+		devExt->DiskNumber,
+		devExt->PartitionNumber,
+		ignoreUsageThreshold ? "ignored" : "90-percent");
 
 	for (;;)
 	{
@@ -4418,9 +4614,13 @@ static VOID CdpMergeWorker(_In_ PVOID Context)
 		{
 			break;
 		}
-		status = CdpCoreJournalUsageAtLeast(devExt->Core, 90, &atLeast);
-		if (!NT_SUCCESS(status) || !atLeast)
-			break;
+		if (!ignoreUsageThreshold)
+		{
+			status = CdpCoreJournalUsageAtLeast(
+				devExt->Core, 90, &atLeast);
+			if (!NT_SUCCESS(status) || !atLeast)
+				break;
+		}
 		KeWaitForSingleObject(
 			&devExt->HistoryMutex,
 			Executive,
@@ -4432,13 +4632,25 @@ static VOID CdpMergeWorker(_In_ PVOID Context)
 		if (CdpCoreConsumePreviewStoppedByMerge(devExt->Core))
 			CdpStopPreviewSessionForSource(driverExt, devExt);
 		if (status == STATUS_NOT_FOUND)
-			break;
-		if (!NT_SUCCESS(status))
 		{
-			Cdp_LOG("[MERGE] compact failed status=0x%08X\n", status);
+			if (ignoreUsageThreshold)
+				Cdp_LOG("[MERGE] manual request found no compactable header region\n");
 			break;
 		}
-		Cdp_LOG("[MERGE] oldest header region materialized and deleted\n");
+		if (!NT_SUCCESS(status))
+		{
+			Cdp_LOG("[MERGE] compact failed mode=%s status=0x%08X\n",
+				ignoreUsageThreshold ? "manual" : "automatic", status);
+			break;
+		}
+		Cdp_LOG("[MERGE] oldest header region materialized and deleted mode=%s\n",
+			ignoreUsageThreshold ? "manual" : "automatic");
+		/* A manual request may cause Core to reclaim contiguous tombstoned RRs
+		 * for newly invalid branches in this same pass.  Do not use manual mode
+		 * to advance into the next ordinary oldest RR; that is space-driven work
+		 * and remains the automatic merge thread's responsibility. */
+		if (ignoreUsageThreshold)
+			break;
 	}
 
 done:
@@ -4469,7 +4681,9 @@ static VOID CdpCloseFinishedMergeHandle(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	DevExt->MergeThreadHandle = NULL;
 }
 
-static NTSTATUS CdpStartMergeThread(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
+static NTSTATUS CdpStartMergeThread(
+	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
+	_In_ BOOLEAN IgnoreUsageThreshold)
 {
 	NTSTATUS status;
 
@@ -4481,6 +4695,8 @@ static NTSTATUS CdpStartMergeThread(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 		return STATUS_DEVICE_BUSY;
 	}
 	CdpCloseFinishedMergeHandle(DevExt);
+	InterlockedExchange(&DevExt->MergeIgnoreUsageThreshold,
+		IgnoreUsageThreshold ? 1 : 0);
 	InterlockedExchange(&DevExt->MergeThreadStopping, 0);
 	KeClearEvent(&DevExt->MergeThreadDoneEvent);
 	status = PsCreateSystemThread(
@@ -4493,6 +4709,7 @@ static NTSTATUS CdpStartMergeThread(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 		DevExt);
 	if (!NT_SUCCESS(status))
 	{
+		InterlockedExchange(&DevExt->MergeIgnoreUsageThreshold, 0);
 		InterlockedExchange(&DevExt->MergeThreadRunning, 0);
 		KeSetEvent(&DevExt->MergeThreadDoneEvent, IO_NO_INCREMENT, FALSE);
 	}
@@ -4532,15 +4749,22 @@ static VOID CdpStopMergeThread(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 {
 	BOOLEAN atLeast = FALSE;
+	LONG phase;
+	ULONG threshold;
 	NTSTATUS status;
 
 	if (!DevExt || !DevExt->Core ||
-		InterlockedCompareExchange(&DevExt->Phase, 0, 0) !=
-			(LONG)Cdp_PHASE_GENERAL ||
 		InterlockedCompareExchange(&DevExt->CaptureEnabled, 0, 0) == 0)
 	{
 		return;
 	}
+	phase = InterlockedCompareExchange(&DevExt->Phase, 0, 0);
+	if (phase == (LONG)Cdp_PHASE_GENERAL)
+		threshold = 90;
+	else if (phase == (LONG)Cdp_PHASE_PREVIEW)
+		threshold = 95;
+	else
+		return;
 	/* The source contains the persistent restore baseline. Compaction would
 	 * overwrite it with newer after-images and make the next boot unable to
 	 * return to the selected point. */
@@ -4549,7 +4773,7 @@ static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	{
 		return;
 	}
-	status = CdpCoreJournalUsageAtLeast(DevExt->Core, 90, &atLeast);
+	status = CdpCoreJournalUsageAtLeast(DevExt->Core, threshold, &atLeast);
 	if (!NT_SUCCESS(status))
 	{
 		Cdp_LOG("[MERGE] usage query failed status=0x%08X\n", status);
@@ -4557,9 +4781,52 @@ static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	}
 	if (!atLeast)
 		return;
-	status = CdpStartMergeThread(DevExt);
+	if (phase == (LONG)Cdp_PHASE_PREVIEW)
+	{
+		PCdp_DRIVER_EXTENSION driverExt =
+			IoGetDriverObjectExtension(g_DriverObject, &g_DriverObject);
+		Cdp_LOG("[MERGE] usage reached %lu percent; aborting Preview before automatic compaction source=%p\n",
+			threshold, DevExt);
+		CdpStopPreviewSessionForSource(driverExt, DevExt);
+	}
+	status = CdpStartMergeThread(DevExt, FALSE);
 	if (!NT_SUCCESS(status) && status != STATUS_DEVICE_BUSY)
 		Cdp_LOG("[MERGE] start failed status=0x%08X\n", status);
+}
+
+static NTSTATUS CdpStartManualMerge(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ const Cdp_MANUAL_MERGE_REQUEST* Request)
+{
+	PCdp_DEVICE_EXTENSION sourceExt;
+	NTSTATUS status;
+
+	if (!DriverExt || !Request)
+		return STATUS_INVALID_PARAMETER;
+	sourceExt = CdpFindSourceExtensionByGuid(
+		DriverExt, &Request->SourceVolumeGuid);
+	if (!sourceExt || !sourceExt->Core ||
+		InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) == 0)
+	{
+		return STATUS_DEVICE_NOT_READY;
+	}
+	if (InterlockedCompareExchange(&sourceExt->Phase, 0, 0) !=
+		(LONG)Cdp_PHASE_GENERAL || CdpAnyPreviewSessionActive(DriverExt))
+	{
+		return STATUS_INVALID_DEVICE_STATE;
+	}
+	if (sourceExt->RedirectJournalEntry &&
+		sourceExt->RedirectJournalEntry->Journal.RestorePointSet)
+	{
+		return STATUS_INVALID_DEVICE_STATE;
+	}
+	status = CdpStartMergeThread(sourceExt, TRUE);
+	if (NT_SUCCESS(status))
+	{
+		Cdp_LOG("[MERGE] manual branch-followup request accepted source=%p disk=%lu part=%lu\n",
+			sourceExt, sourceExt->DiskNumber, sourceExt->PartitionNumber);
+	}
+	return status;
 }
 
 /*
@@ -7042,6 +7309,54 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 				return CdpCompleteIrp(Irp, STATUS_ACCESS_DENIED, 0);
 			}
 			status = CdpDeleteRestorePoint(DriverExt, &request);
+			return CdpCompleteIrp(Irp, status, 0);
+		}
+
+		case IOCTL_Cdp_QUERY_RESTORE_POINT:
+		{
+			Cdp_RESTORE_POINT_QUERY_REQUEST request;
+			PCdp_RESTORE_POINT_QUERY_REPLY reply;
+			ULONG inLen =
+				IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+			ULONG outLen =
+				IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
+			NTSTATUS status;
+
+			if (!DriverExt || !Irp->AssociatedIrp.SystemBuffer ||
+				inLen < sizeof(request) ||
+				outLen < sizeof(Cdp_RESTORE_POINT_QUERY_REPLY))
+			{
+				return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+			}
+			request = *(PCdp_RESTORE_POINT_QUERY_REQUEST)
+				Irp->AssociatedIrp.SystemBuffer;
+			reply = (PCdp_RESTORE_POINT_QUERY_REPLY)
+				Irp->AssociatedIrp.SystemBuffer;
+			status = CdpQueryRestorePoint(DriverExt, &request, reply);
+			return CdpCompleteIrp(
+				Irp, status, NT_SUCCESS(status) ? sizeof(*reply) : 0);
+		}
+
+		case IOCTL_Cdp_MANUAL_MERGE:
+		{
+			Cdp_MANUAL_MERGE_REQUEST request;
+			ULONG inLen =
+				IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+			NTSTATUS status;
+
+			if (!DriverExt || !Irp->AssociatedIrp.SystemBuffer ||
+				inLen < sizeof(request))
+			{
+				return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+			}
+			request = *(PCdp_MANUAL_MERGE_REQUEST)
+				Irp->AssociatedIrp.SystemBuffer;
+			if (!CdpControlHandleAuthorized(
+				Irp, DriverExt, &request.SourceVolumeGuid))
+			{
+				return CdpCompleteIrp(Irp, STATUS_ACCESS_DENIED, 0);
+			}
+			status = CdpStartManualMerge(DriverExt, &request);
 			return CdpCompleteIrp(Irp, status, 0);
 		}
 

@@ -763,6 +763,10 @@ NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
 		Core->Journal, &regionOffset, &firstSequence, &endSequence);
 	if (!NT_SUCCESS(status))
 		goto cleanup;
+#ifndef Cdp_USERMODE
+	Cdp_LOG("[MERGE] region begin rrOffset=%llu sequence=[%llu,%llu)\n",
+		regionOffset, firstSequence, endSequence);
+#endif
 
 	// Once reclamation reaches the record that anchors the requested preview
 	// time, that historical view can no longer be maintained from the retained
@@ -810,7 +814,14 @@ NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
 	status = CdpCoreMaterializeMetaNodes(
 		Core, regionTree.Root, firstSequence, endSequence);
 	if (!NT_SUCCESS(status))
+	{
+#ifndef Cdp_USERMODE
+		Cdp_LOG("[MERGE] region materialize failed rrOffset=%llu sequence=[%llu,%llu) liveNodes=%lu status=0x%08X\n",
+			regionOffset, firstSequence, endSequence,
+			regionTree.NodeCount, status);
+#endif
 		goto cleanup;
+	}
 
 	// Update only MetaTree coverage that still points into the deleted region.
 	// Intersections owned by newer regions remain intact and keep overriding
@@ -871,6 +882,14 @@ NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
 		ULONG deletedTombstoneRegions = 0;
 		status = CdpJournalDeleteContiguousTombstonedRegions(
 			Core->Journal, &deletedTombstoneRegions);
+		if (NT_SUCCESS(status))
+		{
+#ifndef Cdp_USERMODE
+			Cdp_LOG("[MERGE] region complete rrOffset=%llu sequence=[%llu,%llu) liveNodes=%lu tombstoneRrs=%lu\n",
+				regionOffset, firstSequence, endSequence,
+				regionTree.NodeCount, deletedTombstoneRegions);
+#endif
+		}
 		Cdp_RECOVERY_TRACE(
 			"compaction reclaimed primary RR plus %lu contiguous tombstone RRs\n",
 			deletedTombstoneRegions);

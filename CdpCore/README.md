@@ -37,7 +37,7 @@ CdpCore 是驱动与用户态单元测试共用的 after-image Journal 引擎。
 - Recovery：`CdpCoreRecoveryBegin`、`CdpCoreRecoveryCommitStep`、`CdpCoreRecoveryCommit`
 - Drain/物化：`CdpCoreDrainOneMetaRangeWithWriter`、`CdpCoreMaterializeTimeWithWriter`
 - 持久还原点：`CdpCorePreparePersistentRestoreBoot`、`CdpCoreCancelPersistentRestoreBoot`
-- 合并：`CdpCoreSetMergeActive`、`CdpCoreCompactOldestRegion`
+- 合并：`CdpCoreSetMergeActive`、`CdpCoreCompactOldestRegion`（自动模式按 90% 阈值循环；手动模式跳过阈值回收一个最旧 RR，并在该 Core 回收事务内清理由失效分支产生的连续 tombstone RR）
 
 ## 构建与测试
 

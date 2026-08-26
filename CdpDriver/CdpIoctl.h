@@ -56,11 +56,17 @@
 #define IOCTL_Cdp_QUERY_JOURNAL_BRANCHES CTL_CODE(Cdp_IOCTL_TYPE, 0x812, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_SET_RESTORE_POINT       CTL_CODE(Cdp_IOCTL_TYPE, 0x813, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_DELETE_RESTORE_POINT    CTL_CODE(Cdp_IOCTL_TYPE, 0x814, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_Cdp_QUERY_RESTORE_POINT     CTL_CODE(Cdp_IOCTL_TYPE, 0x815, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_Cdp_MANUAL_MERGE             CTL_CODE(Cdp_IOCTL_TYPE, 0x816, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define Cdp_PHASE_GENERAL  0UL
 #define Cdp_PHASE_PREVIEW  1UL
 #define Cdp_PHASE_RECOVERY 2UL
 #define Cdp_PHASE_DRAINING 3UL
+// A protected volume whose ordinary phase is General but whose history merge
+// worker is materializing and reclaiming an RR.  This is a query-only state:
+// callers must wait before starting Preview.
+#define Cdp_PHASE_MERGING  4UL
 #define Cdp_STATUS_UNPROTECTED (-1L)
 
 #define Cdp_CMD_1 1
@@ -141,6 +147,11 @@ typedef struct _Cdp_PREVIEW_BEGIN_REQUEST
 
 typedef struct _Cdp_PREVIEW_BEGIN_REPLY
 {
+	/* State observed while processing the request.  A normal state denial is
+	 * returned as a successful IOCTL with PreviewHandle == 0 so callers can
+	 * explain the reason without a second query. */
+	LONG Status;
+	ULONG Reserved;
 	UINT64 PreviewHandle;
 	UINT64 TargetTime100ns;
 	UINT64 OldestRecoverable100ns;
@@ -167,7 +178,7 @@ typedef struct _Cdp_PHASE_QUERY_REQUEST
 
 typedef struct _Cdp_PHASE_QUERY_REPLY
 {
-	// Cdp_PHASE_GENERAL / PREVIEW / RECOVERY / DRAINING,
+	// Cdp_PHASE_GENERAL / PREVIEW / RECOVERY / DRAINING / MERGING,
 	// or Cdp_STATUS_UNPROTECTED (-1).
 	LONG Status;
 	ULONG Reserved;
@@ -325,6 +336,27 @@ typedef struct _Cdp_RESTORE_POINT_DELETE_REQUEST
 {
 	GUID SourceVolumeGuid;
 } Cdp_RESTORE_POINT_DELETE_REQUEST, *PCdp_RESTORE_POINT_DELETE_REQUEST;
+
+// Compacts one normal oldest region without applying the automatic 90%
+// Journal-usage threshold. Branch-invalidated tombstone regions caused by
+// that same pass are still reclaimed. Completion is asynchronous and visible
+// in logs.
+typedef struct _Cdp_MANUAL_MERGE_REQUEST
+{
+	GUID SourceVolumeGuid;
+} Cdp_MANUAL_MERGE_REQUEST, *PCdp_MANUAL_MERGE_REQUEST;
+
+typedef struct _Cdp_RESTORE_POINT_QUERY_REQUEST
+{
+	GUID SourceVolumeGuid;
+} Cdp_RESTORE_POINT_QUERY_REQUEST, *PCdp_RESTORE_POINT_QUERY_REQUEST;
+
+typedef struct _Cdp_RESTORE_POINT_QUERY_REPLY
+{
+	ULONG IsSet;
+	ULONG Reserved;
+	UINT64 TargetTime100ns;
+} Cdp_RESTORE_POINT_QUERY_REPLY, *PCdp_RESTORE_POINT_QUERY_REPLY;
 
 #pragma pack(pop)
 // Persist this recovery request in the journal.  After a system restart the

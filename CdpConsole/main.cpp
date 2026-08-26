@@ -582,6 +582,14 @@ static BOOL DoPreviewBegin(HANDLE hDevice)
 		ConOutFmt(L"Begin preview failed (err=%lu).\n", GetLastError());
 		return FALSE;
 	}
+	if (reply.PreviewHandle == 0)
+	{
+		if (reply.Status == (LONG)Cdp_PHASE_MERGING)
+			ConOut(L"Begin preview rejected: history merge is in progress; wait for it to finish.\n");
+		else
+			ConOutFmt(L"Begin preview rejected by current state=%ld.\n", reply.Status);
+		return FALSE;
+	}
 	g_PreviewHandle = reply.PreviewHandle;
 	ConOutFmt(L"PreviewHandle=%llu target=%llu range=[%llu, %llu]\n",
 		reply.PreviewHandle,
@@ -849,6 +857,59 @@ static BOOL DoDeleteRestorePoint(HANDLE hDevice)
 	return TRUE;
 }
 
+static BOOL DoQueryRestorePoint(HANDLE hDevice)
+{
+	Cdp_RESTORE_POINT_QUERY_REQUEST req = { 0 };
+	Cdp_RESTORE_POINT_QUERY_REPLY reply = { 0 };
+	DWORD bytesReturned = 0;
+
+	ListVolumes();
+	if (!PromptGuid(L"Protected source volume GUID: ", &req.SourceVolumeGuid))
+		return FALSE;
+	if (!DeviceIoControl(
+		hDevice, IOCTL_Cdp_QUERY_RESTORE_POINT,
+		&req, sizeof(req), &reply, sizeof(reply),
+		&bytesReturned, NULL))
+	{
+		ConOutFmt(L"Query restore point failed (err=%lu).\n", GetLastError());
+		return FALSE;
+	}
+	if (!reply.IsSet)
+		ConOut(L"Persistent restore point is not set.\n");
+	else
+		ConOutFmt(L"Persistent restore point: %llu\n", reply.TargetTime100ns);
+	return TRUE;
+}
+
+static BOOL DoManualMerge(HANDLE hDevice)
+{
+	Cdp_MANUAL_MERGE_REQUEST req = { 0 };
+	DWORD bytesReturned = 0;
+
+	ListVolumes();
+	if (!PromptGuid(L"Protected source volume GUID: ", &req.SourceVolumeGuid))
+		return FALSE;
+	if (!AuthenticatePassword(hDevice))
+		return FALSE;
+	if (!DeviceIoControl(
+		hDevice,
+		IOCTL_Cdp_MANUAL_MERGE,
+		&req,
+		sizeof(req),
+		NULL,
+		0,
+		&bytesReturned,
+		NULL))
+	{
+		ConOutFmt(L"Manual merge request failed (err=%lu).\n", GetLastError());
+		return FALSE;
+	}
+	ConOut(L"Manual merge accepted: one oldest region will be compacted regardless of Journal free space.\n");
+	ConOut(L"Branch-invalidated tombstone regions caused by that pass are reclaimed too.\n");
+	ConOut(L"Completion is asynchronous; check driver [MERGE] logs for the result.\n");
+	return TRUE;
+}
+
 static void PrintGuidLine(_In_ const wchar_t* label, _In_ const GUID* Guid)
 {
 	ConOutFmt(
@@ -905,6 +966,9 @@ static BOOL DoQueryStatus(HANDLE hDevice)
 		break;
 	case (LONG)Cdp_PHASE_DRAINING:
 		ConOut(L"(draining to source)\n");
+		break;
+	case (LONG)Cdp_PHASE_MERGING:
+		ConOut(L"(merging history; Preview unavailable)\n");
 		break;
 	default:
 		ConOut(L"(unknown)\n");
@@ -1461,6 +1525,8 @@ static void PrintHelp(void)
 	ConOut(L"  c  - cancel prepared recovery without writeback\n");
 	ConOut(L"  o  - set persistent restore point (source GUID + time)\n");
 	ConOut(L"  x  - delete persistent restore point\n");
+	ConOut(L"  g  - query current persistent restore point\n");
+	ConOut(L"  m  - compact one oldest region plus invalid-branch follow-up (ignore 90% threshold)\n");
 	ConOut(L"  p  - set / verify / change the shared protection password\n");
 	ConOut(L"  v  - list volumes\n");
 	ConOut(L"  d  - query driver version / build / journal version\n");
@@ -1598,6 +1664,18 @@ int wmain(void)
 			hDevice = EnsureControlDevice(hDevice);
 			if (hDevice != INVALID_HANDLE_VALUE)
 				DoDeleteRestorePoint(hDevice);
+			break;
+		case L'g':
+		case L'G':
+			hDevice = EnsureControlDevice(hDevice);
+			if (hDevice != INVALID_HANDLE_VALUE)
+				DoQueryRestorePoint(hDevice);
+			break;
+		case L'm':
+		case L'M':
+			hDevice = EnsureControlDevice(hDevice);
+			if (hDevice != INVALID_HANDLE_VALUE)
+				DoManualMerge(hDevice);
 			break;
 		case L'p':
 		case L'P':

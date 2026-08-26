@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.6.8-test16"
-#define Cdp_DRIVER_BUILD_STRING   "20260826.103-code-cleanup"
+#define Cdp_DRIVER_VERSION_STRING "1.6.8-test27"
+#define Cdp_DRIVER_BUILD_STRING   "20260826.114-preview-read-auto-close"
 
 // Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.
 // Cdp_DBG: Debug builds only — verbose I/O and path tracing.
@@ -130,6 +130,8 @@ typedef struct _Cdp_PREVIEW_SESSION
 	GUID SourceVolumeGuid;
 	volatile LONG ReferenceCount;
 	BOOLEAN Closing;
+	// Retained until END_PREVIEW after emergency compaction stopped its view.
+	BOOLEAN StoppedByMerge;
 	KEVENT NoReferences;
 } Cdp_PREVIEW_SESSION, *PCdp_PREVIEW_SESSION;
 
@@ -170,8 +172,8 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	// Set only after the complete source/disk/journal/Core object graph has
 	// passed fail-closed activation validation. Disk hot paths require both.
 	volatile LONG ProtectionStateValidated;
-	// Sparse diagnostics for proving whether Disk Upper reads reach source
-	// matching and the journal-audit branch.  Logged at 1 and every 4096 reads.
+	// Counters retained for optional Disk Upper read-path diagnostics. Regular
+	// [READ-TRACE] output is disabled in this build.
 	volatile LONG64 DiskReadPathEntryCount;
 	volatile LONG64 DiskReadPathNoSourceCount;
 	volatile LONG64 DiskReadPathSourceMatchCount;
@@ -233,6 +235,10 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	HANDLE MergeThreadHandle;
 	volatile LONG MergeThreadRunning;
 	volatile LONG MergeThreadStopping;
+	// Set only by an authenticated manual-merge request. The worker consumes it
+	// to compact one normal oldest RR without the automatic 90% usage gate.
+	// That Core pass still reclaims any branch-invalidated tombstone RRs.
+	volatile LONG MergeIgnoreUsageThreshold;
 	KEVENT MergeThreadDoneEvent;
 	KMUTEX HistoryMutex;
 	PCdp_CORE Core;
