@@ -82,12 +82,6 @@ NTSTATUS CdpCoreQueryRecordHeaders(
 	_Out_ PUINT64 Generation,
 	_Out_ PULONG ReturnedCount);
 
-NTSTATUS CdpCoreQueryMetaTreeStats(
-	_Inout_ PCdp_CORE Core,
-	_Out_ PULONG NodeCount,
-	_Out_ PUINT64 LowestOffset,
-	_Out_ PUINT64 HighestEndOffset);
-
 NTSTATUS CdpCoreQueryBranches(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 StartIndex,

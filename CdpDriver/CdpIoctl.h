@@ -41,7 +41,7 @@
 #define IOCTL_Cdp_BEGIN_RECOVERY CTL_CODE(Cdp_IOCTL_TYPE, 0x808, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_COMMIT_RECOVERY CTL_CODE(Cdp_IOCTL_TYPE, 0x809, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-// 查询 journal 内最早/最新 COW 记录的 WallClock100ns
+// 查询 journal 内最早/最新历史记录的 WallClock100ns
 #define IOCTL_Cdp_QUERY_TIME_RANGE CTL_CODE(Cdp_IOCTL_TYPE, 0x80A, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_CANCEL_RECOVERY CTL_CODE(Cdp_IOCTL_TYPE, 0x80B, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_QUERY_VERSION   CTL_CODE(Cdp_IOCTL_TYPE, 0x80C, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -215,7 +215,7 @@ typedef struct _Cdp_TIME_RANGE_QUERY_REQUEST
 
 typedef struct _Cdp_TIME_RANGE_QUERY_REPLY
 {
-	ULONG HasRecords; // 1 if journal has COW history; 0 if empty
+	ULONG HasRecords; // 1 if journal has retained history; 0 if empty
 	ULONG Reserved;
 	UINT64 OldestRecord100ns; // earliest surviving WallClock100ns
 	UINT64 NewestRecord100ns; // latest WallClock100ns
@@ -232,7 +232,7 @@ typedef struct _Cdp_JOURNAL_USAGE_QUERY_REPLY
 	UINT64 JournalMetadataBytes;        // superblock + active header regions
 	UINT64 RecordPayloadBytesUsed;      // sector-aligned payload space in use
 	UINT64 RecordPayloadBytesFree;      // free payload space with current headers
-	UINT64 TotalRecords;                // surviving COW record count
+	UINT64 TotalRecords;                // surviving history record count
 } Cdp_JOURNAL_USAGE_QUERY_REPLY, *PCdp_JOURNAL_USAGE_QUERY_REPLY;
 
 // The returned records contain metadata only.  No payload bytes are returned.

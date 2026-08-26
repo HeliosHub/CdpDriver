@@ -906,38 +906,6 @@ NTSTATUS CdpCoreQueryRecordHeaders(
 		ReturnedCount);
 }
 
-NTSTATUS CdpCoreQueryMetaTreeStats(
-	_Inout_ PCdp_CORE Core,
-	_Out_ PULONG NodeCount,
-	_Out_ PUINT64 LowestOffset,
-	_Out_ PUINT64 HighestEndOffset)
-{
-	PCdp_PREVIEW_TREE_NODE node;
-
-	if (!Core || !NodeCount || !LowestOffset || !HighestEndOffset)
-		return STATUS_INVALID_PARAMETER;
-	*NodeCount = 0;
-	*LowestOffset = 0;
-	*HighestEndOffset = 0;
-	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
-	if (!Core->MetaTreeReady)
-	{
-		Cdp_LOCK_RELEASE(&Core->TreeLock);
-		return STATUS_DEVICE_NOT_READY;
-	}
-	*NodeCount = Core->MetaTree.NodeCount;
-	node = Core->MetaTree.Root;
-	if (node)
-	{
-		*HighestEndOffset = node->MaxEnd;
-		while (node->Left)
-			node = node->Left;
-		*LowestOffset = node->Start;
-	}
-	Cdp_LOCK_RELEASE(&Core->TreeLock);
-	return STATUS_SUCCESS;
-}
-
 NTSTATUS CdpCoreQueryBranches(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 StartIndex,
@@ -1455,9 +1423,8 @@ done:
 	return status;
 }
 
-/* During Preview/Recovery tree construction, staging headers describe writes
- * after the snapshot.  Their payloads are before-images, so staging is used
- * only as a coverage map: its bytes must come from live source. */
+/* MetaTree and PreviewTree store after-image payload locations. Missing ranges
+ * are read from the source baseline. */
 NTSTATUS CdpCoreRead(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,

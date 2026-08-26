@@ -3,6 +3,8 @@
 这是一个独立的最小化 `DiskDrive` Upper Filter，只用于验证磁盘类驱动层的
 after-image 重定向是否能解决卷过滤层可能存在的旁路读取问题。
 
+主 `CdpDriver` 已包含正式的卷层读取与磁盘层读写路径，不链接也不加载本验证驱动；除非专门做 A/B 验证，不需要安装 `CdpDiskFilter`。
+
 ## 行为
 
 - 不自动发现源卷或日志卷，必须由 `CdpDiskCtl` 明确指定同一磁盘上的

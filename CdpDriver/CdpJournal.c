@@ -2567,7 +2567,6 @@ NTSTATUS CdpJournalResetHistoryPreserveRestorePoint(
 	Journal->RecoveryPending = FALSE;
 	Journal->RecoveryFsRepairPending = FALSE;
 	Journal->RecoveryTargetTime100ns = 0;
-	InterlockedExchange(&Journal->RecoveryFsRepairAttempts, 0);
 	Journal->HistoryScanSkipped = FALSE;
 	CdpJournalAdvanceRecordGenerationLocked(Journal);
 	Journal->SuperblockDirty = TRUE;
@@ -2651,7 +2650,6 @@ static NTSTATUS CdpJournalMountInternal(
 		(superblock->Flags & Cdp_JOURNAL_FLAG_RECOVERY_PENDING) != 0;
 	Journal->RecoveryFsRepairPending =
 		(superblock->Flags & Cdp_JOURNAL_FLAG_RECOVERY_FS_REPAIR_PENDING) != 0;
-	InterlockedExchange(&Journal->RecoveryFsRepairAttempts, 0);
 	Journal->RecoveryTargetTime100ns = Journal->RecoveryPending ?
 		superblock->RecoveryTargetTime100ns : 0;
 	Journal->RestorePointSet =
@@ -3125,7 +3123,6 @@ NTSTATUS CdpJournalSetRecoveryIntent(
 	}
 	Journal->RecoveryPending = TRUE;
 	Journal->RecoveryFsRepairPending = FALSE;
-	InterlockedExchange(&Journal->RecoveryFsRepairAttempts, 0);
 	Journal->RecoveryTargetTime100ns = TargetTime100ns;
 	Journal->SuperblockDirty = TRUE;
 	status = CdpJournalWriteSuperblockLocked(Journal);
@@ -3174,28 +3171,6 @@ NTSTATUS CdpJournalCompleteRecoveryIntent(_Inout_ PCdp_JOURNAL Journal)
 	}
 	Journal->RecoveryPending = FALSE;
 	Journal->RecoveryTargetTime100ns = 0;
-	Journal->SuperblockDirty = TRUE;
-	status = CdpJournalWriteSuperblockLocked(Journal);
-	if (NT_SUCCESS(status))
-		status = CdpJournalFlush(Journal);
-done:
-	Cdp_LOCK_RELEASE(&Journal->Lock);
-	return status;
-}
-
-NTSTATUS CdpJournalClearRecoveryFsRepairPending(_Inout_ PCdp_JOURNAL Journal)
-{
-	NTSTATUS status;
-
-	if (!Journal)
-		return STATUS_INVALID_PARAMETER;
-	Cdp_LOCK_ACQUIRE(&Journal->Lock);
-	if (!Journal->Mounted)
-	{
-		status = STATUS_DEVICE_NOT_READY;
-		goto done;
-	}
-	Journal->RecoveryFsRepairPending = FALSE;
 	Journal->SuperblockDirty = TRUE;
 	status = CdpJournalWriteSuperblockLocked(Journal);
 	if (NT_SUCCESS(status))
@@ -4781,10 +4756,9 @@ static NTSTATUS CdpPreviewTreeRemoveRangeInPlace(
 	return STATUS_SUCCESS;
 }
 
-// Build scans journal headers newest-to-oldest.  A newly scanned header is
-// therefore an earlier before-image and must replace newer overlapping bytes.
-// Remove overlaps in-place, preserve their non-overlapping fragments, then
-// insert the complete earlier header.  No header array or tree-wide rebuild.
+// Build and append paths apply records in chronological order. A newly applied
+// after-image replaces older overlapping bytes. Preserve the older records'
+// non-overlapping fragments, then insert the complete new record.
 NTSTATUS CdpPreviewTreeOverlayLatest(
 	_Inout_ PCdp_PREVIEW_TREE Tree,
 	_In_ const Cdp_JOURNAL_RECORD* Record)

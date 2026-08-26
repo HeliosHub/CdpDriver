@@ -75,40 +75,6 @@ static BOOL ParseU64(_In_ PCWSTR Text, _Out_ PUINT64 Value)
 	return TRUE;
 }
 
-static void HexdumpC(
-	_In_ UINT64 BaseOffset,
-	_In_reads_bytes_(Length) const BYTE* Data,
-	_In_ DWORD Length)
-{
-	DWORD i;
-
-	for (i = 0; i < Length; i += 16)
-	{
-		DWORD j;
-		DWORD lineLen = (Length - i > 16) ? 16 : (Length - i);
-
-		wprintf(L"%08llx  ", (unsigned long long)(BaseOffset + i));
-
-		for (j = 0; j < 16; ++j)
-		{
-			if (j == 8)
-				wprintf(L" ");
-			if (j < lineLen)
-				wprintf(L"%02x ", Data[i + j]);
-			else
-				wprintf(L"   ");
-		}
-
-		wprintf(L" |");
-		for (j = 0; j < lineLen; ++j)
-		{
-			BYTE c = Data[i + j];
-			wprintf(L"%c", (c >= 0x20 && c <= 0x7e) ? (WCHAR)c : L'.');
-		}
-		wprintf(L"|\n");
-	}
-}
-
 static BOOL QuerySectorSize(_In_ HANDLE Volume, _Out_ PDWORD SectorSize)
 {
 	DISK_GEOMETRY geometry;

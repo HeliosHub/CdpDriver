@@ -18,11 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.6.8-test15"
-#define Cdp_DRIVER_BUILD_STRING   "20260826.102-disk-force-direct-drain"
-
-#define Cdp_COW_BATCH_MAX_ITEMS 16UL
-#define Cdp_COW_BATCH_MAX_BYTES (16UL * 1024UL * 1024UL)
+#define Cdp_DRIVER_VERSION_STRING "1.6.8-test16"
+#define Cdp_DRIVER_BUILD_STRING   "20260826.103-code-cleanup"
 
 // Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.
 // Cdp_DBG: Debug builds only — verbose I/O and path tracing.
@@ -67,8 +64,8 @@ typedef struct _Cdp_VOLUME_HANDLE_ENTRY
 	LIST_ENTRY Entry;
 	UINT64 HandleId;
 	HANDLE FileHandle;
-	// Volume stack below our filter. Capture writes go here to bypass the
-	// mounted filesystem's DASD write denial (STATUS_ACCESS_DENIED).
+	// Journal payload I/O target below the mounted volume filter. Metadata may
+	// use a separately referenced volume-lower object during auto discovery.
 	PDEVICE_OBJECT TargetLowerDevice;
 	PDEVICE_OBJECT VolumeLowerDevice;
 	// Referenced only by the auto-discovered journal. It keeps the volume-lower
@@ -173,13 +170,6 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	// Set only after the complete source/disk/journal/Core object graph has
 	// passed fail-closed activation validation. Disk hot paths require both.
 	volatile LONG ProtectionStateValidated;
-	volatile LONG64 DiskJournalMirrorWriteCount;
-	volatile LONG64 DiskJournalMirrorWriteBytes;
-	volatile LONG64 DiskJournalMirrorFailureCount;
-	volatile LONG64 DiskJournalAuditReadCount;
-	volatile LONG64 DiskJournalAuditReadBytes;
-	volatile LONG64 DiskJournalAuditReadHitCount;
-	volatile LONG64 DiskJournalAuditReadFailureCount;
 	// Sparse diagnostics for proving whether Disk Upper reads reach source
 	// matching and the journal-audit branch.  Logged at 1 and every 4096 reads.
 	volatile LONG64 DiskReadPathEntryCount;
@@ -248,9 +238,9 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	PCdp_CORE Core;
 	// Journal VolumeHandleList entry used while CaptureEnabled is set.
 	UINT64 JournalHandleId;
-	// Direct-redirect test path keeps one reference for the entire protection
-	// session.  Write dispatch must only read this cached entry; acquiring it for
-	// every I/O serializes on VolumeHandleMutex and destroys large-I/O throughput.
+	// One journal-entry reference is retained for the protection session.
+	// Dispatch reads this cached entry without serializing every I/O on
+	// VolumeHandleMutex.
 	PCdp_VOLUME_HANDLE_ENTRY RedirectJournalEntry;
 	volatile LONG CaptureQueueDepth;
 	/* Low-volume protected-read audit. Reset when protection is enabled and

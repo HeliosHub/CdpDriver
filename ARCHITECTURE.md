@@ -2,95 +2,107 @@
 
 ## 1. 总体结构
 
-CdpDriver 是 Volume Upper Filter。受保护卷的写 IRP 被送入 PASSIVE_LEVEL Worker，应用数据作为 after-image 持久化到专用 Journal；成功后直接完成上层 IRP，不再写入源卷。源卷作为基础镜像，Journal 保存各分支后续产生的数据。
+CdpDriver 同时注册为 `Volume` 与 `DiskDrive` 类 Upper Filter。卷层负责高效识别已绑定保护分区并优先合成读取；磁盘层负责截获最终物理写入，并为绕过卷层的读取提供兜底。两层共享同一个保护上下文和 after-image Journal 视图。
 
-- `CdpDriver`：IRP/IOCTL、启动卷发现、I/O Gate、Worker、合并线程。
-- `CdpCore`：当前视图、Preview、Recovery、合并协调。
-- `CdpJournal`：v15 磁盘格式、Record 扫描、分支树和区间树构建。
-- `CdpConsole`：配置、查询、Preview/Recovery 和安装管理。
+- `CdpDriver`：PnP、卷/磁盘 IRP、自动发现、保护路由、工作线程、drain 与 IOCTL。
+- `CdpCore`：当前视图、Preview、Recovery、还原点物化和空间回收协调。
+- `CdpJournal`：v15 磁盘格式、Record、分支树、区间树及持久化状态。
+- `CdpConsole`：安装、保护配置、查询、Preview、Recovery 和还原点管理。
+- `CdpDiskFilter` / `CdpDiskCtl`：独立的最小磁盘层验证工程，主驱动不依赖它们。
 
-## 2. 写入与读取
+磁盘自动发现可创建不附着设备栈的 `SOURCE` 上下文。已启动卷按磁盘号和分区起始位置绑定到对应保护上下文，卷 I/O 不需要遍历全部分区。
 
-### 写入
+## 2. 保护路由
 
-1. Dispatch 将写 IRP 标记 Pending 并排入卷级队列。
-2. Worker 等待自动发现 Gate，并持有 `HistoryMutex` 串行化日志顺序。
-3. `CdpCoreAppendAfterImage` 写 payload 和普通 Record Header。
-4. 在 `TreeLock` 下用新 Record 覆盖更新当前分支 `MetaTree`。
-5. Journal 成功后完成应用写；失败则使应用写失败。停止保护后才把写 IRP下发源卷。
+每个物理磁盘维护按绝对范围排序的保护路由：
 
-当前不使用旧的 before-image 捕获、批量 COW、HistoryTree、StagingTree 或回填式 Commit。
+1. 先检查最近命中的分区，连续 I/O 通常一次比较完成定位。
+2. 未命中时对有序路由做二分查找，复杂度为 `O(log N)`。
+3. 只有路由容量异常不足时才启用全局扫描兜底；正常未命中直接下发。
 
-### 读取
+关闭保护时先停止新路由引用，再等待已经取得的磁盘 I/O 引用归零，最后销毁 Core 和 Journal 绑定。
 
-所有模式均通过 CdpCore 合成读取：当前模式查 `MetaTree`，Preview 查 `PreviewTree`；命中区间读取 Journal payload，空缺区间读取源卷。树访问由 `TreeLock` 保护。
+## 3. 写入路径
 
-保护开启时抑制 `DeviceDsmAction_Trim`，避免底层回收源卷基础数据；停止保护后直接转发。
+卷层 WRITE 不接管，直接发往下一层。请求到达磁盘 Upper Filter 后按绝对物理范围匹配保护分区：
 
-## 3. Journal v15
+1. Dispatch 保留原始 IRP 和绝对磁盘偏移，排入该磁盘的 FIFO 工作队列。
+2. Worker 在 `PASSIVE_LEVEL` 获取源保护上下文，并用 `HistoryMutex` 串行化写入顺序。
+3. `CdpCoreAppendAfterImage` 依次持久化 payload 与 Record Header。
+4. Journal 成功后更新当前分支 `MetaTree`，并直接完成应用 IRP；写入不会到达源分区。
+5. Journal 失败时应用写失败，不允许绕过保护写入源分区。
 
-磁盘布局为一个 Superblock，随后循环排列 `1 MiB HeaderRegion + PayloadRegion`。HeaderRegion 最后32字节为 `Cdp_HEADER_REGION_LINK`，其余共有32767个32字节 Record 槽。
+保护关闭过程进入 `DRAINING` 后，已经到达的普通应用写仍由磁盘 FIFO 串行处理，不使用卷层 gate，也不依靠线程或范围识别内部写回。
 
-普通 Record 保存时间、源卷偏移、payload 日志偏移、长度和区域内索引。`Sequence` 低16位为区域内索引，最高位 `0x80000000` 为 `BRANCH`；分支 Record 用相同32字节保存分支号、父分支号和继承的全局 Record 序号，且没有 payload。
+## 4. 读取路径
 
-运行时全局序号为：
+- 卷层 READ：已绑定保护卷优先进入合成读取，卷相对偏移只在入口转换一次为绝对磁盘偏移。
+- 磁盘层 READ：处理直接到达磁盘栈、没有经过卷层的读取，作为完整性兜底。
+- 合成规则：命中 `MetaTree`/`PreviewTree` 的区间读取 Journal after-image；未覆盖区间读取源分区基础数据。
+
+保护开启期间抑制 `DeviceDsmAction_Trim`，防止源分区基础数据被底层回收。保护关闭后 READ、WRITE 和 TRIM 均正常下发。
+
+## 5. Drain 与磁盘直写
+
+停止保护时，drain 将 `MetaTree` 中当前视图逐段写回源分区：
+
+1. Phase 从 `GENERAL` 原子切换到 `DRAINING`，停止合并并等待正在提交的重定向写完成。
+2. `CdpCoreDrainOneMetaRangeWithWriter` 每次返回一个仍需写回的绝对磁盘范围。
+3. 驱动直接针对物理磁盘过滤设备的 `LowerDeviceObject` 构造同步 WRITE IRP。
+4. IRP 使用绝对磁盘偏移，并在下一层 `IO_STACK_LOCATION::Flags` 设置 `SL_FORCE_DIRECT_WRITE`。
+5. 写入成功后从当前覆盖树移除对应范围；全部范围完成后才清除保护状态。
+
+该 IRP 从磁盘过滤层下方发起，不经过卷栈，也不会重新进入本驱动的卷层或磁盘层，因此不需要 IRP 私有标记、线程识别或 volume gate。还原点物化复用同一绝对磁盘写回器。
+
+## 6. Journal v15
+
+Journal 由一个 Superblock 和循环排列的 `1 MiB HeaderRegion + PayloadRegion` 组成。HeaderRegion 最后 32 字节为 `Cdp_HEADER_REGION_LINK`，其余包含 32767 个 32 字节 Record 槽。
+
+普通 Record 保存时间、源偏移、payload 偏移和长度。`Sequence` 低 16 位为区域内索引，最高位 `0x80000000` 表示分支 Record。运行时全局序号为：
 
 ```text
 RegionLink.StartSequence + (Header.Sequence & 0xFFFF)
 ```
 
-PayloadRegion 跨度达到日志卷容量的 `1/10` 或 HeaderRegion 写满时切换新区域。普通 Append 不逐次更新 Superblock；区域切换、Recovery 意图、凭据及格式化等元数据变化才更新。
+PayloadRegion 达到 Journal 容量的 `1/10` 或 HeaderRegion 写满时切换区域。普通 append 不逐次更新 Superblock；区域切换、Recovery/还原点标记、凭据和格式化等状态变化才更新。
 
-## 4. 分支与 MetaTree
+## 7. 分支、Preview 与 Recovery
 
-格式化 Journal 时创建分支1。后续每次创建分支都强制新建 HeaderRegion，分支 Record 位于新区域索引0，但 `StartSequence` 延续全局 `NextSequence`。挂载从保留 Record 重建分支信息树，节点包含父分支、继承点、起止 Record 和 latest 标记。当前视图从 newest 向 oldest 单遍扫描，只接纳当前分支及其递归祖先在继承点以内的 Record；相同卷区间只保留最新值。
+格式化时创建根分支 1。新分支固定从新 HeaderRegion 的索引 0 开始，全局 Sequence 跨分支持续递增。挂载扫描保留 Record，重建分支树及当前分支 `MetaTree`。
 
-写入成功后直接用新 Record 更新 `MetaTree`。挂载期间驱动排队读写，树完整发布后才放行。
+- Preview 按目标时间构建只读 `PreviewTree`，不改变当前分支。
+- Recovery 是分支切换：确定父分支与继承点、追加新分支 Record、构建并原子发布新 `MetaTree`，不写回源分区。
+- 重启 Recovery 先持久化意图；下次启动构建目标视图，恢复后的第一笔受保护写在追加 payload 前持久化延迟创建的分支。
 
-## 5. 空间合并
+Preview 与 Recovery 互斥；Preview 构建期间不允许启动合并。
 
-日志使用率达到90%时启动唯一合并线程；已有合并线程时不得重复启动。
+## 8. 持久还原点
 
-1. 定位最旧且不是 active/newest 的 HeaderRegion。
-2. 只在该区域内构建当前分支路径的最新值树，兄弟分支 Record 丢弃。
-3. 把这些最新值从 Journal 写入源卷，使源卷成为新的基础镜像。
-4. 从 `MetaTree` 删除仍指向该区域的覆盖；更新活动 Preview 的相应覆盖。
-5. 若待删区域不包含任何分支继承点，不处理其他区域的不可达数据。
-6. 若待删区域包含继承点，删除祖先分支在有效继承点后的后缀。分支删除采用依赖级联：仅当其继承点 Record 被丢弃，或合并已经到达该非当前分支自己的首个 HeaderRegion时，才删除该分支及其递归后代。
-7. 继承自仍有效或已回填 Record 的兄弟分支不因“不是最新分支”而提前删除，继续保留到合并实际到达其自身区域。
-8. 跨区域删除写成内部 tombstone。槽位的全局 Sequence 永久保留，但不进入 Record 查询、时间范围、分支树或视图树；对应区域成为 oldest 后再整区物理回收。
-9. 全部回填和清理成功后删除目标 HeaderRegion；任一步失败均停止本次合并。
+设置还原点时，驱动把目标时间视图通过磁盘直写器物化到源分区，然后在 Superblock 保存持久标记。重启自动发现看到该标记后：
 
-Preview 正在启动时拒绝合并；合并已运行时拒绝新 Preview。若合并到达 Preview 目标 Record 所在区域，则停止 Preview。
+1. 不扫描已经无关的旧 Record 历史。
+2. 直接把已物化源分区作为当前基础视图。
+3. 第一笔受保护写入前重置旧历史并创建新的根分支，然后正常追加 after-image。
 
-## 6. Preview
+还原点不会自动过期，只能显式删除；启动后尚未完成首次受保护写时不支持删除。
 
-Preview 根据目标时间在分支信息树中定位目标分支和目标 Record，再递归扫描该分支及父分支继承路径，直接构建 `PreviewTree`。读取命中树时取 Journal，空缺取源卷。目标时间早于 oldest 时按 oldest 处理。
+## 9. 空间合并
 
-## 7. Recovery
+Journal 使用率达到 90% 时启动唯一合并线程。合并把最旧区域中当前分支仍有效的最新值写回源分区，再清理对应覆盖与不可达分支数据。跨区域删除使用 tombstone，已分配 Sequence 不复用。任一步失败都会停止本轮合并并保留可重试状态。
 
-Recovery 是分支切换，不修改源卷：
+持久还原点存在时禁用合并，避免改变已经物化的源分区基线。
 
-1. 驱动停止并等待合并线程结束，然后关闭源卷 Recovery I/O Gate。
-2. 根据目标时间确定父分支和继承 Record。
-3. 追加新分支 Record。
-4. 扫描新分支完整继承路径，构建替换 `MetaTree`。
-5. 成功后原子交换新旧树、返回 General 并放行 I/O。
-
-失败时删除刚追加的空分支 Record，保留原 `MetaTree`。`Commit` 是幂等的兼容确认，不执行源卷写回；运行中的同步 Begin 没有可取消的 prepared 状态。
-
-重启 Recovery 意图保存在 Superblock。启动时全部卷完成发现和 Source/Journal 配对前保持 Gate；发现意图后完成上述 Begin，成功发布新树后放行 I/O并清除标记。
-
-## 8. 主要同步对象
+## 10. 主要同步对象
 
 | 对象 | 保护范围 |
 |---|---|
-| `HistoryMutex` | 单卷 Journal 追加、树构建和 Recovery 切换顺序 |
-| `Journal.Lock` | Journal 运行时游标、区域链和磁盘元数据 |
-| `TreeLock` | `MetaTree`、`PreviewTree` 及 Phase/构建协调字段 |
-| `AutoDiscoveryGateEvent` | 启动卷分类和自动 Recovery 完成前的 I/O |
-| 合并线程 Gate | 每个 Core 最多一个合并所有者，并与 Preview/Recovery 协调 |
+| `CaptureConfigMutex` | 保护配置、自动发现和 Source/Journal 对象图变更 |
+| `HistoryMutex` | 单源 Journal append、drain、还原点物化及树发布顺序 |
+| `Journal.Lock` | Journal 游标、区域链和持久元数据 |
+| `TreeLock` | `MetaTree`、`PreviewTree`、Phase 和延迟分支/历史重置状态 |
+| 磁盘 FIFO Worker | 最终物理 I/O 的到达顺序与应用 IRP 完成顺序 |
+| `DiskIoOutstanding` | 路由引用与关闭保护之间的生命周期屏障 |
 
-## 9. 验证边界
+## 11. 验证边界
 
-用户态单测覆盖 after-image 写入与失败、分支继承读取、挂载重建、合并与失败重试、Preview 分支路径、Preview/合并协调以及 Recovery 分支切换与回滚。PnP 时序、真实 Paging MDL、启动 Gate 和签名加载仍需在虚拟机及目标系统做集成验证。
+用户态单元测试覆盖 after-image、挂载重建、区间覆盖、分支继承、Preview、Recovery、持久还原点、drain/物化回调及合并失败重试。PnP 时序、真实 Paging MDL、磁盘过滤栈、`SL_FORCE_DIRECT_WRITE` 和启动盘关闭保护仍需在虚拟机及目标物理机做集成验证。

@@ -5317,9 +5317,8 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 					captureActive && phase != (LONG)Cdp_PHASE_DRAINING &&
 					CdpTryAcquireRedirectWrite(devExt))
 				{
-					/* Serialize exactly like the before-image implementation: the
-					 * next FIFO item cannot start until this payload, header and
-					 * flush have completed and the MetaTree has been published. */
+					/* Preserve FIFO visibility: the next item cannot start until
+					 * payload, header and flush complete and MetaTree is published. */
 					KeWaitForSingleObject(
 						&devExt->HistoryMutex,
 						Executive,

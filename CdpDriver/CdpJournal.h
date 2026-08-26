@@ -261,8 +261,9 @@ typedef struct _Cdp_JOURNAL
 	// persistent restore point makes it irrelevant to the boot view.  The
 	// first protected write resets that history before appending anything.
 	BOOLEAN HistoryScanSkipped;
+	// Preserved only for v14/v15 on-disk compatibility; current recovery never
+	// sets or acts on the retired filesystem-repair flag.
 	BOOLEAN RecoveryFsRepairPending;
-	volatile LONG RecoveryFsRepairAttempts;
 	BOOLEAN SuperblockDirty;
 	UINT64 RecoveryTargetTime100ns;
 	UINT64 RestorePointTime100ns;
@@ -384,12 +385,9 @@ NTSTATUS CdpJournalSetRecoveryIntent(
 
 NTSTATUS CdpJournalClearRecoveryIntent(_Inout_ PCdp_JOURNAL Journal);
 
-// Completes only the branch-switch half of a reboot recovery.  The separate
-// filesystem-repair bit intentionally remains durable until marking dirty
-// succeeds, so a failed attempt cannot create the recovery branch twice.
+// Clears the active reboot-recovery intent after the delayed branch has been
+// persisted. Reserved compatibility flags are left unchanged.
 NTSTATUS CdpJournalCompleteRecoveryIntent(_Inout_ PCdp_JOURNAL Journal);
-
-NTSTATUS CdpJournalClearRecoveryFsRepairPending(_Inout_ PCdp_JOURNAL Journal);
 
 NTSTATUS CdpJournalSetRestorePoint(
 	_Inout_ PCdp_JOURNAL Journal,
