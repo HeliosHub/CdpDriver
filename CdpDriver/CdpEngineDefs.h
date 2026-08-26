@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.6.8-test13"
-#define Cdp_DRIVER_BUILD_STRING   "20260825.100-thread-drain-bypass"
+#define Cdp_DRIVER_VERSION_STRING "1.6.8-test15"
+#define Cdp_DRIVER_BUILD_STRING   "20260826.102-disk-force-direct-drain"
 
 #define Cdp_COW_BATCH_MAX_ITEMS 16UL
 #define Cdp_COW_BATCH_MAX_BYTES (16UL * 1024UL * 1024UL)
@@ -240,11 +240,6 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	// First failure observed while graceful disable is writing/punching the
 	// current MetaTree. Zero means the drain may continue.
 	volatile LONG DrainFailureStatus;
-	/* Out-of-band identity for the one synchronous volume-layer backfill write.
-	 * The partition stack may replace the IRP, so identity must never live in
-	 * Tail.Overlay.DriverContext. Disk Upper matches owner thread + range. */
-	volatile LONG BackfillWriteActive;
-	PETHREAD volatile BackfillWriteThread;
 	HANDLE MergeThreadHandle;
 	volatile LONG MergeThreadRunning;
 	volatile LONG MergeThreadStopping;

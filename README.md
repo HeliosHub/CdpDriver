@@ -2,7 +2,7 @@
 
 CdpDriver 是一个 Windows 卷 Upper Filter 驱动。当前开发版本采用 after-image：受保护卷的应用写持久化到独立 Journal 后直接完成，不再提交到源卷；读取由当前分支的日志数据和源卷基础数据合成。
 
-当前版本：**1.6.8-test13**（Build `20260825.100-thread-drain-bypass`），Journal 磁盘格式：**v15**。
+当前版本：**1.6.8-test15**（Build `20260826.102-disk-force-direct-drain`），Journal 磁盘格式：**v15**。
 
 主要功能：
 

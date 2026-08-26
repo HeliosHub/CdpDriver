@@ -14,6 +14,7 @@ typedef struct _Cdp_DEV_STORE_CTX
 static NTSTATUS CdpDevStoreRawIo(
 	_In_ PDEVICE_OBJECT Device,
 	_In_ UCHAR MajorFunction,
+	_In_ UCHAR StackFlags,
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
 	_Inout_updates_bytes_(Length) PVOID Buffer)
@@ -49,6 +50,7 @@ static NTSTATUS CdpDevStoreRawIo(
 		&iosb);
 	if (!irp)
 		return STATUS_INSUFFICIENT_RESOURCES;
+	IoGetNextIrpStackLocation(irp)->Flags |= StackFlags;
 
 	Cdp_DBG("[DEVSTORE] io begin device=%p major=0x%02X "
 		"offset=%llu len=%lu irp=%p\n",
@@ -128,6 +130,7 @@ static NTSTATUS CdpDevStoreRead(
 	return CdpDevStoreRawIo(
 		ctx->Device,
 		IRP_MJ_READ,
+		0,
 		ctx->BaseOffset + Offset,
 		Length,
 		Buffer);
@@ -146,21 +149,23 @@ static NTSTATUS CdpDevStoreWrite(
 	return CdpDevStoreRawIo(
 		ctx->Device,
 		IRP_MJ_WRITE,
+		0,
 		ctx->BaseOffset + Offset,
 		Length,
 		(PVOID)Buffer);
 }
 
-NTSTATUS CdpDevStoreWriteVolumeRelative(
-	_In_ PDEVICE_OBJECT VolumeLowerDevice,
-	_In_ UINT64 VolumeOffset,
+NTSTATUS CdpDevStoreWriteDiskAbsoluteForceDirect(
+	_In_ PDEVICE_OBJECT DiskLowerDevice,
+	_In_ UINT64 AbsoluteOffset,
 	_In_ ULONG Length,
 	_In_reads_bytes_(Length) const VOID* Buffer)
 {
 	return CdpDevStoreRawIo(
-		VolumeLowerDevice,
+		DiskLowerDevice,
 		IRP_MJ_WRITE,
-		VolumeOffset,
+		SL_FORCE_DIRECT_WRITE,
+		AbsoluteOffset,
 		Length,
 		(PVOID)Buffer);
 }

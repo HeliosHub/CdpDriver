@@ -16,11 +16,11 @@ NTSTATUS CdpDevStoreCreateAbsoluteRange(
 
 VOID CdpDevStoreDestroy(_Inout_opt_ PCdp_STORE Store);
 
-// Submit a synchronous volume-relative write directly below the source volume
-// filter. It does not re-enter CdpDriver and therefore needs no IRP tag.
-NTSTATUS CdpDevStoreWriteVolumeRelative(
-	_In_ PDEVICE_OBJECT VolumeLowerDevice,
-	_In_ UINT64 VolumeOffset,
+// Submit a synchronous absolute write below the physical-disk filter and mark
+// the lower write stack with SL_FORCE_DIRECT_WRITE.
+NTSTATUS CdpDevStoreWriteDiskAbsoluteForceDirect(
+	_In_ PDEVICE_OBJECT DiskLowerDevice,
+	_In_ UINT64 AbsoluteOffset,
 	_In_ ULONG Length,
 	_In_reads_bytes_(Length) const VOID* Buffer);
 

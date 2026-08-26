@@ -12,7 +12,7 @@ static VOID CdpStopMergeThread(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
 static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
 static NTSTATUS CdpDrainAndDisableCapture(
 	_Inout_ PCdp_DEVICE_EXTENSION DevExt);
-static NTSTATUS CdpVolumeBackfillWriteAbsolute(
+static NTSTATUS CdpDiskBackfillWriteAbsolute(
 	_In_opt_ PVOID Context,
 	_In_ UINT64 AbsoluteOffset,
 	_In_ ULONG Length,
@@ -53,6 +53,9 @@ static NTSTATUS CdpForwardWriteCompletion(
 	_In_ PIRP Irp,
 	_In_ PVOID Context);
 static PCdp_DEVICE_EXTENSION CdpFindDiskExtensionByNumber(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ ULONG DiskNumber);
+static PDEVICE_OBJECT CdpReferenceDiskLowerByNumber(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ ULONG DiskNumber);
 static VOID CdpCacheProtectionRouteForSource(
@@ -3265,7 +3268,7 @@ static NTSTATUS CdpSetRestorePoint(
 	status = CdpCoreMaterializeTimeWithWriter(
 		sourceExt->Core,
 		Request->TargetTime100ns,
-		CdpVolumeBackfillWriteAbsolute,
+		CdpDiskBackfillWriteAbsolute,
 		sourceExt,
 		&effective,
 		&targetSequence,
@@ -3755,6 +3758,39 @@ static PCdp_DEVICE_EXTENSION CdpReferenceProtectedSourceForDiskIo(
 	return found;
 }
 
+static PDEVICE_OBJECT CdpReferenceDiskLowerByNumber(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ ULONG DiskNumber)
+{
+	KIRQL oldIrql;
+	PLIST_ENTRY entry;
+	PDEVICE_OBJECT lower = NULL;
+
+	if (!DriverExt)
+		return NULL;
+	KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &oldIrql);
+	for (entry = DriverExt->DeviceObjectListHead.Flink;
+		entry != &DriverExt->DeviceObjectListHead;
+		entry = entry->Flink)
+	{
+		PCdp_DEVICE_LIST_NODE node =
+			CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
+		PCdp_DEVICE_EXTENSION ext =
+			(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
+		if (ext && ext->DeviceKind == Cdp_DEVICE_KIND_DISK &&
+			InterlockedCompareExchange(&ext->Started, 0, 0) != 0 &&
+			ext->DiskLayoutValid && ext->DiskNumber == DiskNumber &&
+			ext->LowerDeviceObject)
+		{
+			lower = ext->LowerDeviceObject;
+			ObReferenceObject(lower);
+			break;
+		}
+	}
+	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
+	return lower;
+}
+
 VOID CdpDestroyDiskProtectionIndex(_Inout_ PCdp_DEVICE_EXTENSION DiskExt)
 {
 	PCdp_DISK_PROTECTION_INDEX index;
@@ -4187,24 +4223,6 @@ static NTSTATUS CdpQueueDiskCaptureIrp(
 		return CdpCompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
 	}
 	phase = InterlockedCompareExchange(&sourceExt->Phase, 0, 0);
-	if (irpSp->MajorFunction == IRP_MJ_WRITE &&
-		phase == (LONG)Cdp_PHASE_DRAINING &&
-		InterlockedCompareExchange(
-			&sourceExt->BackfillWriteActive, 0, 0) != 0)
-	{
-		PETHREAD owner = (PETHREAD)InterlockedCompareExchangePointer(
-			(PVOID volatile*)&sourceExt->BackfillWriteThread, NULL, NULL);
-		if (owner == PsGetCurrentThread())
-		{
-			/* This write originated from the volume-layer drain callback. The
-			 * partition stack may have created a replacement IRP, so recognition
-			 * uses the drain phase and its synchronous owner thread. */
-			ObDereferenceObject(sourceReference);
-			return CdpSendToNextDevice(DiskExt->LowerDeviceObject, Irp);
-		}
-		/* A different thread is an application/storage write. Keep it in the
-		 * normal protected path; range overlap must never reject application I/O. */
-	}
 	if (!CdpAcquireDiskIoOutstanding(sourceExt))
 	{
 		ObDereferenceObject(sourceReference);
@@ -5068,23 +5086,7 @@ static NTSTATUS CdpDispatchProtectedDiskWrite(
 	if (!sourceExt)
 		return CdpSendToNextDevice(DiskExt->LowerDeviceObject, Irp);
 
-	/* A drain backfill re-enters at the disk attachment as an ordinary write.
-	 * Only the synchronous drain owner thread may bypass capture. Other writes
-	 * remain ordered by HistoryMutex, regardless of their byte range. */
 	phase = InterlockedCompareExchange(&sourceExt->Phase, 0, 0);
-	if (phase == (LONG)Cdp_PHASE_DRAINING &&
-		InterlockedCompareExchange(
-			&sourceExt->BackfillWriteActive, 0, 0) != 0)
-	{
-		PETHREAD owner = (PETHREAD)InterlockedCompareExchangePointer(
-			(PVOID volatile*)&sourceExt->BackfillWriteThread, NULL, NULL);
-		if (owner == PsGetCurrentThread())
-		{
-			ObDereferenceObject(sourceReference);
-			return CdpSendToNextDevice(DiskExt->LowerDeviceObject, Irp);
-		}
-		/* Different-thread writes continue below into drain_write. */
-	}
 	if (!CdpAcquireDiskIoOutstanding(sourceExt))
 	{
 		ObDereferenceObject(sourceReference);
@@ -5624,19 +5626,17 @@ VOID CdpStopCaptureWorker(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	InterlockedExchange(&DevExt->CaptureStopping, 0);
 }
 
-static NTSTATUS CdpVolumeBackfillWriteAbsolute(
+static NTSTATUS CdpDiskBackfillWriteAbsolute(
 	_In_opt_ PVOID Context,
 	_In_ UINT64 AbsoluteOffset,
 	_In_ ULONG Length,
 	_In_reads_bytes_(Length) const VOID* Buffer)
 {
 	PCdp_DEVICE_EXTENSION sourceExt = (PCdp_DEVICE_EXTENSION)Context;
+	PCdp_DRIVER_EXTENSION driverExt;
+	PDEVICE_OBJECT diskLower;
 	UINT64 sourceEnd;
-	UINT64 volumeOffset;
 	NTSTATUS status;
-	PETHREAD currentThread;
-	PDEVICE_OBJECT volumeLower = NULL;
-	BOOLEAN volumeLowerReferenced = FALSE;
 
 	if (!sourceExt || !Buffer || Length == 0 ||
 		!sourceExt->DiskLayoutValid || sourceExt->PartitionSize == 0 ||
@@ -5651,60 +5651,32 @@ static NTSTATUS CdpVolumeBackfillWriteAbsolute(
 		(AbsoluteOffset % sourceExt->SectorSize) != 0 ||
 		(Length % sourceExt->SectorSize) != 0)
 	{
-		Cdp_LOG("[DRAIN-VOLUME-WRITE-FAIL] reason=absolute-range source=[%llu,%llu) offset=%llu len=%lu sector=%lu\n",
+		Cdp_LOG("[DRAIN-DISK-WRITE-FAIL] reason=absolute-range source=[%llu,%llu) offset=%llu len=%lu sector=%lu\n",
 			sourceExt->PartitionStart, sourceEnd, AbsoluteOffset, Length,
 			sourceExt->SectorSize);
 		return STATUS_INVALID_PARAMETER;
 	}
-	if (sourceExt->DeviceKind == Cdp_DEVICE_KIND_VOLUME)
-		volumeLower = sourceExt->LowerDeviceObject;
-	else if (sourceExt->DeviceKind == Cdp_DEVICE_KIND_DISK ||
-		sourceExt->DeviceKind == Cdp_DEVICE_KIND_SOURCE)
+	driverExt = IoGetDriverObjectExtension(g_DriverObject, &g_DriverObject);
+	diskLower = CdpReferenceDiskLowerByNumber(
+		driverExt, sourceExt->DiskNumber);
+	if (!diskLower)
 	{
-		PCdp_DRIVER_EXTENSION driverExt =
-			IoGetDriverObjectExtension(g_DriverObject, &g_DriverObject);
-		volumeLower = CdpReferenceVolumeLowerByPhysicalRange(
-			driverExt, sourceExt->DiskNumber, sourceExt->PartitionStart,
-			sourceExt->PartitionSize);
-		volumeLowerReferenced = volumeLower != NULL;
-	}
-	if (!volumeLower)
-	{
-		Cdp_LOG("[DRAIN-VOLUME-WRITE-FAIL] reason=volume-lower-unavailable disk=%lu part=%lu offset=%llu len=%lu\n",
+		Cdp_LOG("[DRAIN-DISK-WRITE-FAIL] reason=disk-lower-unavailable disk=%lu part=%lu offset=%llu len=%lu\n",
 			sourceExt->DiskNumber, sourceExt->PartitionNumber,
 			AbsoluteOffset, Length);
 		return STATUS_DEVICE_NOT_READY;
 	}
 
-	/* Submit through the mounted volume stack so the file system retains its
-	 * normal cache/coherency semantics. During DRAINING the disk attachment
-	 * recognizes this synchronous owner thread and passes its writes through. */
-	volumeOffset = AbsoluteOffset - sourceExt->PartitionStart;
-	if (InterlockedCompareExchange(
-			&sourceExt->BackfillWriteActive, 0, 0) != 0)
-	{
-		if (volumeLowerReferenced)
-			ObDereferenceObject(volumeLower);
-		return STATUS_INVALID_DEVICE_STATE;
-	}
-	currentThread = PsGetCurrentThread();
-	InterlockedExchangePointer(
-		(PVOID volatile*)&sourceExt->BackfillWriteThread, currentThread);
-	KeMemoryBarrier();
-	InterlockedExchange(&sourceExt->BackfillWriteActive, 1);
-	status = CdpDevStoreWriteVolumeRelative(
-		volumeLower, volumeOffset, Length, Buffer);
-	InterlockedExchange(&sourceExt->BackfillWriteActive, 0);
-	KeMemoryBarrier();
-	InterlockedExchangePointer(
-		(PVOID volatile*)&sourceExt->BackfillWriteThread, NULL);
-	if (volumeLowerReferenced)
-		ObDereferenceObject(volumeLower);
+	/* The request starts below our physical-disk attachment, uses the absolute
+	 * disk address, and cannot re-enter either the volume or disk filter path. */
+	status = CdpDevStoreWriteDiskAbsoluteForceDirect(
+		diskLower, AbsoluteOffset, Length, Buffer);
+	ObDereferenceObject(diskLower);
 	if (!NT_SUCCESS(status))
 	{
-		Cdp_LOG("[DRAIN-VOLUME-WRITE-FAIL] reason=lower-write status=0x%08X disk=%lu part=%lu absoluteOffset=%llu volumeOffset=%llu len=%lu\n",
+		Cdp_LOG("[DRAIN-DISK-WRITE-FAIL] reason=lower-write status=0x%08X disk=%lu part=%lu absoluteOffset=%llu len=%lu\n",
 			status, sourceExt->DiskNumber, sourceExt->PartitionNumber,
-			AbsoluteOffset, volumeOffset, Length);
+			AbsoluteOffset, Length);
 	}
 	return status;
 }
@@ -5731,7 +5703,6 @@ static NTSTATUS CdpDrainAndDisableCapture(
 		(LONG)Cdp_PHASE_GENERAL);
 	if (previousPhase != (LONG)Cdp_PHASE_GENERAL)
 		return STATUS_INVALID_DEVICE_STATE;
-
 	InterlockedExchange(&DevExt->DrainFailureStatus, 0);
 	Cdp_LOG("[DRAIN-DIAG] stage=stop-merge-begin source=%p\n", DevExt);
 	CdpStopMergeThread(DevExt);
@@ -5784,7 +5755,7 @@ static NTSTATUS CdpDrainAndDisableCapture(
 		{
 			status = CdpCoreDrainOneMetaRangeWithWriter(
 				DevExt->Core,
-				CdpVolumeBackfillWriteAbsolute,
+				CdpDiskBackfillWriteAbsolute,
 				DevExt,
 				&complete,
 				&offset,
