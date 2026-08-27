@@ -194,6 +194,10 @@ NTSTATUS CdpCoreSetRestorePointMarker(
 	_In_ UINT64 TargetTime100ns);
 NTSTATUS CdpCoreClearRestorePointMarker(_Inout_ PCdp_CORE Core);
 
+// Rebuild the live view after a persistent restore point discarded old
+// Journal records and made the materialized source image the new baseline.
+NTSTATUS CdpCoreRebuildCurrentView(_Inout_ PCdp_CORE Core);
+
 /* Build the exact target view and write each latest interval through the
  * caller's source-volume writer. The live MetaTree/branch is not changed. */
 NTSTATUS CdpCoreMaterializeTimeWithWriter(

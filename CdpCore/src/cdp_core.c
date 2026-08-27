@@ -1959,6 +1959,13 @@ NTSTATUS CdpCoreClearRestorePointMarker(_Inout_ PCdp_CORE Core)
 	return CdpJournalClearRestorePoint(Core->Journal);
 }
 
+NTSTATUS CdpCoreRebuildCurrentView(_Inout_ PCdp_CORE Core)
+{
+	if (!Core)
+		return STATUS_INVALID_PARAMETER;
+	return CdpCoreBuildMetaTree(Core);
+}
+
 static NTSTATUS CdpCoreMaterializeTreeWithWriter(
 	_Inout_ PCdp_CORE Core,
 	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,

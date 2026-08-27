@@ -466,6 +466,16 @@ NTSTATUS CdpJournalDeleteContiguousTombstonedRegions(
 	_Inout_ PCdp_JOURNAL Journal,
 	_Out_ PULONG DeletedRegionCount);
 
+// The source has been materialized to SequenceInclusive.  Reclaim every
+// wholly obsolete oldest RR and tombstone obsolete data headers in the first
+// retained RR.  Structural branch headers in a partially retained RR remain
+// so later records keep a durable branch identity.
+NTSTATUS CdpJournalDeleteRecordsThroughSequence(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 SequenceInclusive,
+	_Out_ PULONG DeletedRegionCount,
+	_Out_ PULONG TombstonedRecordCount);
+
 // If the compacted range contains a branch inheritance point, tombstone all
 // records and branch markers unreachable from the current branch. Otherwise
 // this is a no-op. PreviewTargetDeleted reports whether the active preview

@@ -3832,6 +3832,132 @@ cleanup:
 	return status;
 }
 
+NTSTATUS CdpJournalDeleteRecordsThroughSequence(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 SequenceInclusive,
+	_Out_ PULONG DeletedRegionCount,
+	_Out_ PULONG TombstonedRecordCount)
+{
+	ULONG deletedRegions = 0;
+	ULONG tombstonedRecords = 0;
+	BOOLEAN changed = FALSE;
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Journal || !DeletedRegionCount || !TombstonedRecordCount)
+		return STATUS_INVALID_PARAMETER;
+	*DeletedRegionCount = 0;
+	*TombstonedRecordCount = 0;
+
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup;
+	}
+
+	/* A complete old RR contains no retained record and can be reclaimed as a
+	 * unit.  Never drop the active/newest RR; it remains the append target. */
+	while (Journal->OldestHeaderRegionOff != Journal->LastHeaderRegionOff)
+	{
+		Cdp_HEADER_REGION_LINK link;
+		Cdp_HEADER_REGION_LINK nextLink;
+		ULONG limit;
+		UINT64 endSequence;
+
+		status = CdpJournalReadRegionLink(
+			Journal, Journal->OldestHeaderRegionOff, &link);
+		if (!NT_SUCCESS(status) || !CdpJournalRegionLinkValid(Journal, &link))
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup;
+		}
+		status = CdpJournalGetRegionHeaderLimitLocked(
+			Journal, Journal->OldestHeaderRegionOff, &link, &limit, &nextLink);
+		if (!NT_SUCCESS(status))
+			goto cleanup;
+		if (nextLink.StartSequence == 0 || nextLink.StartSequence - 1 > SequenceInclusive)
+			break;
+		endSequence = nextLink.StartSequence - 1;
+		UNREFERENCED_PARAMETER(endSequence);
+		status = CdpJournalDropOldestRegionLocked(Journal);
+		if (!NT_SUCCESS(status))
+			goto cleanup;
+		deletedRegions++;
+		changed = TRUE;
+	}
+
+	/* Only the (possibly active) boundary RR can now intersect the cutoff.
+	 * Branch headers are retained in that RR: records after the cutoff do not
+	 * carry a branch id themselves, so deleting their preceding marker would
+	 * make a later mount unable to reconstruct their branch. */
+	{
+		Cdp_HEADER_REGION_LINK link;
+		ULONG limit;
+		ULONG index;
+
+		status = CdpJournalReadRegionLink(
+			Journal, Journal->OldestHeaderRegionOff, &link);
+		if (!NT_SUCCESS(status) || !CdpJournalRegionLinkValid(Journal, &link))
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup;
+		}
+		status = CdpJournalGetRegionHeaderLimitLocked(
+			Journal, Journal->OldestHeaderRegionOff, &link, &limit, NULL);
+		if (!NT_SUCCESS(status))
+			goto cleanup;
+		for (index = Journal->OldestHeaderIndex; index < limit; ++index)
+		{
+			Cdp_JOURNAL_RECORD_HEADER header;
+			Cdp_JOURNAL_RECORD_HEADER tombstone;
+			UINT64 sequence;
+
+			if (link.StartSequence > MAXUINT64 - index)
+			{
+				status = STATUS_INTEGER_OVERFLOW;
+				goto cleanup;
+			}
+			sequence = link.StartSequence + index;
+			if (sequence > SequenceInclusive)
+				break;
+			status = CdpJournalReadHeaderAt(
+				Journal, Journal->OldestHeaderRegionOff, index, &header);
+			if (!NT_SUCCESS(status))
+				goto cleanup;
+			if ((header.Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) != index)
+			{
+				status = STATUS_DISK_CORRUPT_ERROR;
+				goto cleanup;
+			}
+			if (CdpJournalHeaderIsDeleted(&header) || CdpJournalHeaderIsBranch(&header))
+				continue;
+			RtlZeroMemory(&tombstone, sizeof(tombstone));
+			tombstone.Sequence = index | Cdp_JOURNAL_RECORD_FLAG_DELETED;
+			status = CdpJournalWriteHeaderAt(
+				Journal, Journal->OldestHeaderRegionOff, index, &tombstone);
+			if (!NT_SUCCESS(status))
+				goto cleanup;
+			tombstonedRecords++;
+			changed = TRUE;
+		}
+	}
+
+	if (changed)
+	{
+		status = CdpJournalFlush(Journal);
+		if (!NT_SUCCESS(status))
+			goto cleanup;
+		CdpJournalAdvanceRecordGenerationLocked(Journal);
+		status = CdpJournalRebuildRuntimeLocked(Journal, NULL);
+	}
+
+cleanup:
+	*DeletedRegionCount = deletedRegions;
+	*TombstonedRecordCount = tombstonedRecords;
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
 NTSTATUS CdpJournalPruneUnreachableForCompaction(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 FirstSequence,

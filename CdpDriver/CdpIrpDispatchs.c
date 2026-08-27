@@ -3358,6 +3358,8 @@ static NTSTATUS CdpSetRestorePoint(
 	UINT64 effective = 0;
 	UINT64 targetSequence = 0;
 	ULONG ranges = 0;
+	ULONG deletedRegions = 0;
+	ULONG tombstonedRecords = 0;
 	UINT64 bytes = 0;
 	LONG previousPhase;
 	NTSTATUS status;
@@ -3420,6 +3422,17 @@ static NTSTATUS CdpSetRestorePoint(
 			status, materializeTarget, ranges, bytes);
 		goto cleanup;
 	}
+	status = CdpJournalDeleteRecordsThroughSequence(
+		&journalEntry->Journal,
+		targetSequence,
+		&deletedRegions,
+		&tombstonedRecords);
+	if (!NT_SUCCESS(status))
+	{
+		Cdp_LOG("[RESTORE-POINT-FAIL] stage=prune-old-records status=0x%08X targetSequence=%llu deletedRR=%lu tombstonedRecords=%lu\n",
+			status, targetSequence, deletedRegions, tombstonedRecords);
+		goto cleanup;
+	}
 	status = CdpJournalSetRestorePoint(
 		&journalEntry->Journal, effective);
 	if (!NT_SUCCESS(status))
@@ -3428,13 +3441,20 @@ static NTSTATUS CdpSetRestorePoint(
 			status, effective, ranges, bytes);
 		goto cleanup;
 	}
+	status = CdpCoreRebuildCurrentView(sourceExt->Core);
+	if (!NT_SUCCESS(status))
+	{
+		Cdp_LOG("[RESTORE-POINT-FAIL] stage=rebuild-current-view status=0x%08X targetSequence=%llu\n",
+			status, targetSequence);
+		goto cleanup;
+	}
 	Reply->TargetTime100ns = effective;
 	Reply->OldestRecoverable100ns = oldest;
 	Reply->NewestRecoverable100ns = newest;
 	Reply->WrittenRanges = ranges;
 	Reply->WrittenBytes = bytes;
-	Cdp_LOG("[RESTORE-POINT] set target=%llu sequence=%llu sourceRanges=%lu sourceBytes=%llu persistent=1\n",
-		effective, targetSequence, ranges, bytes);
+	Cdp_LOG("[RESTORE-POINT] set target=%llu sequence=%llu sourceRanges=%lu sourceBytes=%llu deletedRR=%lu tombstonedRecords=%lu persistent=1\n",
+		effective, targetSequence, ranges, bytes, deletedRegions, tombstonedRecords);
 
 cleanup:
 	if (journalEntry)

@@ -2,7 +2,7 @@
 
 CdpDriver 是一个同时工作在 Windows `Volume` 与 `DiskDrive` 类的 Upper Filter 驱动。当前开发版本采用 after-image：受保护分区的应用写在磁盘层持久化到独立 Journal 后直接完成，不再提交到源分区；卷层优先合成读取，磁盘层为旁路读取兜底。
 
-当前版本：**1.6.8-test27**（Build `20260826.114-preview-read-auto-close`），Journal 磁盘格式：**v15**。
+当前版本：**1.6.8-test28**（Build `20260827.115-restore-point-prune`），Journal 磁盘格式：**v15**。
 
 主要功能：
 
@@ -109,7 +109,7 @@ Recovery Begin 根据目标时间确定父分支和继承点，追加一个新�
 
 ## 持久还原点
 
-`o` 会把指定时间的完整视图物化到源分区，并将还原点标记写入 Journal Superblock。物化写入直接从磁盘过滤层下方向对应物理磁盘发送绝对偏移 WRITE，不经过卷栈。
+`o` 会把指定时间的完整视图物化到源分区，并将还原点标记写入 Journal Superblock。物化写入直接从磁盘过滤层下方向对应物理磁盘发送绝对偏移 WRITE，不经过卷栈。目标 Record 及其之前的历史随即回收：完整过期 HeaderRegion（RR）直接删除；与目标边界同处一个 RR 的旧数据 Record 写为 tombstone。该边界 RR 为保留后续数据所需的分支结构 Header 不删除。
 
 重启后检测到还原点时，驱动直接使用已经物化的源分区作为基础视图，不扫描旧 Record。第一笔受保护写入前会清空旧历史并创建新的根分支。还原点不会自动过期；启动后首次受保护写完成前不支持删除。
 
