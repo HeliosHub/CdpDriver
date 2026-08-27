@@ -197,6 +197,52 @@ typedef struct _Cdp_BRANCH_INFO_TREE
 	ULONG Count;
 } Cdp_BRANCH_INFO_TREE, *PCdp_BRANCH_INFO_TREE;
 
+// Runtime-only checkpoint coverage.  Persistent restore-point boots use the
+// source volume as their durable baseline, so these payload mappings are
+// intentionally not serialized in the superblock or record headers.
+typedef struct _Cdp_RUNTIME_CHECKPOINT
+{
+	UINT64 CheckpointId;
+	UINT64 SourceRegionOffset;
+	UINT64 SourceFirstSequence;
+	UINT64 SourceEndSequence;
+	UINT64 VolumeOffset;
+	UINT64 FileOffset;
+	ULONG DataLength;
+	struct _Cdp_RUNTIME_CHECKPOINT* Next;
+} Cdp_RUNTIME_CHECKPOINT, *PCdp_RUNTIME_CHECKPOINT;
+
+typedef struct _Cdp_CHECKPOINT_REMAP
+{
+	UINT64 VolumeOffset;
+	UINT64 FileOffset;
+	UINT64 PreviousFileOffset;
+	ULONG DataLength;
+} Cdp_CHECKPOINT_REMAP, *PCdp_CHECKPOINT_REMAP;
+
+typedef struct _Cdp_RUNTIME_CHECKPOINT_TREE_INFO
+{
+	UINT64 CheckpointId;
+	UINT64 SourceRegionOffset;
+	UINT64 SourceFirstSequence;
+	UINT64 SourceEndSequence;
+	UINT64 DataBytes;
+	UINT64 AllocatedBytes;
+	ULONG RecordCount;
+	ULONG Reserved;
+} Cdp_RUNTIME_CHECKPOINT_TREE_INFO, *PCdp_RUNTIME_CHECKPOINT_TREE_INFO;
+
+typedef struct _Cdp_RUNTIME_CHECKPOINT_RECORD_TREE_INFO
+{
+	UINT64 CheckpointId;
+	UINT64 RecordIndex;
+	UINT64 VolumeOffset;
+	UINT64 FileOffset;
+	ULONG DataLength;
+	ULONG AllocatedLength;
+} Cdp_RUNTIME_CHECKPOINT_RECORD_TREE_INFO,
+	*PCdp_RUNTIME_CHECKPOINT_RECORD_TREE_INFO;
+
 // Snapshot-safe public projection of an in-memory BranchTree node.  This
 // deliberately contains topology only; no record-header scan is required.
 #define Cdp_JOURNAL_BRANCH_INFO_FLAG_CURRENT   0x00000001UL
@@ -255,6 +301,13 @@ typedef struct _Cdp_JOURNAL
 	LONG CurrentBranchNumber;
 	LONG HighestBranchNumber;
 	Cdp_BRANCH_INFO_TREE BranchTree;
+	PCdp_RUNTIME_CHECKPOINT CheckpointFirst;
+	PCdp_RUNTIME_CHECKPOINT CheckpointLast;
+	UINT64 NextCheckpointId;
+	UINT64 CheckpointGeneration;
+	ULONG CheckpointCount;
+	ULONG CheckpointRecordCount;
+	UINT64 CheckpointPayloadBytes;
 	BOOLEAN RecoveryPending;
 	BOOLEAN RestorePointSet;
 	// Auto discovery may intentionally leave the old history opaque when a
@@ -459,6 +512,63 @@ NTSTATUS CdpJournalDeleteOldestRegion(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 ExpectedRegionOffset);
 
+// Merge one already-deduplicated logical range into runtime checkpoints.
+// Existing checkpoints are inspected in creation order and consume matching
+// fragments.  Only fragments still uncovered after that pass allocate new
+// payload.  Returned remaps describe every resulting payload fragment.
+NTSTATUS CdpJournalMergeIntoRuntimeCheckpoints(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 SourceRegionOffset,
+	_In_ UINT64 SourceFirstSequence,
+	_In_ UINT64 SourceEndSequence,
+	_Inout_ PUINT64 CheckpointId,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_In_reads_bytes_(DataLength) const VOID* Data,
+	_Outptr_result_buffer_(*RemapCount) PCdp_CHECKPOINT_REMAP* Remaps,
+	_Out_ PULONG RemapCount);
+
+VOID CdpJournalFreeCheckpointRemaps(
+	_Inout_opt_ PCdp_CHECKPOINT_REMAP Remaps);
+
+// Before reclaiming a physical RR span, move any runtime checkpoint payload
+// that happens to reside in that span to the current free cursor.
+NTSTATUS CdpJournalRelocateCheckpointsFromRegion(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 RegionOffset,
+	_Outptr_result_buffer_(*RemapCount) PCdp_CHECKPOINT_REMAP* Remaps,
+	_Out_ PULONG RemapCount);
+
+NTSTATUS CdpJournalSnapshotRuntimeCheckpoints(
+	_Inout_ PCdp_JOURNAL Journal,
+	_Outptr_result_buffer_(*CheckpointCount) PCdp_CHECKPOINT_REMAP* Checkpoints,
+	_Out_ PULONG CheckpointCount);
+
+NTSTATUS CdpJournalQueryRuntimeCheckpointInfos(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 StartIndex,
+	_In_ UINT64 ExpectedGeneration,
+	_Out_writes_to_(InfoCapacity, *ReturnedCount)
+		PCdp_RUNTIME_CHECKPOINT_TREE_INFO Infos,
+	_In_ ULONG InfoCapacity,
+	_Out_ PUINT64 TotalCheckpoints,
+	_Out_ PUINT64 Generation,
+	_Out_ PULONG ReturnedCount);
+
+NTSTATUS CdpJournalQueryRuntimeCheckpointRecords(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 CheckpointId,
+	_In_ UINT64 StartIndex,
+	_In_ UINT64 ExpectedGeneration,
+	_Out_writes_to_(RecordCapacity, *ReturnedCount)
+		PCdp_RUNTIME_CHECKPOINT_RECORD_TREE_INFO Records,
+	_In_ ULONG RecordCapacity,
+	_Out_ PUINT64 TotalRecords,
+	_Out_ PUINT64 Generation,
+	_Out_ PULONG ReturnedCount);
+
+VOID CdpJournalClearRuntimeCheckpoints(_Inout_ PCdp_JOURNAL Journal);
+
 // After one materializing compaction, reclaim every immediately following
 // complete RR whose headers are all tombstones. Never skips a retained RR and
 // never removes the active/newest RR.
@@ -585,6 +695,22 @@ NTSTATUS CdpPreviewTreePunchRange(
 	_Inout_ PCdp_PREVIEW_TREE Tree,
 	_In_ UINT64 VolumeOffset,
 	_In_ ULONG DataLength);
+
+// Update only nodes owned by ExpectedSequence.  Intersections owned by newer
+// records remain unchanged; partial nodes are split as required.
+NTSTATUS CdpPreviewTreeRemapSequenceRange(
+	_Inout_ PCdp_PREVIEW_TREE Tree,
+	_In_ UINT64 ExpectedSequence,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_In_ UINT64 NewFileOffset);
+
+NTSTATUS CdpPreviewTreeRemapPayloadRange(
+	_Inout_ PCdp_PREVIEW_TREE Tree,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_In_ UINT64 ExpectedFileOffset,
+	_In_ UINT64 NewFileOffset);
 
 // Caller serializes Tree. Verify that every byte in [VolumeOffset, end) maps
 // to the expected record identity and consecutive payload bytes.

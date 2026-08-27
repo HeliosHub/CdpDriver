@@ -62,6 +62,14 @@ NTSTATUS CdpCoreJournalUsageAtLeast(
 // header region, remove those values from MetaTree, then delete the region.
 NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core);
 
+// Persistent restore-point compaction: move one oldest complete RR into
+// runtime journal checkpoints without modifying the protected source.
+NTSTATUS CdpCoreCheckpointOldestRegion(_Inout_ PCdp_CORE Core);
+
+// Restore-point deletion transition: materialize the runtime checkpoint
+// baseline to source, discard checkpoint mappings and rebuild latest MetaTree.
+NTSTATUS CdpCoreMaterializeRuntimeCheckpoints(_Inout_ PCdp_CORE Core);
+
 // Merge-thread lifetime gate used to make PreviewBegin race-free. Only one
 // merge owner may be active for a core at a time.
 NTSTATUS CdpCoreSetMergeActive(
@@ -77,6 +85,29 @@ NTSTATUS CdpCoreQueryRecordHeaders(
 	_In_ UINT64 StartIndex,
 	_In_ UINT64 ExpectedGeneration,
 	_Out_writes_to_(RecordCapacity, *ReturnedCount) PCdp_JOURNAL_RECORD Records,
+	_In_ ULONG RecordCapacity,
+	_Out_ PUINT64 TotalRecords,
+	_Out_ PUINT64 Generation,
+	_Out_ PULONG ReturnedCount);
+
+NTSTATUS CdpCoreQueryRuntimeCheckpointInfos(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 StartIndex,
+	_In_ UINT64 ExpectedGeneration,
+	_Out_writes_to_(InfoCapacity, *ReturnedCount)
+		PCdp_RUNTIME_CHECKPOINT_TREE_INFO Infos,
+	_In_ ULONG InfoCapacity,
+	_Out_ PUINT64 TotalCheckpoints,
+	_Out_ PUINT64 Generation,
+	_Out_ PULONG ReturnedCount);
+
+NTSTATUS CdpCoreQueryRuntimeCheckpointRecords(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 CheckpointId,
+	_In_ UINT64 StartIndex,
+	_In_ UINT64 ExpectedGeneration,
+	_Out_writes_to_(RecordCapacity, *ReturnedCount)
+		PCdp_RUNTIME_CHECKPOINT_RECORD_TREE_INFO Records,
 	_In_ ULONG RecordCapacity,
 	_Out_ PUINT64 TotalRecords,
 	_Out_ PUINT64 Generation,

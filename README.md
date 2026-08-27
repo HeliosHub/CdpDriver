@@ -2,7 +2,7 @@
 
 CdpDriver 是一个同时工作在 Windows `Volume` 与 `DiskDrive` 类的 Upper Filter 驱动。当前开发版本采用 after-image：受保护分区的应用写在磁盘层持久化到独立 Journal 后直接完成，不再提交到源分区；卷层优先合成读取，磁盘层为旁路读取兜底。
 
-当前版本：**1.6.8-test28**（Build `20260827.115-restore-point-prune`），Journal 磁盘格式：**v15**。
+当前版本：**1.6.8-test44**（Build `20260827.131-query-time-range`），Journal 磁盘格式：**v15**。
 
 主要功能：
 
@@ -67,6 +67,8 @@ msbuild CdpDriver.sln /m /p:Configuration=Release /p:Platform=x64
 | `9` | 查询最早/最新 Record 时间 |
 | `u` | 查询 Journal 容量、元数据空间、Record 负载已用/剩余空间 |
 | `l` | 列出全部现存 Record 元数据和 Flags，不读取或输出 payload |
+| `k` | 按创建顺序列出全部运行时 checkpoint 的来源 RR、Sequence 范围、record 数和空间占用 |
+| `n` | 输入 `CheckpointId`，逐条列出该 checkpoint 的卷偏移、Journal payload 偏移及有效/分配长度 |
 | `b` | 分页列出分支树、当前分支和继承关系 |
 | `s` | 查询源卷保护状态、Phase 和 Journal GUID |
 | `e` | 准备 Recovery；可选择只持久化重启恢复意图 |
@@ -119,16 +121,18 @@ Recovery Begin 根据目标时间确定父分支和继承点，追加一个新�
 
 ## 手动合并
 
-`m` 会异步合并一个最旧的可合并 HeaderRegion，忽略自动合并要求的 90% Journal 使用率。若该次回收使某些分支失效，Core 会在同一回收事务中标记并继续删除连续的 tombstone RR；但不会因此再进入下一个普通 RR，后者仍由自动合并在空间使用率达到阈值时处理。命令需要认证，并且仅在保护处于 General 阶段、没有 Preview、没有持久还原点、也没有正在运行的合并线程时可接受。合并期间，开始 Preview 的返回数据直接带 `MERGING` 状态和空句柄；GUI 据此提示等待合并完成，无需额外查询。完成结果记录在驱动 `[MERGE]` 日志中。
+`m` 会异步合并一个最旧的可合并 HeaderRegion，忽略自动合并要求的 90% Journal 使用率。若该次回收使某些分支失效，Core 会在同一回收事务中标记并继续删除连续的 tombstone RR；但不会因此再进入下一个普通 RR，后者仍由后续合并处理。命令需要认证，并且仅在保护处于 General 阶段、没有 Preview、也没有正在运行的合并线程时可接受。存在持久还原点时，命令改走运行期 checkpoint 合并，不回填源盘。合并期间，开始 Preview 的返回数据直接带 `MERGING` 状态和空句柄；GUI 据此提示等待合并完成，无需额外查询。完成结果记录在驱动 `[MERGE]` / `[CHECKPOINT-MERGE]` 日志中。
 
-自动合并在 General 阶段的阈值为 90%。若存在 Preview，则仅在使用率达到 95% 时紧急中止该 Preview 并开始合并；预览读取会返回“预览已因 Journal 使用率达到 95% 而被自动合并中止”的明确错误，CdpGui 检测到该读取错误后会立即结束对应 Preview 会话。
+自动合并在 General 阶段的阈值为 90%。若存在 Preview，则仅在使用率达到 95% 时紧急中止该 Preview 并开始合并；预览读取会返回“预览已因 Journal 使用率达到 95% 而被自动合并中止”的明确错误，CdpGui 检测到该读取错误后会立即结束对应 Preview 会话。持久还原点模式每个合并线程只处理一个最旧 RR：先在该 RR 内生成去重后的有效区间，按创建顺序复用所有已有 checkpoint，数据全部消耗后立即停止扫描，检查完仍剩余的碎片才分配新 checkpoint。
 
 ## Journal 空间与磁盘格式
 
 当前开发格式为 v15：一个 Superblock，随后是若干 `1 MiB HeaderRegion + PayloadRegion`。单条磁盘 Record Header 为 32 字节，HeaderRegion 末尾 32 字节是 RegionLink。
 
 - 单个 PayloadRegion 的跨度达到 Journal 容量的 `1/10` 时，即使 HeaderRegion 未写满也会切换新区域。
-- 日志使用率达到90%时启动唯一合并线程。删除最旧 HeaderRegion 前，先把其中当前分支仍有效的最新值通过磁盘下层的 `SL_FORCE_DIRECT_WRITE` 写入源卷；兄弟分支记录直接丢弃。合并日志会输出模式、RR 偏移和序号范围。
+- 日志使用率达到90%时启动唯一合并线程。删除最旧 HeaderRegion 前，先把其中当前分支仍有效的最新值通过磁盘下层的 `SL_FORCE_DIRECT_WRITE` 写入源卷；仅继承基线已不可重建的分支及其后代会被标记删除。仍有效分支在后续分叉点之后的 tail 也必须保留，供 Preview 或继续创建分支。合并日志会输出模式、RR 偏移和序号范围。
+- 存在持久还原点时不执行源盘回填：有效数据迁移到运行期 checkpoint；命中已有 checkpoint record 的部分直接覆写，未覆盖碎片才作为本次 RR checkpoint 的新 record 占用空间。每个实际分配过新 record 的 RR 合并对应一个运行时 `CheckpointId`，并记录来源 RR 和 Sequence 范围。当前 `MetaTree` 仅更新仍指向被合并 Record 的 payload，Preview 以 checkpoint 作为已回收历史的基础层。checkpoint 元数据不写 Superblock，重启仍由持久还原点源盘基线接管。Console 的 `k`/`n` 可分页查看这些内存元数据，但不返回 payload 内容。
+- 删除还原点时若存在运行期 checkpoint，会先把 checkpoint 基线写入源盘，再清理内存映射和重建最新 `MetaTree`，随后才清除 Superblock 标记。
 - 淘汰空间通过相邻 RegionLink 和最后一条 Record 的 `FileOffset + DataLength` 计算，不扫描整个 1 MiB HeaderRegion。
 - 普通 Append 持久化 payload 和 Record Header；只有切换 HeaderRegion、Recovery 标记、凭据、Format/Close 等元数据变化时才更新 Superblock，避免每次 Append 的写放大。
 - Record Header 的 `Sequence` 低16位是区域内索引，最高位 `0x80000000` 为 `BRANCH`。分支记录保存分支号、父分支号和继承 Record 序号；普通 Record 的全局序号为 `RegionLink.StartSequence + (Header.Sequence & 0xFFFF)`。

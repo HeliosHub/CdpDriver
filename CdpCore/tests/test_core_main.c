@@ -1609,35 +1609,36 @@ static int TestAfterImageCompactionPrunesOnlyAtInheritancePoint(void)
 		status = CdpCoreQueryRecordHeaders(
 			core, 0, 0, headers, RTL_NUMBER_OF(headers),
 			&total, &generation, &returned);
-	Expect(NT_SUCCESS(status) && total == 4 && returned == 4 &&
-		headers[0].Sequence == 9 && headers[1].Sequence == 10 &&
-		headers[2].Sequence == 13 && headers[3].Sequence == 14,
-		"point compaction keeps sibling from retained b and prunes c descendants");
+	Expect(NT_SUCCESS(status) && total == 10 && returned == 10 &&
+		headers[0].Sequence == 5 && headers[1].Sequence == 6 &&
+		headers[2].Sequence == 7 && headers[3].Sequence == 8 &&
+		headers[4].Sequence == 9 && headers[5].Sequence == 10 &&
+		headers[6].Sequence == 11 && headers[7].Sequence == 12 &&
+		headers[8].Sequence == 13 && headers[9].Sequence == 14,
+		"compaction retains branch tails until their own inherited baseline is reclaimed");
 
-	/* The parent suffix RR and branch-2 RR were contiguous tombstone regions
-	 * and therefore disappeared in the same call. Branch-4 is also tombstoned,
-	 * but the still-valid branch-3 RR sits before it and prevents a skip. */
+	/* The branch-2 tail is still reconstructible here: its inheritance record
+	 * is in a later RR.  A current-branch fork does not make it garbage. */
 	status = CdpCoreQueryJournalUsage(
 		core, &partitionBytes, &metadataBytes, &payloadBytesUsed,
 		&payloadBytesFree, &usageRecords);
-	Expect(NT_SUCCESS(status) &&
-		metadataBytes == SECTOR + 3ULL * Cdp_JOURNAL_HEADER_REGION_SIZE,
-		"contiguous deleted RRs reclaim immediately but a retained RR blocks later tombstones");
+	Expect(NT_SUCCESS(status) && usageRecords == 10,
+		"valid branch records remain counted until their inherited baseline is reclaimed");
 	Expect(NT_SUCCESS(CdpCoreCompactOldestRegion(core)),
-		"merge reaches non-current sibling and then reclaims its tombstoned successor");
+		"merge reaches the branch-2 inheritance RR");
 	returned = 0;
 	status = CdpCoreQueryRecordHeaders(
 		core, 0, 0, headers, RTL_NUMBER_OF(headers),
 		&total, &generation, &returned);
-	Expect(NT_SUCCESS(status) && total == 2 && returned == 2 &&
-		headers[0].Sequence == 13 && headers[1].Sequence == 14,
-		"sibling branch is deleted only when its own region is merged");
+	Expect(NT_SUCCESS(status) && total == 4 && returned == 4 &&
+		headers[0].Sequence == 9 && headers[1].Sequence == 10 &&
+		headers[2].Sequence == 13 && headers[3].Sequence == 14,
+		"branch becomes reclaimable only when its own inherited baseline is merged");
 	status = CdpCoreQueryJournalUsage(
 		core, &partitionBytes, &metadataBytes, &payloadBytesUsed,
 		&payloadBytesFree, &usageRecords);
-	Expect(NT_SUCCESS(status) &&
-		metadataBytes == SECTOR + Cdp_JOURNAL_HEADER_REGION_SIZE,
-		"blocked tombstone RR is physically reclaimed as soon as the gap is removed");
+	Expect(NT_SUCCESS(status) && usageRecords == 4,
+		"invalid branch subtree is reclaimed after its baseline disappears");
 
 	CdpCoreDestroy(core);
 	core = NULL;
@@ -1652,8 +1653,10 @@ static int TestAfterImageCompactionPrunesOnlyAtInheritancePoint(void)
 		status = CdpCoreQueryRecordHeaders(
 			core, 0, 0, headers, RTL_NUMBER_OF(headers),
 			&total, &generation, &returned);
-		Expect(NT_SUCCESS(status) && total == 2 && returned == 2,
-			"remount does not resurrect pruned records or branches");
+		Expect(NT_SUCCESS(status) && total == 4 && returned == 4 &&
+			headers[0].Sequence == 9 && headers[1].Sequence == 10 &&
+			headers[2].Sequence == 13 && headers[3].Sequence == 14,
+			"remount retains valid branches and does not resurrect pruned branches");
 		status = CdpCoreAppendAfterImage(
 			core, 3ULL * 1024 * 1024 + 512,
 			sizeof(postPrune), postPrune, &postPruneRecord);
@@ -2337,6 +2340,239 @@ static int TestPersistentRestorePoint(void)
 	return g_caseFailed;
 }
 
+static int TestRestorePointCheckpointMerge(void)
+{
+	TEST_CTX ctx;
+	Cdp_JOURNAL_RECORD oldestRecord;
+	PUCHAR filler = NULL;
+	PUCHAR sourceBefore = NULL;
+	PUCHAR output = NULL;
+	UCHAR oldestValue[4096];
+	UINT64 oldestTime = 0;
+	UINT64 newestTime = 0;
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(TestCtxCreate(
+		&ctx, 3ULL * 1024 * 1024, JNL_SIZE, 330000)),
+		"setup restore-point checkpoint merge test");
+	if (!ctx.Core)
+		return g_caseFailed;
+	filler = (PUCHAR)malloc(1024 * 1024);
+	sourceBefore = (PUCHAR)malloc(4096);
+	output = (PUCHAR)malloc(4096);
+	if (!filler || !sourceBefore || !output)
+		goto cleanup;
+	FillPattern(oldestValue, sizeof(oldestValue), 0x31);
+	RtlFillMemory(filler, 1024 * 1024, 0x72);
+	RtlFillMemory(sourceBefore, 4096, 0x19);
+	Expect(NT_SUCCESS(ctx.Source->Write(
+		ctx.Source, 0, 4096, sourceBefore)),
+		"seed source baseline before checkpoint merge");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(oldestValue), oldestValue, &oldestRecord)),
+		"append effective data to oldest RR");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 8192, 1024 * 1024, filler, NULL)),
+		"rotate a newer active RR before checkpoint merge");
+	Expect(NT_SUCCESS(CdpCoreSetRestorePointMarker(
+		ctx.Core, oldestRecord.WallClock100ns)),
+		"enable persistent restore point for checkpoint strategy");
+
+	status = CdpCoreCheckpointOldestRegion(ctx.Core);
+	Expect(NT_SUCCESS(status),
+		"checkpoint merge processes exactly one oldest complete RR");
+	RtlZeroMemory(output, 4096);
+	Expect(NT_SUCCESS(ctx.Source->Read(ctx.Source, 0, 4096, output)) &&
+		memcmp(output, sourceBefore, 4096) == 0,
+		"checkpoint merge never writes the protected source baseline");
+	RtlZeroMemory(output, 4096);
+	Expect(NT_SUCCESS(CdpCoreRead(ctx.Core, 0, 4096, output)) &&
+		memcmp(output, oldestValue, 4096) == 0,
+		"MetaTree payload is remapped to checkpoint data before RR reclaim");
+	ExpectStatus(CdpCoreCheckpointOldestRegion(ctx.Core), STATUS_NOT_FOUND,
+		"one merge does not treat the active RR as another candidate");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 8192 + 1024 * 1024, 1024 * 1024, filler, NULL)),
+		"rotate another active RR after the first checkpoint merge");
+	Expect(NT_SUCCESS(CdpCoreCheckpointOldestRegion(ctx.Core)),
+		"second merge relocates checkpoints stored inside the reclaimed RR span");
+	RtlZeroMemory(output, 4096);
+	Expect(NT_SUCCESS(CdpCoreRead(ctx.Core, 0, 4096, output)) &&
+		memcmp(output, oldestValue, 4096) == 0,
+		"multi-RR checkpoint relocation preserves the earlier checkpoint view");
+
+	status = CdpCoreQueryTimeRange(ctx.Core, &oldestTime, &newestTime);
+	if (NT_SUCCESS(status))
+		status = CdpCorePreviewBegin(ctx.Core, newestTime);
+	RtlZeroMemory(output, 4096);
+	Expect(NT_SUCCESS(status) &&
+		NT_SUCCESS(CdpCorePreviewRead(ctx.Core, 0, 4096, output)) &&
+		memcmp(output, oldestValue, 4096) == 0,
+		"preview uses checkpoint baseline after the original RR is reclaimed");
+	if (NT_SUCCESS(status))
+		Expect(NT_SUCCESS(CdpCorePreviewEnd(ctx.Core)),
+			"end checkpoint-backed preview");
+	Expect(NT_SUCCESS(CdpCoreClearRestorePointMarker(ctx.Core)),
+		"deleting restore point materializes and clears runtime checkpoints");
+	RtlZeroMemory(output, 4096);
+	Expect(NT_SUCCESS(ctx.Source->Read(ctx.Source, 0, 4096, output)) &&
+		memcmp(output, oldestValue, 4096) == 0,
+		"restore-point deletion preserves checkpoint baseline on source");
+
+cleanup:
+	if (output)
+		free(output);
+	if (sourceBefore)
+		free(sourceBefore);
+	if (filler)
+		free(filler);
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
+static int TestRuntimeCheckpointReuseOrder(void)
+{
+	PCdp_STORE journalStore = NULL;
+	Cdp_JOURNAL journal;
+	GUID sourceGuid = { 0 };
+	PCdp_CHECKPOINT_REMAP remaps = NULL;
+	ULONG remapCount = 0;
+	UCHAR first[4096];
+	UCHAR wider[8192];
+	UCHAR overwrite[4096];
+	UCHAR cross[4096];
+	UCHAR output[4096];
+	Cdp_RUNTIME_CHECKPOINT_TREE_INFO checkpointInfos[4];
+	Cdp_RUNTIME_CHECKPOINT_RECORD_TREE_INFO checkpointRecords[4];
+	UINT64 firstCheckpointOffset = 0;
+	UINT64 secondCheckpointOffset = 0;
+	UINT64 payloadCursorAfterTwo = 0;
+	UINT64 checkpointId = 0;
+	UINT64 firstCheckpointId = 0;
+	UINT64 secondCheckpointId = 0;
+	UINT64 totalItems = 0;
+	UINT64 queryGeneration = 0;
+	ULONG returnedItems = 0;
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(CdpMemStoreCreate(
+		JNL_SIZE, SECTOR, &journalStore)),
+		"create journal for runtime checkpoint reuse test");
+	if (!journalStore)
+		return g_caseFailed;
+	CdpJournalInitializeWithStore(
+		&journal, journalStore, &sourceGuid,
+		TestPointerTime100ns, (PVOID)(ULONG_PTR)350000);
+	Expect(NT_SUCCESS(CdpJournalFormat(&journal)),
+		"format runtime checkpoint reuse journal");
+	Expect(NT_SUCCESS(CdpJournalSetRestorePoint(&journal, 350000)),
+		"enable restore point before runtime checkpoint allocation");
+	RtlFillMemory(first, sizeof(first), 0x11);
+	RtlFillMemory(wider, sizeof(wider), 0x22);
+	RtlFillMemory(overwrite, sizeof(overwrite), 0x33);
+	RtlFillMemory(cross, sizeof(cross), 0x44);
+
+	status = CdpJournalMergeIntoRuntimeCheckpoints(
+		&journal, 0x100000, 1, 2, &checkpointId,
+		0, sizeof(first), first, &remaps, &remapCount);
+	if (NT_SUCCESS(status) && remapCount == 1)
+	{
+		firstCheckpointOffset = remaps[0].FileOffset;
+		firstCheckpointId = checkpointId;
+	}
+	Expect(NT_SUCCESS(status) && remapCount == 1 &&
+		journal.CheckpointCount == 1,
+		"first range creates one runtime checkpoint");
+	CdpJournalFreeCheckpointRemaps(remaps);
+	remaps = NULL;
+
+	checkpointId = 0;
+	status = CdpJournalMergeIntoRuntimeCheckpoints(
+		&journal, 0x200000, 2, 3, &checkpointId,
+		0, sizeof(wider), wider, &remaps, &remapCount);
+	if (NT_SUCCESS(status) && remapCount == 2)
+	{
+		secondCheckpointOffset = remaps[1].FileOffset;
+		secondCheckpointId = checkpointId;
+	}
+	payloadCursorAfterTwo = journal.PayloadRegionOff;
+	Expect(NT_SUCCESS(status) && remapCount == 2 &&
+		journal.CheckpointCount == 2 &&
+		remaps[0].FileOffset == firstCheckpointOffset &&
+		remaps[1].VolumeOffset == 4096,
+		"wider range reuses the first checkpoint before allocating its remainder");
+	CdpJournalFreeCheckpointRemaps(remaps);
+	remaps = NULL;
+
+	checkpointId = 0;
+	status = CdpJournalMergeIntoRuntimeCheckpoints(
+		&journal, 0x300000, 3, 4, &checkpointId,
+		0, sizeof(overwrite), overwrite, &remaps, &remapCount);
+	Expect(NT_SUCCESS(status) && remapCount == 1 &&
+		journal.CheckpointCount == 2 &&
+		journal.PayloadRegionOff == payloadCursorAfterTwo &&
+		remaps[0].FileOffset == firstCheckpointOffset,
+		"fully consumed data stops immediately without allocating another checkpoint");
+	CdpJournalFreeCheckpointRemaps(remaps);
+	remaps = NULL;
+
+	checkpointId = 0;
+	status = CdpJournalMergeIntoRuntimeCheckpoints(
+		&journal, 0x400000, 4, 5, &checkpointId,
+		2048, sizeof(cross), cross, &remaps, &remapCount);
+	Expect(NT_SUCCESS(status) && remapCount == 2 &&
+		journal.CheckpointCount == 2 &&
+		journal.PayloadRegionOff == payloadCursorAfterTwo &&
+		remaps[0].FileOffset == firstCheckpointOffset + 2048 &&
+		remaps[1].FileOffset == secondCheckpointOffset,
+		"one range checks checkpoints in order and consumes overlaps from both");
+	CdpJournalFreeCheckpointRemaps(remaps);
+	remaps = NULL;
+	RtlZeroMemory(output, sizeof(output));
+	Expect(NT_SUCCESS(CdpJournalReadPayload(
+		&journal, firstCheckpointOffset + 2048, sizeof(output), output)) &&
+		memcmp(output, cross, sizeof(output)) == 0,
+		"reused checkpoint payload contains the final cross-checkpoint data");
+
+	RtlZeroMemory(checkpointInfos, sizeof(checkpointInfos));
+	status = CdpJournalQueryRuntimeCheckpointInfos(
+		&journal, 0, 0, checkpointInfos, RTL_NUMBER_OF(checkpointInfos),
+		&totalItems, &queryGeneration, &returnedItems);
+	Expect(NT_SUCCESS(status) && totalItems == 2 && returnedItems == 2 &&
+		checkpointInfos[0].CheckpointId == firstCheckpointId &&
+		checkpointInfos[0].SourceRegionOffset == 0x100000 &&
+		checkpointInfos[0].SourceFirstSequence == 1 &&
+		checkpointInfos[0].SourceEndSequence == 2 &&
+		checkpointInfos[0].RecordCount == 1 &&
+		checkpointInfos[1].CheckpointId == secondCheckpointId &&
+		checkpointInfos[1].RecordCount == 1 &&
+		journal.CheckpointRecordCount == 2,
+		"checkpoint summary query groups records by their source RR merge");
+
+	RtlZeroMemory(checkpointRecords, sizeof(checkpointRecords));
+	status = CdpJournalQueryRuntimeCheckpointRecords(
+		&journal, secondCheckpointId, 0, queryGeneration,
+		checkpointRecords, RTL_NUMBER_OF(checkpointRecords),
+		&totalItems, &queryGeneration, &returnedItems);
+	Expect(NT_SUCCESS(status) && totalItems == 1 && returnedItems == 1 &&
+		checkpointRecords[0].CheckpointId == secondCheckpointId &&
+		checkpointRecords[0].RecordIndex == 0 &&
+		checkpointRecords[0].VolumeOffset == 4096 &&
+		checkpointRecords[0].FileOffset == secondCheckpointOffset &&
+		checkpointRecords[0].DataLength == 4096 &&
+		checkpointRecords[0].AllocatedLength == 4096,
+		"checkpoint record query returns every extent in the selected checkpoint");
+	ExpectStatus(CdpJournalQueryRuntimeCheckpointRecords(
+		&journal, secondCheckpointId, 0, queryGeneration + 1,
+		checkpointRecords, RTL_NUMBER_OF(checkpointRecords),
+		&totalItems, &queryGeneration, &returnedItems), STATUS_RETRY,
+		"checkpoint record pagination rejects a changed generation");
+
+	CdpJournalClose(&journal);
+	CdpMemStoreDestroy(journalStore);
+	return g_caseFailed;
+}
+
 static int TestAutoDiscoverySkipsRestorePointRecords(void)
 {
 	TEST_CTX ctx;
@@ -2586,6 +2822,97 @@ static int TestSiblingInheritancePointRetention(void)
 	return g_caseFailed;
 }
 
+static int TestAncestorBranchTailRetention(void)
+{
+	PCdp_STORE sourceStore = NULL;
+	PCdp_STORE journalStore = NULL;
+	PCdp_CORE core = NULL;
+	Cdp_JOURNAL journal;
+	GUID sourceGuid = { 0 };
+	Cdp_JOURNAL_RECORD rootRecord;
+	Cdp_JOURNAL_RECORD branch2ForkRecord;
+	Cdp_JOURNAL_RECORD branch2TailRecord;
+	Cdp_JOURNAL_RECORD headers[16];
+	UCHAR root[512];
+	UCHAR branch2Fork[512];
+	UCHAR branch2Tail[512];
+	UCHAR branch3[512];
+	UINT64 total = 0;
+	UINT64 generation = 0;
+	ULONG returned = 0;
+	ULONG index;
+	BOOLEAN tailRetained = FALSE;
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(CdpMemStoreCreate(SRC_SIZE, SECTOR, &sourceStore)),
+		"create source for ancestor-branch tail retention");
+	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &journalStore)),
+		"create journal for ancestor-branch tail retention");
+	if (!sourceStore || !journalStore)
+		goto cleanup;
+	RtlFillMemory(root, sizeof(root), 0x11);
+	RtlFillMemory(branch2Fork, sizeof(branch2Fork), 0x22);
+	RtlFillMemory(branch2Tail, sizeof(branch2Tail), 0x33);
+	RtlFillMemory(branch3, sizeof(branch3), 0x44);
+	CdpJournalInitializeWithStore(
+		&journal, journalStore, &sourceGuid, TestPointerTime100ns,
+		(PVOID)(ULONG_PTR)192000);
+	Expect(NT_SUCCESS(CdpJournalFormat(&journal)),
+		"format ancestor-branch tail retention journal");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 0, sizeof(root), root, &rootRecord)),
+		"append root record before Branch 2 inheritance");
+	Expect(NT_SUCCESS(CdpJournalAppendBranch(
+		&journal, 2, 1, rootRecord.Sequence)),
+		"create Branch 2 from retained root inheritance point");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 512, sizeof(branch2Fork), branch2Fork,
+		&branch2ForkRecord)),
+		"append Branch 2 point inherited by Branch 3");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 1024, sizeof(branch2Tail), branch2Tail,
+		&branch2TailRecord)),
+		"append valid Branch 2 tail after Branch 3 fork point");
+	Expect(NT_SUCCESS(CdpJournalAppendBranch(
+		&journal, 3, 2, branch2ForkRecord.Sequence)),
+		"create current Branch 3 from Branch 2");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 1536, sizeof(branch3), branch3, NULL)),
+		"append current Branch 3 data");
+	CdpJournalClose(&journal);
+
+	status = CdpCoreCreate(sourceStore, journalStore, &core);
+	if (NT_SUCCESS(status))
+		status = CdpCoreMountJournal(core);
+	Expect(NT_SUCCESS(status), "mount ancestor-branch tail retention case");
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+	Expect(NT_SUCCESS(CdpCoreCompactOldestRegion(core)),
+		"compact root RR containing Branch 2 inheritance point");
+	status = CdpCoreQueryRecordHeaders(
+		core, 0, 0, headers, RTL_NUMBER_OF(headers),
+		&total, &generation, &returned);
+	for (index = 0; NT_SUCCESS(status) && index < returned; ++index)
+	{
+		if (headers[index].Sequence == branch2TailRecord.Sequence)
+		{
+			tailRetained = TRUE;
+			break;
+		}
+	}
+	Expect(NT_SUCCESS(status) && tailRetained,
+		"valid Branch 2 tail survives compaction after current Branch 3 forks earlier");
+
+cleanup:
+	if (core)
+		CdpCoreDestroy(core);
+	if (journalStore)
+		CdpMemStoreDestroy(journalStore);
+	if (sourceStore)
+		CdpMemStoreDestroy(sourceStore);
+	return g_caseFailed;
+}
+
 static int TestMultipleProtectedPartitionIsolation(void)
 {
 	TEST_CTX first;
@@ -2698,12 +3025,18 @@ int main(void)
 		TestDeferredRebootRecoveryBranch);
 	failed += RunCase("Persistent restore point",
 		TestPersistentRestorePoint);
+	failed += RunCase("Restore-point checkpoint merge",
+		TestRestorePointCheckpointMerge);
+	failed += RunCase("Runtime checkpoint reuse order",
+		TestRuntimeCheckpointReuseOrder);
 	failed += RunCase("Auto discovery skips restore-point records",
 		TestAutoDiscoverySkipsRestorePointRecords);
 	failed += RunCase("Graceful disable drains MetaTree",
 		TestGracefulDisableDrainsMetaTree);
 	failed += RunCase("Sibling inheritance point retention",
 		TestSiblingInheritancePointRetention);
+	failed += RunCase("Ancestor branch tail retention",
+		TestAncestorBranchTailRetention);
 	failed += RunCase("Multiple protected partition isolation",
 		TestMultipleProtectedPartitionIsolation);
 

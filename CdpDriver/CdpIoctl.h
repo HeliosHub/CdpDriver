@@ -58,6 +58,8 @@
 #define IOCTL_Cdp_DELETE_RESTORE_POINT    CTL_CODE(Cdp_IOCTL_TYPE, 0x814, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_QUERY_RESTORE_POINT     CTL_CODE(Cdp_IOCTL_TYPE, 0x815, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_MANUAL_MERGE             CTL_CODE(Cdp_IOCTL_TYPE, 0x816, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_Cdp_QUERY_RUNTIME_CHECKPOINTS CTL_CODE(Cdp_IOCTL_TYPE, 0x817, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_Cdp_QUERY_CHECKPOINT_RECORDS  CTL_CODE(Cdp_IOCTL_TYPE, 0x818, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define Cdp_PHASE_GENERAL  0UL
 #define Cdp_PHASE_PREVIEW  1UL
@@ -79,6 +81,8 @@
 #define Cdp_BUILD_STRING_CHARS 32
 #define Cdp_JOURNAL_RECORD_QUERY_MAX_PER_CALL 512u
 #define Cdp_JOURNAL_BRANCH_QUERY_MAX_PER_CALL 512u
+#define Cdp_CHECKPOINT_QUERY_MAX_PER_CALL 256u
+#define Cdp_CHECKPOINT_RECORD_QUERY_MAX_PER_CALL 512u
 #define Cdp_RECORD_FLAG_BRANCH   0x80000000UL
 #define Cdp_BRANCH_INFO_FLAG_CURRENT   0x00000001UL
 #define Cdp_BRANCH_INFO_FLAG_SYNTHETIC 0x00000002UL
@@ -229,7 +233,9 @@ typedef struct _Cdp_TIME_RANGE_QUERY_REPLY
 	ULONG HasRecords; // 1 if journal has retained history; 0 if empty
 	ULONG Reserved;
 	UINT64 OldestRecord100ns; // earliest surviving WallClock100ns
-	UINT64 NewestRecord100ns; // latest WallClock100ns
+	// Exclusive upper bound for second-precision clients: latest retained
+	// WallClock100ns plus one second (saturated at MAXUINT64).
+	UINT64 NewestRecord100ns;
 } Cdp_TIME_RANGE_QUERY_REPLY, *PCdp_TIME_RANGE_QUERY_REPLY;
 
 typedef struct _Cdp_JOURNAL_USAGE_QUERY_REQUEST
@@ -275,6 +281,72 @@ typedef struct _Cdp_JOURNAL_RECORD_INFO
 } Cdp_JOURNAL_RECORD_INFO, *PCdp_JOURNAL_RECORD_INFO;
 
 C_ASSERT(sizeof(Cdp_JOURNAL_RECORD_INFO) == 40);
+
+typedef struct _Cdp_RUNTIME_CHECKPOINT_QUERY_REQUEST
+{
+	GUID SourceVolumeGuid;
+	UINT64 StartIndex;
+	UINT64 ExpectedGeneration;
+	ULONG MaxCheckpoints;
+	ULONG Reserved;
+} Cdp_RUNTIME_CHECKPOINT_QUERY_REQUEST,
+	*PCdp_RUNTIME_CHECKPOINT_QUERY_REQUEST;
+
+typedef struct _Cdp_RUNTIME_CHECKPOINT_QUERY_REPLY
+{
+	UINT64 TotalCheckpoints;
+	UINT64 Generation;
+	ULONG CheckpointCount;
+	ULONG Reserved;
+} Cdp_RUNTIME_CHECKPOINT_QUERY_REPLY,
+	*PCdp_RUNTIME_CHECKPOINT_QUERY_REPLY;
+
+typedef struct _Cdp_RUNTIME_CHECKPOINT_INFO
+{
+	UINT64 CheckpointId;
+	UINT64 SourceRegionOffset;
+	UINT64 SourceFirstSequence;
+	UINT64 SourceEndSequence;
+	UINT64 DataBytes;
+	UINT64 AllocatedBytes;
+	ULONG RecordCount;
+	ULONG Reserved;
+} Cdp_RUNTIME_CHECKPOINT_INFO, *PCdp_RUNTIME_CHECKPOINT_INFO;
+
+C_ASSERT(sizeof(Cdp_RUNTIME_CHECKPOINT_INFO) == 56);
+
+typedef struct _Cdp_CHECKPOINT_RECORD_QUERY_REQUEST
+{
+	GUID SourceVolumeGuid;
+	UINT64 CheckpointId;
+	UINT64 StartIndex;
+	UINT64 ExpectedGeneration;
+	ULONG MaxRecords;
+	ULONG Reserved;
+} Cdp_CHECKPOINT_RECORD_QUERY_REQUEST,
+	*PCdp_CHECKPOINT_RECORD_QUERY_REQUEST;
+
+typedef struct _Cdp_CHECKPOINT_RECORD_QUERY_REPLY
+{
+	UINT64 CheckpointId;
+	UINT64 TotalRecords;
+	UINT64 Generation;
+	ULONG RecordCount;
+	ULONG Reserved;
+} Cdp_CHECKPOINT_RECORD_QUERY_REPLY,
+	*PCdp_CHECKPOINT_RECORD_QUERY_REPLY;
+
+typedef struct _Cdp_CHECKPOINT_RECORD_INFO
+{
+	UINT64 CheckpointId;
+	UINT64 RecordIndex;
+	UINT64 VolumeOffset;
+	UINT64 FileOffset;
+	ULONG DataLength;
+	ULONG AllocatedLength;
+} Cdp_CHECKPOINT_RECORD_INFO, *PCdp_CHECKPOINT_RECORD_INFO;
+
+C_ASSERT(sizeof(Cdp_CHECKPOINT_RECORD_INFO) == 40);
 
 typedef struct _Cdp_JOURNAL_BRANCH_QUERY_REQUEST
 {

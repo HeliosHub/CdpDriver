@@ -736,6 +736,417 @@ static PCdp_PREVIEW_TREE_NODE CdpCoreFindMetaNodeBySequenceRange(
 		Node->Right, FirstSequence, EndSequence);
 }
 
+// TreeLock is held. Keep the diagnostic write ledger synchronized with the
+// same payload relocation applied to MetaTree.
+static NTSTATUS CdpCoreRemapWriteLedgerLocked(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 ExpectedSequence,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_In_ UINT64 NewFileOffset)
+{
+	PCdp_WRITE_LEDGER_RANGE* link = &Core->WriteLedger;
+	UINT64 remapEnd = VolumeOffset + DataLength;
+
+	while (*link)
+	{
+		PCdp_WRITE_LEDGER_RANGE range = *link;
+		UINT64 overlapStart;
+		UINT64 overlapEnd;
+		UINT64 originalStart;
+		UINT64 originalFileOffset;
+		PCdp_WRITE_LEDGER_RANGE middle = NULL;
+		PCdp_WRITE_LEDGER_RANGE right = NULL;
+
+		if (range->End <= VolumeOffset)
+		{
+			link = &range->Next;
+			continue;
+		}
+		if (range->Start >= remapEnd)
+			break;
+		if (range->Sequence != ExpectedSequence)
+		{
+			link = &range->Next;
+			continue;
+		}
+		overlapStart = range->Start > VolumeOffset ?
+			range->Start : VolumeOffset;
+		overlapEnd = range->End < remapEnd ? range->End : remapEnd;
+		originalStart = range->Start;
+		originalFileOffset = range->FileOffset;
+
+		if (overlapStart > range->Start)
+		{
+			middle = (PCdp_WRITE_LEDGER_RANGE)Cdp_ALLOC0(sizeof(*middle));
+			if (!middle)
+				return STATUS_INSUFFICIENT_RESOURCES;
+			*middle = *range;
+			middle->Start = overlapStart;
+			middle->FileOffset = NewFileOffset +
+				(overlapStart - VolumeOffset);
+			range->End = overlapStart;
+			range->Next = middle;
+			Core->WriteLedgerRangeCount++;
+		}
+		else
+		{
+			middle = range;
+			middle->FileOffset = NewFileOffset +
+				(overlapStart - VolumeOffset);
+		}
+		if (overlapEnd < middle->End)
+		{
+			right = (PCdp_WRITE_LEDGER_RANGE)Cdp_ALLOC0(sizeof(*right));
+			if (!right)
+				return STATUS_INSUFFICIENT_RESOURCES;
+			*right = *middle;
+			right->Start = overlapEnd;
+			right->FileOffset = originalFileOffset +
+				(overlapEnd - originalStart);
+			middle->End = overlapEnd;
+			middle->Next = right;
+			Core->WriteLedgerRangeCount++;
+		}
+		link = &middle->Next;
+	}
+	return STATUS_SUCCESS;
+}
+
+static NTSTATUS CdpCoreRemapWriteLedgerPayloadLocked(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_In_ UINT64 ExpectedFileOffset,
+	_In_ UINT64 NewFileOffset)
+{
+	PCdp_WRITE_LEDGER_RANGE* link = &Core->WriteLedger;
+	UINT64 remapEnd = VolumeOffset + DataLength;
+
+	while (*link)
+	{
+		PCdp_WRITE_LEDGER_RANGE range = *link;
+		UINT64 overlapStart;
+		UINT64 overlapEnd;
+		UINT64 originalStart;
+		UINT64 originalFileOffset;
+		PCdp_WRITE_LEDGER_RANGE middle;
+		PCdp_WRITE_LEDGER_RANGE right;
+
+		if (range->End <= VolumeOffset)
+		{
+			link = &range->Next;
+			continue;
+		}
+		if (range->Start >= remapEnd)
+			break;
+		overlapStart = range->Start > VolumeOffset ?
+			range->Start : VolumeOffset;
+		overlapEnd = range->End < remapEnd ? range->End : remapEnd;
+		if (range->FileOffset + (overlapStart - range->Start) !=
+			ExpectedFileOffset + (overlapStart - VolumeOffset))
+		{
+			link = &range->Next;
+			continue;
+		}
+		originalStart = range->Start;
+		originalFileOffset = range->FileOffset;
+		if (overlapStart > range->Start)
+		{
+			middle = (PCdp_WRITE_LEDGER_RANGE)Cdp_ALLOC0(sizeof(*middle));
+			if (!middle)
+				return STATUS_INSUFFICIENT_RESOURCES;
+			*middle = *range;
+			middle->Start = overlapStart;
+			middle->FileOffset = NewFileOffset +
+				(overlapStart - VolumeOffset);
+			range->End = overlapStart;
+			range->Next = middle;
+			Core->WriteLedgerRangeCount++;
+		}
+		else
+		{
+			middle = range;
+			middle->FileOffset = NewFileOffset +
+				(overlapStart - VolumeOffset);
+		}
+		if (overlapEnd < middle->End)
+		{
+			right = (PCdp_WRITE_LEDGER_RANGE)Cdp_ALLOC0(sizeof(*right));
+			if (!right)
+				return STATUS_INSUFFICIENT_RESOURCES;
+			*right = *middle;
+			right->Start = overlapEnd;
+			right->FileOffset = originalFileOffset +
+				(overlapEnd - originalStart);
+			middle->End = overlapEnd;
+			middle->Next = right;
+			Core->WriteLedgerRangeCount++;
+		}
+		link = &middle->Next;
+	}
+	return STATUS_SUCCESS;
+}
+
+static NTSTATUS CdpCoreCheckpointRegionNodes(
+	_Inout_ PCdp_CORE Core,
+	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
+	_In_ UINT64 SourceRegionOffset,
+	_In_ UINT64 SourceFirstSequence,
+	_In_ UINT64 SourceEndSequence,
+	_Inout_ PUINT64 CheckpointId,
+	_Inout_ PULONG MergedNodes,
+	_Inout_ PUINT64 MergedBytes)
+{
+	PVOID payload;
+	PCdp_CHECKPOINT_REMAP remaps = NULL;
+	ULONG remapCount = 0;
+	ULONG index;
+	NTSTATUS status;
+
+	if (!Node)
+		return STATUS_SUCCESS;
+	status = CdpCoreCheckpointRegionNodes(
+		Core, Node->Left, SourceRegionOffset, SourceFirstSequence,
+		SourceEndSequence, CheckpointId, MergedNodes, MergedBytes);
+	if (!NT_SUCCESS(status))
+		return status;
+	if (!Node->Invalid)
+	{
+		payload = Cdp_ALLOC(Node->DataLength);
+		if (!payload)
+			return STATUS_INSUFFICIENT_RESOURCES;
+		status = CdpJournalReadPayload(
+			Core->Journal, Node->FileOffset, Node->DataLength, payload);
+		if (NT_SUCCESS(status))
+		{
+			status = CdpJournalMergeIntoRuntimeCheckpoints(
+				Core->Journal,
+				SourceRegionOffset,
+				SourceFirstSequence,
+				SourceEndSequence,
+				CheckpointId,
+				Node->Start,
+				Node->DataLength,
+				payload,
+				&remaps,
+				&remapCount);
+		}
+		Cdp_FREE(payload);
+		if (!NT_SUCCESS(status))
+			return status;
+
+		Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+		for (index = 0; index < remapCount; ++index)
+		{
+			status = CdpPreviewTreeRemapSequenceRange(
+				&Core->MetaTree,
+				Node->Sequence,
+				remaps[index].VolumeOffset,
+				remaps[index].DataLength,
+				remaps[index].FileOffset);
+			if (!NT_SUCCESS(status))
+				break;
+			status = CdpCoreRemapWriteLedgerLocked(
+				Core,
+				Node->Sequence,
+				remaps[index].VolumeOffset,
+				remaps[index].DataLength,
+				remaps[index].FileOffset);
+			if (!NT_SUCCESS(status))
+				break;
+		}
+		if (!NT_SUCCESS(status))
+			Core->MetaTreeReady = FALSE;
+		Cdp_LOCK_RELEASE(&Core->TreeLock);
+		CdpJournalFreeCheckpointRemaps(remaps);
+		if (!NT_SUCCESS(status))
+			return status;
+		(*MergedNodes)++;
+		*MergedBytes += Node->DataLength;
+	}
+	return CdpCoreCheckpointRegionNodes(
+		Core, Node->Right, SourceRegionOffset, SourceFirstSequence,
+		SourceEndSequence, CheckpointId, MergedNodes, MergedBytes);
+}
+
+NTSTATUS CdpCoreCheckpointOldestRegion(_Inout_ PCdp_CORE Core)
+{
+	Cdp_PREVIEW_TREE regionTree;
+	UINT64 regionOffset = 0;
+	UINT64 firstSequence = 0;
+	UINT64 endSequence = 0;
+	UINT64 checkpointId = 0;
+	ULONG mergedNodes = 0;
+	UINT64 mergedBytes = 0;
+	ULONG deletedTombstoneRegions = 0;
+	PCdp_CHECKPOINT_REMAP relocated = NULL;
+	ULONG relocatedCount = 0;
+	ULONG relocatedIndex;
+	BOOLEAN previewTargetDeleted = FALSE;
+	BOOLEAN treeInitialized = FALSE;
+	NTSTATUS status;
+
+	if (!Core || !Core->Journal || !Core->Journal->RestorePointSet)
+		return STATUS_INVALID_DEVICE_STATE;
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	if (!Core->MetaTreeReady || Core->PendingRecoveryBranch ||
+		Core->Phase != Cdp_CORE_PHASE_GENERAL)
+	{
+		Cdp_LOCK_RELEASE(&Core->TreeLock);
+		return STATUS_DEVICE_BUSY;
+	}
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+
+	status = CdpJournalGetOldestCompactableRegion(
+		Core->Journal, &regionOffset, &firstSequence, &endSequence);
+	if (!NT_SUCCESS(status))
+		return status;
+#ifndef Cdp_USERMODE
+	Cdp_LOG("[CHECKPOINT-MERGE] region begin rrOffset=%llu sequence=[%llu,%llu) existingCheckpoints=%lu\n",
+		regionOffset, firstSequence, endSequence,
+		Core->Journal->CheckpointCount);
+#endif
+	status = CdpJournalPruneUnreachableForCompaction(
+		Core->Journal,
+		firstSequence,
+		endSequence,
+		0,
+		&previewTargetDeleted);
+	UNREFERENCED_PARAMETER(previewTargetDeleted);
+	if (!NT_SUCCESS(status))
+		return status;
+	status = CdpJournalBuildCurrentBranchRegionTree(
+		Core->Journal, firstSequence, endSequence, &regionTree);
+	if (!NT_SUCCESS(status))
+		return status;
+	treeInitialized = TRUE;
+
+	status = CdpCoreCheckpointRegionNodes(
+		Core, regionTree.Root, regionOffset, firstSequence, endSequence,
+		&checkpointId, &mergedNodes, &mergedBytes);
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+	status = CdpJournalRelocateCheckpointsFromRegion(
+		Core->Journal, regionOffset, &relocated, &relocatedCount);
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+	if (relocatedCount != 0)
+	{
+		Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+		for (relocatedIndex = 0;
+			relocatedIndex < relocatedCount;
+			++relocatedIndex)
+		{
+			status = CdpPreviewTreeRemapPayloadRange(
+				&Core->MetaTree,
+				relocated[relocatedIndex].VolumeOffset,
+				relocated[relocatedIndex].DataLength,
+				relocated[relocatedIndex].PreviousFileOffset,
+				relocated[relocatedIndex].FileOffset);
+			if (!NT_SUCCESS(status))
+				break;
+			status = CdpCoreRemapWriteLedgerPayloadLocked(
+				Core,
+				relocated[relocatedIndex].VolumeOffset,
+				relocated[relocatedIndex].DataLength,
+				relocated[relocatedIndex].PreviousFileOffset,
+				relocated[relocatedIndex].FileOffset);
+			if (!NT_SUCCESS(status))
+				break;
+		}
+		if (!NT_SUCCESS(status))
+			Core->MetaTreeReady = FALSE;
+		Cdp_LOCK_RELEASE(&Core->TreeLock);
+		if (!NT_SUCCESS(status))
+			goto cleanup;
+	}
+
+	// Payloads and MetaTree remaps are complete.  The short final switch is
+	// the only point at which the old RR becomes reclaimable.
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	status = CdpJournalDeleteOldestRegion(Core->Journal, regionOffset);
+	if (NT_SUCCESS(status))
+	{
+		status = CdpJournalDeleteContiguousTombstonedRegions(
+			Core->Journal, &deletedTombstoneRegions);
+	}
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+#ifndef Cdp_USERMODE
+	if (NT_SUCCESS(status))
+	{
+		Cdp_LOG("[CHECKPOINT-MERGE] region complete rrOffset=%llu sequence=[%llu,%llu) checkpointId=%llu nodes=%lu bytes=%llu checkpoints=%lu records=%lu tombstoneRrs=%lu\n",
+			regionOffset, firstSequence, endSequence, checkpointId,
+			mergedNodes, mergedBytes, Core->Journal->CheckpointCount,
+			Core->Journal->CheckpointRecordCount,
+			deletedTombstoneRegions);
+	}
+#endif
+
+cleanup:
+	CdpJournalFreeCheckpointRemaps(relocated);
+	if (treeInitialized)
+		CdpPreviewTreeFree(&regionTree);
+	return status;
+}
+
+NTSTATUS CdpCoreMaterializeRuntimeCheckpoints(_Inout_ PCdp_CORE Core)
+{
+	PCdp_CHECKPOINT_REMAP checkpoints = NULL;
+	ULONG checkpointCount = 0;
+	ULONG index;
+	NTSTATUS status;
+
+	if (!Core || !Core->Journal || !Core->Journal->RestorePointSet)
+		return STATUS_INVALID_DEVICE_STATE;
+	status = CdpJournalSnapshotRuntimeCheckpoints(
+		Core->Journal, &checkpoints, &checkpointCount);
+	if (!NT_SUCCESS(status) || checkpointCount == 0)
+	{
+		CdpJournalFreeCheckpointRemaps(checkpoints);
+		return status;
+	}
+	for (index = 0; index < checkpointCount; ++index)
+	{
+		PVOID payload = Cdp_ALLOC(checkpoints[index].DataLength);
+		if (!payload)
+		{
+			status = STATUS_INSUFFICIENT_RESOURCES;
+			break;
+		}
+		status = CdpJournalReadPayload(
+			Core->Journal,
+			checkpoints[index].FileOffset,
+			checkpoints[index].DataLength,
+			payload);
+		if (NT_SUCCESS(status))
+		{
+			status = CdpCoreSourceWriteDirect(
+				Core,
+				checkpoints[index].VolumeOffset,
+				checkpoints[index].DataLength,
+				payload);
+		}
+		Cdp_FREE(payload);
+		if (!NT_SUCCESS(status))
+			break;
+	}
+	CdpJournalFreeCheckpointRemaps(checkpoints);
+	if (!NT_SUCCESS(status))
+		return status;
+
+	CdpJournalClearRuntimeCheckpoints(Core->Journal);
+	status = CdpCoreBuildMetaTree(Core);
+#ifndef Cdp_USERMODE
+	if (NT_SUCCESS(status))
+	{
+		Cdp_LOG("[CHECKPOINT-MERGE] materialized runtime baseline before restore-point deletion ranges=%lu\n",
+			checkpointCount);
+	}
+#endif
+	return status;
+}
+
 NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
 {
 	Cdp_PREVIEW_TREE regionTree;
@@ -923,6 +1334,43 @@ NTSTATUS CdpCoreQueryRecordHeaders(
 		TotalRecords,
 		Generation,
 		ReturnedCount);
+}
+
+NTSTATUS CdpCoreQueryRuntimeCheckpointInfos(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 StartIndex,
+	_In_ UINT64 ExpectedGeneration,
+	_Out_writes_to_(InfoCapacity, *ReturnedCount)
+		PCdp_RUNTIME_CHECKPOINT_TREE_INFO Infos,
+	_In_ ULONG InfoCapacity,
+	_Out_ PUINT64 TotalCheckpoints,
+	_Out_ PUINT64 Generation,
+	_Out_ PULONG ReturnedCount)
+{
+	if (!Core || !Core->Journal)
+		return STATUS_INVALID_PARAMETER;
+	return CdpJournalQueryRuntimeCheckpointInfos(
+		Core->Journal, StartIndex, ExpectedGeneration, Infos, InfoCapacity,
+		TotalCheckpoints, Generation, ReturnedCount);
+}
+
+NTSTATUS CdpCoreQueryRuntimeCheckpointRecords(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 CheckpointId,
+	_In_ UINT64 StartIndex,
+	_In_ UINT64 ExpectedGeneration,
+	_Out_writes_to_(RecordCapacity, *ReturnedCount)
+		PCdp_RUNTIME_CHECKPOINT_RECORD_TREE_INFO Records,
+	_In_ ULONG RecordCapacity,
+	_Out_ PUINT64 TotalRecords,
+	_Out_ PUINT64 Generation,
+	_Out_ PULONG ReturnedCount)
+{
+	if (!Core || !Core->Journal)
+		return STATUS_INVALID_PARAMETER;
+	return CdpJournalQueryRuntimeCheckpointRecords(
+		Core->Journal, CheckpointId, StartIndex, ExpectedGeneration,
+		Records, RecordCapacity, TotalRecords, Generation, ReturnedCount);
 }
 
 NTSTATUS CdpCoreQueryBranches(
@@ -1954,8 +2402,12 @@ NTSTATUS CdpCoreSetRestorePointMarker(
 
 NTSTATUS CdpCoreClearRestorePointMarker(_Inout_ PCdp_CORE Core)
 {
+	NTSTATUS status;
 	if (!Core)
 		return STATUS_INVALID_PARAMETER;
+	status = CdpCoreMaterializeRuntimeCheckpoints(Core);
+	if (!NT_SUCCESS(status))
+		return status;
 	return CdpJournalClearRestorePoint(Core->Journal);
 }
 

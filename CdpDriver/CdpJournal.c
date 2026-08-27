@@ -288,22 +288,19 @@ static BOOLEAN CdpBranchTreeSequenceDiscardedByCompaction(
 	_In_ PCdp_BRANCH_INFO_TREE Tree,
 	_In_ UINT64 Sequence,
 	_In_ UINT64 FirstSequence,
-	_In_ UINT64 EndSequence,
-	_In_ BOOLEAN PruneAncestorSuffix)
+	_In_ UINT64 EndSequence)
 {
 	PCdp_BRANCH_INFO_NODE owner;
-	UINT64 allowedSequence;
 	BOOLEAN onLatestPath;
 
 	owner = CdpBranchTreeFindBySequence(Tree, Sequence);
 	if (!owner || owner->PrunePending)
 		return owner != NULL;
-	onLatestPath = CdpBranchTreeLatestPathLimit(
-		Tree, owner, &allowedSequence);
+		onLatestPath = CdpBranchTreeLatestPathLimit(
+		Tree, owner, NULL);
 	if (Sequence >= FirstSequence && Sequence < EndSequence)
-		return !onLatestPath || Sequence > allowedSequence;
-	return PruneAncestorSuffix && onLatestPath &&
-		Sequence > allowedSequence;
+		return !onLatestPath;
+	return FALSE;
 }
 
 static VOID CdpBranchRecordInfoSet(
@@ -2379,6 +2376,723 @@ VOID CdpJournalInitializeWithStore(
 	Cdp_LOCK_INIT(&Journal->Lock);
 }
 
+static VOID CdpJournalFreeRuntimeCheckpointsLocked(
+	_Inout_ PCdp_JOURNAL Journal)
+{
+	PCdp_RUNTIME_CHECKPOINT checkpoint = Journal->CheckpointFirst;
+	BOOLEAN hadCheckpoints = checkpoint != NULL;
+	while (checkpoint)
+	{
+		PCdp_RUNTIME_CHECKPOINT next = checkpoint->Next;
+		cdpfree(checkpoint);
+		checkpoint = next;
+	}
+	Journal->CheckpointFirst = NULL;
+	Journal->CheckpointLast = NULL;
+	Journal->NextCheckpointId = 0;
+	Journal->CheckpointCount = 0;
+	Journal->CheckpointRecordCount = 0;
+	Journal->CheckpointPayloadBytes = 0;
+	if (hadCheckpoints)
+		Journal->CheckpointGeneration++;
+}
+
+static NTSTATUS CdpJournalWritePayloadRangeLocked(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 FileOffset,
+	_In_ ULONG DataLength,
+	_In_reads_bytes_(DataLength) const VOID* Data)
+{
+	UINT64 alignedOffset;
+	UINT64 end;
+	UINT64 alignedEnd;
+	ULONG alignedLength;
+	ULONG prefix;
+	PVOID allocationBase = NULL;
+	PUCHAR buffer;
+	NTSTATUS status;
+
+	if (!Data || DataLength == 0 ||
+		FileOffset > MAXUINT64 - DataLength)
+		return STATUS_INVALID_PARAMETER;
+	end = FileOffset + DataLength;
+	alignedOffset = FileOffset - (FileOffset % Journal->SectorSize);
+	alignedEnd = CdpAlignUp64(end, Journal->SectorSize);
+	if (alignedEnd < end || alignedEnd - alignedOffset > MAXULONG)
+		return STATUS_INTEGER_OVERFLOW;
+	alignedLength = (ULONG)(alignedEnd - alignedOffset);
+	prefix = (ULONG)(FileOffset - alignedOffset);
+	buffer = (PUCHAR)CdpAllocateAligned(
+		Journal, alignedLength, &allocationBase);
+	if (!buffer)
+		return STATUS_INSUFFICIENT_RESOURCES;
+
+	if (prefix != 0 || DataLength != alignedLength)
+	{
+		status = CdpJournalRawIo(
+			Journal, IRP_MJ_READ, alignedOffset, alignedLength, buffer);
+	}
+	else
+	{
+		status = STATUS_SUCCESS;
+	}
+	if (NT_SUCCESS(status))
+	{
+		RtlCopyMemory(buffer + prefix, Data, DataLength);
+		status = CdpJournalRawIo(
+			Journal, IRP_MJ_WRITE, alignedOffset, alignedLength, buffer);
+	}
+	cdpfree(allocationBase);
+	return status;
+}
+
+static NTSTATUS CdpJournalAppendCheckpointRemap(
+	_Inout_ PCdp_CHECKPOINT_REMAP* Remaps,
+	_Inout_ PULONG Count,
+	_Inout_ PULONG Capacity,
+	_In_ UINT64 VolumeOffset,
+	_In_ UINT64 FileOffset,
+	_In_ ULONG DataLength)
+{
+	PCdp_CHECKPOINT_REMAP grown;
+	ULONG newCapacity;
+
+	if (*Count == *Capacity)
+	{
+		newCapacity = *Capacity == 0 ? 8 : *Capacity * 2;
+		if (newCapacity < *Capacity ||
+			newCapacity > MAXULONG / sizeof(**Remaps))
+			return STATUS_INTEGER_OVERFLOW;
+		grown = (PCdp_CHECKPOINT_REMAP)cdpalloc(
+			newCapacity * sizeof(*grown));
+		if (!grown)
+			return STATUS_INSUFFICIENT_RESOURCES;
+		if (*Remaps)
+		{
+			RtlCopyMemory(grown, *Remaps, *Count * sizeof(*grown));
+			cdpfree(*Remaps);
+		}
+		*Remaps = grown;
+		*Capacity = newCapacity;
+	}
+	(*Remaps)[*Count].VolumeOffset = VolumeOffset;
+	(*Remaps)[*Count].FileOffset = FileOffset;
+	(*Remaps)[*Count].PreviousFileOffset = FileOffset;
+	(*Remaps)[*Count].DataLength = DataLength;
+	(*Count)++;
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS CdpJournalMergeIntoRuntimeCheckpoints(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 SourceRegionOffset,
+	_In_ UINT64 SourceFirstSequence,
+	_In_ UINT64 SourceEndSequence,
+	_Inout_ PUINT64 CheckpointId,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_In_reads_bytes_(DataLength) const VOID* Data,
+	_Outptr_result_buffer_(*RemapCount) PCdp_CHECKPOINT_REMAP* Remaps,
+	_Out_ PULONG RemapCount)
+{
+	PCdp_CHECKPOINT_REMAP remaps = NULL;
+	ULONG remapCount = 0;
+	ULONG remapCapacity = 0;
+	PUCHAR covered = NULL;
+	ULONG remaining;
+	PCdp_RUNTIME_CHECKPOINT checkpoint;
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Journal || !CheckpointId || !Data || !Remaps || !RemapCount ||
+		DataLength == 0 || SourceFirstSequence >= SourceEndSequence ||
+		VolumeOffset > MAXUINT64 - DataLength)
+		return STATUS_INVALID_PARAMETER;
+	*Remaps = NULL;
+	*RemapCount = 0;
+	covered = (PUCHAR)cdpalloc(DataLength);
+	if (!covered)
+		return STATUS_INSUFFICIENT_RESOURCES;
+	RtlZeroMemory(covered, DataLength);
+	remaining = DataLength;
+
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted || !Journal->RestorePointSet)
+	{
+		status = STATUS_INVALID_DEVICE_STATE;
+		goto cleanup_locked;
+	}
+	if (*CheckpointId != 0)
+	{
+		checkpoint = Journal->CheckpointLast;
+		if (!checkpoint || checkpoint->CheckpointId != *CheckpointId)
+		{
+			status = STATUS_NOT_FOUND;
+			goto cleanup_locked;
+		}
+		if (checkpoint->SourceRegionOffset != SourceRegionOffset ||
+			checkpoint->SourceFirstSequence != SourceFirstSequence ||
+			checkpoint->SourceEndSequence != SourceEndSequence)
+		{
+			status = STATUS_INVALID_PARAMETER;
+			goto cleanup_locked;
+		}
+	}
+
+	// Creation order is intentional.  Once all input bytes are consumed the
+	// scan stops immediately instead of walking unrelated later checkpoints.
+	for (checkpoint = Journal->CheckpointFirst;
+		checkpoint && remaining != 0;
+		checkpoint = checkpoint->Next)
+	{
+		UINT64 inputEnd = VolumeOffset + DataLength;
+		UINT64 checkpointEnd = checkpoint->VolumeOffset +
+			checkpoint->DataLength;
+		UINT64 overlapStart = checkpoint->VolumeOffset > VolumeOffset ?
+			checkpoint->VolumeOffset : VolumeOffset;
+		UINT64 overlapEnd = checkpointEnd < inputEnd ?
+			checkpointEnd : inputEnd;
+		ULONG cursor;
+		ULONG overlapLimit;
+
+		if (overlapStart >= overlapEnd)
+			continue;
+		cursor = (ULONG)(overlapStart - VolumeOffset);
+		overlapLimit = (ULONG)(overlapEnd - VolumeOffset);
+		while (cursor < overlapLimit)
+		{
+			ULONG runStart;
+			ULONG runLength;
+			while (cursor < overlapLimit && covered[cursor] != 0)
+				cursor++;
+			if (cursor == overlapLimit)
+				break;
+			runStart = cursor;
+			while (cursor < overlapLimit && covered[cursor] == 0)
+				cursor++;
+			runLength = cursor - runStart;
+			status = CdpJournalWritePayloadRangeLocked(
+				Journal,
+				checkpoint->FileOffset +
+					(VolumeOffset + runStart - checkpoint->VolumeOffset),
+				runLength,
+				(PUCHAR)Data + runStart);
+			if (!NT_SUCCESS(status))
+				goto cleanup_locked;
+			RtlFillMemory(covered + runStart, runLength, 1);
+			remaining -= runLength;
+			status = CdpJournalAppendCheckpointRemap(
+				&remaps, &remapCount, &remapCapacity,
+				VolumeOffset + runStart,
+				checkpoint->FileOffset +
+					(VolumeOffset + runStart - checkpoint->VolumeOffset),
+				runLength);
+			if (!NT_SUCCESS(status))
+				goto cleanup_locked;
+		}
+	}
+
+	// Only gaps that survived every existing checkpoint consume new space.
+	{
+		ULONG cursor = 0;
+		while (cursor < DataLength)
+		{
+			ULONG runStart;
+			ULONG runLength;
+			UINT64 alignedLength;
+			UINT64 payloadOffset;
+			UINT64 assignedCheckpointId;
+			BOOLEAN createsCheckpoint;
+			PCdp_RUNTIME_CHECKPOINT added;
+			PVOID allocationBase = NULL;
+			PUCHAR writeBuffer;
+
+			while (cursor < DataLength && covered[cursor] != 0)
+				cursor++;
+			if (cursor == DataLength)
+				break;
+			runStart = cursor;
+			while (cursor < DataLength && covered[cursor] == 0)
+				cursor++;
+			runLength = cursor - runStart;
+			alignedLength = CdpAlignUp64(runLength, Journal->SectorSize);
+			status = CdpJournalEnsureContiguousLocked(Journal, alignedLength);
+			if (!NT_SUCCESS(status))
+				goto cleanup_locked;
+			createsCheckpoint = *CheckpointId == 0;
+			if ((createsCheckpoint &&
+					(Journal->CheckpointCount == MAXULONG ||
+					 Journal->NextCheckpointId == MAXUINT64)) ||
+				Journal->CheckpointRecordCount == MAXULONG ||
+				Journal->CheckpointPayloadBytes > MAXUINT64 - alignedLength ||
+				Journal->PayloadBytesUsed > MAXUINT64 - alignedLength)
+			{
+				status = STATUS_INTEGER_OVERFLOW;
+				goto cleanup_locked;
+			}
+			assignedCheckpointId = createsCheckpoint ?
+				Journal->NextCheckpointId + 1 : *CheckpointId;
+			payloadOffset = Journal->PayloadRegionOff;
+			added = (PCdp_RUNTIME_CHECKPOINT)cdpalloc(sizeof(*added));
+			if (!added)
+			{
+				status = STATUS_INSUFFICIENT_RESOURCES;
+				goto cleanup_locked;
+			}
+			writeBuffer = (PUCHAR)CdpAllocateAligned(
+				Journal, (SIZE_T)alignedLength, &allocationBase);
+			if (!writeBuffer)
+			{
+				cdpfree(added);
+				status = STATUS_INSUFFICIENT_RESOURCES;
+				goto cleanup_locked;
+			}
+			RtlZeroMemory(writeBuffer, (SIZE_T)alignedLength);
+			RtlCopyMemory(writeBuffer, (PUCHAR)Data + runStart, runLength);
+			status = CdpJournalRawIo(
+				Journal, IRP_MJ_WRITE, payloadOffset,
+				(ULONG)alignedLength, writeBuffer);
+			cdpfree(allocationBase);
+			if (!NT_SUCCESS(status))
+			{
+				cdpfree(added);
+				goto cleanup_locked;
+			}
+			added->CheckpointId = assignedCheckpointId;
+			added->SourceRegionOffset = SourceRegionOffset;
+			added->SourceFirstSequence = SourceFirstSequence;
+			added->SourceEndSequence = SourceEndSequence;
+			added->VolumeOffset = VolumeOffset + runStart;
+			added->FileOffset = payloadOffset;
+			added->DataLength = runLength;
+			added->Next = NULL;
+			if (Journal->CheckpointLast)
+				Journal->CheckpointLast->Next = added;
+			else
+				Journal->CheckpointFirst = added;
+			Journal->CheckpointLast = added;
+			if (createsCheckpoint)
+			{
+				Journal->NextCheckpointId = assignedCheckpointId;
+				Journal->CheckpointCount++;
+				*CheckpointId = assignedCheckpointId;
+			}
+			Journal->CheckpointRecordCount++;
+			Journal->CheckpointPayloadBytes += alignedLength;
+			Journal->PayloadRegionOff += alignedLength;
+			Journal->PayloadBytesUsed += alignedLength;
+			Journal->CheckpointGeneration++;
+			status = CdpJournalAppendCheckpointRemap(
+				&remaps, &remapCount, &remapCapacity,
+				added->VolumeOffset, added->FileOffset, added->DataLength);
+			if (!NT_SUCCESS(status))
+				goto cleanup_locked;
+		}
+	}
+
+	status = CdpJournalFlush(Journal);
+
+cleanup_locked:
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	cdpfree(covered);
+	if (!NT_SUCCESS(status))
+	{
+		if (remaps)
+			cdpfree(remaps);
+		return status;
+	}
+	*Remaps = remaps;
+	*RemapCount = remapCount;
+	return STATUS_SUCCESS;
+}
+
+VOID CdpJournalFreeCheckpointRemaps(
+	_Inout_opt_ PCdp_CHECKPOINT_REMAP Remaps)
+{
+	if (Remaps)
+		cdpfree(Remaps);
+}
+
+static BOOLEAN CdpJournalOffsetInRingSpan(
+	_In_ UINT64 Offset,
+	_In_ UINT64 SpanStart,
+	_In_ UINT64 SpanEnd)
+{
+	if (SpanStart < SpanEnd)
+		return Offset >= SpanStart && Offset < SpanEnd;
+	if (SpanStart > SpanEnd)
+		return Offset >= SpanStart || Offset < SpanEnd;
+	return FALSE;
+}
+
+NTSTATUS CdpJournalRelocateCheckpointsFromRegion(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 RegionOffset,
+	_Outptr_result_buffer_(*RemapCount) PCdp_CHECKPOINT_REMAP* Remaps,
+	_Out_ PULONG RemapCount)
+{
+	Cdp_HEADER_REGION_LINK link;
+	PCdp_CHECKPOINT_REMAP remaps = NULL;
+	ULONG remapCount = 0;
+	ULONG remapCapacity = 0;
+	PCdp_RUNTIME_CHECKPOINT checkpoint;
+	UINT64 spanStart;
+	UINT64 spanEnd;
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Journal || !Remaps || !RemapCount)
+		return STATUS_INVALID_PARAMETER;
+	*Remaps = NULL;
+	*RemapCount = 0;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted || RegionOffset != Journal->OldestHeaderRegionOff ||
+		RegionOffset == Journal->LastHeaderRegionOff)
+	{
+		status = STATUS_INVALID_DEVICE_STATE;
+		goto cleanup_locked;
+	}
+	status = CdpJournalReadRegionLink(Journal, RegionOffset, &link);
+	if (!NT_SUCCESS(status) || !CdpJournalRegionLinkValid(Journal, &link) ||
+		link.NextRegionOff == RegionOffset)
+	{
+		status = STATUS_DISK_CORRUPT_ERROR;
+		goto cleanup_locked;
+	}
+	spanStart = RegionOffset + Cdp_JOURNAL_HEADER_REGION_SIZE;
+	spanEnd = link.NextRegionOff;
+
+	for (checkpoint = Journal->CheckpointFirst;
+		checkpoint;
+		checkpoint = checkpoint->Next)
+	{
+		UINT64 alignedLength;
+		UINT64 newOffset;
+		PVOID allocationBase = NULL;
+		PUCHAR buffer;
+
+		if (!CdpJournalOffsetInRingSpan(
+				checkpoint->FileOffset, spanStart, spanEnd))
+			continue;
+		alignedLength = CdpAlignUp64(
+			checkpoint->DataLength, Journal->SectorSize);
+		status = CdpJournalEnsureContiguousLocked(Journal, alignedLength);
+		if (!NT_SUCCESS(status))
+			goto cleanup_locked;
+		if (Journal->PayloadBytesUsed > MAXUINT64 - alignedLength)
+		{
+			status = STATUS_INTEGER_OVERFLOW;
+			goto cleanup_locked;
+		}
+		newOffset = Journal->PayloadRegionOff;
+		buffer = (PUCHAR)CdpAllocateAligned(
+			Journal, (SIZE_T)alignedLength, &allocationBase);
+		if (!buffer)
+		{
+			status = STATUS_INSUFFICIENT_RESOURCES;
+			goto cleanup_locked;
+		}
+		status = CdpJournalRawIo(
+			Journal, IRP_MJ_READ, checkpoint->FileOffset,
+			(ULONG)alignedLength, buffer);
+		if (NT_SUCCESS(status))
+		{
+			status = CdpJournalRawIo(
+				Journal, IRP_MJ_WRITE, newOffset,
+				(ULONG)alignedLength, buffer);
+		}
+		cdpfree(allocationBase);
+		if (!NT_SUCCESS(status))
+			goto cleanup_locked;
+		status = CdpJournalAppendCheckpointRemap(
+			&remaps, &remapCount, &remapCapacity,
+			checkpoint->VolumeOffset, newOffset,
+			checkpoint->DataLength);
+		if (!NT_SUCCESS(status))
+			goto cleanup_locked;
+		remaps[remapCount - 1].PreviousFileOffset = checkpoint->FileOffset;
+		checkpoint->FileOffset = newOffset;
+		Journal->PayloadRegionOff += alignedLength;
+		Journal->PayloadBytesUsed += alignedLength;
+	}
+	if (remapCount != 0)
+	{
+		status = CdpJournalFlush(Journal);
+		if (NT_SUCCESS(status))
+			Journal->CheckpointGeneration++;
+	}
+
+cleanup_locked:
+	if (!NT_SUCCESS(status) && remapCount != 0)
+	{
+		ULONG rollbackIndex;
+		for (rollbackIndex = 0;
+			rollbackIndex < remapCount;
+			++rollbackIndex)
+		{
+			for (checkpoint = Journal->CheckpointFirst;
+				checkpoint;
+				checkpoint = checkpoint->Next)
+			{
+				if (checkpoint->VolumeOffset ==
+						remaps[rollbackIndex].VolumeOffset &&
+					checkpoint->FileOffset ==
+						remaps[rollbackIndex].FileOffset &&
+					checkpoint->DataLength ==
+						remaps[rollbackIndex].DataLength)
+				{
+					checkpoint->FileOffset =
+						remaps[rollbackIndex].PreviousFileOffset;
+					break;
+				}
+			}
+		}
+	}
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	if (!NT_SUCCESS(status))
+	{
+		if (remaps)
+			cdpfree(remaps);
+		return status;
+	}
+	*Remaps = remaps;
+	*RemapCount = remapCount;
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS CdpJournalSnapshotRuntimeCheckpoints(
+	_Inout_ PCdp_JOURNAL Journal,
+	_Outptr_result_buffer_(*CheckpointCount) PCdp_CHECKPOINT_REMAP* Checkpoints,
+	_Out_ PULONG CheckpointCount)
+{
+	PCdp_CHECKPOINT_REMAP checkpoints = NULL;
+	ULONG count = 0;
+	ULONG capacity = 0;
+	PCdp_RUNTIME_CHECKPOINT checkpoint;
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Journal || !Checkpoints || !CheckpointCount)
+		return STATUS_INVALID_PARAMETER;
+	*Checkpoints = NULL;
+	*CheckpointCount = 0;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup_locked;
+	}
+	for (checkpoint = Journal->CheckpointFirst;
+		checkpoint;
+		checkpoint = checkpoint->Next)
+	{
+		status = CdpJournalAppendCheckpointRemap(
+			&checkpoints, &count, &capacity,
+			checkpoint->VolumeOffset,
+			checkpoint->FileOffset,
+			checkpoint->DataLength);
+		if (!NT_SUCCESS(status))
+			break;
+	}
+
+cleanup_locked:
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	if (!NT_SUCCESS(status))
+	{
+		if (checkpoints)
+			cdpfree(checkpoints);
+		return status;
+	}
+	*Checkpoints = checkpoints;
+	*CheckpointCount = count;
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS CdpJournalQueryRuntimeCheckpointInfos(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 StartIndex,
+	_In_ UINT64 ExpectedGeneration,
+	_Out_writes_to_(InfoCapacity, *ReturnedCount)
+		PCdp_RUNTIME_CHECKPOINT_TREE_INFO Infos,
+	_In_ ULONG InfoCapacity,
+	_Out_ PUINT64 TotalCheckpoints,
+	_Out_ PUINT64 Generation,
+	_Out_ PULONG ReturnedCount)
+{
+	PCdp_RUNTIME_CHECKPOINT checkpoint;
+	UINT64 checkpointIndex = 0;
+	ULONG returned = 0;
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Journal || !TotalCheckpoints || !Generation || !ReturnedCount ||
+		(InfoCapacity != 0 && !Infos))
+		return STATUS_INVALID_PARAMETER;
+	*TotalCheckpoints = 0;
+	*Generation = 0;
+	*ReturnedCount = 0;
+
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup_locked;
+	}
+	*TotalCheckpoints = Journal->CheckpointCount;
+	*Generation = Journal->CheckpointGeneration;
+	if (ExpectedGeneration != 0 &&
+		ExpectedGeneration != Journal->CheckpointGeneration)
+	{
+		status = STATUS_RETRY;
+		goto cleanup_locked;
+	}
+	if (StartIndex > Journal->CheckpointCount)
+	{
+		status = STATUS_INVALID_PARAMETER;
+		goto cleanup_locked;
+	}
+
+	checkpoint = Journal->CheckpointFirst;
+	while (checkpoint)
+	{
+		UINT64 checkpointId = checkpoint->CheckpointId;
+		PCdp_RUNTIME_CHECKPOINT record = checkpoint;
+		Cdp_RUNTIME_CHECKPOINT_TREE_INFO info;
+
+		RtlZeroMemory(&info, sizeof(info));
+		info.CheckpointId = checkpointId;
+		info.SourceRegionOffset = checkpoint->SourceRegionOffset;
+		info.SourceFirstSequence = checkpoint->SourceFirstSequence;
+		info.SourceEndSequence = checkpoint->SourceEndSequence;
+		while (record && record->CheckpointId == checkpointId)
+		{
+			UINT64 allocated = CdpAlignUp64(
+				record->DataLength, Journal->SectorSize);
+			if (info.RecordCount == MAXULONG ||
+				info.DataBytes > MAXUINT64 - record->DataLength ||
+				info.AllocatedBytes > MAXUINT64 - allocated)
+			{
+				status = STATUS_INTEGER_OVERFLOW;
+				goto cleanup_locked;
+			}
+			info.RecordCount++;
+			info.DataBytes += record->DataLength;
+			info.AllocatedBytes += allocated;
+			record = record->Next;
+		}
+		if (checkpointIndex >= StartIndex && returned < InfoCapacity)
+			Infos[returned++] = info;
+		checkpointIndex++;
+		checkpoint = record;
+		if (returned == InfoCapacity && InfoCapacity != 0)
+			break;
+	}
+	if (checkpointIndex < StartIndex &&
+		StartIndex != Journal->CheckpointCount)
+		status = STATUS_DISK_CORRUPT_ERROR;
+	else
+		*ReturnedCount = returned;
+
+cleanup_locked:
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
+NTSTATUS CdpJournalQueryRuntimeCheckpointRecords(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 CheckpointId,
+	_In_ UINT64 StartIndex,
+	_In_ UINT64 ExpectedGeneration,
+	_Out_writes_to_(RecordCapacity, *ReturnedCount)
+		PCdp_RUNTIME_CHECKPOINT_RECORD_TREE_INFO Records,
+	_In_ ULONG RecordCapacity,
+	_Out_ PUINT64 TotalRecords,
+	_Out_ PUINT64 Generation,
+	_Out_ PULONG ReturnedCount)
+{
+	PCdp_RUNTIME_CHECKPOINT checkpoint;
+	UINT64 recordIndex = 0;
+	UINT64 total = 0;
+	ULONG returned = 0;
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Journal || CheckpointId == 0 || !TotalRecords || !Generation ||
+		!ReturnedCount || (RecordCapacity != 0 && !Records))
+		return STATUS_INVALID_PARAMETER;
+	*TotalRecords = 0;
+	*Generation = 0;
+	*ReturnedCount = 0;
+
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup_locked;
+	}
+	*Generation = Journal->CheckpointGeneration;
+	if (ExpectedGeneration != 0 &&
+		ExpectedGeneration != Journal->CheckpointGeneration)
+	{
+		status = STATUS_RETRY;
+		goto cleanup_locked;
+	}
+	for (checkpoint = Journal->CheckpointFirst;
+		checkpoint;
+		checkpoint = checkpoint->Next)
+	{
+		if (checkpoint->CheckpointId == CheckpointId)
+			total++;
+	}
+	*TotalRecords = total;
+	if (total == 0)
+	{
+		status = STATUS_NOT_FOUND;
+		goto cleanup_locked;
+	}
+	if (StartIndex > total)
+	{
+		status = STATUS_INVALID_PARAMETER;
+		goto cleanup_locked;
+	}
+	for (checkpoint = Journal->CheckpointFirst;
+		checkpoint && returned < RecordCapacity;
+		checkpoint = checkpoint->Next)
+	{
+		PCdp_RUNTIME_CHECKPOINT_RECORD_TREE_INFO info;
+		UINT64 allocated;
+
+		if (checkpoint->CheckpointId != CheckpointId)
+			continue;
+		if (recordIndex++ < StartIndex)
+			continue;
+		allocated = CdpAlignUp64(
+			checkpoint->DataLength, Journal->SectorSize);
+		if (allocated > MAXULONG)
+		{
+			status = STATUS_INTEGER_OVERFLOW;
+			goto cleanup_locked;
+		}
+		info = &Records[returned++];
+		RtlZeroMemory(info, sizeof(*info));
+		info->CheckpointId = CheckpointId;
+		info->RecordIndex = recordIndex - 1;
+		info->VolumeOffset = checkpoint->VolumeOffset;
+		info->FileOffset = checkpoint->FileOffset;
+		info->DataLength = checkpoint->DataLength;
+		info->AllocatedLength = (ULONG)allocated;
+	}
+	*ReturnedCount = returned;
+
+cleanup_locked:
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
+VOID CdpJournalClearRuntimeCheckpoints(_Inout_ PCdp_JOURNAL Journal)
+{
+	if (!Journal)
+		return;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	CdpJournalFreeRuntimeCheckpointsLocked(Journal);
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+}
+
 VOID CdpJournalSetMetadataDevice(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_opt_ PVOID TargetDevice,
@@ -2439,6 +3153,7 @@ NTSTATUS CdpJournalFormat(_Inout_ PCdp_JOURNAL Journal)
 	}
 
 	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	CdpJournalFreeRuntimeCheckpointsLocked(Journal);
 
 	usableStart = CdpJournalUsableStart(Journal);
 	usableEnd = CdpJournalUsableEnd(Journal);
@@ -2548,6 +3263,7 @@ NTSTATUS CdpJournalResetHistoryPreserveRestorePoint(
 		goto cleanup;
 
 	CdpBranchTreeFree(&Journal->BranchTree);
+	CdpJournalFreeRuntimeCheckpointsLocked(Journal);
 	Journal->HeaderWriteCacheValid = FALSE;
 	Journal->HeaderWriteCacheDirty = FALSE;
 	Journal->LastHeaderRegionOff = headerOff;
@@ -3958,6 +4674,87 @@ cleanup:
 	return status;
 }
 
+// A non-current branch whose FIRST marker is reclaimed can survive a remount
+// only if a later RR begins with that branch's continuation marker.  The
+// continuation is deliberately a complete copy of the branch ancestry, so it
+// is a durable replacement for the reclaimed FIRST marker.
+//
+// Caller holds Journal->Lock.
+static NTSTATUS CdpJournalBranchHasContinuationAfterLocked(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ PCdp_BRANCH_INFO_NODE Branch,
+	_In_ UINT64 EndSequence,
+	_Out_ PBOOLEAN HasContinuation)
+{
+	PUCHAR region;
+	UINT64 regionOff;
+	ULONG guard = 0;
+	NTSTATUS status;
+
+	if (!Journal || !Branch || !HasContinuation)
+		return STATUS_INVALID_PARAMETER;
+	*HasContinuation = FALSE;
+	status = CdpJournalGetHeaderScanBufferLocked(Journal, &region);
+	if (!NT_SUCCESS(status))
+		return status;
+	regionOff = Journal->OldestHeaderRegionOff;
+	for (;;)
+	{
+		Cdp_HEADER_REGION_LINK link;
+		ULONG limit;
+		ULONG index;
+		BOOLEAN isLast;
+
+		if (++guard > 100000UL)
+			return STATUS_DISK_CORRUPT_ERROR;
+		status = CdpJournalReadHeaderRegion(Journal, regionOff, region);
+		if (!NT_SUCCESS(status))
+			return status;
+		RtlCopyMemory(&link,
+			region + Cdp_JOURNAL_HEADER_REGION_SIZE - Cdp_JOURNAL_HEADER_LINK_SIZE,
+			sizeof(link));
+		if (!CdpJournalRegionLinkValid(Journal, &link))
+			return STATUS_DISK_CORRUPT_ERROR;
+		status = CdpJournalGetRegionHeaderLimitLocked(
+			Journal, regionOff, &link, &limit, NULL);
+		if (!NT_SUCCESS(status))
+			return status;
+		isLast = regionOff == Journal->LastHeaderRegionOff;
+		for (index = 0; index < limit; ++index)
+		{
+			Cdp_JOURNAL_RECORD_HEADER header;
+			Cdp_JOURNAL_BRANCH_RECORD_HEADER branchHeader;
+			UINT64 sequence;
+
+			if (link.StartSequence > MAXUINT64 - index)
+				return STATUS_DISK_CORRUPT_ERROR;
+			sequence = link.StartSequence + index;
+			if (sequence < EndSequence)
+				continue;
+			RtlCopyMemory(&header, region + index * sizeof(header), sizeof(header));
+			if (CdpJournalHeaderIsDeleted(&header) ||
+				!CdpJournalHeaderIsBranch(&header))
+			{
+				continue;
+			}
+			RtlCopyMemory(&branchHeader, &header, sizeof(branchHeader));
+			if (CdpJournalBranchHeaderIsContinuation(&branchHeader) &&
+				branchHeader.BranchNumber == Branch->BranchNumber &&
+				branchHeader.ParentBranchNumber == Branch->ParentBranchNumber &&
+				branchHeader.InheritedRecordSequence == Branch->InheritedRecordSequence)
+			{
+				*HasContinuation = TRUE;
+				return STATUS_SUCCESS;
+			}
+		}
+		if (isLast)
+			return STATUS_SUCCESS;
+		if (link.NextRegionOff == regionOff)
+			return STATUS_DISK_CORRUPT_ERROR;
+		regionOff = link.NextRegionOff;
+	}
+}
+
 NTSTATUS CdpJournalPruneUnreachableForCompaction(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 FirstSequence,
@@ -4009,9 +4806,11 @@ NTSTATUS CdpJournalPruneUnreachableForCompaction(
 		}
 	}
 
-	// Reaching the first region of a non-current branch discards that branch
-	// itself. Its descendants depend on it and are pruned recursively. Merely
-	// being a sibling of the latest branch is not enough to delete it early.
+	// Reclaiming a branch's FIRST marker is not by itself a reason to discard
+	// that branch.  Keep it when a later RR has its continuation marker: that
+	// marker reconstructs the branch on the next mount.  Without it, the branch
+	// has no durable structural anchor after this RR is gone, so prune it and
+	// its descendants even if its inherited data would otherwise be available.
 	for (branch = Journal->BranchTree.First; branch; branch = branch->Next)
 	{
 		if (!branch->SyntheticStart &&
@@ -4020,8 +4819,16 @@ NTSTATUS CdpJournalPruneUnreachableForCompaction(
 			!CdpBranchTreeLatestPathLimit(
 				&Journal->BranchTree, branch, NULL))
 		{
-			CdpBranchTreeMarkPruneSubtree(branch);
-			haveBranchToPrune = TRUE;
+			BOOLEAN hasContinuation = FALSE;
+			status = CdpJournalBranchHasContinuationAfterLocked(
+				Journal, branch, EndSequence, &hasContinuation);
+			if (!NT_SUCCESS(status))
+				goto cleanup;
+			if (!hasContinuation)
+			{
+				CdpBranchTreeMarkPruneSubtree(branch);
+				haveBranchToPrune = TRUE;
+			}
 		}
 	}
 
@@ -4048,8 +4855,7 @@ NTSTATUS CdpJournalPruneUnreachableForCompaction(
 						&Journal->BranchTree,
 						branch->InheritedRecordSequence,
 						FirstSequence,
-						EndSequence,
-						containsInheritancePoint))
+						EndSequence))
 				{
 					CdpBranchTreeMarkPruneSubtree(branch);
 					haveBranchToPrune = TRUE;
@@ -4120,36 +4926,25 @@ NTSTATUS CdpJournalPruneUnreachableForCompaction(
 			if (CdpJournalHeaderIsDeleted(&header))
 				continue;
 			globalSequence = link.StartSequence + index;
+			/* A branch that still has a reconstructible inheritance point stays
+			 * wholly valid.  In particular, do not discard its post-fork tail
+			 * merely because the current branch selected an earlier child fork:
+			 * callers may still preview it or create another branch from it. */
 			if (CdpJournalHeaderIsBranch(&header))
 			{
 				Cdp_JOURNAL_BRANCH_RECORD_HEADER branchHeader;
-				UINT64 allowedSequence = MAXUINT64;
-				BOOLEAN onLatestPath;
 				RtlCopyMemory(&branchHeader, &header, sizeof(branchHeader));
 				recordBranch = CdpBranchTreeFind(
 					&Journal->BranchTree, branchHeader.BranchNumber);
-				onLatestPath = CdpBranchTreeLatestPathLimit(
-					&Journal->BranchTree, recordBranch, &allowedSequence);
 				deleteRecord = recordBranch &&
-					(recordBranch->PrunePending ||
-					 (CdpJournalBranchHeaderIsContinuation(&branchHeader) &&
-					  containsInheritancePoint && onLatestPath &&
-					  globalSequence > allowedSequence));
+					recordBranch->PrunePending;
 			}
 			else
 			{
-				UINT64 allowedSequence = MAXUINT64;
-				BOOLEAN onLatestPath;
 				recordBranch = CdpBranchTreeFindBySequence(
 					&Journal->BranchTree, globalSequence);
-				onLatestPath = CdpBranchTreeLatestPathLimit(
-					&Journal->BranchTree,
-					recordBranch,
-					&allowedSequence);
 				deleteRecord = recordBranch &&
-					(recordBranch->PrunePending ||
-					 (containsInheritancePoint && onLatestPath &&
-					  globalSequence > allowedSequence));
+					recordBranch->PrunePending;
 			}
 			if (!deleteRecord)
 				continue;
@@ -5093,6 +5888,227 @@ NTSTATUS CdpPreviewTreePunchRange(
 	return CdpPreviewTreeRemoveRangeInPlace(Tree, VolumeOffset, cutEnd);
 }
 
+static PCdp_PREVIEW_TREE_NODE CdpPreviewTreeFindSequenceOverlap(
+	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
+	_In_ UINT64 ExpectedSequence,
+	_In_ UINT64 QueryStart,
+	_In_ UINT64 QueryEnd)
+{
+	PCdp_PREVIEW_TREE_NODE found;
+
+	if (!Node || Node->MaxEnd <= QueryStart)
+		return NULL;
+	found = CdpPreviewTreeFindSequenceOverlap(
+		Node->Left, ExpectedSequence, QueryStart, QueryEnd);
+	if (found)
+		return found;
+	if (!Node->Invalid && Node->Sequence == ExpectedSequence &&
+		Node->Start < QueryEnd && Node->End > QueryStart)
+		return Node;
+	if (Node->Start < QueryEnd)
+		return CdpPreviewTreeFindSequenceOverlap(
+			Node->Right, ExpectedSequence, QueryStart, QueryEnd);
+	return NULL;
+}
+
+NTSTATUS CdpPreviewTreeRemapSequenceRange(
+	_Inout_ PCdp_PREVIEW_TREE Tree,
+	_In_ UINT64 ExpectedSequence,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_In_ UINT64 NewFileOffset)
+{
+	UINT64 remapEnd;
+	UINT64 cursor;
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Tree || DataLength == 0 ||
+		VolumeOffset > MAXUINT64 - DataLength)
+		return STATUS_INVALID_PARAMETER;
+	remapEnd = VolumeOffset + DataLength;
+	cursor = VolumeOffset;
+	while (cursor < remapEnd)
+	{
+		PCdp_PREVIEW_TREE_NODE overlap = CdpPreviewTreeFindSequenceOverlap(
+			Tree->Root, ExpectedSequence, cursor, remapEnd);
+		Cdp_JOURNAL_RECORD saved;
+		Cdp_JOURNAL_RECORD fragment;
+		UINT64 mappedStart;
+		UINT64 mappedEnd;
+		BOOLEAN removed = FALSE;
+
+		if (!overlap)
+			break;
+		RtlZeroMemory(&saved, sizeof(saved));
+		saved.WallClock100ns = overlap->WallClock100ns;
+		saved.VolumeOffset = overlap->Start;
+		saved.FileOffset = overlap->FileOffset;
+		saved.DataLength = overlap->DataLength;
+		saved.Sequence = overlap->Sequence;
+		mappedStart = saved.VolumeOffset > VolumeOffset ?
+			saved.VolumeOffset : VolumeOffset;
+		mappedEnd = saved.VolumeOffset + saved.DataLength < remapEnd ?
+			saved.VolumeOffset + saved.DataLength : remapEnd;
+		if (mappedStart == saved.VolumeOffset &&
+			mappedEnd == saved.VolumeOffset + saved.DataLength)
+		{
+			overlap->FileOffset = NewFileOffset +
+				(mappedStart - VolumeOffset);
+			cursor = mappedEnd;
+			continue;
+		}
+
+		Tree->Root = CdpPreviewTreeAvlDeleteByStart(
+			Tree->Root, saved.VolumeOffset, &removed);
+		if (!removed)
+			return STATUS_DISK_CORRUPT_ERROR;
+		Tree->NodeCount--;
+		if (saved.VolumeOffset < mappedStart)
+		{
+			fragment = saved;
+			fragment.DataLength = (ULONG)(mappedStart - saved.VolumeOffset);
+			status = CdpPreviewTreeInsertRaw(Tree, &fragment);
+			if (!NT_SUCCESS(status))
+				return status;
+		}
+		fragment = saved;
+		fragment.VolumeOffset = mappedStart;
+		fragment.FileOffset = NewFileOffset + (mappedStart - VolumeOffset);
+		fragment.DataLength = (ULONG)(mappedEnd - mappedStart);
+		status = CdpPreviewTreeInsertRaw(Tree, &fragment);
+		if (!NT_SUCCESS(status))
+			return status;
+		if (mappedEnd < saved.VolumeOffset + saved.DataLength)
+		{
+			fragment = saved;
+			fragment.VolumeOffset = mappedEnd;
+			fragment.FileOffset = saved.FileOffset +
+				(mappedEnd - saved.VolumeOffset);
+			fragment.DataLength = (ULONG)(saved.VolumeOffset +
+				saved.DataLength - mappedEnd);
+			status = CdpPreviewTreeInsertRaw(Tree, &fragment);
+			if (!NT_SUCCESS(status))
+				return status;
+		}
+		cursor = mappedEnd;
+	}
+	return status;
+}
+
+static PCdp_PREVIEW_TREE_NODE CdpPreviewTreeFindPayloadOverlap(
+	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
+	_In_ UINT64 QueryStart,
+	_In_ UINT64 QueryEnd,
+	_In_ UINT64 ExpectedFileOffset,
+	_In_ UINT64 BaseVolumeOffset)
+{
+	PCdp_PREVIEW_TREE_NODE found;
+	UINT64 overlapStart;
+
+	if (!Node || Node->MaxEnd <= QueryStart)
+		return NULL;
+	found = CdpPreviewTreeFindPayloadOverlap(
+		Node->Left, QueryStart, QueryEnd,
+		ExpectedFileOffset, BaseVolumeOffset);
+	if (found)
+		return found;
+	if (!Node->Invalid && Node->Start < QueryEnd && Node->End > QueryStart)
+	{
+		overlapStart = Node->Start > QueryStart ? Node->Start : QueryStart;
+		if (Node->FileOffset + (overlapStart - Node->Start) ==
+			ExpectedFileOffset + (overlapStart - BaseVolumeOffset))
+			return Node;
+	}
+	if (Node->Start < QueryEnd)
+		return CdpPreviewTreeFindPayloadOverlap(
+			Node->Right, QueryStart, QueryEnd,
+			ExpectedFileOffset, BaseVolumeOffset);
+	return NULL;
+}
+
+NTSTATUS CdpPreviewTreeRemapPayloadRange(
+	_Inout_ PCdp_PREVIEW_TREE Tree,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_In_ UINT64 ExpectedFileOffset,
+	_In_ UINT64 NewFileOffset)
+{
+	UINT64 remapEnd;
+	UINT64 cursor;
+
+	if (!Tree || DataLength == 0 ||
+		VolumeOffset > MAXUINT64 - DataLength)
+		return STATUS_INVALID_PARAMETER;
+	remapEnd = VolumeOffset + DataLength;
+	cursor = VolumeOffset;
+	while (cursor < remapEnd)
+	{
+		PCdp_PREVIEW_TREE_NODE overlap = CdpPreviewTreeFindPayloadOverlap(
+			Tree->Root, cursor, remapEnd,
+			ExpectedFileOffset, VolumeOffset);
+		Cdp_JOURNAL_RECORD saved;
+		Cdp_JOURNAL_RECORD fragment;
+		UINT64 mappedStart;
+		UINT64 mappedEnd;
+		BOOLEAN removed = FALSE;
+		NTSTATUS status;
+
+		if (!overlap)
+			break;
+		RtlZeroMemory(&saved, sizeof(saved));
+		saved.WallClock100ns = overlap->WallClock100ns;
+		saved.VolumeOffset = overlap->Start;
+		saved.FileOffset = overlap->FileOffset;
+		saved.DataLength = overlap->DataLength;
+		saved.Sequence = overlap->Sequence;
+		mappedStart = saved.VolumeOffset > cursor ? saved.VolumeOffset : cursor;
+		mappedEnd = saved.VolumeOffset + saved.DataLength < remapEnd ?
+			saved.VolumeOffset + saved.DataLength : remapEnd;
+		if (mappedStart == saved.VolumeOffset &&
+			mappedEnd == saved.VolumeOffset + saved.DataLength)
+		{
+			overlap->FileOffset = NewFileOffset +
+				(mappedStart - VolumeOffset);
+			cursor = mappedEnd;
+			continue;
+		}
+		Tree->Root = CdpPreviewTreeAvlDeleteByStart(
+			Tree->Root, saved.VolumeOffset, &removed);
+		if (!removed)
+			return STATUS_DISK_CORRUPT_ERROR;
+		Tree->NodeCount--;
+		if (saved.VolumeOffset < mappedStart)
+		{
+			fragment = saved;
+			fragment.DataLength = (ULONG)(mappedStart - saved.VolumeOffset);
+			status = CdpPreviewTreeInsertRaw(Tree, &fragment);
+			if (!NT_SUCCESS(status))
+				return status;
+		}
+		fragment = saved;
+		fragment.VolumeOffset = mappedStart;
+		fragment.FileOffset = NewFileOffset + (mappedStart - VolumeOffset);
+		fragment.DataLength = (ULONG)(mappedEnd - mappedStart);
+		status = CdpPreviewTreeInsertRaw(Tree, &fragment);
+		if (!NT_SUCCESS(status))
+			return status;
+		if (mappedEnd < saved.VolumeOffset + saved.DataLength)
+		{
+			fragment = saved;
+			fragment.VolumeOffset = mappedEnd;
+			fragment.FileOffset = saved.FileOffset +
+				(mappedEnd - saved.VolumeOffset);
+			fragment.DataLength = (ULONG)(saved.VolumeOffset +
+				saved.DataLength - mappedEnd);
+			status = CdpPreviewTreeInsertRaw(Tree, &fragment);
+			if (!NT_SUCCESS(status))
+				return status;
+		}
+		cursor = mappedEnd;
+	}
+	return STATUS_SUCCESS;
+}
+
 BOOLEAN CdpPreviewTreeValidateMapping(
 	_In_ PCdp_PREVIEW_TREE Tree,
 	_In_ UINT64 VolumeOffset,
@@ -5340,6 +6356,25 @@ static NTSTATUS CdpJournalBuildCurrentBranchTreeInternal(
 
 	if (!ancestryComplete)
 		status = STATUS_DISK_CORRUPT_ERROR;
+	if (NT_SUCCESS(status) && !RestrictSequenceRange)
+	{
+		PCdp_RUNTIME_CHECKPOINT checkpoint;
+		for (checkpoint = Journal->CheckpointFirst;
+			checkpoint;
+			checkpoint = checkpoint->Next)
+		{
+			Cdp_JOURNAL_RECORD record;
+			RtlZeroMemory(&record, sizeof(record));
+			record.VolumeOffset = checkpoint->VolumeOffset;
+			record.FileOffset = checkpoint->FileOffset;
+			record.DataLength = checkpoint->DataLength;
+			// Sequence zero is the runtime checkpoint baseline.  Existing
+			// retained journal nodes already in Tree keep priority.
+			status = CdpPreviewTreeInsert(Tree, &record);
+			if (!NT_SUCCESS(status))
+				break;
+		}
+	}
 
 cleanup_locked:
 	Cdp_LOCK_RELEASE(&Journal->Lock);
@@ -5603,6 +6638,22 @@ NTSTATUS CdpJournalBuildPreviewTree(
 	status = CdpJournalGetHeaderScanBufferLocked(Journal, &region);
 	if (!NT_SUCCESS(status))
 		goto cleanup_locked;
+	{
+		PCdp_RUNTIME_CHECKPOINT checkpoint;
+		for (checkpoint = Journal->CheckpointFirst;
+			checkpoint;
+			checkpoint = checkpoint->Next)
+		{
+			Cdp_JOURNAL_RECORD record;
+			RtlZeroMemory(&record, sizeof(record));
+			record.VolumeOffset = checkpoint->VolumeOffset;
+			record.FileOffset = checkpoint->FileOffset;
+			record.DataLength = checkpoint->DataLength;
+			status = CdpPreviewTreeOverlayLatest(Tree, &record);
+			if (!NT_SUCCESS(status))
+				goto cleanup_locked;
+		}
+	}
 
 	// One chronological pass over the explicit root-to-target branch path.
 	// Each ancestor stops at the next child's inheritance point.  The target
@@ -5983,6 +7034,7 @@ VOID CdpJournalClose(_Inout_ PCdp_JOURNAL Journal)
 	Journal->HeaderWriteBuffer = NULL;
 	Journal->HeaderWriteCacheValid = FALSE;
 	Journal->HeaderWriteCacheDirty = FALSE;
+	CdpJournalFreeRuntimeCheckpointsLocked(Journal);
 	CdpBranchTreeFree(&Journal->BranchTree);
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	Cdp_LOCK_DELETE(&Journal->Lock);

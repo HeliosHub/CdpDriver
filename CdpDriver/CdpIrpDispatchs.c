@@ -3503,6 +3503,8 @@ static NTSTATUS CdpDeleteRestorePoint(
 	}
 	status = CdpCoreCancelPersistentRestoreBoot(sourceExt->Core);
 	if (NT_SUCCESS(status))
+		status = CdpCoreMaterializeRuntimeCheckpoints(sourceExt->Core);
+	if (NT_SUCCESS(status))
 		status = CdpJournalClearRestorePoint(&journalEntry->Journal);
 	CdpReleaseVolumeHandleEntry(journalEntry);
 
@@ -3587,6 +3589,18 @@ static NTSTATUS CdpQueryTimeRange(
 		&Reply->OldestRecord100ns,
 		&Reply->NewestRecord100ns);
 	CdpReleaseVolumeHandleEntry(journalEntry);
+	// Command 9 presents local time only to whole seconds.  Returning the raw
+	// newest record time would round it down when copied back as a FILETIME,
+	// excluding a record written later in that same second.  Publish an
+	// exclusive upper bound instead; Core/recovery paths retain their exact
+	// newest timestamp and are intentionally unaffected.
+	if (Reply->NewestRecord100ns != 0)
+	{
+		if (Reply->NewestRecord100ns <= MAXUINT64 - 10000000ULL)
+			Reply->NewestRecord100ns += 10000000ULL;
+		else
+			Reply->NewestRecord100ns = MAXUINT64;
+	}
 	Reply->HasRecords =
 		Reply->OldestRecord100ns != 0 && Reply->NewestRecord100ns != 0;
 	return STATUS_SUCCESS;
@@ -3654,6 +3668,78 @@ static NTSTATUS CdpQueryJournalRecords(
 		Request->StartIndex,
 		Request->ExpectedGeneration,
 		records,
+		RecordCapacity,
+		&Reply->TotalRecords,
+		&Reply->Generation,
+		&Reply->RecordCount);
+}
+
+static NTSTATUS CdpQueryRuntimeCheckpoints(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ const Cdp_RUNTIME_CHECKPOINT_QUERY_REQUEST* Request,
+	_Out_ PCdp_RUNTIME_CHECKPOINT_QUERY_REPLY Reply,
+	_In_ ULONG CheckpointCapacity)
+{
+	PCdp_DEVICE_EXTENSION sourceExt;
+	PCdp_RUNTIME_CHECKPOINT_INFO infos;
+
+	C_ASSERT(sizeof(Cdp_RUNTIME_CHECKPOINT_INFO) ==
+		sizeof(Cdp_RUNTIME_CHECKPOINT_TREE_INFO));
+	RtlZeroMemory(Reply, sizeof(*Reply));
+	sourceExt = CdpFindSourceExtensionByGuid(
+		DriverExt, &Request->SourceVolumeGuid);
+	if (!sourceExt)
+		return STATUS_DEVICE_DOES_NOT_EXIST;
+	if (InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) == 0 ||
+		!sourceExt->Core)
+		return STATUS_DEVICE_NOT_READY;
+	if (CheckpointCapacity > Request->MaxCheckpoints)
+		CheckpointCapacity = Request->MaxCheckpoints;
+	if (CheckpointCapacity > Cdp_CHECKPOINT_QUERY_MAX_PER_CALL)
+		CheckpointCapacity = Cdp_CHECKPOINT_QUERY_MAX_PER_CALL;
+	infos = (PCdp_RUNTIME_CHECKPOINT_INFO)(Reply + 1);
+	return CdpCoreQueryRuntimeCheckpointInfos(
+		sourceExt->Core,
+		Request->StartIndex,
+		Request->ExpectedGeneration,
+		(PCdp_RUNTIME_CHECKPOINT_TREE_INFO)infos,
+		CheckpointCapacity,
+		&Reply->TotalCheckpoints,
+		&Reply->Generation,
+		&Reply->CheckpointCount);
+}
+
+static NTSTATUS CdpQueryRuntimeCheckpointRecords(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ const Cdp_CHECKPOINT_RECORD_QUERY_REQUEST* Request,
+	_Out_ PCdp_CHECKPOINT_RECORD_QUERY_REPLY Reply,
+	_In_ ULONG RecordCapacity)
+{
+	PCdp_DEVICE_EXTENSION sourceExt;
+	PCdp_CHECKPOINT_RECORD_INFO records;
+
+	C_ASSERT(sizeof(Cdp_CHECKPOINT_RECORD_INFO) ==
+		sizeof(Cdp_RUNTIME_CHECKPOINT_RECORD_TREE_INFO));
+	RtlZeroMemory(Reply, sizeof(*Reply));
+	Reply->CheckpointId = Request->CheckpointId;
+	sourceExt = CdpFindSourceExtensionByGuid(
+		DriverExt, &Request->SourceVolumeGuid);
+	if (!sourceExt)
+		return STATUS_DEVICE_DOES_NOT_EXIST;
+	if (InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) == 0 ||
+		!sourceExt->Core)
+		return STATUS_DEVICE_NOT_READY;
+	if (RecordCapacity > Request->MaxRecords)
+		RecordCapacity = Request->MaxRecords;
+	if (RecordCapacity > Cdp_CHECKPOINT_RECORD_QUERY_MAX_PER_CALL)
+		RecordCapacity = Cdp_CHECKPOINT_RECORD_QUERY_MAX_PER_CALL;
+	records = (PCdp_CHECKPOINT_RECORD_INFO)(Reply + 1);
+	return CdpCoreQueryRuntimeCheckpointRecords(
+		sourceExt->Core,
+		Request->CheckpointId,
+		Request->StartIndex,
+		Request->ExpectedGeneration,
+		(PCdp_RUNTIME_CHECKPOINT_RECORD_TREE_INFO)records,
 		RecordCapacity,
 		&Reply->TotalRecords,
 		&Reply->Generation,
@@ -4612,13 +4698,16 @@ static VOID CdpMergeWorker(_In_ PVOID Context)
 	BOOLEAN coreMergeActive = FALSE;
 	BOOLEAN ignoreUsageThreshold = InterlockedExchange(
 		&devExt->MergeIgnoreUsageThreshold, 0) != 0;
+	BOOLEAN restorePointMode = devExt->RedirectJournalEntry &&
+		devExt->RedirectJournalEntry->Journal.RestorePointSet;
 
 	status = CdpCoreSetMergeActive(devExt->Core, TRUE);
 	if (!NT_SUCCESS(status))
 		goto done;
 	coreMergeActive = TRUE;
-	Cdp_LOG("[MERGE] start mode=%s source=%p disk=%lu part=%lu threshold=%s\n",
+	Cdp_LOG("[MERGE] start mode=%s strategy=%s source=%p disk=%lu part=%lu threshold=%s\n",
 		ignoreUsageThreshold ? "manual" : "automatic",
+		restorePointMode ? "runtime-checkpoint" : "source-materialize",
 		devExt,
 		devExt->DiskNumber,
 		devExt->PartitionNumber,
@@ -4641,14 +4730,24 @@ static VOID CdpMergeWorker(_In_ PVOID Context)
 			if (!NT_SUCCESS(status) || !atLeast)
 				break;
 		}
-		KeWaitForSingleObject(
-			&devExt->HistoryMutex,
-			Executive,
-			KernelMode,
-			FALSE,
-			NULL);
-		status = CdpCoreCompactOldestRegion(devExt->Core);
-		KeReleaseMutex(&devExt->HistoryMutex, FALSE);
+		if (restorePointMode)
+		{
+			// Checkpoint construction performs long payload I/O without holding
+			// HistoryMutex. Core.TreeLock serializes only the short MetaTree
+			// remap/final RR switch, so protected reads and appends can continue.
+			status = CdpCoreCheckpointOldestRegion(devExt->Core);
+		}
+		else
+		{
+			KeWaitForSingleObject(
+				&devExt->HistoryMutex,
+				Executive,
+				KernelMode,
+				FALSE,
+				NULL);
+			status = CdpCoreCompactOldestRegion(devExt->Core);
+			KeReleaseMutex(&devExt->HistoryMutex, FALSE);
+		}
 		if (CdpCoreConsumePreviewStoppedByMerge(devExt->Core))
 			CdpStopPreviewSessionForSource(driverExt, devExt);
 		if (status == STATUS_NOT_FOUND)
@@ -4663,13 +4762,14 @@ static VOID CdpMergeWorker(_In_ PVOID Context)
 				ignoreUsageThreshold ? "manual" : "automatic", status);
 			break;
 		}
-		Cdp_LOG("[MERGE] oldest header region materialized and deleted mode=%s\n",
-			ignoreUsageThreshold ? "manual" : "automatic");
+		Cdp_LOG("[MERGE] oldest header region completed mode=%s strategy=%s\n",
+			ignoreUsageThreshold ? "manual" : "automatic",
+			restorePointMode ? "runtime-checkpoint" : "source-materialize");
 		/* A manual request may cause Core to reclaim contiguous tombstoned RRs
 		 * for newly invalid branches in this same pass.  Do not use manual mode
 		 * to advance into the next ordinary oldest RR; that is space-driven work
 		 * and remains the automatic merge thread's responsibility. */
-		if (ignoreUsageThreshold)
+		if (ignoreUsageThreshold || restorePointMode)
 			break;
 	}
 
@@ -4785,14 +4885,6 @@ static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 		threshold = 95;
 	else
 		return;
-	/* The source contains the persistent restore baseline. Compaction would
-	 * overwrite it with newer after-images and make the next boot unable to
-	 * return to the selected point. */
-	if (DevExt->RedirectJournalEntry &&
-		DevExt->RedirectJournalEntry->Journal.RestorePointSet)
-	{
-		return;
-	}
 	status = CdpCoreJournalUsageAtLeast(DevExt->Core, threshold, &atLeast);
 	if (!NT_SUCCESS(status))
 	{
@@ -4835,15 +4927,13 @@ static NTSTATUS CdpStartManualMerge(
 	{
 		return STATUS_INVALID_DEVICE_STATE;
 	}
-	if (sourceExt->RedirectJournalEntry &&
-		sourceExt->RedirectJournalEntry->Journal.RestorePointSet)
-	{
-		return STATUS_INVALID_DEVICE_STATE;
-	}
 	status = CdpStartMergeThread(sourceExt, TRUE);
 	if (NT_SUCCESS(status))
 	{
-		Cdp_LOG("[MERGE] manual branch-followup request accepted source=%p disk=%lu part=%lu\n",
+		Cdp_LOG("[MERGE] manual request accepted strategy=%s source=%p disk=%lu part=%lu\n",
+			sourceExt->RedirectJournalEntry &&
+				sourceExt->RedirectJournalEntry->Journal.RestorePointSet ?
+				"runtime-checkpoint" : "source-materialize",
 			sourceExt, sourceExt->DiskNumber, sourceExt->PartitionNumber);
 	}
 	return status;
@@ -7233,6 +7323,78 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 						(ULONG_PTR)reply->RecordCount *
 							sizeof(Cdp_JOURNAL_RECORD_INFO) :
 					0);
+		}
+
+		case IOCTL_Cdp_QUERY_RUNTIME_CHECKPOINTS:
+		{
+			Cdp_RUNTIME_CHECKPOINT_QUERY_REQUEST request;
+			PCdp_RUNTIME_CHECKPOINT_QUERY_REPLY reply;
+			ULONG inLen =
+				IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+			ULONG outLen =
+				IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
+			ULONG checkpointCapacity;
+			NTSTATUS status;
+
+			if (!DriverExt || !Irp->AssociatedIrp.SystemBuffer ||
+				inLen < sizeof(request) ||
+				outLen < sizeof(Cdp_RUNTIME_CHECKPOINT_QUERY_REPLY))
+			{
+				return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+			}
+			request = *(PCdp_RUNTIME_CHECKPOINT_QUERY_REQUEST)
+				Irp->AssociatedIrp.SystemBuffer;
+			if (!CdpControlHandleAuthorized(
+				Irp, DriverExt, &request.SourceVolumeGuid))
+				return CdpCompleteIrp(Irp, STATUS_ACCESS_DENIED, 0);
+			reply = (PCdp_RUNTIME_CHECKPOINT_QUERY_REPLY)
+				Irp->AssociatedIrp.SystemBuffer;
+			checkpointCapacity = (outLen - sizeof(*reply)) /
+				sizeof(Cdp_RUNTIME_CHECKPOINT_INFO);
+			status = CdpQueryRuntimeCheckpoints(
+				DriverExt, &request, reply, checkpointCapacity);
+			return CdpCompleteIrp(
+				Irp,
+				status,
+				NT_SUCCESS(status) ? sizeof(*reply) +
+					(ULONG_PTR)reply->CheckpointCount *
+						sizeof(Cdp_RUNTIME_CHECKPOINT_INFO) : 0);
+		}
+
+		case IOCTL_Cdp_QUERY_CHECKPOINT_RECORDS:
+		{
+			Cdp_CHECKPOINT_RECORD_QUERY_REQUEST request;
+			PCdp_CHECKPOINT_RECORD_QUERY_REPLY reply;
+			ULONG inLen =
+				IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+			ULONG outLen =
+				IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
+			ULONG recordCapacity;
+			NTSTATUS status;
+
+			if (!DriverExt || !Irp->AssociatedIrp.SystemBuffer ||
+				inLen < sizeof(request) ||
+				outLen < sizeof(Cdp_CHECKPOINT_RECORD_QUERY_REPLY))
+			{
+				return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+			}
+			request = *(PCdp_CHECKPOINT_RECORD_QUERY_REQUEST)
+				Irp->AssociatedIrp.SystemBuffer;
+			if (!CdpControlHandleAuthorized(
+				Irp, DriverExt, &request.SourceVolumeGuid))
+				return CdpCompleteIrp(Irp, STATUS_ACCESS_DENIED, 0);
+			reply = (PCdp_CHECKPOINT_RECORD_QUERY_REPLY)
+				Irp->AssociatedIrp.SystemBuffer;
+			recordCapacity = (outLen - sizeof(*reply)) /
+				sizeof(Cdp_CHECKPOINT_RECORD_INFO);
+			status = CdpQueryRuntimeCheckpointRecords(
+				DriverExt, &request, reply, recordCapacity);
+			return CdpCompleteIrp(
+				Irp,
+				status,
+				NT_SUCCESS(status) ? sizeof(*reply) +
+					(ULONG_PTR)reply->RecordCount *
+						sizeof(Cdp_CHECKPOINT_RECORD_INFO) : 0);
 		}
 
 		case IOCTL_Cdp_QUERY_JOURNAL_BRANCHES:

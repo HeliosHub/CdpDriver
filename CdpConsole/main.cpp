@@ -1179,6 +1179,220 @@ static BOOL DoListJournalRecords(HANDLE hDevice)
 	return TRUE;
 }
 
+static BOOL DoListRuntimeCheckpoints(HANDLE hDevice)
+{
+	const ULONG batchSize = Cdp_CHECKPOINT_QUERY_MAX_PER_CALL;
+	const SIZE_T bufferSize = sizeof(Cdp_RUNTIME_CHECKPOINT_QUERY_REPLY) +
+		(SIZE_T)batchSize * sizeof(Cdp_RUNTIME_CHECKPOINT_INFO);
+	Cdp_RUNTIME_CHECKPOINT_QUERY_REQUEST req = { 0 };
+	BYTE* buffer;
+	UINT64 nextIndex = 0;
+	UINT64 generation = 0;
+	UINT64 totalCheckpoints = 0;
+	DWORD bytesReturned;
+	BOOL firstPage = TRUE;
+
+	ListVolumes();
+	if (!PromptGuid(L"Protected source volume GUID: ", &req.SourceVolumeGuid))
+		return FALSE;
+	if (!AuthenticatePassword(hDevice))
+		return FALSE;
+	buffer = (BYTE*)malloc(bufferSize);
+	if (!buffer)
+	{
+		ConOut(L"Unable to allocate checkpoint-list buffer.\n");
+		return FALSE;
+	}
+
+	for (;;)
+	{
+		PCdp_RUNTIME_CHECKPOINT_QUERY_REPLY reply;
+		PCdp_RUNTIME_CHECKPOINT_INFO infos;
+		ULONG i;
+
+		req.StartIndex = nextIndex;
+		req.ExpectedGeneration = generation;
+		req.MaxCheckpoints = batchSize;
+		req.Reserved = 0;
+		bytesReturned = 0;
+		if (!DeviceIoControl(
+			hDevice, IOCTL_Cdp_QUERY_RUNTIME_CHECKPOINTS,
+			&req, sizeof(req), buffer, (DWORD)bufferSize,
+			&bytesReturned, NULL))
+		{
+			DWORD err = GetLastError();
+			ConOut(err == ERROR_RETRY ?
+				L"Checkpoints changed while listing; run k again.\n" :
+				L"List runtime checkpoints failed.\n");
+			if (err != ERROR_RETRY)
+				ConOutFmt(L"Win32 error=%lu.\n", err);
+			free(buffer);
+			return FALSE;
+		}
+		reply = (PCdp_RUNTIME_CHECKPOINT_QUERY_REPLY)buffer;
+		if (bytesReturned < sizeof(*reply) ||
+			reply->CheckpointCount > batchSize ||
+			bytesReturned < sizeof(*reply) +
+				reply->CheckpointCount * sizeof(Cdp_RUNTIME_CHECKPOINT_INFO))
+		{
+			ConOut(L"Driver returned an invalid checkpoint-list reply.\n");
+			free(buffer);
+			return FALSE;
+		}
+		if (firstPage)
+		{
+			totalCheckpoints = reply->TotalCheckpoints;
+			generation = reply->Generation;
+			ConOutFmt(L"Runtime checkpoints: %llu checkpoint(s), oldest first\n",
+				totalCheckpoints);
+			ConOut(L"Id  SourceRR  SequenceRange  Records  DataBytes  AllocatedBytes\n");
+			firstPage = FALSE;
+		}
+		else if (reply->TotalCheckpoints != totalCheckpoints ||
+			reply->Generation != generation)
+		{
+			ConOut(L"Checkpoints changed while listing; run k again.\n");
+			free(buffer);
+			return FALSE;
+		}
+		infos = (PCdp_RUNTIME_CHECKPOINT_INFO)(reply + 1);
+		for (i = 0; i < reply->CheckpointCount; ++i)
+		{
+			ConOutFmt(L"%llu  0x%llX  [%llu,%llu)  %lu  %llu  %llu\n",
+				infos[i].CheckpointId,
+				infos[i].SourceRegionOffset,
+				infos[i].SourceFirstSequence,
+				infos[i].SourceEndSequence,
+				infos[i].RecordCount,
+				infos[i].DataBytes,
+				infos[i].AllocatedBytes);
+		}
+		nextIndex += reply->CheckpointCount;
+		if (nextIndex >= totalCheckpoints)
+			break;
+		if (reply->CheckpointCount == 0)
+		{
+			ConOut(L"Driver returned an incomplete checkpoint-list page.\n");
+			free(buffer);
+			return FALSE;
+		}
+	}
+	free(buffer);
+	return TRUE;
+}
+
+static BOOL DoListCheckpointRecords(HANDLE hDevice)
+{
+	const ULONG batchSize = Cdp_CHECKPOINT_RECORD_QUERY_MAX_PER_CALL;
+	const SIZE_T bufferSize = sizeof(Cdp_CHECKPOINT_RECORD_QUERY_REPLY) +
+		(SIZE_T)batchSize * sizeof(Cdp_CHECKPOINT_RECORD_INFO);
+	Cdp_CHECKPOINT_RECORD_QUERY_REQUEST req = { 0 };
+	wchar_t line[64];
+	BYTE* buffer;
+	UINT64 nextIndex = 0;
+	UINT64 generation = 0;
+	UINT64 totalRecords = 0;
+	DWORD bytesReturned;
+	BOOL firstPage = TRUE;
+
+	ListVolumes();
+	if (!PromptGuid(L"Protected source volume GUID: ", &req.SourceVolumeGuid))
+		return FALSE;
+	ConOut(L"CheckpointId: ");
+	if (!ReadLine(line, _countof(line)))
+		return FALSE;
+	req.CheckpointId = _wcstoui64(line, NULL, 0);
+	if (req.CheckpointId == 0)
+	{
+		ConOut(L"CheckpointId must be greater than zero.\n");
+		return FALSE;
+	}
+	if (!AuthenticatePassword(hDevice))
+		return FALSE;
+	buffer = (BYTE*)malloc(bufferSize);
+	if (!buffer)
+	{
+		ConOut(L"Unable to allocate checkpoint-record buffer.\n");
+		return FALSE;
+	}
+
+	for (;;)
+	{
+		PCdp_CHECKPOINT_RECORD_QUERY_REPLY reply;
+		PCdp_CHECKPOINT_RECORD_INFO records;
+		ULONG i;
+
+		req.StartIndex = nextIndex;
+		req.ExpectedGeneration = generation;
+		req.MaxRecords = batchSize;
+		req.Reserved = 0;
+		bytesReturned = 0;
+		if (!DeviceIoControl(
+			hDevice, IOCTL_Cdp_QUERY_CHECKPOINT_RECORDS,
+			&req, sizeof(req), buffer, (DWORD)bufferSize,
+			&bytesReturned, NULL))
+		{
+			DWORD err = GetLastError();
+			if (err == ERROR_RETRY)
+				ConOut(L"Checkpoint records changed while listing; run n again.\n");
+			else if (err == ERROR_NOT_FOUND || err == ERROR_FILE_NOT_FOUND)
+				ConOutFmt(L"Checkpoint %llu does not exist.\n", req.CheckpointId);
+			else
+				ConOutFmt(L"List checkpoint records failed (err=%lu).\n", err);
+			free(buffer);
+			return FALSE;
+		}
+		reply = (PCdp_CHECKPOINT_RECORD_QUERY_REPLY)buffer;
+		if (bytesReturned < sizeof(*reply) ||
+			reply->CheckpointId != req.CheckpointId ||
+			reply->RecordCount > batchSize ||
+			bytesReturned < sizeof(*reply) +
+				reply->RecordCount * sizeof(Cdp_CHECKPOINT_RECORD_INFO))
+		{
+			ConOut(L"Driver returned an invalid checkpoint-record reply.\n");
+			free(buffer);
+			return FALSE;
+		}
+		if (firstPage)
+		{
+			totalRecords = reply->TotalRecords;
+			generation = reply->Generation;
+			ConOutFmt(L"Checkpoint %llu: %llu record(s)\n",
+				req.CheckpointId, totalRecords);
+			ConOut(L"Index  VolumeOffset  JournalOffset  DataLength  AllocatedLength\n");
+			firstPage = FALSE;
+		}
+		else if (reply->TotalRecords != totalRecords ||
+			reply->Generation != generation)
+		{
+			ConOut(L"Checkpoint records changed while listing; run n again.\n");
+			free(buffer);
+			return FALSE;
+		}
+		records = (PCdp_CHECKPOINT_RECORD_INFO)(reply + 1);
+		for (i = 0; i < reply->RecordCount; ++i)
+		{
+			ConOutFmt(L"%llu  0x%llX  0x%llX  %lu  %lu\n",
+				records[i].RecordIndex,
+				records[i].VolumeOffset,
+				records[i].FileOffset,
+				records[i].DataLength,
+				records[i].AllocatedLength);
+		}
+		nextIndex += reply->RecordCount;
+		if (nextIndex >= totalRecords)
+			break;
+		if (reply->RecordCount == 0)
+		{
+			ConOut(L"Driver returned an incomplete checkpoint-record page.\n");
+			free(buffer);
+			return FALSE;
+		}
+	}
+	free(buffer);
+	return TRUE;
+}
+
 typedef struct _Cdp_CONSOLE_BRANCH_ENTRY
 {
 	Cdp_JOURNAL_BRANCH_INFO Info;
@@ -1518,6 +1732,8 @@ static void PrintHelp(void)
 	ConOut(L"  9  - query journal oldest/newest record time (source GUID)\n");
 	ConOut(L"  u  - query journal record payload usage/free space (source GUID)\n");
 	ConOut(L"  l  - list current journal record metadata (source GUID; no payload)\n");
+	ConOut(L"  k  - list all runtime checkpoint summaries (source GUID)\n");
+	ConOut(L"  n  - list every checkpoint record in one runtime checkpoint\n");
 	ConOut(L"  b  - print retained journal branch topology and inheritance points (source GUID)\n");
 	ConOut(L"  s  - query protect status (source GUID -> status + journal GUID)\n");
 	ConOut(L"  e  - switch to a recovery branch (source GUID + time; no writeback)\n");
@@ -1622,6 +1838,18 @@ int wmain(void)
 			hDevice = EnsureControlDevice(hDevice);
 			if (hDevice != INVALID_HANDLE_VALUE)
 				DoListJournalRecords(hDevice);
+			break;
+		case L'k':
+		case L'K':
+			hDevice = EnsureControlDevice(hDevice);
+			if (hDevice != INVALID_HANDLE_VALUE)
+				DoListRuntimeCheckpoints(hDevice);
+			break;
+		case L'n':
+		case L'N':
+			hDevice = EnsureControlDevice(hDevice);
+			if (hDevice != INVALID_HANDLE_VALUE)
+				DoListCheckpointRecords(hDevice);
 			break;
 		case L'b':
 		case L'B':

@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.6.8-test28"
-#define Cdp_DRIVER_BUILD_STRING   "20260827.115-restore-point-prune"
+#define Cdp_DRIVER_VERSION_STRING "1.6.8-test44"
+#define Cdp_DRIVER_BUILD_STRING   "20260827.131-query-time-range"
 
 // Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.
 // Cdp_DBG: Debug builds only — verbose I/O and path tracing.
