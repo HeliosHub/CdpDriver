@@ -148,6 +148,15 @@ NTSTATUS CdpCoreAppendAfterImageEx(
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord,
 	_Inout_opt_ PCdp_CORE_APPEND_PERF Perf);
 
+NTSTATUS CdpCoreAppendAfterImageExWithPayloadMdl(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_In_reads_bytes_(Length) const VOID* AfterImage,
+	_In_opt_ PVOID PayloadMdl,
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord,
+	_Inout_opt_ PCdp_CORE_APPEND_PERF Perf);
+
 // Graceful protection shutdown: materialize one current-view interval to the
 // source and punch it from MetaTree. Complete is TRUE when no coverage remains.
 typedef NTSTATUS (*Cdp_CORE_DRAIN_WRITE_ROUTINE)(

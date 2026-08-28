@@ -1027,12 +1027,13 @@ NTSTATUS CdpCoreMaterializeRuntimeCheckpoints(_Inout_ PCdp_CORE Core)
 NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
 {
 	Cdp_PREVIEW_TREE regionTree;
-	UINT64 regionOffset;
-	UINT64 firstSequence;
-	UINT64 endSequence;
+	UINT64 regionOffset = 0;
+	UINT64 firstSequence = 0;
+	UINT64 endSequence = 0;
 	NTSTATUS status;
 	BOOLEAN regionTreeInitialized = FALSE;
 	BOOLEAN previewTargetDeleted = FALSE;
+	PCSTR failureStage = "begin";
 
 	if (!Core)
 		return STATUS_INVALID_PARAMETER;
@@ -1047,6 +1048,7 @@ NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
 		status = STATUS_DEVICE_BUSY;
 		goto cleanup;
 	}
+	failureStage = "get-oldest-region";
 	status = CdpJournalGetOldestCompactableRegion(
 		Core->Journal, &regionOffset, &firstSequence, &endSequence);
 	if (!NT_SUCCESS(status))
@@ -1071,6 +1073,7 @@ NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
 		Core->PreviewStoppedByMerge = TRUE;
 	}
 
+	failureStage = "prune-unreachable";
 	status = CdpJournalPruneUnreachableForCompaction(
 		Core->Journal,
 		firstSequence,
@@ -1094,11 +1097,13 @@ NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
 	// regions deliberately do not suppress these values: the source becomes
 	// the complete base produced by this region, while newer MetaTree records
 	// continue to overlay it.
+	failureStage = "build-region-tree";
 	status = CdpJournalBuildCurrentBranchRegionTree(
 		Core->Journal, firstSequence, endSequence, &regionTree);
 	if (!NT_SUCCESS(status))
 		goto cleanup;
 	regionTreeInitialized = TRUE;
+	failureStage = "materialize-source";
 	status = CdpCoreMaterializeMetaNodes(
 		Core, regionTree.Root, firstSequence, endSequence);
 	if (!NT_SUCCESS(status))
@@ -1125,6 +1130,7 @@ NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
 			break;
 		start = node->Start;
 		length = node->DataLength;
+		failureStage = "punch-metatree";
 		status = CdpPreviewTreePunchRange(
 			&Core->MetaTree, start, length);
 		if (!NT_SUCCESS(status))
@@ -1150,6 +1156,7 @@ NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
 				break;
 			start = node->Start;
 			length = node->DataLength;
+			failureStage = "punch-preview-tree";
 			status = CdpPreviewTreePunchRange(
 				&Core->PreviewTree, start, length);
 			if (!NT_SUCCESS(status))
@@ -1159,11 +1166,13 @@ NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
 
 	// The source now contains every live value referenced by this region.
 	// Only after that point is its header/payload span made reclaimable.
+	failureStage = "delete-oldest-region";
 	status = CdpJournalDeleteOldestRegion(
 		Core->Journal, regionOffset);
 	if (NT_SUCCESS(status))
 	{
 		ULONG deletedTombstoneRegions = 0;
+		failureStage = "delete-tombstoned-regions";
 		status = CdpJournalDeleteContiguousTombstonedRegions(
 			Core->Journal, &deletedTombstoneRegions);
 		if (NT_SUCCESS(status))
@@ -1180,6 +1189,13 @@ NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
 	}
 
 cleanup:
+#ifndef Cdp_USERMODE
+	if (!NT_SUCCESS(status) && status != STATUS_NOT_FOUND)
+	{
+		Cdp_LOG("[MERGE] region failed stage=%s rrOffset=%llu sequence=[%llu,%llu) status=0x%08X\n",
+			failureStage, regionOffset, firstSequence, endSequence, status);
+	}
+#endif
 	if (regionTreeInitialized)
 		CdpPreviewTreeFree(&regionTree);
 	Cdp_LOCK_RELEASE(&Core->TreeLock);
@@ -1407,6 +1423,19 @@ NTSTATUS CdpCoreAppendAfterImageEx(
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord,
 	_Inout_opt_ PCdp_CORE_APPEND_PERF Perf)
 {
+	return CdpCoreAppendAfterImageExWithPayloadMdl(
+		Core, Offset, Length, AfterImage, NULL, WrittenRecord, Perf);
+}
+
+NTSTATUS CdpCoreAppendAfterImageExWithPayloadMdl(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_In_reads_bytes_(Length) const VOID* AfterImage,
+	_In_opt_ PVOID PayloadMdl,
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord,
+	_Inout_opt_ PCdp_CORE_APPEND_PERF Perf)
+{
 	NTSTATUS status;
 	Cdp_JOURNAL_RECORD record;
 	ULONG nodeCountBefore = 0;
@@ -1440,12 +1469,13 @@ NTSTATUS CdpCoreAppendAfterImageEx(
 		Cdp_LOCK_RELEASE(&Core->TreeLock);
 		return status;
 	}
-	status = CdpJournalAppendEx(
+	status = CdpJournalAppendExWithPayloadMdl(
 		Core->Journal,
 		Offset,
 		Length,
 		AfterImage,
 		0,
+		PayloadMdl,
 		&record,
 		Perf ? &Perf->Journal : NULL);
 	if (!NT_SUCCESS(status))

@@ -495,6 +495,18 @@ NTSTATUS CdpJournalAppendEx(
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord,
 	_Inout_opt_ PCdp_JOURNAL_APPEND_PERF Perf);
 
+// PayloadMdl is supplied only by the kernel write path. When non-NULL, the
+// payload write can reuse the already locked application MDL directly.
+NTSTATUS CdpJournalAppendExWithPayloadMdl(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_In_reads_bytes_(DataLength) const VOID* AfterImage,
+	_In_ ULONG RecordFlags,
+	_In_opt_ PVOID PayloadMdl,
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord,
+	_Inout_opt_ PCdp_JOURNAL_APPEND_PERF Perf);
+
 // Serialize a durability barrier with journal append transactions.
 NTSTATUS CdpJournalFlushBuffers(_Inout_ PCdp_JOURNAL Journal);
 

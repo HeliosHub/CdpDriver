@@ -44,6 +44,7 @@ static NTSTATUS CdpGetDirectWriteBuffer(
 	_In_ PIRP Irp,
 	_In_ ULONG RequiredLength,
 	_Outptr_result_bytebuffer_(RequiredLength) PUCHAR* Buffer,
+	_Outptr_result_maybenull_ PMDL* DirectMdl,
 	_Out_ PULONG MdlCount,
 	_Out_ PUINT64 MdlBytes);
 
@@ -5101,15 +5102,18 @@ static NTSTATUS CdpGetDirectWriteBuffer(
 	_In_ PIRP Irp,
 	_In_ ULONG RequiredLength,
 	_Outptr_result_bytebuffer_(RequiredLength) PUCHAR* Buffer,
+	_Outptr_result_maybenull_ PMDL* DirectMdl,
 	_Out_ PULONG MdlCount,
 	_Out_ PUINT64 MdlBytes)
 {
 	PMDL mdl;
 	PVOID mapped;
 
-	if (!Irp || !Buffer || !MdlCount || !MdlBytes || RequiredLength == 0)
+	if (!Irp || !Buffer || !DirectMdl || !MdlCount || !MdlBytes ||
+		RequiredLength == 0)
 		return STATUS_INVALID_PARAMETER;
 	*Buffer = NULL;
+	*DirectMdl = NULL;
 	*MdlCount = 0;
 	*MdlBytes = 0;
 
@@ -5124,6 +5128,7 @@ static NTSTATUS CdpGetDirectWriteBuffer(
 	if (!mapped)
 		return STATUS_INSUFFICIENT_RESOURCES;
 	*Buffer = (PUCHAR)mapped;
+	*DirectMdl = mdl;
 	return STATUS_SUCCESS;
 }
 
@@ -5250,6 +5255,7 @@ static NTSTATUS CdpRedirectJournalWrite(
 	PIO_STACK_LOCATION irpSp;
 	PUCHAR writeBuffer = NULL;
 	PUCHAR snapshot = NULL;
+	PMDL directMdl = NULL;
 	Cdp_JOURNAL_RECORD record;
 	ULONG writeLength;
 	ULONG chunkOffset;
@@ -5285,7 +5291,7 @@ static NTSTATUS CdpRedirectJournalWrite(
 	if (Timing)
 		Timing->MapBegin = KeQueryPerformanceCounter(NULL);
 	status = CdpGetDirectWriteBuffer(
-		Irp, writeLength, &writeBuffer, &mdlCount, &mdlBytes);
+		Irp, writeLength, &writeBuffer, &directMdl, &mdlCount, &mdlBytes);
 	if (status == STATUS_NOT_SUPPORTED)
 	{
 		if (Timing)
@@ -5293,6 +5299,7 @@ static NTSTATUS CdpRedirectJournalWrite(
 		status = CdpSnapshotWriteMdlChain(
 			Irp, writeLength, &snapshot, &mdlCount, &mdlBytes);
 		writeBuffer = snapshot;
+		directMdl = NULL;
 	}
 	if (Timing)
 		Timing->MapDone = KeQueryPerformanceCounter(NULL);
@@ -5323,11 +5330,12 @@ static NTSTATUS CdpRedirectJournalWrite(
 
 		if (chunkLength > Cdp_JOURNAL_MAX_RECORD_DATA)
 			chunkLength = Cdp_JOURNAL_MAX_RECORD_DATA;
-		status = CdpCoreAppendAfterImageEx(
+		status = CdpCoreAppendAfterImageExWithPayloadMdl(
 			SourceExt->Core,
 			chunkVolumeOffset,
 			chunkLength,
 			chunkData,
+			(chunkOffset == 0 && chunkLength == writeLength) ? directMdl : NULL,
 			&record,
 			Timing ? &Timing->CoreAppend : NULL);
 		if (!NT_SUCCESS(status))

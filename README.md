@@ -2,7 +2,7 @@
 
 CdpDriver 是一个同时工作在 Windows `Volume` 与 `DiskDrive` 类的 Upper Filter 驱动。当前开发版本采用 after-image：受保护分区的应用写在磁盘层持久化到独立 Journal 后直接完成，不再提交到源分区；卷层优先合成读取，磁盘层为旁路读取兜底。
 
-当前版本：**1.6.8-test63**（Build `20260828.150-header-writeback-2s`），Journal 磁盘格式：**v15**。
+当前版本：**1.6.8-test71**（Build `20260828.158-recovery-branch-tree-resolve-fix`），Journal 磁盘格式：**v15**。
 
 主要功能：
 
