@@ -597,9 +597,8 @@ static NTSTATUS CdpJournalDecodeRecord(
 	return STATUS_SUCCESS;
 }
 
-// Caller holds Journal->Lock. Any write that overlaps the cached header
-// sector makes its in-memory copy stale. CdpJournalWriteHeaderAt restores
-// validity after its own write-through succeeds.
+// Caller holds Journal->Lock. Any external write that overlaps the cached
+// header sector makes its in-memory copy stale.
 static VOID CdpJournalInvalidateHeaderWriteCacheRangeLocked(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 Offset,
@@ -902,10 +901,31 @@ static NTSTATUS CdpJournalMetadataRawIo(
 #endif
 }
 
-// Caller holds Journal->Lock.  Cache the active record-header sector so we do
-// not reread it for every 32-byte header.  Each update is nevertheless copied
-// to an independent buffer and submitted immediately: a partial sector must
-// never remain memory-only until it happens to fill.
+// Caller holds Journal->Lock. Commit the in-memory record-header sector. A
+// completed commit makes every header currently in that sector visible.
+static NTSTATUS CdpJournalCommitHeaderWriteCacheLocked(
+	_Inout_ PCdp_JOURNAL Journal)
+{
+	NTSTATUS status;
+
+	if (!Journal->HeaderWriteCacheDirty)
+		return STATUS_SUCCESS;
+	if (!Journal->HeaderWriteCacheValid || !Journal->HeaderWriteBuffer)
+		return STATUS_INVALID_DEVICE_STATE;
+	status = CdpJournalMetadataRawIo(
+		Journal,
+		IRP_MJ_WRITE,
+		Journal->HeaderWriteSectorOffset,
+		Journal->SectorSize,
+		Journal->HeaderWriteBuffer);
+	if (NT_SUCCESS(status))
+	{
+		Journal->HeaderWriteCacheValid = TRUE;
+		Journal->HeaderWriteCacheDirty = FALSE;
+	}
+	return status;
+}
+
 static NTSTATUS CdpJournalRawWriteSub(
 	_In_ PCdp_JOURNAL Journal,
 	_In_ UINT64 Offset,
@@ -946,6 +966,11 @@ static NTSTATUS CdpJournalRawWriteSub(
 
 static NTSTATUS CdpJournalFlush(_In_ PCdp_JOURNAL Journal)
 {
+	NTSTATUS status;
+
+	status = CdpJournalCommitHeaderWriteCacheLocked(Journal);
+	if (!NT_SUCCESS(status))
+		return status;
 	if (Journal->Store)
 		return STATUS_SUCCESS;
 
@@ -956,8 +981,6 @@ static NTSTATUS CdpJournalFlush(_In_ PCdp_JOURNAL Journal)
 	PIRP irp;
 	PDEVICE_OBJECT flushDevice = Journal->MetadataTargetDevice ?
 		Journal->MetadataTargetDevice : Journal->TargetDevice;
-	NTSTATUS status;
-
 	if (!flushDevice)
 		return STATUS_DEVICE_NOT_READY;
 	KeInitializeEvent(&event, NotificationEvent, FALSE);
@@ -1408,14 +1431,36 @@ static NTSTATUS CdpJournalReadHeaderRegion(
 	return STATUS_SUCCESS;
 }
 
+static UINT64 CdpJournalPerfNow(_In_opt_ PCdp_JOURNAL_APPEND_PERF Perf)
+{
+	return Perf && Perf->QueryTicks ?
+		Perf->QueryTicks(Perf->QueryTicksContext) : 0;
+}
+
+static VOID CdpJournalPerfAccumulate(
+	_Inout_opt_ PCdp_JOURNAL_APPEND_PERF Perf,
+	_Inout_ PUINT64 Value,
+	_In_ UINT64 Start)
+{
+	UINT64 end;
+
+	if (!Perf || !Perf->QueryTicks || Start == 0)
+		return;
+	end = CdpJournalPerfNow(Perf);
+	if (end >= Start)
+		*Value += end - Start;
+}
+
 static NTSTATUS CdpJournalWriteHeaderAt(
 	_In_ PCdp_JOURNAL Journal,
 	_In_ UINT64 RegionOff,
 	_In_ ULONG Index,
-	_In_ const Cdp_JOURNAL_RECORD_HEADER* Header)
+	_In_ const Cdp_JOURNAL_RECORD_HEADER* Header,
+	_Inout_opt_ PCdp_JOURNAL_APPEND_PERF Perf)
 {
 	UINT64 headerOffset;
 	UINT64 sectorOffset;
+	UINT64 headerStart;
 	ULONG sectorByteOffset;
 	NTSTATUS status;
 
@@ -1428,6 +1473,7 @@ static NTSTATUS CdpJournalWriteHeaderAt(
 	sectorByteOffset = (ULONG)(headerOffset - sectorOffset);
 	if (sectorByteOffset + sizeof(*Header) > Journal->SectorSize)
 		return STATUS_DISK_CORRUPT_ERROR;
+	headerStart = CdpJournalPerfNow(Perf);
 
 	if (!Journal->HeaderWriteBuffer)
 	{
@@ -1436,12 +1482,18 @@ static NTSTATUS CdpJournalWriteHeaderAt(
 			Journal->SectorSize,
 			&Journal->HeaderWriteAllocationBase);
 		if (!Journal->HeaderWriteBuffer)
-			return STATUS_INSUFFICIENT_RESOURCES;
+		{
+			status = STATUS_INSUFFICIENT_RESOURCES;
+			goto cleanup;
+		}
 	}
 
 	if (!Journal->HeaderWriteCacheValid ||
 		Journal->HeaderWriteSectorOffset != sectorOffset)
 	{
+		status = CdpJournalCommitHeaderWriteCacheLocked(Journal);
+		if (!NT_SUCCESS(status))
+			goto cleanup;
 		Journal->HeaderWriteCacheValid = FALSE;
 		status = CdpJournalMetadataRawIo(
 			Journal,
@@ -1450,7 +1502,7 @@ static NTSTATUS CdpJournalWriteHeaderAt(
 			Journal->SectorSize,
 			Journal->HeaderWriteBuffer);
 		if (!NT_SUCCESS(status))
-			return status;
+			goto cleanup;
 		Journal->HeaderWriteSectorOffset = sectorOffset;
 		Journal->HeaderWriteCacheValid = TRUE;
 	}
@@ -1459,17 +1511,24 @@ static NTSTATUS CdpJournalWriteHeaderAt(
 		Journal->HeaderWriteBuffer + sectorByteOffset,
 		Header,
 		sizeof(*Header));
-	status = CdpJournalMetadataRawIo(
-		Journal,
-		IRP_MJ_WRITE,
-		sectorOffset,
-		Journal->SectorSize,
-		Journal->HeaderWriteBuffer);
-	if (NT_SUCCESS(status))
+	Journal->HeaderWriteCacheDirty = TRUE;
+	if (Journal->Store ||
+		sectorByteOffset + sizeof(*Header) == Journal->SectorSize)
 	{
-		Journal->HeaderWriteSectorOffset = sectorOffset;
-		Journal->HeaderWriteCacheValid = TRUE;
+		/* The in-memory test store commits immediately so persistence tests can
+		 * inspect it deterministically. Real devices commit only a full header
+		 * sector. Do not issue FLUSH_BUFFERS here: ordinary writes explicitly
+		 * accept a power-loss tail and must not stall every 16 records. */
+		status = CdpJournalCommitHeaderWriteCacheLocked(Journal);
 	}
+	else
+	{
+		status = STATUS_SUCCESS;
+	}
+
+cleanup:
+	if (Perf)
+		CdpJournalPerfAccumulate(Perf, &Perf->HeaderTicks, headerStart);
 	return status;
 }
 
@@ -3555,7 +3614,8 @@ static NTSTATUS CdpJournalAppendBranchLocked(
 		Journal,
 		Journal->LastHeaderRegionOff,
 		Journal->CurrentHeaderCount,
-		(PCdp_JOURNAL_RECORD_HEADER)&branchHeader);
+		(PCdp_JOURNAL_RECORD_HEADER)&branchHeader,
+		NULL);
 	if (!NT_SUCCESS(status))
 	{
 		NTSTATUS discardStatus = STATUS_SUCCESS;
@@ -3685,7 +3745,8 @@ static NTSTATUS CdpJournalAppendBranchContinuationLocked(
 		Journal,
 		Journal->LastHeaderRegionOff,
 		0,
-		(PCdp_JOURNAL_RECORD_HEADER)&branchHeader);
+		(PCdp_JOURNAL_RECORD_HEADER)&branchHeader,
+		NULL);
 	if (!NT_SUCCESS(status))
 		return status;
 
@@ -4076,7 +4137,8 @@ NTSTATUS CdpJournalAppend(
 		DataLength,
 		AfterImage,
 		0,
-		WrittenRecord);
+		WrittenRecord,
+		NULL);
 }
 
 NTSTATUS CdpJournalAppendEx(
@@ -4085,7 +4147,8 @@ NTSTATUS CdpJournalAppendEx(
 	_In_ ULONG DataLength,
 	_In_reads_bytes_(DataLength) const VOID* AfterImage,
 	_In_ ULONG RecordFlags,
-	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord)
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord,
+	_Inout_opt_ PCdp_JOURNAL_APPEND_PERF Perf)
 {
 	Cdp_JOURNAL_RECORD_HEADER header;
 	Cdp_JOURNAL_RECORD record;
@@ -4095,6 +4158,8 @@ NTSTATUS CdpJournalAppendEx(
 	PUCHAR payloadBuffer = NULL;
 	UINT64 writeSeq;
 	UINT64 writeTime;
+	UINT64 payloadStart;
+	UINT64 superblockWriteStart;
 	BOOLEAN rotateHeaderRegion;
 	NTSTATUS status = STATUS_SUCCESS;
 
@@ -4181,12 +4246,16 @@ NTSTATUS CdpJournalAppendEx(
 		RtlCopyMemory(payloadBuffer, AfterImage, DataLength);
 	}
 
+	payloadStart = CdpJournalPerfNow(Perf);
 	status = CdpJournalRawIo(
 		Journal,
 		IRP_MJ_WRITE,
 		payloadOff,
 		(ULONG)alignedSize,
 		payloadBuffer);
+	if (Perf)
+		CdpJournalPerfAccumulate(
+			Perf, &Perf->PayloadWriteTicks, payloadStart);
 	if (!NT_SUCCESS(status))
 		goto cleanup;
 
@@ -4238,7 +4307,8 @@ NTSTATUS CdpJournalAppendEx(
 		Journal,
 		Journal->LastHeaderRegionOff,
 		Journal->CurrentHeaderCount,
-		&header);
+		&header,
+		Perf);
 	if (!NT_SUCCESS(status))
 		goto cleanup;
 	CdpBranchTreeAdvanceLatest(
@@ -4281,18 +4351,18 @@ NTSTATUS CdpJournalAppendEx(
 
 	if (Journal->SuperblockDirty)
 	{
-		// Make the new region, link, payload and record header durable before
-		// publishing the region through the superblock.
-		status = CdpJournalFlush(Journal);
-		if (NT_SUCCESS(status))
-			status = CdpJournalWriteSuperblockLocked(Journal);
-		if (NT_SUCCESS(status))
-			status = CdpJournalFlush(Journal);
+		/* Lifecycle metadata follows the same write-back policy as normal
+		 * records. The Superblock is written now, but no synchronous flush is
+		 * issued; an unexpected power loss may discard this newest transition. */
+		superblockWriteStart = CdpJournalPerfNow(Perf);
+		status = CdpJournalWriteSuperblockLocked(Journal);
+		if (Perf)
+			CdpJournalPerfAccumulate(
+				Perf, &Perf->SuperblockWriteTicks, superblockWriteStart);
 	}
-	else
-	{
-		status = CdpJournalFlush(Journal);
-	}
+	/* Normal records stay memory-resident until the header sector fills or an
+	 * explicit close/preview/recovery flush occurs. Power loss may discard
+	 * that tail. */
 
 cleanup:
 	if (allocationBase)
@@ -4650,7 +4720,7 @@ NTSTATUS CdpJournalDeleteRecordsThroughSequence(
 			RtlZeroMemory(&tombstone, sizeof(tombstone));
 			tombstone.Sequence = index | Cdp_JOURNAL_RECORD_FLAG_DELETED;
 			status = CdpJournalWriteHeaderAt(
-				Journal, Journal->OldestHeaderRegionOff, index, &tombstone);
+				Journal, Journal->OldestHeaderRegionOff, index, &tombstone, NULL);
 			if (!NT_SUCCESS(status))
 				goto cleanup;
 			tombstonedRecords++;
@@ -4952,7 +5022,7 @@ NTSTATUS CdpJournalPruneUnreachableForCompaction(
 			RtlZeroMemory(&tombstone, sizeof(tombstone));
 			tombstone.Sequence = index | Cdp_JOURNAL_RECORD_FLAG_DELETED;
 			status = CdpJournalWriteHeaderAt(
-				Journal, regionOff, index, &tombstone);
+				Journal, regionOff, index, &tombstone, NULL);
 			if (!NT_SUCCESS(status))
 				break;
 			changed = TRUE;
@@ -6586,6 +6656,17 @@ NTSTATUS CdpJournalBuildPreviewTree(
 		status = STATUS_DEVICE_NOT_READY;
 		goto cleanup_locked;
 	}
+	/* Preview/Recovery rebuilds read record headers back from the journal. A
+	 * partial header sector may still be memory-only because normal app writes
+	 * batch it for throughput. Commit it at this explicit history-view
+	 * boundary so an in-memory target time cannot select records the scan then
+	 * fails to see. */
+	if (Journal->HeaderWriteCacheDirty)
+	{
+		status = CdpJournalFlush(Journal);
+		if (!NT_SUCCESS(status))
+			goto cleanup_locked;
+	}
 	if (CdpJournalIsEmptyLocked(Journal) || !Journal->BranchTree.First)
 		goto cleanup_locked;
 	if (TargetTime100ns < Journal->Oldest100ns)
@@ -7020,7 +7101,13 @@ VOID CdpJournalClose(_Inout_ PCdp_JOURNAL Journal)
 {
 	Cdp_LOCK_ACQUIRE(&Journal->Lock);
 	if (Journal->Mounted)
-		(VOID)CdpJournalWriteSuperblockLocked(Journal);
+	{
+		if (NT_SUCCESS(CdpJournalFlush(Journal)))
+		{
+			if (NT_SUCCESS(CdpJournalWriteSuperblockLocked(Journal)))
+				(VOID)CdpJournalFlush(Journal);
+		}
+	}
 	Journal->Mounted = FALSE;
 	Journal->TargetDevice = NULL;
 	Journal->Store = NULL;

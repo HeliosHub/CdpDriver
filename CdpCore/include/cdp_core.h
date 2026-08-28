@@ -16,6 +16,12 @@ typedef enum _Cdp_CORE_PHASE
 
 typedef struct _Cdp_CORE Cdp_CORE, *PCdp_CORE;
 
+typedef struct _Cdp_CORE_APPEND_PERF
+{
+	Cdp_JOURNAL_APPEND_PERF Journal;
+	UINT64 MetaTreeTicks;
+} Cdp_CORE_APPEND_PERF, *PCdp_CORE_APPEND_PERF;
+
 /* Usermode: both stores; journal owned by core via Store backend. */
 NTSTATUS CdpCoreCreate(
 	_In_ PCdp_STORE Source,
@@ -133,6 +139,14 @@ NTSTATUS CdpCoreAppendAfterImage(
 	_In_ ULONG Length,
 	_In_reads_bytes_(Length) const VOID* AfterImage,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
+
+NTSTATUS CdpCoreAppendAfterImageEx(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_In_reads_bytes_(Length) const VOID* AfterImage,
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord,
+	_Inout_opt_ PCdp_CORE_APPEND_PERF Perf);
 
 // Graceful protection shutdown: materialize one current-view interval to the
 // source and punch it from MetaTree. Complete is TRUE when no coverage remains.

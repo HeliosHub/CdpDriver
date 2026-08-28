@@ -2,7 +2,7 @@
 
 CdpDriver 是一个同时工作在 Windows `Volume` 与 `DiskDrive` 类的 Upper Filter 驱动。当前开发版本采用 after-image：受保护分区的应用写在磁盘层持久化到独立 Journal 后直接完成，不再提交到源分区；卷层优先合成读取，磁盘层为旁路读取兜底。
 
-当前版本：**1.6.8-test44**（Build `20260827.131-query-time-range`），Journal 磁盘格式：**v15**。
+当前版本：**1.6.8-test62**（Build `20260828.149-read-audit-off`），Journal 磁盘格式：**v15**。
 
 主要功能：
 
@@ -143,7 +143,11 @@ Recovery Begin 根据目标时间确定父分支和继承点，追加一个新�
 
 ## 读写分层与 TRIM
 
-卷层 WRITE 始终透传，由磁盘层完成最终保护截获。卷层 READ 对已绑定保护分区优先合成；直接到达磁盘层的读取由磁盘层兜底。每个磁盘使用“最近命中分区 + 有序范围二分查找”定位保护分区，多分区查找复杂度为 `O(log N)`。
+卷层 WRITE 始终透传，由磁盘层完成最终保护截获。普通写入的 journal payload 优先直接复用原 IRP 的单段 MDL 映射；只有多段 MDL 或不支持的缓冲形式才复制到临时 snapshot。`MetaTree` 是当前视图的唯一范围映射；不再维护重复的 WriteLedger 校验链表。卷层 READ 对已绑定保护分区优先合成；直接到达磁盘层的读取由磁盘层兜底。每个磁盘使用“最近命中分区 + 有序范围二分查找”定位保护分区，多分区查找复杂度为 `O(log N)`。
+
+普通 record 的 32 字节 header 与普通写入期间发生的 Superblock 更新都不发物理 flush；正常关闭和显式 flush 会提交并 flush 未满扇区。该性能模式允许意外断电丢失最近一批历史（包括已提交但尚未刷盘的 header 和最新 Superblock 变更）。
+
+预览、恢复等需要重新扫描历史 record 的操作，会先提交并 flush 当前未满的 header 扇区，再按目标时间构建历史视图。
 
 保护开启期间，驱动拦截并抑制 `DeviceDsmAction_Trim`，避免底层回收破坏源卷基础数据。停止保护后 TRIM 和普通写直接下发。
 

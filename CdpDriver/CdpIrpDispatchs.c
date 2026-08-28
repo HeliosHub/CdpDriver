@@ -6,6 +6,11 @@
 #include <ntddstor.h>
 #include <ntstrsafe.h>
 
+/* Keep disabled for normal performance testing. Set to 1 only while
+ * investigating write-path latency; it adds QPC sampling and one log line per
+ * protected application write. */
+#define Cdp_ENABLE_WRITE_PERF_TRACE 0
+
 static VOID CdpDisableAllCaptureSources(_In_ PCdp_DRIVER_EXTENSION DriverExt);
 static NTSTATUS CdpStartMergeThread(
 	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
@@ -35,6 +40,43 @@ static NTSTATUS CdpSnapshotWriteMdlChain(
 	_Outptr_result_bytebuffer_(RequiredLength) PUCHAR* Snapshot,
 	_Out_ PULONG MdlCount,
 	_Out_ PUINT64 MdlBytes);
+static NTSTATUS CdpGetDirectWriteBuffer(
+	_In_ PIRP Irp,
+	_In_ ULONG RequiredLength,
+	_Outptr_result_bytebuffer_(RequiredLength) PUCHAR* Buffer,
+	_Out_ PULONG MdlCount,
+	_Out_ PUINT64 MdlBytes);
+
+typedef struct _Cdp_WRITE_PERF_TIMING
+{
+	LARGE_INTEGER Start;
+	LARGE_INTEGER RouteDone;
+	LARGE_INTEGER LockBegin;
+	LARGE_INTEGER LockDone;
+	LARGE_INTEGER MapBegin;
+	LARGE_INTEGER MapDone;
+	LARGE_INTEGER AppendBegin;
+	LARGE_INTEGER AppendDone;
+	LARGE_INTEGER MergeBegin;
+	LARGE_INTEGER MergeDone;
+	Cdp_CORE_APPEND_PERF CoreAppend;
+	ULONG Chunks;
+	BOOLEAN UsedSnapshot;
+} Cdp_WRITE_PERF_TIMING, *PCdp_WRITE_PERF_TIMING;
+
+static UINT64 CdpWritePerfElapsedUs(
+	_In_ LARGE_INTEGER Start,
+	_In_ LARGE_INTEGER End,
+	_In_ LARGE_INTEGER Frequency);
+static UINT64 CdpWritePerfTicksToUs(
+	_In_ UINT64 Ticks,
+	_In_ LARGE_INTEGER Frequency);
+static UINT64 CdpQueryWritePerfTicks(_In_opt_ PVOID Context);
+static VOID CdpLogWritePerf(
+	_In_ PCdp_WRITE_PERF_TIMING Timing,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_In_ NTSTATUS Status);
 static NTSTATUS CdpQueueDiskCaptureIrp(
 	_Inout_ PCdp_DEVICE_EXTENSION DiskExt,
 	_Inout_ PIRP Irp);
@@ -50,9 +92,6 @@ static VOID CdpReleaseVolumeHandleEntry(_In_ PCdp_VOLUME_HANDLE_ENTRY Item);
 static NTSTATUS CdpCloseVolumeHandle(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ UINT64 HandleId);
-static VOID CdpAuditProtectedReadSummary(
-	_In_ PCdp_DEVICE_EXTENSION DevExt,
-	_In_ PCSTR Reason);
 static NTSTATUS CdpForwardWriteCompletion(
 	_In_ PDEVICE_OBJECT DeviceObject,
 	_In_ PIRP Irp,
@@ -228,92 +267,6 @@ static BOOLEAN CdpShouldTraceRead(_In_ LONG64 Sequence)
 	/* Read-path tracing is intentionally disabled in normal builds.  Preserve
 	 * the guard so it can be selectively re-enabled during I/O diagnosis. */
 	return FALSE;
-}
-
-static VOID CdpAuditProtectedReadReset(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
-{
-	InterlockedExchange64(&DevExt->AuditReadSeenCount, 0);
-	InterlockedExchange64(&DevExt->AuditReadSeenBytes, 0);
-	InterlockedExchange64(&DevExt->AuditReadCoreSuccessCount, 0);
-	InterlockedExchange64(&DevExt->AuditReadCoreSuccessBytes, 0);
-	InterlockedExchange64(&DevExt->AuditReadCoreFailureCount, 0);
-	InterlockedExchange64(&DevExt->AuditReadSourceBypassCount, 0);
-	InterlockedExchange64(&DevExt->AuditReadSourceBypassBytes, 0);
-	InterlockedExchange(&DevExt->AuditReadBypassReported, 0);
-}
-
-static VOID CdpAuditProtectedReadCoreResult(
-	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
-	_In_ ULONG Length,
-	_In_ NTSTATUS Status)
-{
-	if (NT_SUCCESS(Status))
-	{
-		LONG64 count = InterlockedIncrement64(
-			&DevExt->AuditReadCoreSuccessCount);
-		InterlockedAdd64(&DevExt->AuditReadCoreSuccessBytes, Length);
-		if (count == 1 || (count & 0xFFF) == 0)
-			CdpAuditProtectedReadSummary(DevExt, "core-checkpoint");
-	}
-	else
-	{
-		InterlockedIncrement64(&DevExt->AuditReadCoreFailureCount);
-	}
-}
-
-static VOID CdpAuditProtectedReadBypass(
-	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
-	_In_ PIRP Irp,
-	_In_ PCSTR Reason)
-{
-	PIO_STACK_LOCATION irpSp;
-	ULONG length;
-
-	if (!DevExt || !Irp ||
-		InterlockedCompareExchange(&DevExt->CaptureEnabled, 0, 0) == 0 ||
-		InterlockedCompareExchange(&DevExt->Phase, 0, 0) ==
-			(LONG)Cdp_PHASE_DRAINING)
-	{
-		return;
-	}
-	irpSp = IoGetCurrentIrpStackLocation(Irp);
-	length = irpSp->Parameters.Read.Length;
-	InterlockedIncrement64(&DevExt->AuditReadSourceBypassCount);
-	InterlockedAdd64(&DevExt->AuditReadSourceBypassBytes, length);
-	if (InterlockedCompareExchange(
-		&DevExt->AuditReadBypassReported, 1, 0) == 0)
-	{
-		Cdp_LOG("[PROTECTED-READ-BYPASS] FIRST reason=%s irp=%p device=%p lower=%p offset=%lld len=%lu flags=0x%08lX minor=0x%02X enabled=%ld stopping=%ld phase=%ld core=%p\n",
-			Reason,
-			Irp,
-			DevExt->FilterDeviceObject,
-			DevExt->LowerDeviceObject,
-			irpSp->Parameters.Read.ByteOffset.QuadPart,
-			length,
-			Irp->Flags,
-			irpSp->MinorFunction,
-			InterlockedCompareExchange(&DevExt->CaptureEnabled, 0, 0),
-			InterlockedCompareExchange(&DevExt->CaptureStopping, 0, 0),
-			InterlockedCompareExchange(&DevExt->Phase, 0, 0),
-			DevExt->Core);
-	}
-}
-
-static VOID CdpAuditProtectedReadSummary(
-	_In_ PCdp_DEVICE_EXTENSION DevExt,
-	_In_ PCSTR Reason)
-{
-	if (!DevExt)
-		return;
-	Cdp_LOG("[PROTECTED-READ-AUDIT] reason=%s seen=%lld seenBytes=%lld coreOk=%lld coreBytes=%lld coreFail=%lld sourceBypass=%lld bypassBytes=%lld\n",
-		Reason,
-		InterlockedCompareExchange64(&DevExt->AuditReadSeenCount, 0, 0),
-		InterlockedCompareExchange64(&DevExt->AuditReadSeenBytes, 0, 0),
-		InterlockedCompareExchange64(&DevExt->AuditReadCoreSuccessCount, 0, 0),
-		InterlockedCompareExchange64(&DevExt->AuditReadCoreSuccessBytes, 0, 0),
-		InterlockedCompareExchange64(&DevExt->AuditReadCoreFailureCount, 0, 0),
-		InterlockedCompareExchange64(&DevExt->AuditReadSourceBypassCount, 0, 0),
-		InterlockedCompareExchange64(&DevExt->AuditReadSourceBypassBytes, 0, 0));
 }
 
 static NTSTATUS CdpBeginRecovery(
@@ -1597,12 +1550,9 @@ static NTSTATUS CdpConfigureCaptureInternal(
 	}
 
 	CdpCacheProtectionRouteForSource(DriverExt, sourceExt);
-	CdpAuditProtectedReadReset(sourceExt);
 	InterlockedExchange(&sourceExt->DiskIoAccepting, 1);
 	InterlockedExchange(&sourceExt->ProtectionStateValidated, 1);
 	InterlockedExchange(&sourceExt->CaptureEnabled, 1);
-	Cdp_LOG("[PROTECTED-READ-AUDIT] reset protection enabled sourceExt=%p\n",
-		sourceExt);
 	Cdp_LOG("[PROTECTION-ACTIVE] protection enabled immediately; writes redirect to journal and MetaTree reads are active\n");
 
 	*JournalHandleId = journalHandleId;
@@ -1849,12 +1799,9 @@ static NTSTATUS CdpActivateAutoJournal(
 		}
 	}
 	CdpCacheProtectionRouteForSource(DriverExt, sourceExt);
-	CdpAuditProtectedReadReset(sourceExt);
 	InterlockedExchange(&sourceExt->DiskIoAccepting, 1);
 	InterlockedExchange(&sourceExt->ProtectionStateValidated, 1);
 	InterlockedExchange(&sourceExt->CaptureEnabled, 1);
-	Cdp_LOG("[PROTECTED-READ-AUDIT] reset auto protection enabled sourceExt=%p\n",
-		sourceExt);
 	Cdp_LOG("[DISK-UPPER] auto protection enabled: writes redirect to journal; MetaTree current-view reads active\n");
 	Cdp_LOG("[AUTO-CDP] enabled journalHandle=%llu sourceExt=%p\n",
 		JournalHandleId, sourceExt);
@@ -2350,7 +2297,6 @@ static NTSTATUS CdpDiscoverJournalForStartedDisk(
 			}
 		}
 		CdpCacheProtectionRouteForSource(DriverExt, sourceExt);
-		CdpAuditProtectedReadReset(sourceExt);
 		InterlockedExchange(&sourceExt->DiskIoAccepting, 1);
 		InterlockedExchange(&sourceExt->ProtectionStateValidated, 1);
 		InterlockedExchange(&sourceExt->CaptureEnabled, 1);
@@ -4638,7 +4584,6 @@ static VOID CdpFailQueuedProtectedRead(
 {
 	PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
 
-	CdpAuditProtectedReadBypass(DevExt, Irp, Reason);
 	Cdp_LOG("[PROTECTED-READ-BLOCKED] reason=%s irp=%p offset=%lld len=%lu enabled=%ld stopping=%ld phase=%ld core=%p\n",
 		Reason,
 		Irp,
@@ -4985,6 +4930,76 @@ static NTSTATUS CdpCompleteFailedRedirectWrite(
 	return CdpCompleteIrp(Irp, Status, 0);
 }
 
+static UINT64 CdpWritePerfElapsedUs(
+	_In_ LARGE_INTEGER Start,
+	_In_ LARGE_INTEGER End,
+	_In_ LARGE_INTEGER Frequency)
+{
+	UINT64 delta;
+	UINT64 frequency;
+
+	if (End.QuadPart < Start.QuadPart || Frequency.QuadPart <= 0)
+		return 0;
+	delta = (UINT64)(End.QuadPart - Start.QuadPart);
+	frequency = (UINT64)Frequency.QuadPart;
+	return (delta / frequency) * 1000000ULL +
+		((delta % frequency) * 1000000ULL) / frequency;
+}
+
+static UINT64 CdpWritePerfTicksToUs(
+	_In_ UINT64 Ticks,
+	_In_ LARGE_INTEGER Frequency)
+{
+	UINT64 frequency;
+
+	if (Frequency.QuadPart <= 0)
+		return 0;
+	frequency = (UINT64)Frequency.QuadPart;
+	return (Ticks / frequency) * 1000000ULL +
+		((Ticks % frequency) * 1000000ULL) / frequency;
+}
+
+static UINT64 CdpQueryWritePerfTicks(_In_opt_ PVOID Context)
+{
+	UNREFERENCED_PARAMETER(Context);
+	return (UINT64)KeQueryPerformanceCounter(NULL).QuadPart;
+}
+
+static VOID CdpLogWritePerf(
+	_In_ PCdp_WRITE_PERF_TIMING Timing,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_In_ NTSTATUS Status)
+{
+	LARGE_INTEGER frequency;
+	LARGE_INTEGER end;
+
+	if (!Timing)
+		return;
+	end = KeQueryPerformanceCounter(&frequency);
+	Cdp_LOG("[WRITE-PERF] status=0x%08X offset=%llu len=%lu routeUs=%llu lockWaitUs=%llu mapUs=%llu payloadUs=%llu headerUs=%llu headerFlushUs=%llu superblockUs=%llu metaTreeUs=%llu appendUs=%llu mergeCheckUs=%llu totalUs=%llu chunks=%lu buffer=%s\n",
+		Status,
+		Offset,
+		Length,
+		CdpWritePerfElapsedUs(Timing->Start, Timing->RouteDone, frequency),
+		CdpWritePerfElapsedUs(Timing->LockBegin, Timing->LockDone, frequency),
+		CdpWritePerfElapsedUs(Timing->MapBegin, Timing->MapDone, frequency),
+		CdpWritePerfTicksToUs(
+			Timing->CoreAppend.Journal.PayloadWriteTicks, frequency),
+		CdpWritePerfTicksToUs(
+			Timing->CoreAppend.Journal.HeaderTicks, frequency),
+		CdpWritePerfTicksToUs(
+			Timing->CoreAppend.Journal.HeaderFlushTicks, frequency),
+		CdpWritePerfTicksToUs(
+			Timing->CoreAppend.Journal.SuperblockWriteTicks, frequency),
+		CdpWritePerfTicksToUs(Timing->CoreAppend.MetaTreeTicks, frequency),
+		CdpWritePerfElapsedUs(Timing->AppendBegin, Timing->AppendDone, frequency),
+		CdpWritePerfElapsedUs(Timing->MergeBegin, Timing->MergeDone, frequency),
+		CdpWritePerfElapsedUs(Timing->Start, end, frequency),
+		Timing->Chunks,
+		Timing->UsedSnapshot ? "snapshot" : "direct-mdl");
+}
+
 static NTSTATUS CdpSnapshotWriteMdlChain(
 	_In_ PIRP Irp,
 	_In_ ULONG RequiredLength,
@@ -5075,6 +5090,40 @@ static NTSTATUS CdpSnapshotWriteMdlChain(
 		return STATUS_BUFFER_TOO_SMALL;
 	}
 	*Snapshot = snapshot;
+	return STATUS_SUCCESS;
+}
+
+/* The original IRP is held pending until CdpRedirectJournalWrite returns, so
+ * its single MDL is still locked throughout the synchronous journal append.
+ * Reuse the common single-MDL buffer directly; use a contiguous snapshot only
+ * when the request is fragmented or otherwise unsupported. */
+static NTSTATUS CdpGetDirectWriteBuffer(
+	_In_ PIRP Irp,
+	_In_ ULONG RequiredLength,
+	_Outptr_result_bytebuffer_(RequiredLength) PUCHAR* Buffer,
+	_Out_ PULONG MdlCount,
+	_Out_ PUINT64 MdlBytes)
+{
+	PMDL mdl;
+	PVOID mapped;
+
+	if (!Irp || !Buffer || !MdlCount || !MdlBytes || RequiredLength == 0)
+		return STATUS_INVALID_PARAMETER;
+	*Buffer = NULL;
+	*MdlCount = 0;
+	*MdlBytes = 0;
+
+	mdl = Irp->MdlAddress;
+	if (!mdl || mdl->Next != NULL)
+		return STATUS_NOT_SUPPORTED;
+	*MdlCount = 1;
+	*MdlBytes = MmGetMdlByteCount(mdl);
+	if (*MdlBytes < RequiredLength)
+		return STATUS_BUFFER_TOO_SMALL;
+	mapped = MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority);
+	if (!mapped)
+		return STATUS_INSUFFICIENT_RESOURCES;
+	*Buffer = (PUCHAR)mapped;
 	return STATUS_SUCCESS;
 }
 
@@ -5194,10 +5243,12 @@ static NTSTATUS CdpScatterReadMdlChain(
 
 static NTSTATUS CdpRedirectJournalWrite(
 	_In_ PCdp_DEVICE_EXTENSION SourceExt,
-	_Inout_ PCdp_CAPTURE_ITEM Item)
+	_Inout_ PCdp_CAPTURE_ITEM Item,
+	_Inout_opt_ PCdp_WRITE_PERF_TIMING Timing)
 {
 	PIRP Irp;
 	PIO_STACK_LOCATION irpSp;
+	PUCHAR writeBuffer = NULL;
 	PUCHAR snapshot = NULL;
 	Cdp_JOURNAL_RECORD record;
 	ULONG writeLength;
@@ -5231,8 +5282,20 @@ static NTSTATUS CdpRedirectJournalWrite(
 	if (!SourceExt->RedirectJournalEntry)
 		return CdpCompleteFailedRedirectWrite(
 			SourceExt, Irp, STATUS_DEVICE_NOT_READY);
-	status = CdpSnapshotWriteMdlChain(
-		Irp, writeLength, &snapshot, &mdlCount, &mdlBytes);
+	if (Timing)
+		Timing->MapBegin = KeQueryPerformanceCounter(NULL);
+	status = CdpGetDirectWriteBuffer(
+		Irp, writeLength, &writeBuffer, &mdlCount, &mdlBytes);
+	if (status == STATUS_NOT_SUPPORTED)
+	{
+		if (Timing)
+			Timing->UsedSnapshot = TRUE;
+		status = CdpSnapshotWriteMdlChain(
+			Irp, writeLength, &snapshot, &mdlCount, &mdlBytes);
+		writeBuffer = snapshot;
+	}
+	if (Timing)
+		Timing->MapDone = KeQueryPerformanceCounter(NULL);
 	if (!NT_SUCCESS(status))
 	{
 		Cdp_LOG("[VERIFY-FAIL] stage=mdl status=0x%08X sourceOffset=%lld len=%lu mdlCount=%lu mdlBytes=%llu\n",
@@ -5245,22 +5308,32 @@ static NTSTATUS CdpRedirectJournalWrite(
 	}
 	/* A source IRP may be much larger than one on-disk record. Commit every
 	 * real application-data chunk to the journal and never write the source. */
+	if (Timing)
+	{
+		Timing->CoreAppend.Journal.QueryTicks = CdpQueryWritePerfTicks;
+		Timing->CoreAppend.Journal.QueryTicksContext = NULL;
+	}
+	if (Timing)
+		Timing->AppendBegin = KeQueryPerformanceCounter(NULL);
 	for (chunkOffset = 0; chunkOffset < writeLength; )
 	{
 		ULONG chunkLength = writeLength - chunkOffset;
-		PUCHAR chunkData = snapshot + chunkOffset;
+		PUCHAR chunkData = writeBuffer + chunkOffset;
 		UINT64 chunkVolumeOffset = Item->OriginalDiskOffset + chunkOffset;
 
 		if (chunkLength > Cdp_JOURNAL_MAX_RECORD_DATA)
 			chunkLength = Cdp_JOURNAL_MAX_RECORD_DATA;
-		status = CdpCoreAppendAfterImage(
+		status = CdpCoreAppendAfterImageEx(
 			SourceExt->Core,
 			chunkVolumeOffset,
 			chunkLength,
 			chunkData,
-			&record);
+			&record,
+			Timing ? &Timing->CoreAppend : NULL);
 		if (!NT_SUCCESS(status))
 		{
+			if (Timing)
+				Timing->AppendDone = KeQueryPerformanceCounter(NULL);
 			Cdp_LOG("[REDIRECT-WRITE-FAIL] stage=append-publish status=0x%08X offset=%lld len=%lu chunkOffset=%lu chunkLen=%lu chunksCommitted=%lu\n",
 				status,
 				irpSp->Parameters.Write.ByteOffset.QuadPart,
@@ -5268,15 +5341,25 @@ static NTSTATUS CdpRedirectJournalWrite(
 				chunkOffset,
 				chunkLength,
 				chunkOffset / Cdp_JOURNAL_MAX_RECORD_DATA);
-			cdpfree(snapshot);
+			if (snapshot)
+				cdpfree(snapshot);
 			return CdpCompleteFailedRedirectWrite(SourceExt, Irp, status);
 		}
 		chunkOffset += chunkLength;
+		if (Timing)
+			Timing->Chunks++;
 	}
+	if (Timing)
+		Timing->AppendDone = KeQueryPerformanceCounter(NULL);
 
-	cdpfree(snapshot);
+	if (snapshot)
+		cdpfree(snapshot);
 
+	if (Timing)
+		Timing->MergeBegin = KeQueryPerformanceCounter(NULL);
 	CdpStartMergeIfNeeded(SourceExt);
+	if (Timing)
+		Timing->MergeDone = KeQueryPerformanceCounter(NULL);
 	CdpReleaseRedirectWrite(SourceExt);
 	return CdpCompleteIrp(Irp, STATUS_SUCCESS, writeLength);
 }
@@ -5448,6 +5531,10 @@ static NTSTATUS CdpDispatchProtectedDiskWrite(
 	PDEVICE_OBJECT sourceReference = NULL;
 	PCdp_DEVICE_EXTENSION sourceExt;
 	Cdp_CAPTURE_ITEM directItem;
+	PCdp_WRITE_PERF_TIMING timing = NULL;
+#if Cdp_ENABLE_WRITE_PERF_TRACE
+	Cdp_WRITE_PERF_TIMING timingState;
+#endif
 	NTSTATUS status;
 	LONG phase;
 
@@ -5458,10 +5545,18 @@ static NTSTATUS CdpDispatchProtectedDiskWrite(
 	}
 	absoluteOffset = (UINT64)irpSp->Parameters.Write.ByteOffset.QuadPart;
 	length = irpSp->Parameters.Write.Length;
+#if Cdp_ENABLE_WRITE_PERF_TRACE
+	RtlZeroMemory(&timingState, sizeof(timingState));
+	timingState.Start = KeQueryPerformanceCounter(NULL);
+	timing = &timingState;
+#endif
 	sourceExt = CdpReferenceProtectedSourceForDiskIo(
 		DiskExt, absoluteOffset, length, &sourceReference);
 	if (!sourceExt)
 		return CdpSendToNextDevice(DiskExt->LowerDeviceObject, Irp);
+#if Cdp_ENABLE_WRITE_PERF_TRACE
+	timing->RouteDone = KeQueryPerformanceCounter(NULL);
+#endif
 
 	phase = InterlockedCompareExchange(&sourceExt->Phase, 0, 0);
 	if (!CdpAcquireDiskIoOutstanding(sourceExt))
@@ -5494,10 +5589,19 @@ static NTSTATUS CdpDispatchProtectedDiskWrite(
 	if (InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) != 0 &&
 		CdpTryAcquireRedirectWrite(sourceExt))
 	{
+#if Cdp_ENABLE_WRITE_PERF_TRACE
+		timing->LockBegin = KeQueryPerformanceCounter(NULL);
+#endif
 		KeWaitForSingleObject(&sourceExt->HistoryMutex,
 			Executive, KernelMode, FALSE, NULL);
-		status = CdpRedirectJournalWrite(sourceExt, &directItem);
+#if Cdp_ENABLE_WRITE_PERF_TRACE
+		timing->LockDone = KeQueryPerformanceCounter(NULL);
+#endif
+		status = CdpRedirectJournalWrite(sourceExt, &directItem, timing);
 		KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
+#if Cdp_ENABLE_WRITE_PERF_TRACE
+		CdpLogWritePerf(timing, absoluteOffset, length, status);
+#endif
 		CdpReleaseDiskIoOutstanding(sourceExt);
 		ObDereferenceObject(sourceReference);
 		return status;
@@ -5702,7 +5806,7 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 						KernelMode,
 						FALSE,
 						NULL);
-					(void)CdpRedirectJournalWrite(devExt, item);
+					(void)CdpRedirectJournalWrite(devExt, item, NULL);
 					KeReleaseMutex(&devExt->HistoryMutex, FALSE);
 				}
 				else if (majorFunction == IRP_MJ_READ && captureActive)
@@ -5719,7 +5823,6 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 						Cdp_CORE_READ_COVERAGE_NONE;
 					UINT64 sourceReadOffset = readOffset;
 					ULONG sourceReadLength = ioLength;
-					LONG64 protectedSequence;
 					NTSTATUS readStatus;
 					if (readOffset < devExt->PartitionStart ||
 						devExt->PartitionStart >
@@ -5747,36 +5850,9 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 							devExt->Core, readOffset, ioLength, &coverage,
 							&sourceReadOffset, &sourceReadLength) :
 						STATUS_DEVICE_NOT_READY;
-					protectedSequence = InterlockedIncrement64(
-						&devExt->AuditReadSeenCount);
-					InterlockedAdd64(
-						&devExt->AuditReadSeenBytes, ioLength);
-					if (CdpShouldTraceRead(protectedSequence))
-					{
-						Cdp_LOG("[READ-TRACE] layer=io-worker stage=coverage seq=%lld queueKind=%lu disk=%lu absoluteOffset=%llu len=%lu status=0x%08X coverage=%lu sourceOffset=%llu sourceLength=%lu phase=%ld\n",
-							protectedSequence,
-							(ULONG)queueExt->DeviceKind,
-							devExt->DiskNumber,
-							readOffset,
-							ioLength,
-							readStatus,
-							(ULONG)coverage,
-							sourceReadOffset,
-							sourceReadLength,
-							InterlockedCompareExchange(
-								&devExt->Phase, 0, 0));
-					}
 					if (NT_SUCCESS(readStatus) &&
 						coverage == Cdp_CORE_READ_COVERAGE_NONE)
 					{
-						if (CdpShouldTraceRead(protectedSequence))
-						{
-							Cdp_LOG("[READ-TRACE] layer=io-worker stage=forward-lower seq=%lld queueKind=%lu absoluteOffset=%llu len=%lu\n",
-								protectedSequence,
-								(ULONG)queueExt->DeviceKind,
-								readOffset,
-								ioLength);
-						}
 						KeReleaseMutex(&devExt->HistoryMutex, FALSE);
 						(void)CdpForwardQueuedDiskIrpSynchronously(item);
 						IoCompleteRequest(item->Irp, IO_NO_INCREMENT);
@@ -5810,8 +5886,6 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 							readOffset,
 							ioLength,
 							buffer);
-						CdpAuditProtectedReadCoreResult(
-							devExt, ioLength, readStatus);
 					}
 					KeReleaseMutex(&devExt->HistoryMutex, FALSE);
 					if (NT_SUCCESS(readStatus))
@@ -5819,17 +5893,6 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 						readStatus = CdpScatterReadMdlChain(
 							item->Irp, buffer, ioLength, &mdlCount,
 							&mdlBytes, &copiedBytes);
-					}
-					if (CdpShouldTraceRead(protectedSequence))
-					{
-						Cdp_LOG("[READ-TRACE] layer=io-worker stage=complete seq=%lld queueKind=%lu absoluteOffset=%llu len=%lu coverage=%lu status=0x%08X copied=%lu\n",
-							protectedSequence,
-							(ULONG)queueExt->DeviceKind,
-							readOffset,
-							ioLength,
-							(ULONG)coverage,
-							readStatus,
-							copiedBytes);
 					}
 					if (!NT_SUCCESS(readStatus))
 					{
@@ -6193,8 +6256,6 @@ VOID CdpDisableAndDestroyCapture(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	InterlockedExchange(&DevExt->ProtectionStateValidated, 0);
 	if (driverExt)
 		CdpRemoveProtectionRouteForSource(driverExt, DevExt);
-	CdpAuditProtectedReadSummary(DevExt, "protection-disable");
-
 	while (InterlockedCompareExchange(
 			&DevExt->DiskIoOutstanding, 0, 0) != 0)
 	{

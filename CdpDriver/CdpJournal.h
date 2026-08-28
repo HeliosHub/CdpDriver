@@ -150,6 +150,21 @@ typedef struct _Cdp_JOURNAL_RECORD
 	ULONG Flags; // Cdp_JOURNAL_RECORD_FLAG_* from the header high 16 bits
 } Cdp_JOURNAL_RECORD, *PCdp_JOURNAL_RECORD;
 
+/* Optional, caller-supplied timing hooks for one append. The Journal stays
+ * platform-neutral: kernel callers provide a QPC callback, test/store callers
+ * may leave QueryTicks NULL. All values are raw ticks in that callback's
+ * timebase. */
+typedef UINT64 (*Cdp_JOURNAL_QUERY_TICKS_ROUTINE)(_In_opt_ PVOID Context);
+typedef struct _Cdp_JOURNAL_APPEND_PERF
+{
+	Cdp_JOURNAL_QUERY_TICKS_ROUTINE QueryTicks;
+	PVOID QueryTicksContext;
+	UINT64 PayloadWriteTicks;
+	UINT64 HeaderTicks;
+	UINT64 HeaderFlushTicks;
+	UINT64 SuperblockWriteTicks;
+} Cdp_JOURNAL_APPEND_PERF, *PCdp_JOURNAL_APPEND_PERF;
+
 C_ASSERT(sizeof(Cdp_JOURNAL_RECORD) == 40);
 
 #define Cdp_JOURNAL_HEADERS_PER_REGION \
@@ -477,7 +492,8 @@ NTSTATUS CdpJournalAppendEx(
 	_In_ ULONG DataLength,
 	_In_reads_bytes_(DataLength) const VOID* AfterImage,
 	_In_ ULONG RecordFlags,
-	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord,
+	_Inout_opt_ PCdp_JOURNAL_APPEND_PERF Perf);
 
 // Serialize a durability barrier with journal append transactions.
 NTSTATUS CdpJournalFlushBuffers(_Inout_ PCdp_JOURNAL Journal);

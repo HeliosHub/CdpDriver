@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.6.8-test44"
-#define Cdp_DRIVER_BUILD_STRING   "20260827.131-query-time-range"
+#define Cdp_DRIVER_VERSION_STRING "1.6.8-test62"
+#define Cdp_DRIVER_BUILD_STRING   "20260828.149-read-audit-off"
 
 // Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.
 // Cdp_DBG: Debug builds only — verbose I/O and path tracing.
@@ -249,17 +249,6 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	// VolumeHandleMutex.
 	PCdp_VOLUME_HANDLE_ENTRY RedirectJournalEntry;
 	volatile LONG CaptureQueueDepth;
-	/* Low-volume protected-read audit. Reset when protection is enabled and
-	 * summarized when it is disabled. All byte counters are monotonic for one
-	 * protection session. */
-	volatile LONG64 AuditReadSeenCount;
-	volatile LONG64 AuditReadSeenBytes;
-	volatile LONG64 AuditReadCoreSuccessCount;
-	volatile LONG64 AuditReadCoreSuccessBytes;
-	volatile LONG64 AuditReadCoreFailureCount;
-	volatile LONG64 AuditReadSourceBypassCount;
-	volatile LONG64 AuditReadSourceBypassBytes;
-	volatile LONG AuditReadBypassReported;
 } Cdp_DEVICE_EXTENSION, *PCdp_DEVICE_EXTENSION;
 
 typedef struct _Cdp_CAPTURE_ITEM
