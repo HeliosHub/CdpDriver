@@ -5718,23 +5718,103 @@ static NTSTATUS CdpFlushProtectedJournalsForDisk(
 	return firstFailure;
 }
 
+/* Runs in the ordered disk worker at PASSIVE_LEVEL.  This is write-back for
+ * a partial record-header sector only; it deliberately does not send
+ * IRP_MJ_FLUSH_BUFFERS. */
+static VOID CdpCommitPendingHeadersForDisk(
+	_In_ PCdp_DEVICE_EXTENSION DiskExt)
+{
+	PCdp_DRIVER_EXTENSION driverExt;
+	PDEVICE_OBJECT* sources;
+	ULONG count = 0;
+	ULONG index;
+	KIRQL oldIrql;
+	PLIST_ENTRY entry;
+
+	if (!DiskExt)
+		return;
+	driverExt = IoGetDriverObjectExtension(g_DriverObject, &g_DriverObject);
+	if (!driverExt)
+		return;
+	sources = (PDEVICE_OBJECT*)cdpalloc(
+		Cdp_PARTITION_LAYOUT_MAX_PARTITIONS * sizeof(*sources));
+	if (!sources)
+		return;
+
+	KeAcquireSpinLock(&driverExt->DeviceObjectListLock, &oldIrql);
+	for (entry = driverExt->DeviceObjectListHead.Flink;
+		entry != &driverExt->DeviceObjectListHead &&
+			count < Cdp_PARTITION_LAYOUT_MAX_PARTITIONS;
+		entry = entry->Flink)
+	{
+		PCdp_DEVICE_LIST_NODE node =
+			CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
+		PCdp_DEVICE_EXTENSION ext =
+			(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
+		if (ext && (ext->DeviceKind == Cdp_DEVICE_KIND_VOLUME ||
+			ext->DeviceKind == Cdp_DEVICE_KIND_DISK ||
+			ext->DeviceKind == Cdp_DEVICE_KIND_SOURCE) &&
+			ext->DiskNumber == DiskExt->DiskNumber &&
+			InterlockedCompareExchange(&ext->CaptureEnabled, 0, 0) != 0 &&
+			ext->RedirectJournalEntry)
+		{
+			ObReferenceObject(node->DeviceObject);
+			sources[count++] = node->DeviceObject;
+		}
+	}
+	KeReleaseSpinLock(&driverExt->DeviceObjectListLock, oldIrql);
+
+	for (index = 0; index < count; ++index)
+	{
+		PCdp_DEVICE_EXTENSION sourceExt =
+			(PCdp_DEVICE_EXTENSION)sources[index]->DeviceExtension;
+		NTSTATUS status;
+
+		KeWaitForSingleObject(&sourceExt->HistoryMutex,
+			Executive, KernelMode, FALSE, NULL);
+		status = sourceExt->RedirectJournalEntry ?
+			CdpJournalCommitPendingHeaders(
+				&sourceExt->RedirectJournalEntry->Journal) :
+			STATUS_DEVICE_NOT_READY;
+		KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
+		if (!NT_SUCCESS(status) && status != STATUS_DEVICE_NOT_READY)
+		{
+			Cdp_LOG("[HEADER-WRITEBACK] failed disk=%lu source=%p status=0x%08X\n",
+				DiskExt->DiskNumber, sourceExt, status);
+		}
+		ObDereferenceObject(sources[index]);
+	}
+	cdpfree(sources);
+}
+
 static VOID CdpCaptureWorker(_In_ PVOID Context)
 {
 	PCdp_DEVICE_EXTENSION queueExt = (PCdp_DEVICE_EXTENSION)Context;
+	UINT64 nextHeaderWriteback100ns = KeQueryInterruptTime() +
+		2ULL * 1000ULL * 1000ULL * 10ULL;
 
 	for (;;)
 	{
 		PLIST_ENTRY entry = NULL;
 		KIRQL oldIrql;
+		LARGE_INTEGER waitTimeout;
 
+		waitTimeout.QuadPart = -2LL * 1000LL * 1000LL * 10LL;
 		KeWaitForSingleObject(
 			&queueExt->CaptureEvent,
 			Executive,
 			KernelMode,
 			FALSE,
-			NULL);
+			&waitTimeout);
 		for (;;)
 		{
+			UINT64 now100ns = KeQueryInterruptTime();
+			if (now100ns >= nextHeaderWriteback100ns)
+			{
+				CdpCommitPendingHeadersForDisk(queueExt);
+				nextHeaderWriteback100ns = now100ns +
+					2ULL * 1000ULL * 1000ULL * 10ULL;
+			}
 			KeAcquireSpinLock(&queueExt->CaptureQueueLock, &oldIrql);
 			if (!IsListEmpty(&queueExt->CaptureQueue))
 			{
@@ -5799,7 +5879,7 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 					CdpTryAcquireRedirectWrite(devExt))
 				{
 					/* Preserve FIFO visibility: the next item cannot start until
-					 * payload, header and flush complete and MetaTree is published. */
+					 * payload and header write complete and MetaTree is published. */
 					KeWaitForSingleObject(
 						&devExt->HistoryMutex,
 						Executive,
@@ -5912,18 +5992,10 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 				else if (majorFunction == IRP_MJ_FLUSH_BUFFERS && captureActive &&
 					phase != (LONG)Cdp_PHASE_DRAINING)
 				{
-					NTSTATUS flushStatus;
-					KeWaitForSingleObject(&devExt->HistoryMutex,
-						Executive, KernelMode, FALSE, NULL);
-					flushStatus = devExt->RedirectJournalEntry ?
-						CdpJournalFlushBuffers(
-							&devExt->RedirectJournalEntry->Journal) :
-						STATUS_DEVICE_NOT_READY;
-					KeReleaseMutex(&devExt->HistoryMutex, FALSE);
-					if (!NT_SUCCESS(flushStatus))
-						Cdp_LOG("[ORDERED-IO] journal flush failed status=0x%08X\n",
-							flushStatus);
-					CdpCompleteIrp(item->Irp, flushStatus, 0);
+					/* Protected writes are intentionally write-back.  Do not turn a
+					 * filesystem flush into a journal-device flush; shutdown and
+					 * journal teardown are the only durability barriers. */
+					CdpCompleteIrp(item->Irp, STATUS_SUCCESS, 0);
 				}
 				else if (majorFunction == IRP_MJ_WRITE && InterlockedCompareExchange(
 						&devExt->CaptureEnabled, 0, 0) != 0 &&

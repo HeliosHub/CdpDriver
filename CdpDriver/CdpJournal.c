@@ -1532,6 +1532,20 @@ cleanup:
 	return status;
 }
 
+NTSTATUS CdpJournalCommitPendingHeaders(_Inout_ PCdp_JOURNAL Journal)
+{
+	NTSTATUS status;
+
+	if (!Journal)
+		return STATUS_INVALID_PARAMETER;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	status = Journal->Mounted ?
+		CdpJournalCommitHeaderWriteCacheLocked(Journal) :
+		STATUS_DEVICE_NOT_READY;
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
 static NTSTATUS CdpJournalRefreshOldestTimeLocked(_Inout_ PCdp_JOURNAL Journal)
 {
 	UINT64 regionOff;
@@ -2748,8 +2762,6 @@ NTSTATUS CdpJournalMergeIntoRuntimeCheckpoints(
 		}
 	}
 
-	status = CdpJournalFlush(Journal);
-
 cleanup_locked:
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	cdpfree(covered);
@@ -2873,11 +2885,7 @@ NTSTATUS CdpJournalRelocateCheckpointsFromRegion(
 		Journal->PayloadBytesUsed += alignedLength;
 	}
 	if (remapCount != 0)
-	{
-		status = CdpJournalFlush(Journal);
-		if (NT_SUCCESS(status))
-			Journal->CheckpointGeneration++;
-	}
+		Journal->CheckpointGeneration++;
 
 cleanup_locked:
 	if (!NT_SUCCESS(status) && remapCount != 0)
@@ -3261,7 +3269,7 @@ NTSTATUS CdpJournalFormat(_Inout_ PCdp_JOURNAL Journal)
 	Journal->SuperblockDirty = TRUE;
 	status = CdpJournalWriteSuperblockLocked(Journal);
 	if (NT_SUCCESS(status))
-		status = CdpJournalFlush(Journal);
+		status = CdpJournalCommitHeaderWriteCacheLocked(Journal);
 	if (NT_SUCCESS(status))
 	{
 		Journal->Mounted = TRUE;
@@ -3658,11 +3666,11 @@ static NTSTATUS CdpJournalAppendBranchLocked(
 
 	if (Journal->SuperblockDirty)
 	{
-		status = CdpJournalFlush(Journal);
+		status = CdpJournalCommitHeaderWriteCacheLocked(Journal);
 		if (!NT_SUCCESS(status))
 		{
 #ifndef Cdp_USERMODE
-			Cdp_LOG("[RECOVERY-BRANCH-FAIL] stage=pre-superblock-flush status=0x%08X branch=%ld\n",
+			Cdp_LOG("[RECOVERY-BRANCH-FAIL] stage=pre-superblock-header-commit status=0x%08X branch=%ld\n",
 				status, BranchNumber);
 #endif
 		}
@@ -3679,11 +3687,11 @@ static NTSTATUS CdpJournalAppendBranchLocked(
 		}
 		if (NT_SUCCESS(status))
 		{
-			status = CdpJournalFlush(Journal);
+			status = CdpJournalCommitHeaderWriteCacheLocked(Journal);
 			if (!NT_SUCCESS(status))
 			{
 #ifndef Cdp_USERMODE
-				Cdp_LOG("[RECOVERY-BRANCH-FAIL] stage=post-superblock-flush status=0x%08X branch=%ld\n",
+				Cdp_LOG("[RECOVERY-BRANCH-FAIL] stage=post-superblock-header-commit status=0x%08X branch=%ld\n",
 					status, BranchNumber);
 #endif
 			}
@@ -3691,11 +3699,11 @@ static NTSTATUS CdpJournalAppendBranchLocked(
 	}
 	else
 	{
-		status = CdpJournalFlush(Journal);
+		status = CdpJournalCommitHeaderWriteCacheLocked(Journal);
 		if (!NT_SUCCESS(status))
 		{
 #ifndef Cdp_USERMODE
-			Cdp_LOG("[RECOVERY-BRANCH-FAIL] stage=branch-flush status=0x%08X branch=%ld\n",
+			Cdp_LOG("[RECOVERY-BRANCH-FAIL] stage=branch-header-commit status=0x%08X branch=%ld\n",
 				status, BranchNumber);
 #endif
 		}
@@ -3873,11 +3881,11 @@ NTSTATUS CdpJournalRollbackLatestBranch(
 		Journal->BranchTree.Latest->EndRecord.WallClock100ns : 0;
 	Journal->SuperblockDirty = TRUE;
 	CdpJournalAdvanceRecordGenerationLocked(Journal);
-	status = CdpJournalFlush(Journal);
+	status = CdpJournalCommitHeaderWriteCacheLocked(Journal);
 	if (NT_SUCCESS(status))
 		status = CdpJournalWriteSuperblockLocked(Journal);
 	if (NT_SUCCESS(status))
-		status = CdpJournalFlush(Journal);
+		status = CdpJournalCommitHeaderWriteCacheLocked(Journal);
 
 cleanup:
 	Cdp_LOCK_RELEASE(&Journal->Lock);
@@ -3904,7 +3912,7 @@ NTSTATUS CdpJournalSetRecoveryIntent(
 	Journal->SuperblockDirty = TRUE;
 	status = CdpJournalWriteSuperblockLocked(Journal);
 	if (NT_SUCCESS(status))
-		status = CdpJournalFlush(Journal);
+		status = CdpJournalCommitHeaderWriteCacheLocked(Journal);
 done:
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	return status;
@@ -3928,7 +3936,7 @@ NTSTATUS CdpJournalClearRecoveryIntent(_Inout_ PCdp_JOURNAL Journal)
 	Journal->SuperblockDirty = TRUE;
 	status = CdpJournalWriteSuperblockLocked(Journal);
 	if (NT_SUCCESS(status))
-		status = CdpJournalFlush(Journal);
+		status = CdpJournalCommitHeaderWriteCacheLocked(Journal);
 done:
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	return status;
@@ -3951,7 +3959,7 @@ NTSTATUS CdpJournalCompleteRecoveryIntent(_Inout_ PCdp_JOURNAL Journal)
 	Journal->SuperblockDirty = TRUE;
 	status = CdpJournalWriteSuperblockLocked(Journal);
 	if (NT_SUCCESS(status))
-		status = CdpJournalFlush(Journal);
+		status = CdpJournalCommitHeaderWriteCacheLocked(Journal);
 done:
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	return status;
@@ -3990,7 +3998,7 @@ NTSTATUS CdpJournalSetRestorePoint(
 	Journal->SuperblockDirty = TRUE;
 	status = CdpJournalWriteSuperblockLocked(Journal);
 	if (NT_SUCCESS(status))
-		status = CdpJournalFlush(Journal);
+		status = CdpJournalCommitHeaderWriteCacheLocked(Journal);
 	if (!NT_SUCCESS(status))
 	{
 		Journal->RestorePointSet = oldSet;
@@ -4023,7 +4031,7 @@ NTSTATUS CdpJournalClearRestorePoint(_Inout_ PCdp_JOURNAL Journal)
 	Journal->SuperblockDirty = TRUE;
 	status = CdpJournalWriteSuperblockLocked(Journal);
 	if (NT_SUCCESS(status))
-		status = CdpJournalFlush(Journal);
+		status = CdpJournalCommitHeaderWriteCacheLocked(Journal);
 	if (!NT_SUCCESS(status))
 	{
 		Journal->RestorePointSet = oldSet;
@@ -4055,7 +4063,7 @@ NTSTATUS CdpJournalSetCredential(
 		Journal->SuperblockDirty = TRUE;
 		status = CdpJournalWriteSuperblockLocked(Journal);
 		if (NT_SUCCESS(status))
-			status = CdpJournalFlush(Journal);
+			status = CdpJournalCommitHeaderWriteCacheLocked(Journal);
 	}
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	return status;
@@ -4537,7 +4545,7 @@ NTSTATUS CdpJournalDeleteOldestRegion(
 	{
 		status = CdpJournalDropOldestRegionLocked(Journal);
 		if (NT_SUCCESS(status))
-			status = CdpJournalFlush(Journal);
+			status = CdpJournalCommitHeaderWriteCacheLocked(Journal);
 	}
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	return status;
@@ -4610,7 +4618,7 @@ NTSTATUS CdpJournalDeleteContiguousTombstonedRegions(
 	}
 
 	if (NT_SUCCESS(status) && deleted != 0)
-		status = CdpJournalFlush(Journal);
+		status = CdpJournalCommitHeaderWriteCacheLocked(Journal);
 	*DeletedRegionCount = deleted;
 
 cleanup:
@@ -4730,7 +4738,7 @@ NTSTATUS CdpJournalDeleteRecordsThroughSequence(
 
 	if (changed)
 	{
-		status = CdpJournalFlush(Journal);
+		status = CdpJournalCommitHeaderWriteCacheLocked(Journal);
 		if (!NT_SUCCESS(status))
 			goto cleanup;
 		CdpJournalAdvanceRecordGenerationLocked(Journal);
@@ -5042,7 +5050,7 @@ NTSTATUS CdpJournalPruneUnreachableForCompaction(
 	if (changed)
 	{
 		NTSTATUS rebuildStatus;
-		NTSTATUS flushStatus = CdpJournalFlush(Journal);
+		NTSTATUS flushStatus = CdpJournalCommitHeaderWriteCacheLocked(Journal);
 		CdpJournalAdvanceRecordGenerationLocked(Journal);
 		rebuildStatus = CdpJournalRebuildRuntimeLocked(Journal, NULL);
 		if (NT_SUCCESS(status) && !NT_SUCCESS(flushStatus))

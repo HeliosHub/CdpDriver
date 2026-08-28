@@ -26,7 +26,7 @@ CdpDriver 同时注册为 `Volume` 与 `DiskDrive` 类 Upper Filter。卷层负�
 
 卷层 WRITE 不接管，直接发往下一层。请求到达磁盘 Upper Filter 后按绝对物理范围匹配保护分区；journal payload 优先直接复用原 IRP 的单段 MDL 映射，多段 MDL 或不支持的缓冲形式才建立连续 snapshot：
 
-普通 record header 以一个物理扇区为提交批次：满扇区时只写入，不发物理 flush；普通写中的 Superblock 更新也只写入。显式 flush 与正常关闭会提交并 flush 未满扇区。意外断电可丢失最近批次，预览扫描不会把仍只存在于内存的 header 作为已提交历史。
+普通 record header 以一个物理扇区为提交批次：满扇区时只写入，不发物理 flush；未满扇区由有序 I/O worker 每 2 秒检查并写回。普通写中的 Superblock 更新也只写入。只有关机、Journal 卸载以及开始 Preview/Recovery 扫描前会发物理 flush。意外断电仍可丢失最近批次。
 
 开始预览或恢复时，重建目标视图前会先提交并 flush 当前脏 header 扇区，因此可选择当前未满批次中的任意 record 时间点。
 
