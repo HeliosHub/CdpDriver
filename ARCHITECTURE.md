@@ -24,11 +24,13 @@ CdpDriver 同时注册为 `Volume` 与 `DiskDrive` 类 Upper Filter。卷层负�
 
 ## 3. 写入路径
 
-卷层 WRITE 不接管，直接发往下一层。请求到达磁盘 Upper Filter 后按绝对物理范围匹配保护分区：
+卷层 WRITE 不接管，直接发往下一层。请求到达磁盘 Upper Filter 后按绝对物理范围匹配保护分区；journal payload 优先直接复用原 IRP 的单段 MDL 映射，多段 MDL 或不支持的缓冲形式才建立连续 snapshot：
 
-1. Dispatch 保留原始 IRP 和绝对磁盘偏移，排入该磁盘的 FIFO 工作队列。
-2. Worker 在 `PASSIVE_LEVEL` 获取源保护上下文，并用 `HistoryMutex` 串行化写入顺序。
-3. `CdpCoreAppendAfterImage` 依次持久化 payload 与 Record Header。
+普通 record header 以一个物理扇区为提交批次：满扇区时写入并 flush，显式 flush 与正常关闭会提交未满扇区。意外断电可丢失尚未提交批次，但不会把未满 header 作为已提交历史扫描。
+
+1. Dispatch 保留原始 IRP 和绝对磁盘偏移；可在 `PASSIVE_LEVEL` 直接处理，不能直接处理的请求进入磁盘 FIFO Worker。
+2. 普通重定向写不获取 `HistoryMutex`。`CdpCoreAppendAfterImage` 先在 `Journal.Lock` 内预留 sequence/payload/header 位置，再锁外持久化 payload；原子 publish ticket 按预留顺序提交 Header，`TreeLock` 只在读写 `MetaTree` 时持有。Tree 发布完成后递增 ticket，下一条才能发布。
+3. RR 切换前仅等待当时已经预留的 ticket 全部发布，保证刚关闭的 RR 不含在途记录；该等待不影响同一 RR 内 payload 并行写入。
 4. Journal 成功后更新当前分支 `MetaTree`，并直接完成应用 IRP；写入不会到达源分区。
 5. Journal 失败时应用写失败，不允许绕过保护写入源分区。
 
@@ -97,9 +99,10 @@ Journal 使用率达到 90% 时启动唯一合并线程。Console 的认证命�
 | 对象 | 保护范围 |
 |---|---|
 | `CaptureConfigMutex` | 保护配置、自动发现和 Source/Journal 对象图变更 |
-| `HistoryMutex` | 单源 Journal append、drain、还原点物化及树发布顺序 |
-| `Journal.Lock` | Journal 游标、区域链和持久元数据 |
+| `HistoryMutex` | drain、预览读取、还原点/Recovery 等生命周期操作；普通重定向写不获取 |
+| `Journal.Lock` | Journal record 序号、payload/header 位置预留、区域链和持久元数据 |
 | `TreeLock` | `MetaTree`、`PreviewTree`、Phase 和延迟分支/历史重置状态 |
+| publish ticket | 按预留顺序发布 Record Header 和 `MetaTree`，RR 切换前收敛在途预留 |
 | 磁盘 FIFO Worker | 最终物理 I/O 的到达顺序与应用 IRP 完成顺序 |
 | `DiskIoOutstanding` | 路由引用与关闭保护之间的生命周期屏障 |
 

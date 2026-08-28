@@ -35,6 +35,12 @@ static NTSTATUS CdpSnapshotWriteMdlChain(
 	_Outptr_result_bytebuffer_(RequiredLength) PUCHAR* Snapshot,
 	_Out_ PULONG MdlCount,
 	_Out_ PUINT64 MdlBytes);
+static NTSTATUS CdpGetDirectWriteBuffer(
+	_In_ PIRP Irp,
+	_In_ ULONG RequiredLength,
+	_Outptr_result_bytebuffer_(RequiredLength) PUCHAR* Buffer,
+	_Out_ PULONG MdlCount,
+	_Out_ PUINT64 MdlBytes);
 static NTSTATUS CdpQueueDiskCaptureIrp(
 	_Inout_ PCdp_DEVICE_EXTENSION DiskExt,
 	_Inout_ PIRP Irp);
@@ -5078,6 +5084,40 @@ static NTSTATUS CdpSnapshotWriteMdlChain(
 	return STATUS_SUCCESS;
 }
 
+/* The original IRP is held pending until CdpRedirectJournalWrite returns, so
+ * its single MDL is still locked throughout the synchronous journal append.
+ * Reuse the common single-MDL buffer directly; use a contiguous snapshot only
+ * when the request is fragmented or otherwise unsupported. */
+static NTSTATUS CdpGetDirectWriteBuffer(
+	_In_ PIRP Irp,
+	_In_ ULONG RequiredLength,
+	_Outptr_result_bytebuffer_(RequiredLength) PUCHAR* Buffer,
+	_Out_ PULONG MdlCount,
+	_Out_ PUINT64 MdlBytes)
+{
+	PMDL mdl;
+	PVOID mapped;
+
+	if (!Irp || !Buffer || !MdlCount || !MdlBytes || RequiredLength == 0)
+		return STATUS_INVALID_PARAMETER;
+	*Buffer = NULL;
+	*MdlCount = 0;
+	*MdlBytes = 0;
+
+	mdl = Irp->MdlAddress;
+	if (!mdl || mdl->Next != NULL)
+		return STATUS_NOT_SUPPORTED;
+	*MdlCount = 1;
+	*MdlBytes = MmGetMdlByteCount(mdl);
+	if (*MdlBytes < RequiredLength)
+		return STATUS_BUFFER_TOO_SMALL;
+	mapped = MmGetSystemAddressForMdlSafe(mdl, NormalPagePriority);
+	if (!mapped)
+		return STATUS_INSUFFICIENT_RESOURCES;
+	*Buffer = (PUCHAR)mapped;
+	return STATUS_SUCCESS;
+}
+
 static NTSTATUS CdpQueryMdlChain(
 	_In_opt_ PMDL FirstMdl,
 	_Out_ PULONG MdlCount,
@@ -5198,6 +5238,7 @@ static NTSTATUS CdpRedirectJournalWrite(
 {
 	PIRP Irp;
 	PIO_STACK_LOCATION irpSp;
+	PUCHAR writeBuffer = NULL;
 	PUCHAR snapshot = NULL;
 	Cdp_JOURNAL_RECORD record;
 	ULONG writeLength;
@@ -5231,8 +5272,14 @@ static NTSTATUS CdpRedirectJournalWrite(
 	if (!SourceExt->RedirectJournalEntry)
 		return CdpCompleteFailedRedirectWrite(
 			SourceExt, Irp, STATUS_DEVICE_NOT_READY);
-	status = CdpSnapshotWriteMdlChain(
-		Irp, writeLength, &snapshot, &mdlCount, &mdlBytes);
+	status = CdpGetDirectWriteBuffer(
+		Irp, writeLength, &writeBuffer, &mdlCount, &mdlBytes);
+	if (status == STATUS_NOT_SUPPORTED)
+	{
+		status = CdpSnapshotWriteMdlChain(
+			Irp, writeLength, &snapshot, &mdlCount, &mdlBytes);
+		writeBuffer = snapshot;
+	}
 	if (!NT_SUCCESS(status))
 	{
 		Cdp_LOG("[VERIFY-FAIL] stage=mdl status=0x%08X sourceOffset=%lld len=%lu mdlCount=%lu mdlBytes=%llu\n",
@@ -5248,7 +5295,7 @@ static NTSTATUS CdpRedirectJournalWrite(
 	for (chunkOffset = 0; chunkOffset < writeLength; )
 	{
 		ULONG chunkLength = writeLength - chunkOffset;
-		PUCHAR chunkData = snapshot + chunkOffset;
+		PUCHAR chunkData = writeBuffer + chunkOffset;
 		UINT64 chunkVolumeOffset = Item->OriginalDiskOffset + chunkOffset;
 
 		if (chunkLength > Cdp_JOURNAL_MAX_RECORD_DATA)
@@ -5268,13 +5315,15 @@ static NTSTATUS CdpRedirectJournalWrite(
 				chunkOffset,
 				chunkLength,
 				chunkOffset / Cdp_JOURNAL_MAX_RECORD_DATA);
-			cdpfree(snapshot);
+			if (snapshot)
+				cdpfree(snapshot);
 			return CdpCompleteFailedRedirectWrite(SourceExt, Irp, status);
 		}
 		chunkOffset += chunkLength;
 	}
 
-	cdpfree(snapshot);
+	if (snapshot)
+		cdpfree(snapshot);
 
 	CdpStartMergeIfNeeded(SourceExt);
 	CdpReleaseRedirectWrite(SourceExt);
@@ -5494,10 +5543,7 @@ static NTSTATUS CdpDispatchProtectedDiskWrite(
 	if (InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) != 0 &&
 		CdpTryAcquireRedirectWrite(sourceExt))
 	{
-		KeWaitForSingleObject(&sourceExt->HistoryMutex,
-			Executive, KernelMode, FALSE, NULL);
 		status = CdpRedirectJournalWrite(sourceExt, &directItem);
-		KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
 		CdpReleaseDiskIoOutstanding(sourceExt);
 		ObDereferenceObject(sourceReference);
 		return status;
@@ -5694,16 +5740,9 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 					captureActive && phase != (LONG)Cdp_PHASE_DRAINING &&
 					CdpTryAcquireRedirectWrite(devExt))
 				{
-					/* Preserve FIFO visibility: the next item cannot start until
-					 * payload, header and flush complete and MetaTree is published. */
-					KeWaitForSingleObject(
-						&devExt->HistoryMutex,
-						Executive,
-						KernelMode,
-						FALSE,
-						NULL);
+					/* Journal reservation tickets and ordered MetaTree publication
+					 * serialize visibility; ordinary writes do not take HistoryMutex. */
 					(void)CdpRedirectJournalWrite(devExt, item);
-					KeReleaseMutex(&devExt->HistoryMutex, FALSE);
 				}
 				else if (majorFunction == IRP_MJ_READ && captureActive)
 				{
@@ -6229,9 +6268,9 @@ VOID CdpDisableAndDestroyCapture(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	if (redirectJournalEntry)
 		CdpReleaseVolumeHandleEntry(redirectJournalEntry);
 
-	// The capture worker holds HistoryMutex whenever it can access Core.  Take
-	// ownership under that mutex only after the worker has stopped, then free
-	// Core outside every spin lock and outside the mutex.
+	// The worker has stopped and RedirectWritesInFlight is drained above. Take
+	// ownership under HistoryMutex to exclude remaining lifecycle/read users,
+	// then free Core outside every spin lock and outside the mutex.
 	KeWaitForSingleObject(&DevExt->HistoryMutex,
 		Executive, KernelMode, FALSE, NULL);
 	core = DevExt->Core;

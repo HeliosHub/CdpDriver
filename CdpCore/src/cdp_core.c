@@ -1514,9 +1514,9 @@ NTSTATUS CdpCoreAppendAfterImage(
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord)
 {
 	NTSTATUS status;
+	NTSTATUS publishStatus;
 	Cdp_JOURNAL_RECORD record;
-	ULONG nodeCountBefore = 0;
-	ULONG nodeCountAfter = 0;
+	UINT64 publishTicket = 0;
 	PCdp_WRITE_LEDGER_RANGE ledgerRange;
 	if (!Core || !AfterImage || Length == 0 ||
 		Length > Cdp_JOURNAL_MAX_RECORD_DATA)
@@ -1540,7 +1540,8 @@ NTSTATUS CdpCoreAppendAfterImage(
 		Cdp_FREE(ledgerRange);
 		return STATUS_DEVICE_NOT_READY;
 	}
-	nodeCountBefore = Core->MetaTree.NodeCount;
+	/* TreeLock protects tree/state transitions only.  The journal payload write
+	 * below may block on disk, so do not retain this lock across it. */
 	status = CdpCoreMaterializePendingRestoreResetLocked(Core);
 	if (!NT_SUCCESS(status))
 	{
@@ -1555,13 +1556,15 @@ NTSTATUS CdpCoreAppendAfterImage(
 		Cdp_FREE(ledgerRange);
 		return status;
 	}
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
 	status = CdpJournalAppendEx(
 		Core->Journal,
 		Offset,
 		Length,
 		AfterImage,
 		0,
-		&record);
+		&record,
+		&publishTicket);
 	if (!NT_SUCCESS(status))
 	{
 #ifndef Cdp_USERMODE
@@ -1571,6 +1574,15 @@ NTSTATUS CdpCoreAppendAfterImage(
 	}
 	if (NT_SUCCESS(status))
 	{
+		Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+		if (!Core->MetaTreeReady)
+		{
+			Cdp_LOCK_RELEASE(&Core->TreeLock);
+			Cdp_FREE(ledgerRange);
+			(VOID)CdpJournalCompleteAppendPublish(
+				Core->Journal, publishTicket);
+			return STATUS_DEVICE_NOT_READY;
+		}
 		status = CdpPreviewTreeOverlayLatest(&Core->MetaTree, &record);
 		if (!NT_SUCCESS(status))
 		{
@@ -1596,11 +1608,17 @@ NTSTATUS CdpCoreAppendAfterImage(
 				Core->MetaTreeReady = FALSE;
 			}
 		}
+		Cdp_LOCK_RELEASE(&Core->TreeLock);
 	}
-	nodeCountAfter = Core->MetaTree.NodeCount;
-	Cdp_LOCK_RELEASE(&Core->TreeLock);
 	if (ledgerRange)
 		Cdp_FREE(ledgerRange);
+	if (publishTicket != 0)
+	{
+		publishStatus = CdpJournalCompleteAppendPublish(
+			Core->Journal, publishTicket);
+		if (NT_SUCCESS(status) && !NT_SUCCESS(publishStatus))
+			status = publishStatus;
+	}
 	if (NT_SUCCESS(status))
 	{
 		Core->Time100ns += 1;

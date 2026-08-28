@@ -4,7 +4,7 @@ CdpCore 是驱动与用户态单元测试共用的 after-image Journal 引擎。
 
 ## 当前数据语义
 
-- 应用写只追加到日志卷，成功后直接完成上层写请求，不再写源卷。
+- 应用写只追加到日志卷，成功后直接完成上层写请求，不再写源卷；普通追加不依赖驱动层 `HistoryMutex`，由 Journal 预留锁、publish ticket 与 `TreeLock` 分别负责位置分配、发布顺序和树更新。
 - 当前分支的 `MetaTree` 保存每个卷区间的最新日志位置；读取命中树时取日志 payload，空缺区间取源卷。
 - Journal 格式版本为 v15。Record Header 的 `Sequence` 低16位为区域内索引，最高位 `BRANCH` 表示分支记录；新分支固定从新 HeaderRegion 的索引0开始，全局 Sequence 跨分支持续递增。
 - 普通挂载扫描保留记录，重建分支信息树和当前分支 `MetaTree`；启动自动发现会在文件系统挂载源卷前完成保护对象图发布。

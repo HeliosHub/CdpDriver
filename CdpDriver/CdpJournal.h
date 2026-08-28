@@ -345,6 +345,11 @@ typedef struct _Cdp_JOURNAL
 	PCdp_STORE Store; // if set, RawIo uses store instead of TargetDevice
 	Cdp_QUERY_TIME_100NS QueryTime100ns;
 	PVOID QueryTimeContext;
+	// Append publication tickets are independent of on-disk record Sequence
+	// because branch markers also consume record Sequence values.
+	volatile LONG64 NextAppendTicket;
+	volatile LONG64 NextPublishTicket;
+	UINT64 LastReservedTime100ns;
 	Cdp_LOCK Lock;
 } Cdp_JOURNAL, *PCdp_JOURNAL;
 
@@ -477,7 +482,13 @@ NTSTATUS CdpJournalAppendEx(
 	_In_ ULONG DataLength,
 	_In_reads_bytes_(DataLength) const VOID* AfterImage,
 	_In_ ULONG RecordFlags,
-	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord,
+	_Out_opt_ PUINT64 PublishTicket);
+
+// Called only after the matching record has been published into MetaTree.
+NTSTATUS CdpJournalCompleteAppendPublish(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 PublishTicket);
 
 // Serialize a durability barrier with journal append transactions.
 NTSTATUS CdpJournalFlushBuffers(_Inout_ PCdp_JOURNAL Journal);

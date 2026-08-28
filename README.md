@@ -2,7 +2,7 @@
 
 CdpDriver 是一个同时工作在 Windows `Volume` 与 `DiskDrive` 类的 Upper Filter 驱动。当前开发版本采用 after-image：受保护分区的应用写在磁盘层持久化到独立 Journal 后直接完成，不再提交到源分区；卷层优先合成读取，磁盘层为旁路读取兜底。
 
-当前版本：**1.6.8-test44**（Build `20260827.131-query-time-range`），Journal 磁盘格式：**v15**。
+当前版本：**1.6.8-test61**（Build `20260828.148-write-without-history-mutex`），Journal 磁盘格式：**v15**。
 
 主要功能：
 
@@ -100,7 +100,7 @@ Preview 按目标时间定位分支，递归包含父分支继承路径并构建
 
 Recovery Begin 根据目标时间确定父分支和继承点，追加一个新分支记录，再构建完整的新 `MetaTree`。构建成功后原子替换旧树；整个过程不向源分区回填数据。`r` / Commit 仅作为兼容确认命令，不执行磁盘写回。
 
-应用写逐条追加 payload 和 Record Header。日志写失败时对应应用写失败，不会绕过 Journal 写入源卷。
+应用写逐条追加 payload 和 Record Header。普通重定向写不获取 `HistoryMutex`；`Journal.Lock` 内一次性预留 record sequence、payload 位置和 header 槽位，payload 的原始 I/O 在锁外执行。独立的原子 publish ticket 保证 Header 与 `MetaTree` 按预留顺序发布；满 header 扇区先在锁内生成私有快照，再释放 `Journal.Lock` 落盘。只有前一条完成 Tree 更新并递增 ticket 后，后一条才能发布。RR 切换前仅等待已有 ticket 收敛，避免刚关闭的 RR 仍有在途记录。日志写失败时对应应用写失败，不会绕过 Journal 写入源卷。
 
 选择“重启恢复”时，`e` 只把恢复标记和目标时间写入 Journal Superblock，不立即构建历史树。下次启动时：
 
@@ -143,7 +143,9 @@ Recovery Begin 根据目标时间确定父分支和继承点，追加一个新�
 
 ## 读写分层与 TRIM
 
-卷层 WRITE 始终透传，由磁盘层完成最终保护截获。卷层 READ 对已绑定保护分区优先合成；直接到达磁盘层的读取由磁盘层兜底。每个磁盘使用“最近命中分区 + 有序范围二分查找”定位保护分区，多分区查找复杂度为 `O(log N)`。
+卷层 WRITE 始终透传，由磁盘层完成最终保护截获。普通写入的 journal payload 优先直接复用原 IRP 的单段 MDL 映射；只有多段 MDL 或不支持的缓冲形式才复制到临时 snapshot。卷层 READ 对已绑定保护分区优先合成；直接到达磁盘层的读取由磁盘层兜底。每个磁盘使用“最近命中分区 + 有序范围二分查找”定位保护分区，多分区查找复杂度为 `O(log N)`。
+
+普通 record 的 32 字节 header 会在内存中聚合到一个物理扇区后再写入并 flush；正常关闭和显式 flush 会提交未满扇区。该性能模式允许意外断电丢失尚未提交的当前 header 扇区中的最新 record。
 
 保护开启期间，驱动拦截并抑制 `DeviceDsmAction_Trim`，避免底层回收破坏源卷基础数据。停止保护后 TRIM 和普通写直接下发。
 
