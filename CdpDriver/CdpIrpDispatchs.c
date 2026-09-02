@@ -3689,18 +3689,9 @@ static NTSTATUS CdpQueryTimeRange(
 		&Reply->OldestRecord100ns,
 		&Reply->NewestRecord100ns);
 	CdpReleaseVolumeHandleEntry(journalEntry);
-	// Command 9 presents local time only to whole seconds.  Returning the raw
-	// newest record time would round it down when copied back as a FILETIME,
-	// excluding a record written later in that same second.  Publish an
-	// exclusive upper bound instead; Core/recovery paths retain their exact
-	// newest timestamp and are intentionally unaffected.
-	if (Reply->NewestRecord100ns != 0)
-	{
-		if (Reply->NewestRecord100ns <= MAXUINT64 - 10000000ULL)
-			Reply->NewestRecord100ns += 10000000ULL;
-		else
-			Reply->NewestRecord100ns = MAXUINT64;
-	}
+	// Command 9 reports the actual newest retained UTC Unix second.  Records
+	// written in the same second are ordered by Sequence, not by manufacturing
+	// a later timestamp.
 	Reply->HasRecords =
 		Reply->OldestRecord100ns != 0 && Reply->NewestRecord100ns != 0;
 	return STATUS_SUCCESS;

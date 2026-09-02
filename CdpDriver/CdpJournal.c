@@ -152,24 +152,37 @@ static UINT64 CdpJournalQueryWallClock100ns(_In_ PCdp_JOURNAL Journal)
 #ifdef Cdp_USERMODE
 	{
 		FILETIME utcFt;
-		FILETIME localFt;
 		ULARGE_INTEGER u;
 		GetSystemTimeAsFileTime(&utcFt);
-		if (!FileTimeToLocalFileTime(&utcFt, &localFt))
-			localFt = utcFt;
-		u.LowPart = localFt.dwLowDateTime;
-		u.HighPart = localFt.dwHighDateTime;
-		return u.QuadPart;
+		u.LowPart = utcFt.dwLowDateTime;
+		u.HighPart = utcFt.dwHighDateTime;
+		return u.QuadPart / 10000000ULL - 11644473600ULL;
 	}
 #else
 	{
 		LARGE_INTEGER systemTime;
-		LARGE_INTEGER localTime;
 		KeQuerySystemTime(&systemTime);
-		ExSystemTimeToLocalTime(&systemTime, &localTime);
-		return (UINT64)localTime.QuadPart;
+		return (UINT64)systemTime.QuadPart / 10000000ULL - 11644473600ULL;
 	}
 #endif
+}
+
+/* The caller holds Journal->Lock.  UTC Unix seconds are intentionally allowed
+ * to repeat.  A backwards wall-clock adjustment must not make the retained
+ * time range or branch ordering run backwards, so clamp only to the current
+ * newest second; never advance it artificially. */
+static UINT64 CdpJournalQueryRecordTimeSecondsLocked(_In_ PCdp_JOURNAL Journal)
+{
+	UINT64 wallClockSeconds = CdpJournalQueryWallClock100ns(Journal);
+
+	if (Journal->Newest100ns != 0 &&
+		wallClockSeconds < Journal->Newest100ns)
+	{
+		Cdp_LOG("[JOURNAL-TIME] UTC clock moved backward raw=%llu clamped=%llu\n",
+			wallClockSeconds, Journal->Newest100ns);
+		return Journal->Newest100ns;
+	}
+	return wallClockSeconds;
 }
 
 static BOOLEAN CdpJournalHeaderIsBranch(
@@ -1128,8 +1141,7 @@ static BOOLEAN CdpJournalSuperblockValid(
 	UINT64 usableEnd;
 
 	if (Superblock->Magic != Cdp_JOURNAL_MAGIC ||
-		(Superblock->Version != Cdp_JOURNAL_VERSION &&
-		 Superblock->Version != Cdp_JOURNAL_VERSION_PREVIOUS) ||
+		Superblock->Version != Cdp_JOURNAL_VERSION ||
 		Superblock->SectorSize != Journal->SectorSize ||
 		Superblock->PartitionSize != Journal->PartitionSize)
 	{
@@ -3557,17 +3569,7 @@ static NTSTATUS CdpJournalAppendBranchLocked(
 	}
 
 	writeSequence = Journal->NextSequence;
-	writeTime = CdpJournalQueryWallClock100ns(Journal);
-	if (Journal->Newest100ns != 0 && writeTime <= Journal->Newest100ns)
-	{
-		if (Journal->Newest100ns == MAXUINT64)
-		{
-			if (newRegionAllocated)
-				(void)CdpJournalDiscardEmptyNewestRegionLocked(Journal);
-			return STATUS_INTEGER_OVERFLOW;
-		}
-		writeTime = Journal->Newest100ns + 1;
-	}
+	writeTime = CdpJournalQueryRecordTimeSecondsLocked(Journal);
 	branchNode = CdpBranchTreeAllocateNode(
 		BranchNumber,
 		ParentBranchNumber,
@@ -3708,13 +3710,7 @@ static NTSTATUS CdpJournalAppendBranchContinuationLocked(
 		return STATUS_DISK_CORRUPT_ERROR;
 
 	writeSequence = Journal->NextSequence;
-	writeTime = CdpJournalQueryWallClock100ns(Journal);
-	if (Journal->Newest100ns != 0 && writeTime <= Journal->Newest100ns)
-	{
-		if (Journal->Newest100ns == MAXUINT64)
-			return STATUS_INTEGER_OVERFLOW;
-		writeTime = Journal->Newest100ns + 1;
-	}
+	writeTime = CdpJournalQueryRecordTimeSecondsLocked(Journal);
 	RtlZeroMemory(&branchHeader, sizeof(branchHeader));
 	branchHeader.WallClock100ns = writeTime;
 	branchHeader.BranchNumber = branchNode->BranchNumber;
@@ -4317,41 +4313,7 @@ NTSTATUS CdpJournalAppendEx(
 		goto cleanup;
 
 	writeSeq = Journal->NextSequence;
-	if (Journal->QueryTime100ns)
-	{
-		writeTime = Journal->QueryTime100ns(Journal->QueryTimeContext);
-	}
-	else
-	{
-#ifdef Cdp_USERMODE
-		FILETIME utcFt;
-		FILETIME localFt;
-		ULARGE_INTEGER u;
-		GetSystemTimeAsFileTime(&utcFt);
-		if (!FileTimeToLocalFileTime(&utcFt, &localFt))
-			localFt = utcFt;
-		u.LowPart = localFt.dwLowDateTime;
-		u.HighPart = localFt.dwHighDateTime;
-		writeTime = u.QuadPart;
-#else
-		{
-			LARGE_INTEGER systemTime;
-			LARGE_INTEGER localTime;
-			KeQuerySystemTime(&systemTime);
-			ExSystemTimeToLocalTime(&systemTime, &localTime);
-			writeTime = (UINT64)localTime.QuadPart;
-		}
-#endif
-	}
-	if (Journal->Newest100ns != 0 && writeTime <= Journal->Newest100ns)
-	{
-		if (Journal->Newest100ns == MAXUINT64)
-		{
-			status = STATUS_INTEGER_OVERFLOW;
-			goto cleanup;
-		}
-		writeTime = Journal->Newest100ns + 1;
-	}
+	writeTime = CdpJournalQueryRecordTimeSecondsLocked(Journal);
 
 	RtlZeroMemory(&header, sizeof(header));
 	header.WallClock100ns = writeTime;

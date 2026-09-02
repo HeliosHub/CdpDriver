@@ -1,6 +1,7 @@
 ﻿#include <stdio.h>
 #include <stdlib.h>
 #include <stdarg.h>
+#include <time.h>
 #include <Windows.h>
 #include <objbase.h>
 #include "..\CdpDriver\CdpIoctl.h"
@@ -463,8 +464,8 @@ static void PrintMaxReadHint(void)
 
 static void PrintTime100nsLabel(_In_ const wchar_t* label, _In_ UINT64 time100ns)
 {
-	FILETIME ft;
-	SYSTEMTIME st;
+	time_t seconds;
+	tm localTime = { 0 };
 
 	ConOutFmt(L"%s: %llu", label, time100ns);
 	if (time100ns == 0)
@@ -473,18 +474,17 @@ static void PrintTime100nsLabel(_In_ const wchar_t* label, _In_ UINT64 time100ns
 		return;
 	}
 
-	ft.dwLowDateTime = (DWORD)(time100ns & 0xFFFFFFFFUL);
-	ft.dwHighDateTime = (DWORD)(time100ns >> 32);
-	if (FileTimeToSystemTime(&ft, &st))
+	seconds = (time_t)time100ns;
+	if (localtime_s(&localTime, &seconds) == 0)
 	{
 		ConOutFmt(
 			L"  (%04u-%02u-%02u %02u:%02u:%02u local)\n",
-			st.wYear,
-			st.wMonth,
-			st.wDay,
-			st.wHour,
-			st.wMinute,
-			st.wSecond);
+			localTime.tm_year + 1900,
+			localTime.tm_mon + 1,
+			localTime.tm_mday,
+			localTime.tm_hour,
+			localTime.tm_min,
+			localTime.tm_sec);
 	}
 	else
 	{
@@ -551,7 +551,10 @@ static BOOL DoConvertLocalTimeTo100ns(void)
 
 	value.LowPart = ft.dwLowDateTime;
 	value.HighPart = ft.dwHighDateTime;
-	ConOutFmt(L"WallClock100ns: %llu\n", value.QuadPart);
+	if (value.QuadPart < 116444736000000000ULL)
+		return FALSE;
+	ConOutFmt(L"UTC Unix seconds: %llu\n",
+		(value.QuadPart - 116444736000000000ULL) / 10000000ULL);
 	return TRUE;
 }
 
@@ -574,7 +577,7 @@ static BOOL DoPreviewBegin(HANDLE hDevice)
 			GetLastError());
 		return FALSE;
 	}
-	ConOut(L"TargetTime100ns (local wall-clock FILETIME value): ");
+	ConOut(L"Target UTC Unix seconds: ");
 	if (!ReadLine(line, _countof(line)))
 		return FALSE;
 	req.TargetTime100ns = _wcstoui64(line, NULL, 10);
@@ -689,7 +692,7 @@ static BOOL DoRecoveryBegin(HANDLE hDevice)
 		return FALSE;
 	if (!AuthenticatePassword(hDevice))
 		return FALSE;
-	ConOut(L"TargetTime100ns (local wall-clock FILETIME value): ");
+	ConOut(L"Target UTC Unix seconds: ");
 	if (!ReadLine(line, _countof(line)))
 		return FALSE;
 	req.TargetTime100ns = _wcstoui64(line, NULL, 10);
@@ -815,7 +818,7 @@ static BOOL DoSetRestorePoint(HANDLE hDevice)
 		return FALSE;
 	if (!AuthenticatePassword(hDevice))
 		return FALSE;
-	ConOut(L"Restore-point TargetTime100ns: ");
+	ConOut(L"Restore-point UTC Unix seconds: ");
 	if (!ReadLine(line, _countof(line)))
 		return FALSE;
 	req.TargetTime100ns = _wcstoui64(line, NULL, 10);
@@ -1025,7 +1028,7 @@ static BOOL DoQueryTimeRange(HANDLE hDevice)
 		return TRUE;
 	}
 
-	ConOut(L"Journal record time range (WallClock100ns / local):\n");
+	ConOut(L"Journal record time range (UTC Unix seconds / local display):\n");
 	PrintTime100nsLabel(L"  Oldest", reply.OldestRecord100ns);
 	PrintTime100nsLabel(L"  Newest", reply.NewestRecord100ns);
 	return TRUE;
@@ -1149,7 +1152,7 @@ static BOOL DoListJournalRecords(HANDLE hDevice)
 			ConOutFmt(
 				L"Journal record list: %llu record(s), oldest first (metadata only)\n",
 				totalRecords);
-			ConOut(L"Index  WallClock100ns  VolumeOffset  JournalOffset  Length  Sequence  Flags\n");
+			ConOut(L"Index  UtcUnixSeconds  VolumeOffset  JournalOffset  Length  Sequence  Flags\n");
 			firstPage = FALSE;
 		}
 		else if (reply->TotalRecords != totalRecords ||
@@ -1762,7 +1765,7 @@ static void PrintHelp(void)
 	ConOut(L"  p  - set / verify / change the shared protection password\n");
 	ConOut(L"  v  - list volumes\n");
 	ConOut(L"  d  - query driver version / build / journal version\n");
-	ConOut(L"  t  - convert local time (year-month-day hour:minute:second) to WallClock100ns\n");
+	ConOut(L"  t  - convert local time (year-month-day hour:minute:second) to UTC Unix seconds\n");
 	ConOut(L"  h  - help\n");
 	ConOut(L"  q  - quit console (does not stop CDP)\n");
 	PrintMaxReadHint();

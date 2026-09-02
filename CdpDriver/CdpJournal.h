@@ -9,8 +9,7 @@
 #endif
 
 #define Cdp_JOURNAL_MAGIC            0x4C4E4A51UL /* 'QJNL' */
-#define Cdp_JOURNAL_VERSION          15UL
-#define Cdp_JOURNAL_VERSION_PREVIOUS 14UL
+#define Cdp_JOURNAL_VERSION          17UL
 #define Cdp_JOURNAL_MAX_RECORD_DATA  (2UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_REGION_SIZE (1UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_LINK_SIZE 32UL
@@ -50,7 +49,7 @@
 // Per-record header stored in 1MB header regions (32 bytes).
 typedef struct _Cdp_JOURNAL_RECORD_HEADER
 {
-	UINT64 WallClock100ns; // 8  local wall-clock 100ns (FILETIME epoch)
+	UINT64 WallClock100ns; // 8  UTC Unix seconds (v17; field offset preserved)
 	UINT64 VolumeOffset;   // 8  absolute byte offset on the source physical disk
 	UINT64 FileOffset;     // 8  payload offset inside the CDP partition
 	ULONG DataLength;      // 4

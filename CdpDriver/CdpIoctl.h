@@ -41,7 +41,7 @@
 #define IOCTL_Cdp_BEGIN_RECOVERY CTL_CODE(Cdp_IOCTL_TYPE, 0x808, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_COMMIT_RECOVERY CTL_CODE(Cdp_IOCTL_TYPE, 0x809, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
-// 查询 journal 内最早/最新历史记录的 WallClock100ns
+// Query Journal timestamps as UTC Unix seconds.
 #define IOCTL_Cdp_QUERY_TIME_RANGE CTL_CODE(Cdp_IOCTL_TYPE, 0x80A, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_CANCEL_RECOVERY CTL_CODE(Cdp_IOCTL_TYPE, 0x80B, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_QUERY_VERSION   CTL_CODE(Cdp_IOCTL_TYPE, 0x80C, METHOD_BUFFERED, FILE_ANY_ACCESS)
@@ -146,7 +146,8 @@ typedef struct _Cdp_COMMAND_REPLY
 	WCHAR Message[Cdp_COMMAND_REPLY_MSG_CHARS];
 } Cdp_COMMAND_REPLY, *PCdp_COMMAND_REPLY;
 
-// TargetTime100ns 使用本地时区 wall-clock（与 COW 记录 WallClock100ns 同口径）。
+// TargetTime100ns fields retain their ABI name but carry UTC Unix seconds
+// (same unit as persisted Journal timestamps in v17).
 typedef struct _Cdp_PREVIEW_BEGIN_REQUEST
 {
 	GUID SourceVolumeGuid;
@@ -236,9 +237,9 @@ typedef struct _Cdp_TIME_RANGE_QUERY_REPLY
 {
 	ULONG HasRecords; // 1 if journal has retained history; 0 if empty
 	ULONG Reserved;
-	UINT64 OldestRecord100ns; // earliest surviving WallClock100ns
-	// Exclusive upper bound for second-precision clients: latest retained
-	// WallClock100ns plus one second (saturated at MAXUINT64).
+	UINT64 OldestRecord100ns; // earliest surviving UTC Unix second
+	// Latest retained UTC Unix second.  Same-second records are distinguished
+	// by Sequence in Cdp_JOURNAL_RECORD_INFO.
 	UINT64 NewestRecord100ns;
 } Cdp_TIME_RANGE_QUERY_REPLY, *PCdp_TIME_RANGE_QUERY_REPLY;
 

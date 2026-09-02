@@ -335,6 +335,43 @@ static int TestAfterImageInitialBranchRecord(void)
 	return g_caseFailed;
 }
 
+static int TestUnixSecondTimeRangeDoesNotAdvance(void)
+{
+	PCdp_STORE store = NULL;
+	Cdp_JOURNAL journal;
+	GUID sourceGuid = { 0 };
+	UCHAR first[512];
+	UCHAR second[512];
+	UINT64 oldest = 0;
+	UINT64 newest = 0;
+	const UINT64 recordSecond = 1788322913ULL;
+
+	RtlFillMemory(first, sizeof(first), 0xA5);
+	RtlFillMemory(second, sizeof(second), 0x5A);
+	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &store)),
+		"create journal for UTC Unix-second range test");
+	if (!store)
+		return g_caseFailed;
+
+	CdpJournalInitializeWithStore(
+		&journal, store, &sourceGuid, TestPointerTime100ns,
+		(PVOID)(ULONG_PTR)recordSecond);
+	Expect(NT_SUCCESS(CdpJournalFormat(&journal)),
+		"format UTC Unix-second range journal");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 0, sizeof(first), first, NULL)) &&
+		NT_SUCCESS(CdpJournalAppend(
+			&journal, sizeof(first), sizeof(second), second, NULL)),
+		"append two records in the same UTC Unix second");
+	Expect(NT_SUCCESS(CdpJournalQueryTimeRange(&journal, &oldest, &newest)) &&
+		oldest == recordSecond && newest == recordSecond,
+		"same-second records keep the actual UTC Unix second; Newest does not advance");
+
+	CdpJournalClose(&journal);
+	CdpMemStoreDestroy(store);
+	return g_caseFailed;
+}
+
 static int TestJournalPhysicalLayoutPersistence(void)
 {
 	PCdp_STORE store = NULL;
@@ -1906,15 +1943,15 @@ static int TestAfterImagePreviewBranchPath(void)
 		goto cleanup;
 
 	status = CdpCorePreviewBegin(core, siblingRecord.WallClock100ns);
-	Expect(NT_SUCCESS(status), "select branch 2 from target time");
+	Expect(NT_SUCCESS(status), "select final branch in target second");
 	RtlCopyMemory(expected, inherited, 512);
-	RtlCopyMemory(expected + 512, sibling, 512);
-	RtlCopyMemory(expected + 1024, source + 1024, 512);
+	RtlCopyMemory(expected + 512, source + 512, 512);
+	RtlCopyMemory(expected + 1024, current, 512);
 	RtlZeroMemory(output, sizeof(output));
 	if (NT_SUCCESS(status))
 		status = CdpCorePreviewRead(core, 0, sizeof(output), output);
 	Expect(NT_SUCCESS(status) && memcmp(output, expected, sizeof(output)) == 0,
-		"preview recursively includes parent inheritance and excludes other branches");
+		"same-second preview resolves to the final Sequence in that second");
 	Expect(NT_SUCCESS(CdpCorePreviewEnd(core)), "end sibling preview");
 
 	status = CdpCorePreviewBegin(core, currentRecord.WallClock100ns);
@@ -3053,6 +3090,8 @@ int main(void)
 
 	failed += RunCase("After-image initial branch record",
 		TestAfterImageInitialBranchRecord);
+	failed += RunCase("UTC Unix-second range does not advance",
+		TestUnixSecondTimeRangeDoesNotAdvance);
 	failed += RunCase("Journal physical-layout persistence",
 		TestJournalPhysicalLayoutPersistence);
 	failed += RunCase("After-image append does not touch source",
