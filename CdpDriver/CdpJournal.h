@@ -183,6 +183,11 @@ typedef struct _Cdp_BRANCH_INFO_NODE
 	UINT64 InheritedRecordSequence;
 	Cdp_BRANCH_RECORD_INFO StartRecord;
 	Cdp_BRANCH_RECORD_INFO EndRecord;
+	// Latest durable FIRST/CONTINUATION marker. EndRecord also advances for
+	// ordinary records, so it cannot answer whether a later RR anchors branch.
+	Cdp_BRANCH_RECORD_INFO LatestAnchorRecord;
+	UINT64 LiveRecordCount;
+	UINT64 CompactScanRecords; // transient count produced by oldest-RR scan
 	BOOLEAN Latest;
 	BOOLEAN SyntheticStart;
 	BOOLEAN PrunePending; // transient mark used only while compaction holds Lock
@@ -301,6 +306,15 @@ typedef struct _Cdp_JOURNAL
 	UINT64 ActiveHeaderRegionCount;
 	UINT64 PayloadBytesUsed;
 	UINT64 RecordGeneration;
+	// One-RR compaction snapshot. BuildCurrentBranchRegionTree fills this while
+	// performing the only permitted Record Header scan; DeleteOldestRegion
+	// consumes it instead of scanning the same RR again.
+	UINT64 CompactScanGeneration;
+	UINT64 CompactScanRegionOffset;
+	UINT64 CompactScanFirstSequence;
+	UINT64 CompactScanEndSequence;
+	UINT64 CompactScanLiveRecords;
+	BOOLEAN CompactScanValid;
 	UINT64 Oldest100ns;
 	UINT64 Newest100ns;
 	LONG CurrentBranchNumber;

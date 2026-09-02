@@ -145,6 +145,7 @@ typedef struct _TEST_FAIL_STORE
 	LONG FailNextReads;
 	ULONG ReadCallCount;
 	ULONG ReadLength32Count;
+	ULONG HeaderRegionReadCount;
 	ULONG MaxReadLength;
 	ULONG OversizeReadCount;
 	ULONG LargestSuccessfulRead;
@@ -175,6 +176,8 @@ static NTSTATUS TestFailStoreRead(
 	++fail->ReadCallCount;
 	if (Length == sizeof(Cdp_JOURNAL_RECORD_HEADER))
 		++fail->ReadLength32Count;
+	if (Length == Cdp_JOURNAL_HEADER_REGION_SIZE)
+		++fail->HeaderRegionReadCount;
 	if (fail->FailNextReads > 0)
 	{
 		--fail->FailNextReads;
@@ -251,6 +254,7 @@ static VOID TestFailStoreInstall(_Inout_ PCdp_STORE Store, _Out_ PTEST_FAIL_STOR
 	Fail->FailNextReads = 0;
 	Fail->ReadCallCount = 0;
 	Fail->ReadLength32Count = 0;
+	Fail->HeaderRegionReadCount = 0;
 	Fail->MaxReadLength = 0;
 	Fail->OversizeReadCount = 0;
 	Fail->LargestSuccessfulRead = 0;
@@ -1505,6 +1509,8 @@ static int TestAfterImageCompactsOnlyCurrentBranch(void)
 	UINT64 oldRegion;
 	UINT64 firstSequence;
 	UINT64 endSequence;
+	TEST_FAIL_STORE mergeIo;
+	BOOLEAN mergeIoInstalled = FALSE;
 	NTSTATUS status;
 
 	Expect(NT_SUCCESS(CdpMemStoreCreate(SRC_SIZE * 32, SECTOR, &sourceStore)),
@@ -1561,8 +1567,20 @@ static int TestAfterImageCompactsOnlyCurrentBranch(void)
 		status = CdpCoreMountJournal(core);
 	Expect(NT_SUCCESS(status), "mount current branch before compaction");
 	if (NT_SUCCESS(status))
+	{
+		TestFailStoreInstall(journalStore, &mergeIo);
+		mergeIoInstalled = TRUE;
+	}
+	if (NT_SUCCESS(status))
 		status = CdpCoreCompactOldestRegion(core);
 	Expect(NT_SUCCESS(status), "materialize and delete oldest region");
+	Expect(!mergeIoInstalled || mergeIo.HeaderRegionReadCount == 1,
+		"one merge scans exactly one complete Record Header Region");
+	if (mergeIoInstalled)
+	{
+		TestFailStoreRemove(journalStore, &mergeIo);
+		mergeIoInstalled = FALSE;
+	}
 	Expect(memcmp(CdpMemStoreData(sourceStore), inherited, 512) == 0 &&
 		memcmp((PUCHAR)CdpMemStoreData(sourceStore) + 512,
 			source + 512, 512) == 0 &&
@@ -1594,6 +1612,8 @@ static int TestAfterImageCompactsOnlyCurrentBranch(void)
 		"remounted MetaTree retains newer-region journal data");
 
 cleanup:
+	if (mergeIoInstalled)
+		TestFailStoreRemove(journalStore, &mergeIo);
 	if (core)
 		CdpCoreDestroy(core);
 	if (filler)
