@@ -157,6 +157,14 @@ typedef struct _Cdp_JOURNAL_RECORD
 
 C_ASSERT(sizeof(Cdp_JOURNAL_RECORD) == 40);
 
+typedef struct _Cdp_JOURNAL_RECORD_LOCATION
+{
+	UINT64 Sequence;
+	UINT64 WallClock100ns;
+	UINT64 HeaderRegionOffset;
+	ULONG HeaderIndex;
+} Cdp_JOURNAL_RECORD_LOCATION, *PCdp_JOURNAL_RECORD_LOCATION;
+
 #define Cdp_JOURNAL_HEADERS_PER_REGION \
 	((Cdp_JOURNAL_HEADER_REGION_SIZE - Cdp_JOURNAL_HEADER_LINK_SIZE) / \
 		sizeof(Cdp_JOURNAL_RECORD_HEADER))
@@ -320,6 +328,12 @@ typedef struct _Cdp_JOURNAL
 	LONG CurrentBranchNumber;
 	LONG HighestBranchNumber;
 	Cdp_BRANCH_INFO_TREE BranchTree;
+	// Normal mount builds the current view during the same reverse Record
+	// Header scan that rebuilds BranchTree.  CoreBind/CoreMountJournal consumes
+	// this root instead of starting a second full scan.
+	struct _Cdp_PREVIEW_TREE_NODE* MountMetaTreeRoot;
+	ULONG MountMetaTreeNodeCount;
+	BOOLEAN MountMetaTreeReady;
 	PCdp_RUNTIME_CHECKPOINT CheckpointFirst;
 	PCdp_RUNTIME_CHECKPOINT CheckpointLast;
 	UINT64 NextCheckpointId;
@@ -428,6 +442,12 @@ VOID CdpJournalSetPhysicalLayout(
 NTSTATUS CdpJournalFormat(_Inout_ PCdp_JOURNAL Journal);
 
 NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal);
+
+// Transfer the current-view tree produced by the one-pass mount scan.  The
+// caller owns the returned nodes.  This is single-consumer by design.
+NTSTATUS CdpJournalTakeMountMetaTree(
+	_Inout_ PCdp_JOURNAL Journal,
+	_Out_ PCdp_PREVIEW_TREE Tree);
 
 // Auto discovery only: when a restore point is present (and no recovery
 // intent takes precedence), mount from the superblock without walking Record
@@ -700,6 +720,31 @@ NTSTATUS CdpJournalBuildPreviewTree(
 	_In_ BOOLEAN IncludeTargetTime,
 	_Out_ PCdp_PREVIEW_TREE Tree,
 	_Out_opt_ PUINT64 TargetRecordSequence);
+
+// Extended target-tree builder.  Branch identity and physical location are
+// returned from the same Header scan used to build Tree.
+NTSTATUS CdpJournalBuildPreviewTreeEx(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 TargetTime100ns,
+	_In_ UINT64 MaxSequence,
+	_In_ BOOLEAN IncludeTargetTime,
+	_Out_ PCdp_PREVIEW_TREE Tree,
+	_Out_opt_ PLONG TargetBranchNumber,
+	_Out_opt_ PUINT64 TargetRecordSequence,
+	_Out_opt_ PCdp_JOURNAL_RECORD_LOCATION TargetLocation);
+
+// Preview-specific one-pass builder.  It finds the base record, evaluates the
+// following contiguous-second window and builds the settled target tree during
+// one chronological Header scan.
+NTSTATUS CdpJournalBuildSettledPreviewTree(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 RequestedTime100ns,
+	_In_ UINT64 MaxSequence,
+	_In_ ULONG MaxLookaheadSeconds,
+	_Out_ PCdp_PREVIEW_TREE Tree,
+	_Out_ PUINT64 SettledTime100ns,
+	_Out_opt_ PUINT64 TargetRecordSequence,
+	_Out_opt_ PCdp_JOURNAL_RECORD_LOCATION TargetLocation);
 
 NTSTATUS CdpJournalApplyPreviewTree(
 	_Inout_ PCdp_JOURNAL Journal,

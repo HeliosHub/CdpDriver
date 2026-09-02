@@ -9,40 +9,26 @@
 
 static VOID CdpCoreTraceTargetRecord(
 	_In_ PCSTR Operation,
-	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 RequestedTime100ns,
 	_In_ UINT64 EffectiveTime100ns,
-	_In_ UINT64 TargetSequence)
+	_In_ const Cdp_JOURNAL_RECORD_LOCATION* Location)
 {
-	UINT64 recordIndex = 0;
-	UINT64 recordTime = 0;
-	UINT64 regionOffset = 0;
-	ULONG headerIndex = 0;
-	NTSTATUS status;
-
-	status = CdpJournalFindRecordLocationBySequence(
-		Journal,
-		TargetSequence,
-		&recordIndex,
-		&recordTime,
-		&regionOffset,
-		&headerIndex);
-	if (NT_SUCCESS(status))
+	if (Location && Location->Sequence != 0)
 	{
-		Cdp_LOG("[%s-TARGET] requestedTime=%llu effectiveTime=%llu recordTime=%llu recordIndex=%llu sequence=%llu rrOffset=%llu headerIndex=%lu\n",
-			Operation, RequestedTime100ns, EffectiveTime100ns, recordTime,
-			recordIndex, TargetSequence, regionOffset, headerIndex);
+		Cdp_LOG("[%s-TARGET] requestedTime=%llu effectiveTime=%llu recordTime=%llu sequence=%llu rrOffset=%llu headerIndex=%lu\n",
+			Operation, RequestedTime100ns, EffectiveTime100ns,
+			Location->WallClock100ns, Location->Sequence,
+			Location->HeaderRegionOffset, Location->HeaderIndex);
 	}
 	else
 	{
-		Cdp_LOG("[%s-TARGET] requestedTime=%llu effectiveTime=%llu target sequence=%llu location unavailable status=0x%08X\n",
-			Operation, RequestedTime100ns, EffectiveTime100ns,
-			TargetSequence, status);
+		Cdp_LOG("[%s-TARGET] requestedTime=%llu effectiveTime=%llu location unavailable\n",
+			Operation, RequestedTime100ns, EffectiveTime100ns);
 	}
 }
 #else
 #define Cdp_RECOVERY_TRACE(fmt, ...) ((void)0)
-#define CdpCoreTraceTargetRecord(Operation, Journal, Requested, Effective, Sequence) ((void)0)
+#define CdpCoreTraceTargetRecord(Operation, Requested, Effective, Location) ((void)0)
 #endif
 
 #ifdef Cdp_USERMODE
@@ -125,7 +111,12 @@ static NTSTATUS CdpCoreBuildMetaTree(_Inout_ PCdp_CORE Core)
 	if (!Core || !Core->Journal || !Core->Journal->Mounted)
 		return STATUS_DEVICE_NOT_READY;
 	Core->MetaTreeReady = FALSE;
-	status = CdpJournalBuildCurrentBranchTree(Core->Journal, &newTree);
+	// A normal mount already built this tree during its single reverse Header
+	// scan.  Rebuild explicitly only for later callers whose mount snapshot has
+	// already been consumed or invalidated by a runtime transition.
+	status = CdpJournalTakeMountMetaTree(Core->Journal, &newTree);
+	if (status == STATUS_NOT_FOUND)
+		status = CdpJournalBuildCurrentBranchTree(Core->Journal, &newTree);
 	if (!NT_SUCCESS(status))
 		return status;
 
@@ -1559,8 +1550,8 @@ NTSTATUS CdpCorePreviewBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns
 {
 	NTSTATUS status;
 	UINT64 effectiveTargetTime100ns;
-	UINT64 settledTargetTime100ns;
 	UINT64 targetRecordSequence = 0;
+	Cdp_JOURNAL_RECORD_LOCATION targetLocation;
 
 	if (!Core)
 		return STATUS_INVALID_PARAMETER;
@@ -1570,16 +1561,6 @@ NTSTATUS CdpCorePreviewBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns
 		Core, TargetTime100ns, &effectiveTargetTime100ns);
 	if (!NT_SUCCESS(status))
 		return status;
-	settledTargetTime100ns = effectiveTargetTime100ns;
-	status = CdpJournalResolveSettledPreviewTime(
-		Core->Journal,
-		effectiveTargetTime100ns,
-		10,
-		&settledTargetTime100ns);
-	if (!NT_SUCCESS(status) && status != STATUS_NOT_FOUND)
-		return status;
-	effectiveTargetTime100ns = settledTargetTime100ns;
-
 	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
 	if (Core->Phase != Cdp_CORE_PHASE_GENERAL ||
 		Core->PendingRecoveryBranch)
@@ -1601,13 +1582,16 @@ NTSTATUS CdpCorePreviewBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns
 	CdpPreviewTreeInitialize(&Core->PreviewTree);
 	Cdp_LOCK_RELEASE(&Core->TreeLock);
 
-	status = CdpJournalBuildPreviewTree(
+	RtlZeroMemory(&targetLocation, sizeof(targetLocation));
+	status = CdpJournalBuildSettledPreviewTree(
 		Core->Journal,
 		effectiveTargetTime100ns,
 		Core->Journal->NextSequence,
-		TRUE,
+		10,
 		&Core->PreviewTree,
-		&targetRecordSequence);
+		&effectiveTargetTime100ns,
+		&targetRecordSequence,
+		&targetLocation);
 	if (!NT_SUCCESS(status) && status != STATUS_NOT_FOUND)
 	{
 		Cdp_LOCK_ACQUIRE(&Core->TreeLock);
@@ -1620,15 +1604,15 @@ NTSTATUS CdpCorePreviewBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns
 		status = STATUS_SUCCESS;
 
 	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	Core->TargetTime100ns = effectiveTargetTime100ns;
 	Core->PreviewTargetSequence = targetRecordSequence;
 	Core->Building = 0;
 	Cdp_LOCK_RELEASE(&Core->TreeLock);
 	CdpCoreTraceTargetRecord(
 		"PREVIEW",
-		Core->Journal,
 		TargetTime100ns,
 		effectiveTargetTime100ns,
-		targetRecordSequence);
+		&targetLocation);
 
 	return STATUS_SUCCESS;
 }
@@ -1675,6 +1659,7 @@ NTSTATUS CdpCorePrepareRebootRecovery(
 	LONG parentBranch = 0;
 	LONG newBranch = 0;
 	UINT64 inheritedSequence = 0;
+	Cdp_JOURNAL_RECORD_LOCATION targetLocation;
 	UINT64 effectiveTargetTime100ns;
 	UINT64 previousTargetTime100ns = 0;
 	ULONG publishedNodeCount = 0;
@@ -1710,29 +1695,17 @@ NTSTATUS CdpCorePrepareRebootRecovery(
 	Core->TargetTime100ns = effectiveTargetTime100ns;
 	Cdp_LOCK_RELEASE(&Core->TreeLock);
 
-	failureStage = "resolve-target-branch";
-	status = CdpJournalResolveTargetBranch(
-		Core->Journal,
-		effectiveTargetTime100ns,
-		&parentBranch,
-		&inheritedSequence);
-	if (!NT_SUCCESS(status))
-		goto failure;
-	CdpCoreTraceTargetRecord(
-		"REBOOT-RECOVERY",
-		Core->Journal,
-		TargetTime100ns,
-		effectiveTargetTime100ns,
-		inheritedSequence);
-
 	failureStage = "build-target-metatree";
-	status = CdpJournalBuildPreviewTree(
+	RtlZeroMemory(&targetLocation, sizeof(targetLocation));
+	status = CdpJournalBuildPreviewTreeEx(
 		Core->Journal,
 		effectiveTargetTime100ns,
 		Core->Journal->NextSequence,
 		TRUE,
 		&newTree,
-		&inheritedSequence);
+		&parentBranch,
+		&inheritedSequence,
+		&targetLocation);
 	if (!NT_SUCCESS(status) && status != STATUS_NOT_FOUND)
 		goto failure;
 	if (status == STATUS_NOT_FOUND)
@@ -1741,6 +1714,11 @@ NTSTATUS CdpCorePrepareRebootRecovery(
 		status = STATUS_SUCCESS;
 	}
 	newTreeInitialized = TRUE;
+	CdpCoreTraceTargetRecord(
+		"REBOOT-RECOVERY",
+		TargetTime100ns,
+		effectiveTargetTime100ns,
+		&targetLocation);
 	if (Core->Journal->HighestBranchNumber >= 0x7FFFFFFFL)
 	{
 		status = STATUS_INTEGER_OVERFLOW;
@@ -2028,6 +2006,7 @@ NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100n
 	LONG parentBranch = 0;
 	LONG newBranch = 0;
 	UINT64 inheritedSequence = 0;
+	Cdp_JOURNAL_RECORD_LOCATION targetLocation;
 	UINT64 effectiveTargetTime100ns;
 	UINT64 previousTargetTime100ns = 0;
 	ULONG publishedNodeCount = 0;
@@ -2070,33 +2049,21 @@ NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100n
 	Core->TargetTime100ns = effectiveTargetTime100ns;
 	Cdp_LOCK_RELEASE(&Core->TreeLock);
 
-	failureStage = "resolve-target-branch";
-	status = CdpJournalResolveTargetBranch(
-		Core->Journal,
-		effectiveTargetTime100ns,
-		&parentBranch,
-		&inheritedSequence);
-	if (!NT_SUCCESS(status))
-		goto failure;
-	CdpCoreTraceTargetRecord(
-		"RECOVERY",
-		Core->Journal,
-		TargetTime100ns,
-		effectiveTargetTime100ns,
-		inheritedSequence);
-
 	/* Build recovery from the same root-to-target scan used by Preview.  This
 	 * tree is complete before the new branch marker is appended, so Preview
 	 * and Recovery at the same time cannot diverge through different rebuild
 	 * algorithms. */
 	failureStage = "build-target-metatree";
-	status = CdpJournalBuildPreviewTree(
+	RtlZeroMemory(&targetLocation, sizeof(targetLocation));
+	status = CdpJournalBuildPreviewTreeEx(
 		Core->Journal,
 		effectiveTargetTime100ns,
 		Core->Journal->NextSequence,
 		TRUE,
 		&newTree,
-		&inheritedSequence);
+		&parentBranch,
+		&inheritedSequence,
+		&targetLocation);
 	if (!NT_SUCCESS(status) && status != STATUS_NOT_FOUND)
 		goto failure;
 	if (status == STATUS_NOT_FOUND)
@@ -2105,6 +2072,11 @@ NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100n
 		status = STATUS_SUCCESS;
 	}
 	newTreeInitialized = TRUE;
+	CdpCoreTraceTargetRecord(
+		"RECOVERY",
+		TargetTime100ns,
+		effectiveTargetTime100ns,
+		&targetLocation);
 
 	if (Core->Journal->HighestBranchNumber >= 0x7FFFFFFFL)
 	{

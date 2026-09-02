@@ -793,6 +793,8 @@ static int TestAfterImageMixedReadAndLatestOverlap(void)
 	UCHAR latest[512];
 	UCHAR expected[2048];
 	UCHAR output[2048];
+	TEST_FAIL_STORE mountIo;
+	BOOLEAN mountIoInstalled = FALSE;
 	NTSTATUS status;
 
 	Expect(NT_SUCCESS(TestCtxCreate(
@@ -825,8 +827,20 @@ static int TestAfterImageMixedReadAndLatestOverlap(void)
 	status = CdpCoreCreate(ctx.Source, ctx.Journal, &ctx.Core);
 	Expect(NT_SUCCESS(status), "recreate core for meta-tree mount scan");
 	if (NT_SUCCESS(status))
+	{
+		TestFailStoreInstall(ctx.Journal, &mountIo);
+		mountIoInstalled = TRUE;
+	}
+	if (NT_SUCCESS(status))
 		status = CdpCoreMountJournal(ctx.Core);
 	Expect(NT_SUCCESS(status), "mount rebuilds current-branch meta tree");
+	Expect(!mountIoInstalled || mountIo.HeaderRegionReadCount == 1,
+		"one-RR mount reads its Record Header Region exactly once");
+	if (mountIoInstalled)
+	{
+		TestFailStoreRemove(ctx.Journal, &mountIo);
+		mountIoInstalled = FALSE;
+	}
 	RtlZeroMemory(output, sizeof(output));
 	if (NT_SUCCESS(status))
 		status = CdpCoreRead(ctx.Core, 0, sizeof(output), output);
@@ -1984,6 +1998,7 @@ static int TestAfterImagePreviewBranchPath(void)
 	Cdp_JOURNAL_RECORD excludedRecord;
 	Cdp_JOURNAL_RECORD siblingRecord;
 	Cdp_JOURNAL_RECORD currentRecord;
+	TEST_FAIL_STORE previewIo;
 	GUID sourceGuid = { 0 };
 	UCHAR source[1536];
 	UCHAR inherited[512];
@@ -2040,8 +2055,12 @@ static int TestAfterImagePreviewBranchPath(void)
 	if (!NT_SUCCESS(status))
 		goto cleanup;
 
+	TestFailStoreInstall(journalStore, &previewIo);
 	status = CdpCorePreviewBegin(core, siblingRecord.WallClock100ns);
 	Expect(NT_SUCCESS(status), "select final branch in target second");
+	Expect(previewIo.HeaderRegionReadCount == 3,
+		"three-RR Preview settles time, builds target tree and locates target with one read per RR");
+	TestFailStoreRemove(journalStore, &previewIo);
 	RtlCopyMemory(expected, inherited, 512);
 	RtlCopyMemory(expected + 512, source + 512, 512);
 	RtlCopyMemory(expected + 1024, current, 512);
@@ -2183,6 +2202,7 @@ static int TestAfterImageRecoveryBranchSwitch(void)
 {
 	TEST_CTX ctx;
 	TEST_FAIL_STORE sourceTrace;
+	TEST_FAIL_STORE journalTrace;
 	Cdp_JOURNAL_RECORD firstRecord;
 	Cdp_JOURNAL_RECORD latestRecord;
 	Cdp_JOURNAL_RECORD postRecoveryRecord;
@@ -2223,13 +2243,17 @@ static int TestAfterImageRecoveryBranchSwitch(void)
 		"clear merge owner as the driver stop/join path would do");
 
 	TestFailStoreInstall(ctx.Source, &sourceTrace);
+	TestFailStoreInstall(ctx.Journal, &journalTrace);
 	status = CdpCoreRecoveryBegin(ctx.Core, firstRecord.WallClock100ns);
 	Expect(NT_SUCCESS(status) &&
 		CdpCoreGetPhase(ctx.Core) == Cdp_CORE_PHASE_GENERAL,
 		"recovery creates and publishes a new branch in one begin operation");
 	Expect(sourceTrace.ReadCallCount == 0 && sourceTrace.WriteCallCount == 0,
 		"recovery branch switch performs no source read or writeback");
+	Expect(journalTrace.HeaderRegionReadCount == 1,
+		"one-RR recovery resolves branch, builds MetaTree and locates target in one Header scan");
 	TestFailStoreRemove(ctx.Source, &sourceTrace);
+	TestFailStoreRemove(ctx.Journal, &journalTrace);
 	RtlZeroMemory(output, sizeof(output));
 	status = CdpCoreRead(ctx.Core, 0, sizeof(output), output);
 	Expect(NT_SUCCESS(status) && memcmp(output, first, sizeof(output)) == 0,
