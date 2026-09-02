@@ -1559,6 +1559,7 @@ NTSTATUS CdpCorePreviewBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns
 {
 	NTSTATUS status;
 	UINT64 effectiveTargetTime100ns;
+	UINT64 settledTargetTime100ns;
 	UINT64 targetRecordSequence = 0;
 
 	if (!Core)
@@ -1569,6 +1570,15 @@ NTSTATUS CdpCorePreviewBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns
 		Core, TargetTime100ns, &effectiveTargetTime100ns);
 	if (!NT_SUCCESS(status))
 		return status;
+	settledTargetTime100ns = effectiveTargetTime100ns;
+	status = CdpJournalResolveSettledPreviewTime(
+		Core->Journal,
+		effectiveTargetTime100ns,
+		10,
+		&settledTargetTime100ns);
+	if (!NT_SUCCESS(status) && status != STATUS_NOT_FOUND)
+		return status;
+	effectiveTargetTime100ns = settledTargetTime100ns;
 
 	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
 	if (Core->Phase != Cdp_CORE_PHASE_GENERAL ||

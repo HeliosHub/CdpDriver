@@ -436,6 +436,17 @@ NTSTATUS CdpJournalResolveTargetBranch(
 	_Out_ PLONG BranchNumber,
 	_Out_ PUINT64 InheritedRecordSequence);
 
+// Preview-only target settling.  First resolve the last valid record at or
+// before the requested UTC Unix second, then inspect the following seconds.
+// Accept a contiguous run only when an empty second is found within
+// MaxLookaheadSeconds.  A fully occupied window falls back to that original
+// record.  Sibling branches and marker/deleted records are ignored.
+NTSTATUS CdpJournalResolveSettledPreviewTime(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 RequestedTime100ns,
+	_In_ ULONG MaxLookaheadSeconds,
+	_Out_ PUINT64 SettledTime100ns);
+
 // Undo the newest empty branch marker. Used only when Recovery created a
 // branch but failed before publishing its replacement MetaTree.
 NTSTATUS CdpJournalRollbackLatestBranch(

@@ -79,6 +79,11 @@ static UINT64 TestPointerTime100ns(_In_opt_ PVOID Context)
 	return (UINT64)(ULONG_PTR)Context;
 }
 
+static UINT64 TestMutableTime100ns(_In_opt_ PVOID Context)
+{
+	return Context ? *(const UINT64*)Context : 0;
+}
+
 static NTSTATUS TestCtxCreateWithSector(
 	_Out_ PTEST_CTX Ctx,
 	_In_ UINT64 SourceSize,
@@ -366,6 +371,79 @@ static int TestUnixSecondTimeRangeDoesNotAdvance(void)
 	Expect(NT_SUCCESS(CdpJournalQueryTimeRange(&journal, &oldest, &newest)) &&
 		oldest == recordSecond && newest == recordSecond,
 		"same-second records keep the actual UTC Unix second; Newest does not advance");
+
+	CdpJournalClose(&journal);
+	CdpMemStoreDestroy(store);
+	return g_caseFailed;
+}
+
+static int TestSettledPreviewTargetTime(void)
+{
+	PCdp_STORE store = NULL;
+	Cdp_JOURNAL journal;
+	GUID sourceGuid = { 0 };
+	UCHAR data[512];
+	UINT64 now = 100;
+	UINT64 settled = 0;
+	UINT64 inheritedSequence = 0;
+	LONG branchNumber = 0;
+	ULONG second;
+
+	RtlFillMemory(data, sizeof(data), 0x6C);
+	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &store)),
+		"create journal for settled Preview target test");
+	if (!store)
+		return g_caseFailed;
+	CdpJournalInitializeWithStore(
+		&journal, store, &sourceGuid, TestMutableTime100ns, &now);
+	Expect(NT_SUCCESS(CdpJournalFormat(&journal)),
+		"format settled Preview target journal");
+
+	for (now = 101; now <= 103; ++now)
+	{
+		Expect(NT_SUCCESS(CdpJournalAppend(
+			&journal, now * 512, sizeof(data), data, NULL)),
+			"append initial contiguous-second Preview record");
+	}
+	now = 105;
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, now * 512, sizeof(data), data, NULL)),
+		"append record after the first empty second");
+	Expect(NT_SUCCESS(CdpJournalResolveSettledPreviewTime(
+		&journal, 101, 10, &settled)) && settled == 103,
+		"Preview settles at the last record before the first empty second");
+	Expect(NT_SUCCESS(CdpJournalResolveSettledPreviewTime(
+		&journal, 104, 10, &settled)) && settled == 103,
+		"Preview starts from the record corresponding to the requested time");
+
+	for (now = 106; now <= 115; ++now)
+	{
+		Expect(NT_SUCCESS(CdpJournalAppend(
+			&journal, now * 512, sizeof(data), data, NULL)),
+			"append fully occupied ten-second Preview window");
+	}
+	Expect(NT_SUCCESS(CdpJournalResolveSettledPreviewTime(
+		&journal, 105, 10, &settled)) && settled == 105,
+		"fully occupied ten-second window falls back to the original record");
+
+	// A later branch must not fill the next second of the original branch.
+	Expect(NT_SUCCESS(CdpJournalResolveTargetBranch(
+		&journal, 115, &branchNumber, &inheritedSequence)) && branchNumber == 1,
+		"resolve root inheritance point before sibling branch");
+	now = 116;
+	Expect(NT_SUCCESS(CdpJournalAppendBranch(
+		&journal, 2, 1, inheritedSequence)),
+		"create later branch for Preview path isolation");
+	for (second = 0; second < 2; ++second)
+	{
+		now = 116 + second;
+		Expect(NT_SUCCESS(CdpJournalAppend(
+			&journal, now * 512, sizeof(data), data, NULL)),
+			"append record on later Preview branch");
+	}
+	Expect(NT_SUCCESS(CdpJournalResolveSettledPreviewTime(
+		&journal, 115, 10, &settled)) && settled == 115,
+		"records on a later branch do not extend the original branch window");
 
 	CdpJournalClose(&journal);
 	CdpMemStoreDestroy(store);
@@ -2054,6 +2132,9 @@ static int TestAfterImagePreviewMergeCoordination(void)
 	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
 		ctx.Core, 0, sizeof(oldValue), oldValue, &oldRecord)),
 		"append target record in oldest region");
+	// Keep an empty second after the target so Preview settling remains anchored
+	// to oldRecord; this case specifically verifies target-region reclamation.
+	CdpCoreSetTime100ns(ctx.Core, oldRecord.WallClock100ns + 2);
 	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
 		ctx.Core, 4096, 1024 * 1024, filler, NULL)),
 		"create a newer region for target-stop compaction");
@@ -3092,6 +3173,8 @@ int main(void)
 		TestAfterImageInitialBranchRecord);
 	failed += RunCase("UTC Unix-second range does not advance",
 		TestUnixSecondTimeRangeDoesNotAdvance);
+	failed += RunCase("Settled Preview target time",
+		TestSettledPreviewTargetTime);
 	failed += RunCase("Journal physical-layout persistence",
 		TestJournalPhysicalLayoutPersistence);
 	failed += RunCase("After-image append does not touch source",

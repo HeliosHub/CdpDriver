@@ -2957,8 +2957,9 @@ static NTSTATUS CdpBeginPreviewSession(
 	Reply->OldestRecoverable100ns = oldestTime;
 	Reply->NewestRecoverable100ns = newestTime;
 
-	Cdp_DBG("[PREVIEW] begin handle=%llu target=%llu (Core)\n",
+	Cdp_DBG("[PREVIEW] begin handle=%llu requested=%llu settled=%llu (Core)\n",
 		session->HandleId,
+		Request->TargetTime100ns,
 		session->TargetTime100ns);
 	return STATUS_SUCCESS;
 

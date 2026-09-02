@@ -178,8 +178,10 @@ static UINT64 CdpJournalQueryRecordTimeSecondsLocked(_In_ PCdp_JOURNAL Journal)
 	if (Journal->Newest100ns != 0 &&
 		wallClockSeconds < Journal->Newest100ns)
 	{
+#ifndef Cdp_USERMODE
 		Cdp_LOG("[JOURNAL-TIME] UTC clock moved backward raw=%llu clamped=%llu\n",
 			wallClockSeconds, Journal->Newest100ns);
+#endif
 		return Journal->Newest100ns;
 	}
 	return wallClockSeconds;
@@ -6533,6 +6535,220 @@ static LONG CdpBranchPathFind(
 			return (LONG)index;
 	}
 	return -1;
+}
+
+NTSTATUS CdpJournalResolveSettledPreviewTime(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 RequestedTime100ns,
+	_In_ ULONG MaxLookaheadSeconds,
+	_Out_ PUINT64 SettledTime100ns)
+{
+	PCdp_BRANCH_INFO_NODE targetBranch;
+	PCdp_BRANCH_INFO_NODE branch;
+	PCdp_BRANCH_INFO_NODE* branchPath = NULL;
+	ULONG branchPathCount = 0;
+	PUCHAR region = NULL;
+	UINT64 regionOff;
+	UINT64 baseTime = 0;
+	UINT64 occupiedSeconds = 0;
+	UINT64 nextBranchTime = MAXUINT64;
+	ULONG guardRegions = 0;
+	ULONG second;
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Journal || !SettledTime100ns || MaxLookaheadSeconds == 0 ||
+		MaxLookaheadSeconds > 63)
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+	*SettledTime100ns = RequestedTime100ns;
+
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto cleanup;
+	}
+	if (CdpJournalIsEmptyLocked(Journal) || !Journal->BranchTree.First)
+		goto cleanup;
+	if (RequestedTime100ns < Journal->Oldest100ns)
+		RequestedTime100ns = Journal->Oldest100ns;
+
+	targetBranch = CdpBranchTreeFindTargetTime(
+		&Journal->BranchTree, RequestedTime100ns);
+	if (!targetBranch)
+	{
+		status = STATUS_NOT_FOUND;
+		goto cleanup;
+	}
+	if (targetBranch->Next)
+		nextBranchTime = targetBranch->Next->StartRecord.WallClock100ns;
+
+	branchPath = (PCdp_BRANCH_INFO_NODE*)cdpalloc(
+		sizeof(*branchPath) * Journal->BranchTree.Count);
+	if (!branchPath)
+	{
+		status = STATUS_INSUFFICIENT_RESOURCES;
+		goto cleanup;
+	}
+	for (branch = targetBranch; branch; branch = branch->Parent)
+	{
+		if (branchPathCount >= Journal->BranchTree.Count)
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup;
+		}
+		branchPath[branchPathCount++] = branch;
+	}
+	if (branchPathCount == 0)
+	{
+		status = STATUS_DISK_CORRUPT_ERROR;
+		goto cleanup;
+	}
+	{
+		ULONG left = 0;
+		ULONG right = branchPathCount - 1;
+		while (left < right)
+		{
+			PCdp_BRANCH_INFO_NODE swap = branchPath[left];
+			branchPath[left++] = branchPath[right];
+			branchPath[right--] = swap;
+		}
+	}
+
+	status = CdpJournalGetHeaderScanBufferLocked(Journal, &region);
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+	regionOff = Journal->OldestHeaderRegionOff;
+	for (;;)
+	{
+		Cdp_HEADER_REGION_LINK link;
+		ULONG limit;
+		ULONG startIndex;
+		ULONG index;
+		BOOLEAN isLast;
+
+		if (++guardRegions > 100000UL)
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup;
+		}
+		status = CdpJournalReadHeaderRegion(Journal, regionOff, region);
+		if (!NT_SUCCESS(status))
+			goto cleanup;
+		RtlCopyMemory(
+			&link,
+			region + Cdp_JOURNAL_HEADER_REGION_SIZE -
+				Cdp_JOURNAL_HEADER_LINK_SIZE,
+			sizeof(link));
+		if (!CdpJournalRegionLinkValid(Journal, &link))
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup;
+		}
+		isLast = regionOff == Journal->LastHeaderRegionOff;
+		status = CdpJournalGetRegionHeaderLimitLocked(
+			Journal, regionOff, &link, &limit, NULL);
+		if (!NT_SUCCESS(status))
+			goto cleanup;
+		startIndex = regionOff == Journal->OldestHeaderRegionOff ?
+			Journal->OldestHeaderIndex : 0;
+
+		for (index = startIndex; index < limit; ++index)
+		{
+			Cdp_JOURNAL_RECORD_HEADER header;
+			Cdp_JOURNAL_RECORD record;
+			PCdp_BRANCH_INFO_NODE recordBranch;
+			LONG pathIndex;
+			UINT64 allowedSequence;
+
+			RtlCopyMemory(
+				&header, region + index * sizeof(header), sizeof(header));
+			if ((header.Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) != index)
+			{
+				status = STATUS_DISK_CORRUPT_ERROR;
+				goto cleanup;
+			}
+			if (CdpJournalHeaderIsDeleted(&header) ||
+				CdpJournalHeaderIsBranch(&header))
+			{
+				continue;
+			}
+			if ((header.Sequence & Cdp_JOURNAL_RECORD_FLAGS_MASK) != 0 ||
+				header.DataLength == 0 ||
+				header.DataLength > Cdp_JOURNAL_MAX_RECORD_DATA ||
+				header.VolumeOffset > MAXUINT64 - header.DataLength)
+			{
+				status = STATUS_DISK_CORRUPT_ERROR;
+				goto cleanup;
+			}
+			status = CdpJournalDecodeRecord(&link, &header, &record);
+			if (!NT_SUCCESS(status))
+				goto cleanup;
+			recordBranch = CdpBranchTreeFindBySequence(
+				&Journal->BranchTree, record.Sequence);
+			pathIndex = recordBranch ? CdpBranchPathFind(
+				branchPath, branchPathCount, recordBranch) : -1;
+			if (pathIndex < 0)
+				continue;
+			allowedSequence = ((ULONG)pathIndex + 1 < branchPathCount) ?
+				branchPath[pathIndex + 1]->InheritedRecordSequence : MAXUINT64;
+			if (record.Sequence > allowedSequence)
+				continue;
+
+			if (record.WallClock100ns <= RequestedTime100ns)
+			{
+				baseTime = record.WallClock100ns;
+				continue;
+			}
+			if (baseTime != 0 && recordBranch == targetBranch &&
+				record.WallClock100ns > baseTime &&
+				record.WallClock100ns - baseTime <= MaxLookaheadSeconds)
+			{
+				occupiedSeconds |= 1ULL <<
+					(ULONG)(record.WallClock100ns - baseTime - 1);
+			}
+		}
+		if (isLast)
+			break;
+		if (link.NextRegionOff == regionOff)
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup;
+		}
+		regionOff = link.NextRegionOff;
+	}
+
+	if (baseTime == 0)
+		goto cleanup;
+	*SettledTime100ns = baseTime;
+	for (second = 1; second <= MaxLookaheadSeconds; ++second)
+	{
+		UINT64 checkedTime;
+		BOOLEAN occupied;
+
+		if (baseTime > MAXUINT64 - second)
+			break;
+		checkedTime = baseTime + second;
+		occupied = (occupiedSeconds & (1ULL << (second - 1))) != 0;
+		// Crossing a subsequently created branch would make the normal Preview
+		// resolver select that sibling/child.  Treat it as the end of this path.
+		if (nextBranchTime <= checkedTime)
+			occupied = FALSE;
+		if (!occupied)
+		{
+			if (second > 1)
+				*SettledTime100ns = checkedTime - 1;
+			break;
+		}
+	}
+	// When every second in the window is occupied, Settled remains baseTime.
+
+cleanup:
+	if (branchPath)
+		cdpfree(branchPath);
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
 }
 
 NTSTATUS CdpJournalResolveTargetBranch(
