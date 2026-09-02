@@ -385,6 +385,10 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 	InterlockedExchange(&DeviceExtension->DiskIoAccepting, 0);
 	InterlockedExchange(&DeviceExtension->DiskIoOutstanding, 0);
 	InterlockedExchange(&DeviceExtension->ShutdownInProgress, 0);
+	InterlockedExchange64(&DeviceExtension->ShutdownIrpEntryCount, 0);
+	InterlockedExchange64(&DeviceExtension->ShutdownIrpCompletionCount, 0);
+	InterlockedExchange64(&DeviceExtension->PowerIrpEntryCount, 0);
+	InterlockedExchange64(&DeviceExtension->PowerIrpCompletionCount, 0);
 	KeInitializeEvent(&DeviceExtension->MergeThreadDoneEvent,
 		NotificationEvent, TRUE);
 	KeInitializeMutex(&DeviceExtension->HistoryMutex, 0);

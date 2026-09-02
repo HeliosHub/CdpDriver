@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.6.8-test44"
-#define Cdp_DRIVER_BUILD_STRING   "20260827.131-query-time-range"
+#define Cdp_DRIVER_VERSION_STRING "1.6.10-test55"
+#define Cdp_DRIVER_BUILD_STRING   "20260902.160-restore-boot-service"
 
 // Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.
 // Cdp_DBG: Debug builds only — verbose I/O and path tracing.
@@ -100,6 +100,8 @@ typedef struct _Cdp_DRIVER_EXTENSION
 	// KMUTEX (not FastMutex): configure/auto-discover issue sync IoBuild*
 	// IRPs and must stay at PASSIVE_LEVEL for the whole critical section.
 	KMUTEX CaptureConfigMutex;
+	// Per-boot gate set by the preview UI. It is never persisted.
+	volatile LONG AutoDiscoveryDisabled;
 
 	// 按时间点读取的文件预览会话
 	LIST_ENTRY PreviewSessionList;
@@ -182,10 +184,18 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	volatile LONG DiskIoAccepting;
 	volatile LONG DiskIoOutstanding;
 	KEVENT DiskIoDrainedEvent;
-	/* Set permanently once IRP_MJ_SHUTDOWN reaches the disk filter.  No new
-	 * protected write may bypass to the source while the ordered queue and
-	 * journal cache are being drained. */
+	/* Protected source objects use 0=normal, 1=publishing the terminal durable
+	 * barrier, 2=terminal durable I/O. State 2 keeps capture admission open;
+	 * every later redirected write is flushed before it completes. The state is
+	 * deliberately lock-free: shutdown must not depend on a second dispatcher
+	 * object that could have been invalidated during volume teardown. */
 	volatile LONG ShutdownInProgress;
+	/* Per-filter-hop accounting. Every logged shutdown entry must eventually
+	 * increment completion after the lower stack finishes that same IRP. */
+	volatile LONG64 ShutdownIrpEntryCount;
+	volatile LONG64 ShutdownIrpCompletionCount;
+	volatile LONG64 PowerIrpEntryCount;
+	volatile LONG64 PowerIrpCompletionCount;
 	volatile LONG Phase;
 	// START_DEVICE publishes this before pre-mount discovery uses the lower
 	// device stack.

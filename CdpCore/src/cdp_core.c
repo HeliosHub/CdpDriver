@@ -81,296 +81,7 @@ struct _Cdp_CORE
 	LONG PendingRecoveryBranchNumber;
 	UINT64 PendingRecoveryInheritedSequence;
 	GUID SourceGuid;
-	struct _Cdp_WRITE_LEDGER_RANGE* WriteLedger;
-	ULONG WriteLedgerRangeCount;
 };
-
-typedef struct _Cdp_WRITE_LEDGER_RANGE
-{
-	UINT64 Start;
-	UINT64 End;
-	UINT64 Sequence;
-	UINT64 FileOffset;
-	struct _Cdp_WRITE_LEDGER_RANGE* Next;
-} Cdp_WRITE_LEDGER_RANGE, *PCdp_WRITE_LEDGER_RANGE;
-
-static VOID CdpCoreClearWriteLedger(_Inout_ PCdp_CORE Core)
-{
-	PCdp_WRITE_LEDGER_RANGE range;
-	PCdp_WRITE_LEDGER_RANGE next;
-
-	if (!Core)
-		return;
-	range = Core->WriteLedger;
-	while (range)
-	{
-		next = range->Next;
-		Cdp_FREE(range);
-		range = next;
-	}
-	Core->WriteLedger = NULL;
-	Core->WriteLedgerRangeCount = 0;
-}
-
-/* TreeLock must be held.  The ledger is a sorted, non-overlapping union of
- * application-write ranges and is deliberately independent of MetaTree. */
-static NTSTATUS CdpCorePunchWriteLedgerLocked(
-	_Inout_ PCdp_CORE Core,
-	_In_ UINT64 Start,
-	_In_ UINT64 End);
-
-static NTSTATUS CdpCoreInsertWriteLedgerLocked(
-	_Inout_ PCdp_CORE Core,
-	_Inout_ PCdp_WRITE_LEDGER_RANGE NewRange)
-{
-	PCdp_WRITE_LEDGER_RANGE* link = &Core->WriteLedger;
-	NTSTATUS status;
-
-	status = CdpCorePunchWriteLedgerLocked(
-		Core, NewRange->Start, NewRange->End);
-	if (!NT_SUCCESS(status))
-		return status;
-	while (*link && (*link)->Start < NewRange->Start)
-		link = &(*link)->Next;
-	NewRange->Next = *link;
-	*link = NewRange;
-	Core->WriteLedgerRangeCount++;
-	return STATUS_SUCCESS;
-}
-
-/* TreeLock must be held.  Forget bytes that have deliberately fallen through
- * to the source (drain/direct-source write). */
-static NTSTATUS CdpCorePunchWriteLedgerLocked(
-	_Inout_ PCdp_CORE Core,
-	_In_ UINT64 Start,
-	_In_ UINT64 End)
-{
-	PCdp_WRITE_LEDGER_RANGE* link = &Core->WriteLedger;
-	PCdp_WRITE_LEDGER_RANGE range;
-
-	while ((range = *link) != NULL)
-	{
-		PCdp_WRITE_LEDGER_RANGE right;
-		if (range->End <= Start)
-		{
-			link = &range->Next;
-			continue;
-		}
-		if (range->Start >= End)
-			break;
-		if (Start <= range->Start && End >= range->End)
-		{
-			*link = range->Next;
-			Cdp_FREE(range);
-			Core->WriteLedgerRangeCount--;
-			continue;
-		}
-		if (Start <= range->Start)
-		{
-			range->FileOffset += End - range->Start;
-			range->Start = End;
-			break;
-		}
-		if (End >= range->End)
-		{
-			range->End = Start;
-			link = &range->Next;
-			continue;
-		}
-		right = (PCdp_WRITE_LEDGER_RANGE)Cdp_ALLOC0(sizeof(*right));
-		if (!right)
-			return STATUS_INSUFFICIENT_RESOURCES;
-		right->Start = End;
-		right->End = range->End;
-		right->Sequence = range->Sequence;
-		right->FileOffset = range->FileOffset + (End - range->Start);
-		right->Next = range->Next;
-		range->End = Start;
-		range->Next = right;
-		Core->WriteLedgerRangeCount++;
-		break;
-	}
-	return STATUS_SUCCESS;
-}
-
-static BOOLEAN CdpCoreMaskRangeCovered(
-	_In_reads_bytes_((Length + 7) / 8) const UCHAR* Mask,
-	_In_ ULONG Length,
-	_In_ ULONG Start,
-	_In_ ULONG End,
-	_Out_ PULONG FirstGap)
-{
-	ULONG index = Start;
-	while (index < End && (index & 7UL) != 0)
-	{
-		if ((Mask[index >> 3] & (UCHAR)(1U << (index & 7UL))) == 0)
-		{
-			*FirstGap = index;
-			return FALSE;
-		}
-		index++;
-	}
-	while (index + 8UL <= End)
-	{
-		if (Mask[index >> 3] != 0xFFU)
-		{
-			ULONG bit;
-			for (bit = 0; bit < 8; ++bit)
-			{
-				if ((Mask[index >> 3] & (UCHAR)(1U << bit)) == 0)
-				{
-					*FirstGap = index + bit;
-					return FALSE;
-				}
-			}
-		}
-		index += 8UL;
-	}
-	while (index < End)
-	{
-		if ((Mask[index >> 3] & (UCHAR)(1U << (index & 7UL))) == 0)
-		{
-			*FirstGap = index;
-			return FALSE;
-		}
-		index++;
-	}
-	UNREFERENCED_PARAMETER(Length);
-	return TRUE;
-}
-
-static BOOLEAN CdpCoreValidateWriteLedgerLocked(
-	_In_ PCdp_CORE Core,
-	_In_ UINT64 Offset,
-	_In_ ULONG Length,
-	_In_reads_bytes_((Length + 7) / 8) const UCHAR* CoveredMask,
-	_Out_ PUINT64 ExpectedStart,
-	_Out_ PUINT64 ExpectedEnd,
-	_Out_ PUINT64 FirstGap,
-	_Out_ PUINT64 ExpectedSequence,
-	_Out_ PUINT64 ExpectedFileOffset,
-	_Out_ PUINT64 ActualSequence,
-	_Out_ PUINT64 ActualFileOffset)
-{
-	PCdp_WRITE_LEDGER_RANGE range;
-	UINT64 readEnd = Offset + Length;
-
-	for (range = Core->WriteLedger; range; range = range->Next)
-	{
-		UINT64 start;
-		UINT64 end;
-		ULONG relativeGap;
-		if (range->End <= Offset)
-			continue;
-		if (range->Start >= readEnd)
-			break;
-		start = range->Start > Offset ? range->Start : Offset;
-		end = range->End < readEnd ? range->End : readEnd;
-		if (!CdpCoreMaskRangeCovered(
-			CoveredMask, Length, (ULONG)(start - Offset),
-			(ULONG)(end - Offset), &relativeGap))
-		{
-			*ExpectedStart = range->Start;
-			*ExpectedEnd = range->End;
-			*FirstGap = Offset + relativeGap;
-			*ExpectedSequence = range->Sequence;
-			*ExpectedFileOffset = range->FileOffset +
-				(*FirstGap - range->Start);
-			return FALSE;
-		}
-		if (!CdpPreviewTreeValidateMapping(
-			&Core->MetaTree, start, (ULONG)(end - start),
-			range->Sequence,
-			range->FileOffset + (start - range->Start),
-			FirstGap, ActualSequence, ActualFileOffset))
-		{
-			*ExpectedStart = range->Start;
-			*ExpectedEnd = range->End;
-			*ExpectedSequence = range->Sequence;
-			*ExpectedFileOffset = range->FileOffset +
-				(*FirstGap - range->Start);
-			return FALSE;
-		}
-	}
-	return TRUE;
-}
-
-/* TreeLock is held by the caller, keeping ledger identity stable while the
- * independently addressed payload bytes are compared with the returned view. */
-static NTSTATUS CdpCoreValidateWriteLedgerDataLocked(
-	_Inout_ PCdp_CORE Core,
-	_In_ UINT64 Offset,
-	_In_ ULONG Length,
-	_In_reads_bytes_(Length) const UCHAR* Buffer,
-	_Out_ PUINT64 RangeStart,
-	_Out_ PUINT64 RangeEnd,
-	_Out_ PUINT64 Sequence,
-	_Out_ PUINT64 PayloadOffset,
-	_Out_ PUINT64 FirstMismatch,
-	_Out_ PUCHAR ExpectedByte,
-	_Out_ PUCHAR ActualByte)
-{
-	PCdp_WRITE_LEDGER_RANGE range;
-	UINT64 readEnd = Offset + Length;
-
-	for (range = Core->WriteLedger; range; range = range->Next)
-	{
-		UINT64 start;
-		UINT64 end;
-		ULONG compareLength;
-		PUCHAR expected;
-		UINT64 payloadAtStart;
-		UINT64 alignedPayload;
-		ULONG payloadPrefix;
-		ULONG readLength;
-		ULONG index;
-		NTSTATUS status;
-		if (range->End <= Offset)
-			continue;
-		if (range->Start >= readEnd)
-			break;
-		start = range->Start > Offset ? range->Start : Offset;
-		end = range->End < readEnd ? range->End : readEnd;
-		compareLength = (ULONG)(end - start);
-		payloadAtStart = range->FileOffset + (start - range->Start);
-		alignedPayload = payloadAtStart -
-			(payloadAtStart % Core->Journal->SectorSize);
-		payloadPrefix = (ULONG)(payloadAtStart - alignedPayload);
-		readLength = payloadPrefix + compareLength;
-		expected = (PUCHAR)Cdp_ALLOC(readLength);
-		if (!expected)
-			return STATUS_INSUFFICIENT_RESOURCES;
-		status = CdpJournalReadPayload(
-			Core->Journal,
-			alignedPayload,
-			readLength,
-			expected);
-		if (!NT_SUCCESS(status))
-		{
-			Cdp_FREE(expected);
-			return status;
-		}
-		for (index = 0; index < compareLength; ++index)
-		{
-			UCHAR actual = Buffer[(ULONG)(start - Offset) + index];
-			if (expected[payloadPrefix + index] != actual)
-			{
-				*RangeStart = range->Start;
-				*RangeEnd = range->End;
-				*Sequence = range->Sequence;
-				*PayloadOffset = range->FileOffset +
-					(start - range->Start) + index;
-				*FirstMismatch = start + index;
-				*ExpectedByte = expected[payloadPrefix + index];
-				*ActualByte = actual;
-				Cdp_FREE(expected);
-				return STATUS_DATA_ERROR;
-			}
-		}
-		Cdp_FREE(expected);
-	}
-	return STATUS_SUCCESS;
-}
 
 static UINT64 CdpCoreQueryTime(_In_opt_ PVOID Context)
 {
@@ -422,7 +133,6 @@ static NTSTATUS CdpCoreBuildMetaTree(_Inout_ PCdp_CORE Core)
 	oldTree = Core->MetaTree;
 	Core->MetaTree = newTree;
 	Core->MetaTreeReady = TRUE;
-	CdpCoreClearWriteLedger(Core);
 	Cdp_LOCK_RELEASE(&Core->TreeLock);
 	CdpPreviewTreeFree(&oldTree);
 	return STATUS_SUCCESS;
@@ -520,7 +230,6 @@ VOID CdpCoreDestroy(_Inout_opt_ PCdp_CORE Core)
 		CdpJournalClose(Core->Journal);
 	CdpPreviewTreeFree(&Core->PreviewTree);
 	CdpPreviewTreeFree(&Core->MetaTree);
-	CdpCoreClearWriteLedger(Core);
 	Cdp_LOCK_DELETE(&Core->TreeLock);
 #ifndef Cdp_USERMODE
 	if (Core->Source)
@@ -553,7 +262,6 @@ NTSTATUS CdpCoreFormatJournal(_Inout_ PCdp_CORE Core)
 	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
 	oldTree = Core->MetaTree;
 	CdpPreviewTreeInitialize(&Core->MetaTree);
-	CdpCoreClearWriteLedger(Core);
 	Core->MetaTreeReady = TRUE;
 	Cdp_LOCK_RELEASE(&Core->TreeLock);
 	CdpPreviewTreeFree(&oldTree);
@@ -736,158 +444,6 @@ static PCdp_PREVIEW_TREE_NODE CdpCoreFindMetaNodeBySequenceRange(
 		Node->Right, FirstSequence, EndSequence);
 }
 
-// TreeLock is held. Keep the diagnostic write ledger synchronized with the
-// same payload relocation applied to MetaTree.
-static NTSTATUS CdpCoreRemapWriteLedgerLocked(
-	_Inout_ PCdp_CORE Core,
-	_In_ UINT64 ExpectedSequence,
-	_In_ UINT64 VolumeOffset,
-	_In_ ULONG DataLength,
-	_In_ UINT64 NewFileOffset)
-{
-	PCdp_WRITE_LEDGER_RANGE* link = &Core->WriteLedger;
-	UINT64 remapEnd = VolumeOffset + DataLength;
-
-	while (*link)
-	{
-		PCdp_WRITE_LEDGER_RANGE range = *link;
-		UINT64 overlapStart;
-		UINT64 overlapEnd;
-		UINT64 originalStart;
-		UINT64 originalFileOffset;
-		PCdp_WRITE_LEDGER_RANGE middle = NULL;
-		PCdp_WRITE_LEDGER_RANGE right = NULL;
-
-		if (range->End <= VolumeOffset)
-		{
-			link = &range->Next;
-			continue;
-		}
-		if (range->Start >= remapEnd)
-			break;
-		if (range->Sequence != ExpectedSequence)
-		{
-			link = &range->Next;
-			continue;
-		}
-		overlapStart = range->Start > VolumeOffset ?
-			range->Start : VolumeOffset;
-		overlapEnd = range->End < remapEnd ? range->End : remapEnd;
-		originalStart = range->Start;
-		originalFileOffset = range->FileOffset;
-
-		if (overlapStart > range->Start)
-		{
-			middle = (PCdp_WRITE_LEDGER_RANGE)Cdp_ALLOC0(sizeof(*middle));
-			if (!middle)
-				return STATUS_INSUFFICIENT_RESOURCES;
-			*middle = *range;
-			middle->Start = overlapStart;
-			middle->FileOffset = NewFileOffset +
-				(overlapStart - VolumeOffset);
-			range->End = overlapStart;
-			range->Next = middle;
-			Core->WriteLedgerRangeCount++;
-		}
-		else
-		{
-			middle = range;
-			middle->FileOffset = NewFileOffset +
-				(overlapStart - VolumeOffset);
-		}
-		if (overlapEnd < middle->End)
-		{
-			right = (PCdp_WRITE_LEDGER_RANGE)Cdp_ALLOC0(sizeof(*right));
-			if (!right)
-				return STATUS_INSUFFICIENT_RESOURCES;
-			*right = *middle;
-			right->Start = overlapEnd;
-			right->FileOffset = originalFileOffset +
-				(overlapEnd - originalStart);
-			middle->End = overlapEnd;
-			middle->Next = right;
-			Core->WriteLedgerRangeCount++;
-		}
-		link = &middle->Next;
-	}
-	return STATUS_SUCCESS;
-}
-
-static NTSTATUS CdpCoreRemapWriteLedgerPayloadLocked(
-	_Inout_ PCdp_CORE Core,
-	_In_ UINT64 VolumeOffset,
-	_In_ ULONG DataLength,
-	_In_ UINT64 ExpectedFileOffset,
-	_In_ UINT64 NewFileOffset)
-{
-	PCdp_WRITE_LEDGER_RANGE* link = &Core->WriteLedger;
-	UINT64 remapEnd = VolumeOffset + DataLength;
-
-	while (*link)
-	{
-		PCdp_WRITE_LEDGER_RANGE range = *link;
-		UINT64 overlapStart;
-		UINT64 overlapEnd;
-		UINT64 originalStart;
-		UINT64 originalFileOffset;
-		PCdp_WRITE_LEDGER_RANGE middle;
-		PCdp_WRITE_LEDGER_RANGE right;
-
-		if (range->End <= VolumeOffset)
-		{
-			link = &range->Next;
-			continue;
-		}
-		if (range->Start >= remapEnd)
-			break;
-		overlapStart = range->Start > VolumeOffset ?
-			range->Start : VolumeOffset;
-		overlapEnd = range->End < remapEnd ? range->End : remapEnd;
-		if (range->FileOffset + (overlapStart - range->Start) !=
-			ExpectedFileOffset + (overlapStart - VolumeOffset))
-		{
-			link = &range->Next;
-			continue;
-		}
-		originalStart = range->Start;
-		originalFileOffset = range->FileOffset;
-		if (overlapStart > range->Start)
-		{
-			middle = (PCdp_WRITE_LEDGER_RANGE)Cdp_ALLOC0(sizeof(*middle));
-			if (!middle)
-				return STATUS_INSUFFICIENT_RESOURCES;
-			*middle = *range;
-			middle->Start = overlapStart;
-			middle->FileOffset = NewFileOffset +
-				(overlapStart - VolumeOffset);
-			range->End = overlapStart;
-			range->Next = middle;
-			Core->WriteLedgerRangeCount++;
-		}
-		else
-		{
-			middle = range;
-			middle->FileOffset = NewFileOffset +
-				(overlapStart - VolumeOffset);
-		}
-		if (overlapEnd < middle->End)
-		{
-			right = (PCdp_WRITE_LEDGER_RANGE)Cdp_ALLOC0(sizeof(*right));
-			if (!right)
-				return STATUS_INSUFFICIENT_RESOURCES;
-			*right = *middle;
-			right->Start = overlapEnd;
-			right->FileOffset = originalFileOffset +
-				(overlapEnd - originalStart);
-			middle->End = overlapEnd;
-			middle->Next = right;
-			Core->WriteLedgerRangeCount++;
-		}
-		link = &middle->Next;
-	}
-	return STATUS_SUCCESS;
-}
-
 static NTSTATUS CdpCoreCheckpointRegionNodes(
 	_Inout_ PCdp_CORE Core,
 	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
@@ -941,14 +497,6 @@ static NTSTATUS CdpCoreCheckpointRegionNodes(
 		{
 			status = CdpPreviewTreeRemapSequenceRange(
 				&Core->MetaTree,
-				Node->Sequence,
-				remaps[index].VolumeOffset,
-				remaps[index].DataLength,
-				remaps[index].FileOffset);
-			if (!NT_SUCCESS(status))
-				break;
-			status = CdpCoreRemapWriteLedgerLocked(
-				Core,
 				Node->Sequence,
 				remaps[index].VolumeOffset,
 				remaps[index].DataLength,
@@ -1040,14 +588,6 @@ NTSTATUS CdpCoreCheckpointOldestRegion(_Inout_ PCdp_CORE Core)
 		{
 			status = CdpPreviewTreeRemapPayloadRange(
 				&Core->MetaTree,
-				relocated[relocatedIndex].VolumeOffset,
-				relocated[relocatedIndex].DataLength,
-				relocated[relocatedIndex].PreviousFileOffset,
-				relocated[relocatedIndex].FileOffset);
-			if (!NT_SUCCESS(status))
-				break;
-			status = CdpCoreRemapWriteLedgerPayloadLocked(
-				Core,
 				relocated[relocatedIndex].VolumeOffset,
 				relocated[relocatedIndex].DataLength,
 				relocated[relocatedIndex].PreviousFileOffset,
@@ -1255,10 +795,6 @@ NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
 			Core->MetaTreeReady = FALSE;
 			goto cleanup;
 		}
-		status = CdpCorePunchWriteLedgerLocked(
-			Core, start, start + length);
-		if (!NT_SUCCESS(status))
-			goto cleanup;
 	}
 
 	// If Preview remains active, records reclaimed below its target boundary
@@ -1517,7 +1053,6 @@ NTSTATUS CdpCoreAppendAfterImage(
 	Cdp_JOURNAL_RECORD record;
 	ULONG nodeCountBefore = 0;
 	ULONG nodeCountAfter = 0;
-	PCdp_WRITE_LEDGER_RANGE ledgerRange;
 	if (!Core || !AfterImage || Length == 0 ||
 		Length > Cdp_JOURNAL_MAX_RECORD_DATA)
 	{
@@ -1527,17 +1062,11 @@ NTSTATUS CdpCoreAppendAfterImage(
 		return STATUS_DEVICE_NOT_READY;
 	if (!Core->MetaTreeReady)
 		return STATUS_DEVICE_NOT_READY;
-	ledgerRange = (PCdp_WRITE_LEDGER_RANGE)Cdp_ALLOC0(sizeof(*ledgerRange));
-	if (!ledgerRange)
-		return STATUS_INSUFFICIENT_RESOURCES;
-	ledgerRange->Start = Offset;
-	ledgerRange->End = Offset + Length;
 
 	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
 	if (!Core->MetaTreeReady)
 	{
 		Cdp_LOCK_RELEASE(&Core->TreeLock);
-		Cdp_FREE(ledgerRange);
 		return STATUS_DEVICE_NOT_READY;
 	}
 	nodeCountBefore = Core->MetaTree.NodeCount;
@@ -1545,14 +1074,12 @@ NTSTATUS CdpCoreAppendAfterImage(
 	if (!NT_SUCCESS(status))
 	{
 		Cdp_LOCK_RELEASE(&Core->TreeLock);
-		Cdp_FREE(ledgerRange);
 		return status;
 	}
 	status = CdpCoreMaterializePendingRecoveryBranchLocked(Core);
 	if (!NT_SUCCESS(status))
 	{
 		Cdp_LOCK_RELEASE(&Core->TreeLock);
-		Cdp_FREE(ledgerRange);
 		return status;
 	}
 	status = CdpJournalAppendEx(
@@ -1580,27 +1107,9 @@ NTSTATUS CdpCoreAppendAfterImage(
 #endif
 			Core->MetaTreeReady = FALSE;
 		}
-		else
-		{
-			ledgerRange->Sequence = record.Sequence;
-			ledgerRange->FileOffset = record.FileOffset;
-			status = CdpCoreInsertWriteLedgerLocked(Core, ledgerRange);
-			if (NT_SUCCESS(status))
-				ledgerRange = NULL;
-			else
-			{
-#ifndef Cdp_USERMODE
-				Cdp_LOG("[REDIRECT-WRITE-FAIL] stage=write-ledger offset=%llu len=%lu sequence=%llu payloadOffset=%llu status=0x%08X\n",
-					Offset, Length, record.Sequence, record.FileOffset, status);
-#endif
-				Core->MetaTreeReady = FALSE;
-			}
-		}
 	}
 	nodeCountAfter = Core->MetaTree.NodeCount;
 	Cdp_LOCK_RELEASE(&Core->TreeLock);
-	if (ledgerRange)
-		Cdp_FREE(ledgerRange);
 	if (NT_SUCCESS(status))
 	{
 		Core->Time100ns += 1;
@@ -1676,9 +1185,6 @@ NTSTATUS CdpCoreDrainOneMetaRangeWithWriter(
 		status = CdpPreviewTreePunchRange(&Core->MetaTree, offset, length);
 		if (!NT_SUCCESS(status))
 			Core->MetaTreeReady = FALSE;
-		else
-			status = CdpCorePunchWriteLedgerLocked(
-				Core, offset, offset + length);
 	}
 	if (NT_SUCCESS(status))
 	{
@@ -1715,9 +1221,6 @@ NTSTATUS CdpCorePunchMetaRange(
 		status = CdpPreviewTreePunchRange(&Core->MetaTree, Offset, Length);
 		if (!NT_SUCCESS(status))
 			Core->MetaTreeReady = FALSE;
-		else
-			status = CdpCorePunchWriteLedgerLocked(
-				Core, Offset, Offset + Length);
 	}
 	Cdp_LOCK_RELEASE(&Core->TreeLock);
 	return status;
@@ -1729,7 +1232,6 @@ static NTSTATUS CdpCoreSynthesizeRead(
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
 	_Out_writes_bytes_(Length) PVOID Buffer,
-	_In_ BOOLEAN ValidateWriteLedger,
 	_In_ BOOLEAN ReadSourceBaseline)
 {
 	PUCHAR coveredMask = NULL;
@@ -1822,69 +1324,6 @@ static NTSTATUS CdpCoreSynthesizeRead(
 				goto done;
 		}
 	}
-	if (NT_SUCCESS(status) && ValidateWriteLedger)
-	{
-		UINT64 expectedStart = 0;
-		UINT64 expectedEnd = 0;
-		UINT64 firstGap = 0;
-		UINT64 expectedSequence = 0;
-		UINT64 expectedFileOffset = 0;
-		UINT64 actualSequence = 0;
-		UINT64 actualFileOffset = 0;
-		ULONG ledgerRanges;
-		ULONG metaNodes;
-		BOOLEAN valid;
-		Cdp_LOCK_ACQUIRE(&Core->TreeLock);
-		valid = CdpCoreValidateWriteLedgerLocked(
-			Core, Offset, Length, coveredMask,
-			&expectedStart, &expectedEnd, &firstGap,
-			&expectedSequence, &expectedFileOffset,
-			&actualSequence, &actualFileOffset);
-		ledgerRanges = Core->WriteLedgerRangeCount;
-		metaNodes = Core->MetaTree.NodeCount;
-		Cdp_LOCK_RELEASE(&Core->TreeLock);
-		if (!valid)
-		{
-#ifndef Cdp_USERMODE
-			Cdp_LOG("[WRITE-LEDGER-MAP-MISS] read=[%llu,%llu) expected=[%llu,%llu) firstMismatch=%llu expectedSeq=%llu expectedPayload=%llu actualSeq=%llu actualPayload=%llu ledgerRanges=%lu metaNodes=%lu covered=%lu\n",
-				Offset, Offset + Length, expectedStart, expectedEnd,
-				firstGap, expectedSequence, expectedFileOffset,
-				actualSequence, actualFileOffset,
-				ledgerRanges, metaNodes, coveredCount);
-#endif
-			status = STATUS_DISK_CORRUPT_ERROR;
-		}
-		else
-		{
-			UINT64 rangeStart = 0;
-			UINT64 rangeEnd = 0;
-			UINT64 sequence = 0;
-			UINT64 payloadOffset = 0;
-			UINT64 firstMismatch = 0;
-			UCHAR expectedByte = 0;
-			UCHAR actualByte = 0;
-			Cdp_LOCK_ACQUIRE(&Core->TreeLock);
-			status = CdpCoreValidateWriteLedgerDataLocked(
-				Core, Offset, Length, (const UCHAR*)Buffer,
-				&rangeStart, &rangeEnd, &sequence, &payloadOffset,
-				&firstMismatch, &expectedByte, &actualByte);
-			Cdp_LOCK_RELEASE(&Core->TreeLock);
-#ifndef Cdp_USERMODE
-			if (status == STATUS_DATA_ERROR)
-			{
-				Cdp_LOG("[WRITE-LEDGER-DATA-MISMATCH] read=[%llu,%llu) ledger=[%llu,%llu) firstMismatch=%llu sequence=%llu payloadOffset=%llu expected=0x%02X actual=0x%02X\n",
-					Offset, Offset + Length, rangeStart, rangeEnd,
-					firstMismatch, sequence, payloadOffset,
-					expectedByte, actualByte);
-			}
-			else if (!NT_SUCCESS(status))
-			{
-				Cdp_LOG("[WRITE-LEDGER-DATA-READ-FAIL] read=[%llu,%llu) status=0x%08X\n",
-					Offset, Offset + Length, status);
-			}
-#endif
-		}
-	}
 done:
 	Cdp_FREE(coveredMask);
 	return status;
@@ -1902,12 +1341,12 @@ NTSTATUS CdpCoreRead(
 		return STATUS_INVALID_PARAMETER;
 	if (Core->Phase == Cdp_CORE_PHASE_PREVIEW)
 		return CdpCoreSynthesizeRead(
-			Core, &Core->PreviewTree, Offset, Length, Buffer, FALSE, TRUE);
+			Core, &Core->PreviewTree, Offset, Length, Buffer, TRUE);
 	if (!Core->MetaTreeReady)
 		return STATUS_DEVICE_NOT_READY;
 
 	return CdpCoreSynthesizeRead(
-		Core, &Core->MetaTree, Offset, Length, Buffer, TRUE, TRUE);
+		Core, &Core->MetaTree, Offset, Length, Buffer, TRUE);
 }
 
 NTSTATUS CdpCoreOverlayCurrentRead(
@@ -1920,14 +1359,14 @@ NTSTATUS CdpCoreOverlayCurrentRead(
 		return STATUS_INVALID_PARAMETER;
 	if (Core->Phase == Cdp_CORE_PHASE_PREVIEW)
 		return CdpCoreSynthesizeRead(
-			Core, &Core->PreviewTree, Offset, Length, Buffer, FALSE, FALSE);
+			Core, &Core->PreviewTree, Offset, Length, Buffer, FALSE);
 	if (!Core->MetaTreeReady)
 		return STATUS_DEVICE_NOT_READY;
 
 	/* Buffer already contains the source-disk baseline. Apply only journal
 	 * ranges; holes deliberately retain the bytes returned by Disk Lower. */
 	return CdpCoreSynthesizeRead(
-		Core, &Core->MetaTree, Offset, Length, Buffer, TRUE, FALSE);
+		Core, &Core->MetaTree, Offset, Length, Buffer, FALSE);
 }
 
 typedef struct _Cdp_CORE_COVERAGE_SCAN
@@ -2088,7 +1527,7 @@ NTSTATUS CdpCorePreviewRead(
 	if (Core->Phase != Cdp_CORE_PHASE_PREVIEW || Core->Building)
 		return STATUS_INVALID_DEVICE_STATE;
 	return CdpCoreSynthesizeRead(
-		Core, &Core->PreviewTree, Offset, Length, Buffer, FALSE, TRUE);
+		Core, &Core->PreviewTree, Offset, Length, Buffer, TRUE);
 }
 
 static NTSTATUS CdpCoreResolveTargetTime(
@@ -2304,7 +1743,6 @@ NTSTATUS CdpCorePrepareRebootRecovery(
 	oldTree = Core->MetaTree;
 	Core->MetaTree = newTree;
 	Core->MetaTreeReady = TRUE;
-	CdpCoreClearWriteLedger(Core);
 	Core->PendingRecoveryParentBranch = parentBranch;
 	Core->PendingRecoveryBranchNumber = newBranch;
 	Core->PendingRecoveryInheritedSequence = inheritedSequence;
@@ -2345,31 +1783,91 @@ failure:
 	return status;
 }
 
-NTSTATUS CdpCorePreparePersistentRestoreBoot(_Inout_ PCdp_CORE Core)
+NTSTATUS CdpCorePreparePersistentRestoreBoot(
+	_Inout_ PCdp_CORE Core,
+	_In_ Cdp_CORE_DRAIN_WRITE_ROUTINE WriteRoutine,
+	_In_opt_ PVOID WriteContext,
+	_Out_opt_ PBOOLEAN PreviousBootConfirmed,
+	_Out_opt_ PULONG MaterializedRanges,
+	_Out_opt_ PUINT64 MaterializedBytes)
 {
 	Cdp_PREVIEW_TREE oldTree;
+	BOOLEAN previousConfirmed = FALSE;
+	BOOLEAN complete = FALSE;
+	ULONG ranges = 0;
+	UINT64 bytes = 0;
+	ULONG drainedLength = 0;
+	NTSTATUS status;
 
-	if (!Core || !Core->Journal || !Core->Journal->Mounted)
+	if (PreviousBootConfirmed)
+		*PreviousBootConfirmed = FALSE;
+	if (MaterializedRanges)
+		*MaterializedRanges = 0;
+	if (MaterializedBytes)
+		*MaterializedBytes = 0;
+	if (!Core || !WriteRoutine || !Core->Journal || !Core->Journal->Mounted)
 		return STATUS_DEVICE_NOT_READY;
 	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
 	if (Core->Phase != Cdp_CORE_PHASE_GENERAL || Core->Building ||
 		Core->MergeActive || Core->PendingRecoveryBranch ||
 		Core->Journal->RecoveryPending ||
-		!Core->Journal->RestorePointSet)
+		!Core->Journal->RestorePointSet || !Core->MetaTreeReady)
+	{
+		Cdp_LOCK_RELEASE(&Core->TreeLock);
+		return STATUS_INVALID_DEVICE_STATE;
+	}
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+
+	status = CdpJournalBeginRestoreBoot(
+		Core->Journal, &previousConfirmed);
+	if (!NT_SUCCESS(status))
+		return status;
+	if (PreviousBootConfirmed)
+		*PreviousBootConfirmed = previousConfirmed;
+
+	/* A zero acknowledgement means the last boot never reached the service.
+	 * Preserve all repair/startup writes from that attempt in the physical
+	 * source before discarding its Journal history. Each successful range is
+	 * punched, so a crash or retry resumes idempotently from what remains. */
+	while (!previousConfirmed && !complete)
+	{
+		drainedLength = 0;
+		status = CdpCoreDrainOneMetaRangeWithWriter(
+			Core, WriteRoutine, WriteContext, &complete, NULL,
+			&drainedLength);
+		if (!NT_SUCCESS(status))
+			return status;
+		if (drainedLength != 0)
+		{
+			ranges++;
+			bytes += drainedLength;
+		}
+	}
+	if (MaterializedRanges)
+		*MaterializedRanges = ranges;
+	if (MaterializedBytes)
+		*MaterializedBytes = bytes;
+
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	if (Core->Phase != Cdp_CORE_PHASE_GENERAL || Core->Building ||
+		Core->MergeActive || Core->PendingRecoveryBranch ||
+		Core->Journal->RecoveryPending ||
+		!Core->Journal->RestorePointSet ||
+		Core->Journal->RestoreBootPending || !Core->MetaTreeReady)
 	{
 		Cdp_LOCK_RELEASE(&Core->TreeLock);
 		return STATUS_INVALID_DEVICE_STATE;
 	}
 	oldTree = Core->MetaTree;
 	CdpPreviewTreeInitialize(&Core->MetaTree);
-	CdpCoreClearWriteLedger(Core);
 	Core->MetaTreeReady = TRUE;
 	Core->PendingRestoreReset = TRUE;
 	Cdp_LOCK_RELEASE(&Core->TreeLock);
 	CdpPreviewTreeFree(&oldTree);
 #ifndef Cdp_USERMODE
-	Cdp_LOG("[RESTORE-POINT] boot baseline published target=%llu; history reset deferred to first write\n",
-		Core->Journal->RestorePointTime100ns);
+	Cdp_LOG("[RESTORE-POINT] boot baseline published target=%llu previousBootConfirmed=%u materializedRanges=%lu materializedBytes=%llu; history reset deferred to first write\n",
+		Core->Journal->RestorePointTime100ns,
+		previousConfirmed ? 1u : 0u, ranges, bytes);
 #endif
 	return STATUS_SUCCESS;
 }
@@ -2400,11 +1898,21 @@ NTSTATUS CdpCoreSetRestorePointMarker(
 	return CdpJournalSetRestorePoint(Core->Journal, TargetTime100ns);
 }
 
+NTSTATUS CdpCoreConfirmPersistentRestoreBoot(_Inout_ PCdp_CORE Core)
+{
+	if (!Core || !Core->Journal)
+		return STATUS_INVALID_PARAMETER;
+	return CdpJournalConfirmRestoreBoot(Core->Journal);
+}
+
 NTSTATUS CdpCoreClearRestorePointMarker(_Inout_ PCdp_CORE Core)
 {
 	NTSTATUS status;
 	if (!Core)
 		return STATUS_INVALID_PARAMETER;
+	/* Keep the explicit delete operation idempotent for existing callers. */
+	if (!Core->Journal || !Core->Journal->RestorePointSet)
+		return STATUS_SUCCESS;
 	status = CdpCoreMaterializeRuntimeCheckpoints(Core);
 	if (!NT_SUCCESS(status))
 		return status;
@@ -2624,7 +2132,6 @@ NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100n
 	oldTree = Core->MetaTree;
 	Core->MetaTree = newTree;
 	Core->MetaTreeReady = TRUE;
-	CdpCoreClearWriteLedger(Core);
 	Core->Building = 0;
 	Core->Phase = Cdp_CORE_PHASE_GENERAL;
 	publishedNodeCount = Core->MetaTree.NodeCount;

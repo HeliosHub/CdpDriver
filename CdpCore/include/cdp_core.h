@@ -215,14 +215,22 @@ NTSTATUS CdpCorePrepareRebootRecovery(
 
 BOOLEAN CdpCoreHasPendingRecoveryBranch(_In_ PCdp_CORE Core);
 
-/* Persistent restore-point boot handling. Discovery publishes an empty
- * MetaTree without issuing boot-time journal writes; the first protected
- * append durably resets history before recording its payload. */
-NTSTATUS CdpCorePreparePersistentRestoreBoot(_Inout_ PCdp_CORE Core);
+/* Persistent restore-point boot handling. The boot acknowledgement is cleared
+ * durably first. If the previous boot was not acknowledged, the current
+ * Journal view is materialized to the source before an empty restore baseline
+ * is published. The first protected append then resets old history. */
+NTSTATUS CdpCorePreparePersistentRestoreBoot(
+	_Inout_ PCdp_CORE Core,
+	_In_ Cdp_CORE_DRAIN_WRITE_ROUTINE WriteRoutine,
+	_In_opt_ PVOID WriteContext,
+	_Out_opt_ PBOOLEAN PreviousBootConfirmed,
+	_Out_opt_ PULONG MaterializedRanges,
+	_Out_opt_ PUINT64 MaterializedBytes);
 NTSTATUS CdpCoreCancelPersistentRestoreBoot(_Inout_ PCdp_CORE Core);
 NTSTATUS CdpCoreSetRestorePointMarker(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 TargetTime100ns);
+NTSTATUS CdpCoreConfirmPersistentRestoreBoot(_Inout_ PCdp_CORE Core);
 NTSTATUS CdpCoreClearRestorePointMarker(_Inout_ PCdp_CORE Core);
 
 // Rebuild the live view after a persistent restore point discarded old

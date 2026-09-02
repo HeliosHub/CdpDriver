@@ -18,7 +18,11 @@ BOOL CdpRegisterVolumeUpperFilter(void);
 
 BOOL CdpRegisterDiskUpperFilter(void);
 
+BOOL CdpInstallBootConfirmService(void);
+
 BOOL CdpInstallDriverPackage(void);
+
+const wchar_t* CdpGetInstallFailureStage(void);
 
 #ifdef __cplusplus
 }

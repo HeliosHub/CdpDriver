@@ -616,12 +616,16 @@ static VOID CdpJournalInvalidateHeaderWriteCacheRangeLocked(
 		Journal->HeaderWriteCacheValid = FALSE;
 }
 
-static NTSTATUS CdpJournalRawIo(
+/* Keep the immediate high-level Journal caller in every raw-I/O trace.  A
+ * boot-time hang cannot be classified from IRP_MJ_READ alone: the same raw
+ * transport is used for mount metadata, payload reads and checkpoint work. */
+static NTSTATUS CdpJournalRawIoImpl(
 	_In_ PCdp_JOURNAL Journal,
 	_In_ UCHAR MajorFunction,
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
-	_Inout_updates_bytes_(Length) PVOID Buffer)
+	_Inout_updates_bytes_(Length) PVOID Buffer,
+	_In_z_ const char* Origin)
 {
 	NTSTATUS status;
 
@@ -655,14 +659,20 @@ static NTSTATUS CdpJournalRawIo(
 #ifndef Cdp_USERMODE
 		if (!NT_SUCCESS(status))
 		{
-			Cdp_LOG("[JOURNAL-RAW-FAIL] backend=store major=0x%02X status=0x%08X offset=%llu len=%lu\n",
-				MajorFunction, status, Offset, Length);
+			Cdp_LOG("[JOURNAL-RAW-FAIL] backend=store origin=%s major=0x%02X status=0x%08X offset=%llu len=%lu\n",
+				Origin, MajorFunction, status, Offset, Length);
 		}
 #endif
 		return status;
 	}
 
 #ifndef Cdp_USERMODE
+	if (InterlockedCompareExchange(&Journal->RawIoQuiesced, 0, 0) != 0)
+	{
+		Cdp_LOG("[JOURNAL-RAW-BLOCKED] origin=%s major=0x%02X offset=%llu len=%lu reason=device-power-quiesced\n",
+			Origin, MajorFunction, Offset, Length);
+		return STATUS_DEVICE_NOT_READY;
+	}
 	// Prefer the volume stack below our own filter.  This keeps offsets volume-
 	// relative and avoids blocking on a synchronous \\PhysicalDrive handle.
 	// Retain the physical-disk backend only as a compatibility fallback when no
@@ -682,13 +692,14 @@ static NTSTATUS CdpJournalRawIo(
 		byteOffset.QuadPart =
 			(LONGLONG)(Journal->TargetBaseOffset + Offset);
 		RtlZeroMemory(&iosb, sizeof(iosb));
-		Cdp_DBG("[JOURNAL-PHYSICAL] io begin handle=%p "
-			"major=0x%02X partitionOffset=%llu diskOffset=%llu len=%lu\n",
-			Journal->RawDiskHandle,
+		Cdp_DBG("[JOURNAL-PHYSICAL] io begin origin=%s handle=%p "
+			"major=0x%02X partitionOffset=%llu diskOffset=%llu len=%lu thread=%p\n",
+			Origin, Journal->RawDiskHandle,
 			MajorFunction,
 			Offset,
 			(UINT64)byteOffset.QuadPart,
-			Length);
+			Length,
+			PsGetCurrentThread());
 		if (MajorFunction == IRP_MJ_READ)
 		{
 			status = ZwReadFile(
@@ -713,8 +724,8 @@ static NTSTATUS CdpJournalRawIo(
 			return STATUS_UNEXPECTED_IO_ERROR;
 		if (!NT_SUCCESS(status))
 		{
-			Cdp_LOG("[JOURNAL-RAW-FAIL] backend=physical major=0x%02X status=0x%08X partitionOffset=%llu diskOffset=%llu len=%lu\n",
-				MajorFunction,
+			Cdp_LOG("[JOURNAL-RAW-FAIL] backend=physical origin=%s major=0x%02X status=0x%08X partitionOffset=%llu diskOffset=%llu len=%lu\n",
+				Origin, MajorFunction,
 				status,
 				Offset,
 				(UINT64)byteOffset.QuadPart,
@@ -751,14 +762,15 @@ static NTSTATUS CdpJournalRawIo(
 		&iosb);
 	if (!irp)
 		return STATUS_INSUFFICIENT_RESOURCES;
-	Cdp_DBG("[JOURNAL-RAW] io begin target=%p major=0x%02X "
-		"partitionOffset=%llu diskOffset=%llu len=%lu irp=%p\n",
-		Journal->TargetDevice,
+	Cdp_DBG("[JOURNAL-RAW] io begin origin=%s target=%p major=0x%02X "
+		"partitionOffset=%llu diskOffset=%llu len=%lu irp=%p thread=%p\n",
+		Origin, Journal->TargetDevice,
 		MajorFunction,
 		Offset,
 		(UINT64)byteOffset.QuadPart,
 		Length,
-		irp);
+		irp,
+		PsGetCurrentThread());
 	status = IoCallDriver(Journal->TargetDevice, irp);
 	Cdp_DBG("[JOURNAL-RAW] IoCallDriver returned irp=%p "
 		"status=0x%08X iosb=0x%08X bytes=%Iu\n",
@@ -777,9 +789,12 @@ static NTSTATUS CdpJournalRawIo(
 				Executive, KernelMode, FALSE, &diagnosticTimeout);
 			if (waitStatus == STATUS_TIMEOUT)
 			{
-				Cdp_LOG("[DRAIN-DIAG] stage=journal-io-wait-still-blocked target=%p major=0x%02X partitionOffset=%llu diskOffset=%llu len=%lu irp=%p iosb=0x%08X\n",
-					Journal->TargetDevice, MajorFunction, Offset,
-					(UINT64)byteOffset.QuadPart, Length, irp, iosb.Status);
+				Cdp_LOG("[DRAIN-DIAG] stage=journal-io-wait-still-blocked origin=%s target=%p major=0x%02X partitionOffset=%llu diskOffset=%llu len=%lu irp=%p iosb=0x%08X thread=%p\n",
+					Origin, Journal->TargetDevice, MajorFunction, Offset,
+					(UINT64)byteOffset.QuadPart, Length, irp, iosb.Status,
+					PsGetCurrentThread());
+					/* Keep the timeout trace small but sufficient to map it to the
+					 * owning worker in the stopped debugger. */
 			}
 		} while (waitStatus == STATUS_TIMEOUT);
 		status = iosb.Status;
@@ -797,8 +812,8 @@ static NTSTATUS CdpJournalRawIo(
 		return STATUS_UNEXPECTED_IO_ERROR;
 	if (!NT_SUCCESS(status))
 	{
-		Cdp_LOG("[JOURNAL-RAW-FAIL] backend=device major=0x%02X status=0x%08X partitionOffset=%llu diskOffset=%llu len=%lu target=%p\n",
-			MajorFunction,
+		Cdp_LOG("[JOURNAL-RAW-FAIL] backend=device origin=%s major=0x%02X status=0x%08X partitionOffset=%llu diskOffset=%llu len=%lu target=%p\n",
+			Origin, MajorFunction,
 			status,
 			Offset,
 			(UINT64)byteOffset.QuadPart,
@@ -818,6 +833,10 @@ static NTSTATUS CdpJournalRawIo(
 #endif
 }
 
+#define CdpJournalRawIo(Journal, MajorFunction, Offset, Length, Buffer) \
+	CdpJournalRawIoImpl((Journal), (MajorFunction), (Offset), (Length), \
+		(Buffer), __FUNCTION__)
+
 // Metadata can use the adjacent partition's volume stack while payload I/O
 // continues to use the disk stack and absolute offsets. This matters during
 // boot: the disk lower can already serve reads yet still reject a raw write
@@ -830,6 +849,15 @@ static NTSTATUS CdpJournalMetadataRawIo(
 	_Inout_updates_bytes_(Length) PVOID Buffer)
 {
 	NTSTATUS status;
+
+#ifndef Cdp_USERMODE
+	if (InterlockedCompareExchange(&Journal->RawIoQuiesced, 0, 0) != 0)
+	{
+		Cdp_LOG("[JOURNAL-METADATA-BLOCKED] major=0x%02X offset=%llu len=%lu reason=device-power-quiesced\n",
+			MajorFunction, Offset, Length);
+		return STATUS_DEVICE_NOT_READY;
+	}
+#endif
 
 	if (!Journal->MetadataTargetDevice || Journal->Store)
 		return CdpJournalRawIo(
@@ -1041,7 +1069,11 @@ static NTSTATUS CdpJournalWriteSuperblockLocked(_Inout_ PCdp_JOURNAL Journal)
 	if (Journal->CredentialConfigured)
 		superblock->Flags |= Cdp_JOURNAL_FLAG_CREDENTIAL_CONFIGURED;
 	if (Journal->RestorePointSet)
+	{
 		superblock->Flags |= Cdp_JOURNAL_FLAG_RESTORE_POINT_SET;
+	}
+	if (Journal->RestoreBootPending)
+		superblock->Flags |= Cdp_JOURNAL_FLAG_RESTORE_BOOT_PENDING;
 	superblock->PartitionSize = Journal->PartitionSize;
 	superblock->LastHeaderRegionOff = Journal->LastHeaderRegionOff;
 	superblock->SourceVolumeGuid = Journal->SourceVolumeGuid;
@@ -1129,6 +1161,11 @@ static BOOLEAN CdpJournalSuperblockValid(
 		 CdpCrc32c(0, Superblock,
 			FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, RestorePointCrc32c)) !=
 			Superblock->RestorePointCrc32c))
+	{
+		return FALSE;
+	}
+	if ((Superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_BOOT_PENDING) != 0 &&
+		(Superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_POINT_SET) == 0)
 	{
 		return FALSE;
 	}
@@ -3193,6 +3230,7 @@ NTSTATUS CdpJournalFormat(_Inout_ PCdp_JOURNAL Journal)
 	Journal->RecoveryFsRepairPending = FALSE;
 	Journal->RecoveryTargetTime100ns = 0;
 	Journal->RestorePointSet = FALSE;
+	Journal->RestoreBootPending = FALSE;
 	Journal->RestorePointTime100ns = 0;
 	Journal->HistoryScanSkipped = FALSE;
 	Journal->HeaderWriteCacheValid = FALSE;
@@ -3248,7 +3286,6 @@ NTSTATUS CdpJournalResetHistoryPreserveRestorePoint(
 		status = STATUS_INVALID_DEVICE_STATE;
 		goto cleanup;
 	}
-
 	usableStart = CdpJournalUsableStart(Journal);
 	usableEnd = CdpJournalUsableEnd(Journal);
 	headerOff = usableStart;
@@ -3289,6 +3326,8 @@ NTSTATUS CdpJournalResetHistoryPreserveRestorePoint(
 	/* AppendBranch persists the initialized RR and the valid branch-1
 	 * superblock in its existing flush -> superblock -> flush order. */
 	status = CdpJournalAppendBranchLocked(Journal, 1, 0, 0);
+	/* AppendBranch persists the fresh history root while preserving the
+	 * restore anchor and the already-cleared boot acknowledgement. */
 
 cleanup:
 	Cdp_LOCK_RELEASE(&Journal->Lock);
@@ -3371,6 +3410,8 @@ static NTSTATUS CdpJournalMountInternal(
 	Journal->RestorePointSet =
 		(superblock->Version >= Cdp_JOURNAL_VERSION) &&
 		((superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_POINT_SET) != 0);
+	Journal->RestoreBootPending = Journal->RestorePointSet &&
+		((superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_BOOT_PENDING) != 0);
 	Journal->RestorePointTime100ns = Journal->RestorePointSet ?
 		superblock->RestorePointTime100ns : 0;
 	Journal->CredentialConfigured =
@@ -3385,7 +3426,7 @@ static NTSTATUS CdpJournalMountInternal(
 	 * baseline and the old journal will be reset before the first new write.
 	 * Auto discovery therefore must not spend boot time reading Record headers.
 	 * Recovery retains precedence because it needs the historical branch tree. */
-	if (AutoDiscovery && Journal->RestorePointSet &&
+	if (AutoDiscovery && Journal->RestoreBootPending &&
 		!Journal->RecoveryPending)
 	{
 		Journal->TotalRecords = 0;
@@ -3912,6 +3953,7 @@ NTSTATUS CdpJournalSetRestorePoint(
 {
 	NTSTATUS status;
 	BOOLEAN oldSet;
+	BOOLEAN oldPending;
 	UINT64 oldTime;
 
 	if (!Journal || TargetTime100ns == 0)
@@ -3923,8 +3965,10 @@ NTSTATUS CdpJournalSetRestorePoint(
 		goto done;
 	}
 	oldSet = Journal->RestorePointSet;
+	oldPending = Journal->RestoreBootPending;
 	oldTime = Journal->RestorePointTime100ns;
 	Journal->RestorePointSet = TRUE;
+	Journal->RestoreBootPending = TRUE;
 	Journal->RestorePointTime100ns = TargetTime100ns;
 	Journal->SuperblockDirty = TRUE;
 	status = CdpJournalWriteSuperblockLocked(Journal);
@@ -3933,8 +3977,86 @@ NTSTATUS CdpJournalSetRestorePoint(
 	if (!NT_SUCCESS(status))
 	{
 		Journal->RestorePointSet = oldSet;
+		Journal->RestoreBootPending = oldPending;
 		Journal->RestorePointTime100ns = oldTime;
 		Journal->SuperblockDirty = TRUE;
+	}
+done:
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
+NTSTATUS CdpJournalBeginRestoreBoot(
+	_Inout_ PCdp_JOURNAL Journal,
+	_Out_ PBOOLEAN PreviousBootConfirmed)
+{
+	NTSTATUS status = STATUS_SUCCESS;
+	BOOLEAN previousConfirmed;
+
+	if (!Journal || !PreviousBootConfirmed)
+		return STATUS_INVALID_PARAMETER;
+	*PreviousBootConfirmed = FALSE;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto done;
+	}
+	if (!Journal->RestorePointSet || Journal->RestorePointTime100ns == 0)
+	{
+		status = STATUS_INVALID_DEVICE_STATE;
+		goto done;
+	}
+	previousConfirmed = Journal->RestoreBootPending;
+	if (previousConfirmed)
+	{
+		Journal->RestoreBootPending = FALSE;
+		Journal->SuperblockDirty = TRUE;
+		status = CdpJournalWriteSuperblockLocked(Journal);
+		if (NT_SUCCESS(status))
+			status = CdpJournalFlush(Journal);
+		if (!NT_SUCCESS(status))
+		{
+			Journal->RestoreBootPending = TRUE;
+			Journal->SuperblockDirty = TRUE;
+			goto done;
+		}
+	}
+	*PreviousBootConfirmed = previousConfirmed;
+done:
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
+NTSTATUS CdpJournalConfirmRestoreBoot(_Inout_ PCdp_JOURNAL Journal)
+{
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Journal)
+		return STATUS_INVALID_PARAMETER;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted)
+	{
+		status = STATUS_DEVICE_NOT_READY;
+		goto done;
+	}
+	if (!Journal->RestorePointSet || Journal->RestorePointTime100ns == 0)
+	{
+		status = STATUS_INVALID_DEVICE_STATE;
+		goto done;
+	}
+	if (!Journal->RestoreBootPending)
+	{
+		Journal->RestoreBootPending = TRUE;
+		Journal->SuperblockDirty = TRUE;
+		status = CdpJournalWriteSuperblockLocked(Journal);
+		if (NT_SUCCESS(status))
+			status = CdpJournalFlush(Journal);
+		if (!NT_SUCCESS(status))
+		{
+			Journal->RestoreBootPending = FALSE;
+			Journal->SuperblockDirty = TRUE;
+		}
 	}
 done:
 	Cdp_LOCK_RELEASE(&Journal->Lock);
@@ -3945,6 +4067,7 @@ NTSTATUS CdpJournalClearRestorePoint(_Inout_ PCdp_JOURNAL Journal)
 {
 	NTSTATUS status;
 	BOOLEAN oldSet;
+	BOOLEAN oldPending;
 	UINT64 oldTime;
 
 	if (!Journal)
@@ -3956,8 +4079,10 @@ NTSTATUS CdpJournalClearRestorePoint(_Inout_ PCdp_JOURNAL Journal)
 		goto done;
 	}
 	oldSet = Journal->RestorePointSet;
+	oldPending = Journal->RestoreBootPending;
 	oldTime = Journal->RestorePointTime100ns;
 	Journal->RestorePointSet = FALSE;
+	Journal->RestoreBootPending = FALSE;
 	Journal->RestorePointTime100ns = 0;
 	Journal->SuperblockDirty = TRUE;
 	status = CdpJournalWriteSuperblockLocked(Journal);
@@ -3966,6 +4091,7 @@ NTSTATUS CdpJournalClearRestorePoint(_Inout_ PCdp_JOURNAL Journal)
 	if (!NT_SUCCESS(status))
 	{
 		Journal->RestorePointSet = oldSet;
+		Journal->RestoreBootPending = oldPending;
 		Journal->RestorePointTime100ns = oldTime;
 		Journal->SuperblockDirty = TRUE;
 	}

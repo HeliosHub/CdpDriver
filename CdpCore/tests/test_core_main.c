@@ -2242,10 +2242,13 @@ static int TestPersistentRestorePoint(void)
 	UINT64 effective = 0;
 	UINT64 targetSequence = 0;
 	UINT64 writtenBytes = 0;
+	UINT64 materializedBytes = 0;
 	UINT64 total = 0;
 	UINT64 generation = 0;
 	ULONG writtenRanges = 0;
+	ULONG materializedRanges = 0;
 	ULONG returned = 0;
+	BOOLEAN previousBootConfirmed = FALSE;
 	NTSTATUS status;
 
 	Expect(NT_SUCCESS(TestCtxCreate(
@@ -2286,13 +2289,16 @@ static int TestPersistentRestorePoint(void)
 		"persist restore-point marker in superblock");
 	superblock = (PCdp_JOURNAL_SUPERBLOCK)CdpMemStoreData(ctx.Journal);
 	Expect((superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_POINT_SET) != 0 &&
+		(superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_BOOT_PENDING) != 0 &&
 		superblock->RestorePointTime100ns == targetRecord.WallClock100ns,
-		"superblock contains persistent restore-point time");
+		"superblock contains persistent restore-point time and initial boot confirmation");
 
 	Expect(NT_SUCCESS(CdpCorePrepareRebootRecovery(
 		ctx.Core, targetRecord.WallClock100ns)),
 		"prepare higher-priority recovery view");
-	ExpectStatus(CdpCorePreparePersistentRestoreBoot(ctx.Core),
+	ExpectStatus(CdpCorePreparePersistentRestoreBoot(
+		ctx.Core, TestDrainAbsoluteWriter, &writer,
+		&previousBootConfirmed, &materializedRanges, &materializedBytes),
 		STATUS_INVALID_DEVICE_STATE,
 		"recovery preparation prevents restore-point boot handling");
 
@@ -2302,8 +2308,15 @@ static int TestPersistentRestorePoint(void)
 	if (NT_SUCCESS(status))
 		status = CdpCoreMountJournal(ctx.Core);
 	Expect(NT_SUCCESS(status), "remount persistent restore-point journal");
-	Expect(NT_SUCCESS(CdpCorePreparePersistentRestoreBoot(ctx.Core)),
-		"boot publishes empty MetaTree without writing journal");
+	previousBootConfirmed = FALSE;
+	materializedRanges = 0;
+	materializedBytes = 0;
+	Expect(NT_SUCCESS(CdpCorePreparePersistentRestoreBoot(
+		ctx.Core, TestDrainAbsoluteWriter, &writer,
+		&previousBootConfirmed, &materializedRanges, &materializedBytes)) &&
+		previousBootConfirmed && materializedRanges == 0 &&
+		materializedBytes == 0,
+		"confirmed boot publishes restore baseline without materializing old Journal data");
 	status = CdpCoreQueryRecordHeaders(
 		ctx.Core, 0, 0, records, RTL_NUMBER_OF(records),
 		&total, &generation, &returned);
@@ -2328,8 +2341,45 @@ static int TestPersistentRestorePoint(void)
 		records[1].Flags == 0,
 		"old history is replaced by root marker and first fresh record");
 	superblock = (PCdp_JOURNAL_SUPERBLOCK)CdpMemStoreData(ctx.Journal);
-	Expect((superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_POINT_SET) != 0,
-		"history reset preserves restore-point marker");
+	Expect((superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_POINT_SET) != 0 &&
+		superblock->RestorePointTime100ns == targetRecord.WallClock100ns,
+		"first protected write preserves the persistent restore anchor");
+	Expect((superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_BOOT_PENDING) == 0,
+		"restore boot remains unconfirmed until the service acknowledges it");
+
+	CdpCoreDestroy(ctx.Core);
+	ctx.Core = NULL;
+	status = CdpCoreCreate(ctx.Source, ctx.Journal, &ctx.Core);
+	if (NT_SUCCESS(status))
+		status = CdpCoreMountJournal(ctx.Core);
+	Expect(NT_SUCCESS(status), "remount unconfirmed restore boot Journal");
+	RtlZeroMemory(&writer, sizeof(writer));
+	writer.Store = ctx.Source;
+	previousBootConfirmed = TRUE;
+	materializedRanges = 0;
+	materializedBytes = 0;
+	Expect(NT_SUCCESS(CdpCorePreparePersistentRestoreBoot(
+		ctx.Core, TestDrainAbsoluteWriter, &writer,
+		&previousBootConfirmed, &materializedRanges, &materializedBytes)) &&
+		!previousBootConfirmed && materializedRanges == 1 &&
+		materializedBytes == sizeof(fresh),
+		"unconfirmed boot materializes the current Journal view before restore");
+	RtlZeroMemory(output, sizeof(output));
+	Expect(NT_SUCCESS(ctx.Source->Read(
+		ctx.Source, 0, sizeof(output), output)) &&
+		memcmp(output, fresh, sizeof(output)) == 0,
+		"unconfirmed boot preserves previous repair/startup writes in source");
+
+	CdpCoreSetTime100ns(ctx.Core, 280000);
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(latest), latest, NULL)),
+		"first write after abnormal-boot recovery starts fresh history");
+	Expect(NT_SUCCESS(CdpCoreConfirmPersistentRestoreBoot(ctx.Core)),
+		"service acknowledgement durably marks the restore boot successful");
+	Expect((superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_POINT_SET) != 0 &&
+		(superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_BOOT_PENDING) != 0 &&
+		superblock->RestorePointTime100ns == targetRecord.WallClock100ns,
+		"service acknowledgement preserves the restore anchor and sets boot confirmation");
 	Expect(NT_SUCCESS(CdpCoreClearRestorePointMarker(ctx.Core)),
 		"explicit delete clears persistent restore point");
 	Expect((superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_POINT_SET) == 0 &&
@@ -2584,6 +2634,7 @@ static int TestAutoDiscoverySkipsRestorePointRecords(void)
 	UINT64 total = 0;
 	UINT64 generation = 0;
 	ULONG returned = 0;
+	BOOLEAN previousBootConfirmed = FALSE;
 	NTSTATUS status;
 
 	Expect(NT_SUCCESS(TestCtxCreate(
@@ -2611,9 +2662,13 @@ static int TestAutoDiscoverySkipsRestorePointRecords(void)
 		"auto discovery detects restore point without allocating or scanning Record headers");
 	if (NT_SUCCESS(status))
 	{
+		Expect(NT_SUCCESS(CdpJournalBeginRestoreBoot(
+			&autoJournal, &previousBootConfirmed)) &&
+			previousBootConfirmed && !autoJournal.RestoreBootPending,
+			"restore boot durably clears the previous success acknowledgement");
 		Expect(NT_SUCCESS(CdpJournalResetHistoryPreserveRestorePoint(
 			&autoJournal)),
-			"materialize deferred reset after scan-free auto discovery");
+			"reset skipped history while preserving the restore anchor");
 		Expect(NT_SUCCESS(CdpJournalAppend(
 			&autoJournal, 0, sizeof(freshValue), freshValue, NULL)),
 			"first write resets skipped history before append");
@@ -2625,6 +2680,23 @@ static int TestAutoDiscoverySkipsRestorePointRecords(void)
 			record.Flags == Cdp_JOURNAL_RECORD_FLAG_BRANCH,
 			"scan-free mount transitions to fresh root history");
 		CdpJournalClose(&autoJournal);
+
+		CdpJournalInitializeWithStore(
+			&autoJournal, ctx.Journal, &zeroGuid, NULL, NULL);
+		status = CdpJournalMountForAutoDiscovery(&autoJournal);
+		Expect(NT_SUCCESS(status) && autoJournal.Mounted &&
+			autoJournal.RestorePointSet &&
+			!autoJournal.RestoreBootPending &&
+			!autoJournal.HistoryScanSkipped &&
+			autoJournal.TotalRecords == 2,
+			"unconfirmed next boot scans writes made after restore boot");
+		if (NT_SUCCESS(status))
+		{
+			Expect(NT_SUCCESS(CdpJournalConfirmRestoreBoot(&autoJournal)) &&
+				autoJournal.RestoreBootPending,
+				"service acknowledgement rearms scan-free normal restore");
+			CdpJournalClose(&autoJournal);
+		}
 	}
 	TestCtxDestroy(&ctx);
 	return g_caseFailed;

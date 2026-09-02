@@ -567,6 +567,13 @@ static BOOL DoPreviewBegin(HANDLE hDevice)
 		return FALSE;
 	if (!AuthenticatePassword(hDevice))
 		return FALSE;
+	if (!DeviceIoControl(hDevice, IOCTL_Cdp_DISABLE_AUTO_DISCOVERY,
+		NULL, 0, NULL, 0, &bytesReturned, NULL))
+	{
+		ConOutFmt(L"Disable runtime Journal discovery failed (err=%lu).\n",
+			GetLastError());
+		return FALSE;
+	}
 	ConOut(L"TargetTime100ns (local wall-clock FILETIME value): ");
 	if (!ReadLine(line, _countof(line)))
 		return FALSE;
@@ -877,7 +884,12 @@ static BOOL DoQueryRestorePoint(HANDLE hDevice)
 	if (!reply.IsSet)
 		ConOut(L"Persistent restore point is not set.\n");
 	else
+	{
 		ConOutFmt(L"Persistent restore point: %llu\n", reply.TargetTime100ns);
+		ConOutFmt(L"Boot confirmation: %s (PENDING=%lu)\n",
+			reply.BootConfirmed ? L"confirmed" : L"unconfirmed",
+			reply.BootConfirmed ? 1UL : 0UL);
+	}
 	return TRUE;
 }
 
@@ -1695,12 +1707,16 @@ static BOOL DoInstallDriver(void)
 
 	if (!CdpInstallDriverPackage())
 	{
+		DWORD installError = GetLastError();
+		ConOutFmt(L"Install failed at: %s (Win32 error %lu)\n",
+			CdpGetInstallFailureStage(), installError);
 		if (!CdpResolveDriverInfPath(infPath, _countof(infPath)))
 		{
-			ConOut(L"Install failed: CdpDriver.inf/.sys not found.\n");
+			ConOut(L"Install failed: CdpDriver package or CdpBootService.exe not found.\n");
 			ConOut(L"Expected locations (relative to CdpConsole.exe):\n");
 			ConOut(L"  .\\driver\\CdpDriver.inf\n");
 			ConOut(L"  .\\CdpDriver.inf\n");
+			ConOut(L"  .\\CdpBootService.exe\n");
 		}
 		else
 		{
@@ -1713,7 +1729,7 @@ static BOOL DoInstallDriver(void)
 
 	if (CdpResolveDriverInfPath(infPath, _countof(infPath)))
 		ConOutFmt(L"Driver package: %s\n", infPath);
-	ConOut(L"Driver installed; Volume and DiskDrive UpperFilters registered.\n");
+	ConOut(L"Driver and CdpBootConfirm service installed; Volume and DiskDrive UpperFilters registered.\n");
 	ConOut(L"Reboot is required before both filter layers attach.\n");
 	return TRUE;
 }
@@ -1721,7 +1737,7 @@ static BOOL DoInstallDriver(void)
 static void PrintHelp(void)
 {
 	ConOut(L"\nCommands:\n");
-	ConOut(L"  i  - install/register CdpDriver (Volume + DiskDrive UpperFilters)\n");
+	ConOut(L"  i  - install CdpDriver + CdpBootConfirm service; register filters\n");
 	ConOut(L"  1  - configure capture: source GUID + dedicated journal GUID\n");
 	ConOut(L"  2  - stop capture for a source GUID (invalidate its journal)\n");
 	ConOut(L"  6  - begin point-in-time preview (source GUID + time)\n");

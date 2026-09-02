@@ -22,6 +22,12 @@
 // repair.
 #define Cdp_JOURNAL_FLAG_RECOVERY_FS_REPAIR_PENDING 0x00000004UL
 #define Cdp_JOURNAL_FLAG_RESTORE_POINT_SET 0x00000008UL
+// Boot-success acknowledgement for a persistent restore point. Setting a
+// restore point and a successful user-mode boot acknowledgement set this bit.
+// The driver durably clears it before publishing each restore boot. A cleared
+// bit on the next boot means that the previous boot was not acknowledged and
+// its current Journal view must first be materialized to the source baseline.
+#define Cdp_JOURNAL_FLAG_RESTORE_BOOT_PENDING 0x00000010UL
 #define Cdp_JOURNAL_RECORD_INDEX_MASK     0x0000FFFFUL
 #define Cdp_JOURNAL_RECORD_FLAGS_MASK     0xFFFF0000UL
 // Highest Sequence bit selects the branch-record interpretation.
@@ -310,6 +316,7 @@ typedef struct _Cdp_JOURNAL
 	UINT64 CheckpointPayloadBytes;
 	BOOLEAN RecoveryPending;
 	BOOLEAN RestorePointSet;
+	BOOLEAN RestoreBootPending;
 	// Auto discovery may intentionally leave the old history opaque when a
 	// persistent restore point makes it irrelevant to the boot view.  The
 	// first protected write resets that history before appending anything.
@@ -343,6 +350,10 @@ typedef struct _Cdp_JOURNAL
 	UINT64 TargetBaseOffset; // partition start on RawDiskHandle
 	UINT64 MetadataTargetBaseOffset; // normally zero for a partition volume
 	PCdp_STORE Store; // if set, RawIo uses store instead of TargetDevice
+	/* Set when the owning physical disk accepts a non-D0 device-power IRP.
+	 * No new raw Journal request may be issued after that point: its target
+	 * stack can already be powering down. */
+	volatile LONG RawIoQuiesced;
 	Cdp_QUERY_TIME_100NS QueryTime100ns;
 	PVOID QueryTimeContext;
 	Cdp_LOCK Lock;
@@ -445,6 +456,15 @@ NTSTATUS CdpJournalCompleteRecoveryIntent(_Inout_ PCdp_JOURNAL Journal);
 NTSTATUS CdpJournalSetRestorePoint(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 TargetTime100ns);
+
+// Start one restore boot. Returns the previously persisted boot-success
+// acknowledgement and durably clears it before any restored-system write.
+NTSTATUS CdpJournalBeginRestoreBoot(
+	_Inout_ PCdp_JOURNAL Journal,
+	_Out_ PBOOLEAN PreviousBootConfirmed);
+
+// User-mode service acknowledgement after Windows has started successfully.
+NTSTATUS CdpJournalConfirmRestoreBoot(_Inout_ PCdp_JOURNAL Journal);
 
 NTSTATUS CdpJournalClearRestorePoint(_Inout_ PCdp_JOURNAL Journal);
 

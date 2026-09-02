@@ -2,10 +2,18 @@
 
 #include <SetupAPI.h>
 #include <Shlwapi.h>
+#include <strsafe.h>
 #include <stdio.h>
 
 #pragma comment(lib, "SetupAPI.lib")
 #pragma comment(lib, "Shlwapi.lib")
+
+static const wchar_t* g_CdpInstallFailureStage = L"unknown";
+
+const wchar_t* CdpGetInstallFailureStage(void)
+{
+	return g_CdpInstallFailureStage;
+}
 
 static BOOL CdpFileExists(_In_ const wchar_t* path)
 {
@@ -260,7 +268,10 @@ static BOOL CdpRegisterClassUpperFilter(_In_ const wchar_t* classKey)
 		KEY_READ | KEY_SET_VALUE,
 		&hKey);
 	if (result != ERROR_SUCCESS)
+	{
+		SetLastError((DWORD)result);
 		return FALSE;
+	}
 
 	existing[0] = L'\0';
 	existing[1] = L'\0';
@@ -305,6 +316,7 @@ static BOOL CdpRegisterClassUpperFilter(_In_ const wchar_t* classKey)
 		if ((size_t)(pEnd - existing) + wcslen(filterName) + 2 >= _countof(existing))
 		{
 			RegCloseKey(hKey);
+			SetLastError(ERROR_BUFFER_OVERFLOW);
 			return FALSE;
 		}
 
@@ -322,6 +334,7 @@ static BOOL CdpRegisterClassUpperFilter(_In_ const wchar_t* classKey)
 		if (result != ERROR_SUCCESS)
 		{
 			RegCloseKey(hKey);
+			SetLastError((DWORD)result);
 			return FALSE;
 		}
 	}
@@ -346,20 +359,73 @@ BOOL CdpRegisterDiskUpperFilter(void)
 		L"{4d36e967-e325-11ce-bfc1-08002be10318}");
 }
 
+BOOL CdpInstallBootConfirmService(void)
+{
+	wchar_t exeDir[MAX_PATH];
+	wchar_t servicePath[MAX_PATH];
+	wchar_t commandLine[MAX_PATH + 32];
+	STARTUPINFOW startupInfo;
+	PROCESS_INFORMATION processInfo;
+	DWORD exitCode = 1;
+
+	CdpGetExeDirectory(exeDir, _countof(exeDir));
+	if (!exeDir[0] ||
+		FAILED(StringCchPrintfW(
+			servicePath, _countof(servicePath), L"%s\\CdpBootService.exe", exeDir)) ||
+		!CdpFileExists(servicePath))
+	{
+		SetLastError(ERROR_FILE_NOT_FOUND);
+		return FALSE;
+	}
+	if (FAILED(StringCchPrintfW(
+		commandLine, _countof(commandLine), L"\"%s\" --install", servicePath)))
+	{
+		SetLastError(ERROR_FILENAME_EXCED_RANGE);
+		return FALSE;
+	}
+	ZeroMemory(&startupInfo, sizeof(startupInfo));
+	ZeroMemory(&processInfo, sizeof(processInfo));
+	startupInfo.cb = sizeof(startupInfo);
+	if (!CreateProcessW(
+		NULL, commandLine, NULL, NULL, FALSE, 0, NULL, exeDir,
+		&startupInfo, &processInfo))
+	{
+		return FALSE;
+	}
+	WaitForSingleObject(processInfo.hProcess, INFINITE);
+	GetExitCodeProcess(processInfo.hProcess, &exitCode);
+	CloseHandle(processInfo.hThread);
+	CloseHandle(processInfo.hProcess);
+	if (exitCode != 0)
+	{
+		SetLastError(exitCode);
+		return FALSE;
+	}
+	return TRUE;
+}
+
 BOOL CdpInstallDriverPackage(void)
 {
 	wchar_t infPath[MAX_PATH];
 
+	g_CdpInstallFailureStage = L"resolving driver package";
 	if (!CdpResolveDriverInfPath(infPath, _countof(infPath)))
 		return FALSE;
 
+	g_CdpInstallFailureStage = L"updating CdpDriver.sys / driver service";
 	if (!CdpInstallDriverFromInf(infPath))
 		return FALSE;
 
+	g_CdpInstallFailureStage = L"registering Volume UpperFilter";
 	if (!CdpRegisterVolumeUpperFilter())
 		return FALSE;
+	g_CdpInstallFailureStage = L"registering DiskDrive UpperFilter";
 	if (!CdpRegisterDiskUpperFilter())
 		return FALSE;
+	g_CdpInstallFailureStage = L"installing CdpBootConfirm service";
+	if (!CdpInstallBootConfirmService())
+		return FALSE;
+	g_CdpInstallFailureStage = L"none";
 
 	/* System Settings Change reboot dialog (same family as INF AddFilter). */
 	(void)SetupPromptReboot(NULL, NULL, FALSE);
