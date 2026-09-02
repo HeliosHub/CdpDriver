@@ -57,9 +57,6 @@ static VOID CdpReleaseVolumeHandleEntry(_In_ PCdp_VOLUME_HANDLE_ENTRY Item);
 static NTSTATUS CdpCloseVolumeHandle(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ UINT64 HandleId);
-static VOID CdpAuditProtectedReadSummary(
-	_In_ PCdp_DEVICE_EXTENSION DevExt,
-	_In_ PCSTR Reason);
 static NTSTATUS CdpForwardWriteCompletion(
 	_In_ PDEVICE_OBJECT DeviceObject,
 	_In_ PIRP Irp,
@@ -239,92 +236,6 @@ static BOOLEAN CdpShouldTraceRead(_In_ LONG64 Sequence)
 	/* Read-path tracing is intentionally disabled in normal builds.  Preserve
 	 * the guard so it can be selectively re-enabled during I/O diagnosis. */
 	return FALSE;
-}
-
-static VOID CdpAuditProtectedReadReset(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
-{
-	InterlockedExchange64(&DevExt->AuditReadSeenCount, 0);
-	InterlockedExchange64(&DevExt->AuditReadSeenBytes, 0);
-	InterlockedExchange64(&DevExt->AuditReadCoreSuccessCount, 0);
-	InterlockedExchange64(&DevExt->AuditReadCoreSuccessBytes, 0);
-	InterlockedExchange64(&DevExt->AuditReadCoreFailureCount, 0);
-	InterlockedExchange64(&DevExt->AuditReadSourceBypassCount, 0);
-	InterlockedExchange64(&DevExt->AuditReadSourceBypassBytes, 0);
-	InterlockedExchange(&DevExt->AuditReadBypassReported, 0);
-}
-
-static VOID CdpAuditProtectedReadCoreResult(
-	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
-	_In_ ULONG Length,
-	_In_ NTSTATUS Status)
-{
-	if (NT_SUCCESS(Status))
-	{
-		LONG64 count = InterlockedIncrement64(
-			&DevExt->AuditReadCoreSuccessCount);
-		InterlockedAdd64(&DevExt->AuditReadCoreSuccessBytes, Length);
-		if (count == 1 || (count & 0xFFF) == 0)
-			CdpAuditProtectedReadSummary(DevExt, "core-checkpoint");
-	}
-	else
-	{
-		InterlockedIncrement64(&DevExt->AuditReadCoreFailureCount);
-	}
-}
-
-static VOID CdpAuditProtectedReadBypass(
-	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
-	_In_ PIRP Irp,
-	_In_ PCSTR Reason)
-{
-	PIO_STACK_LOCATION irpSp;
-	ULONG length;
-
-	if (!DevExt || !Irp ||
-		InterlockedCompareExchange(&DevExt->CaptureEnabled, 0, 0) == 0 ||
-		InterlockedCompareExchange(&DevExt->Phase, 0, 0) ==
-			(LONG)Cdp_PHASE_DRAINING)
-	{
-		return;
-	}
-	irpSp = IoGetCurrentIrpStackLocation(Irp);
-	length = irpSp->Parameters.Read.Length;
-	InterlockedIncrement64(&DevExt->AuditReadSourceBypassCount);
-	InterlockedAdd64(&DevExt->AuditReadSourceBypassBytes, length);
-	if (InterlockedCompareExchange(
-		&DevExt->AuditReadBypassReported, 1, 0) == 0)
-	{
-		Cdp_LOG("[PROTECTED-READ-BYPASS] FIRST reason=%s irp=%p device=%p lower=%p offset=%lld len=%lu flags=0x%08lX minor=0x%02X enabled=%ld stopping=%ld phase=%ld core=%p\n",
-			Reason,
-			Irp,
-			DevExt->FilterDeviceObject,
-			DevExt->LowerDeviceObject,
-			irpSp->Parameters.Read.ByteOffset.QuadPart,
-			length,
-			Irp->Flags,
-			irpSp->MinorFunction,
-			InterlockedCompareExchange(&DevExt->CaptureEnabled, 0, 0),
-			InterlockedCompareExchange(&DevExt->CaptureStopping, 0, 0),
-			InterlockedCompareExchange(&DevExt->Phase, 0, 0),
-			DevExt->Core);
-	}
-}
-
-static VOID CdpAuditProtectedReadSummary(
-	_In_ PCdp_DEVICE_EXTENSION DevExt,
-	_In_ PCSTR Reason)
-{
-	if (!DevExt)
-		return;
-	Cdp_LOG("[PROTECTED-READ-AUDIT] reason=%s seen=%lld seenBytes=%lld coreOk=%lld coreBytes=%lld coreFail=%lld sourceBypass=%lld bypassBytes=%lld\n",
-		Reason,
-		InterlockedCompareExchange64(&DevExt->AuditReadSeenCount, 0, 0),
-		InterlockedCompareExchange64(&DevExt->AuditReadSeenBytes, 0, 0),
-		InterlockedCompareExchange64(&DevExt->AuditReadCoreSuccessCount, 0, 0),
-		InterlockedCompareExchange64(&DevExt->AuditReadCoreSuccessBytes, 0, 0),
-		InterlockedCompareExchange64(&DevExt->AuditReadCoreFailureCount, 0, 0),
-		InterlockedCompareExchange64(&DevExt->AuditReadSourceBypassCount, 0, 0),
-		InterlockedCompareExchange64(&DevExt->AuditReadSourceBypassBytes, 0, 0));
 }
 
 static NTSTATUS CdpBeginRecovery(
@@ -1608,12 +1519,9 @@ static NTSTATUS CdpConfigureCaptureInternal(
 	}
 
 	CdpCacheProtectionRouteForSource(DriverExt, sourceExt);
-	CdpAuditProtectedReadReset(sourceExt);
 	InterlockedExchange(&sourceExt->DiskIoAccepting, 1);
 	InterlockedExchange(&sourceExt->ProtectionStateValidated, 1);
 	InterlockedExchange(&sourceExt->CaptureEnabled, 1);
-	Cdp_LOG("[PROTECTED-READ-AUDIT] reset protection enabled sourceExt=%p\n",
-		sourceExt);
 	Cdp_LOG("[PROTECTION-ACTIVE] protection enabled immediately; writes redirect to journal and MetaTree reads are active\n");
 
 	*JournalHandleId = journalHandleId;
@@ -1906,12 +1814,9 @@ static NTSTATUS CdpActivateAutoJournal(
 		}
 	}
 	CdpCacheProtectionRouteForSource(DriverExt, sourceExt);
-	CdpAuditProtectedReadReset(sourceExt);
 	InterlockedExchange(&sourceExt->DiskIoAccepting, 1);
 	InterlockedExchange(&sourceExt->ProtectionStateValidated, 1);
 	InterlockedExchange(&sourceExt->CaptureEnabled, 1);
-	Cdp_LOG("[PROTECTED-READ-AUDIT] reset auto protection enabled sourceExt=%p\n",
-		sourceExt);
 	Cdp_LOG("[DISK-UPPER] auto protection enabled: writes redirect to journal; MetaTree current-view reads active\n");
 	Cdp_LOG("[AUTO-CDP] enabled journalHandle=%llu sourceExt=%p\n",
 		JournalHandleId, sourceExt);
@@ -2408,7 +2313,6 @@ static NTSTATUS CdpDiscoverJournalForStartedDisk(
 			}
 		}
 		CdpCacheProtectionRouteForSource(DriverExt, sourceExt);
-		CdpAuditProtectedReadReset(sourceExt);
 		InterlockedExchange(&sourceExt->DiskIoAccepting, 1);
 		InterlockedExchange(&sourceExt->ProtectionStateValidated, 1);
 		InterlockedExchange(&sourceExt->CaptureEnabled, 1);
@@ -4771,7 +4675,6 @@ static VOID CdpFailQueuedProtectedRead(
 {
 	PIO_STACK_LOCATION irpSp = IoGetCurrentIrpStackLocation(Irp);
 
-	CdpAuditProtectedReadBypass(DevExt, Irp, Reason);
 	Cdp_LOG("[PROTECTED-READ-BLOCKED] reason=%s irp=%p offset=%lld len=%lu enabled=%ld stopping=%ld phase=%ld core=%p\n",
 		Reason,
 		Irp,
@@ -5800,7 +5703,6 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 						Cdp_CORE_READ_COVERAGE_NONE;
 					UINT64 sourceReadOffset = readOffset;
 					ULONG sourceReadLength = ioLength;
-					LONG64 protectedSequence;
 					NTSTATUS readStatus;
 					if (readOffset < devExt->PartitionStart ||
 						devExt->PartitionStart >
@@ -5828,36 +5730,9 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 							devExt->Core, readOffset, ioLength, &coverage,
 							&sourceReadOffset, &sourceReadLength) :
 						STATUS_DEVICE_NOT_READY;
-					protectedSequence = InterlockedIncrement64(
-						&devExt->AuditReadSeenCount);
-					InterlockedAdd64(
-						&devExt->AuditReadSeenBytes, ioLength);
-					if (CdpShouldTraceRead(protectedSequence))
-					{
-						Cdp_LOG("[READ-TRACE] layer=io-worker stage=coverage seq=%lld queueKind=%lu disk=%lu absoluteOffset=%llu len=%lu status=0x%08X coverage=%lu sourceOffset=%llu sourceLength=%lu phase=%ld\n",
-							protectedSequence,
-							(ULONG)queueExt->DeviceKind,
-							devExt->DiskNumber,
-							readOffset,
-							ioLength,
-							readStatus,
-							(ULONG)coverage,
-							sourceReadOffset,
-							sourceReadLength,
-							InterlockedCompareExchange(
-								&devExt->Phase, 0, 0));
-					}
 					if (NT_SUCCESS(readStatus) &&
 						coverage == Cdp_CORE_READ_COVERAGE_NONE)
 					{
-						if (CdpShouldTraceRead(protectedSequence))
-						{
-							Cdp_LOG("[READ-TRACE] layer=io-worker stage=forward-lower seq=%lld queueKind=%lu absoluteOffset=%llu len=%lu\n",
-								protectedSequence,
-								(ULONG)queueExt->DeviceKind,
-								readOffset,
-								ioLength);
-						}
 						KeReleaseMutex(&devExt->HistoryMutex, FALSE);
 						(void)CdpForwardQueuedDiskIrpSynchronously(item);
 						IoCompleteRequest(item->Irp, IO_NO_INCREMENT);
@@ -5891,8 +5766,6 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 							readOffset,
 							ioLength,
 							buffer);
-						CdpAuditProtectedReadCoreResult(
-							devExt, ioLength, readStatus);
 					}
 					KeReleaseMutex(&devExt->HistoryMutex, FALSE);
 					if (NT_SUCCESS(readStatus))
@@ -5900,17 +5773,6 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 						readStatus = CdpScatterReadMdlChain(
 							item->Irp, buffer, ioLength, &mdlCount,
 							&mdlBytes, &copiedBytes);
-					}
-					if (CdpShouldTraceRead(protectedSequence))
-					{
-						Cdp_LOG("[READ-TRACE] layer=io-worker stage=complete seq=%lld queueKind=%lu absoluteOffset=%llu len=%lu coverage=%lu status=0x%08X copied=%lu\n",
-							protectedSequence,
-							(ULONG)queueExt->DeviceKind,
-							readOffset,
-							ioLength,
-							(ULONG)coverage,
-							readStatus,
-							copiedBytes);
 					}
 					if (!NT_SUCCESS(readStatus))
 					{
@@ -6274,8 +6136,6 @@ VOID CdpDisableAndDestroyCapture(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	InterlockedExchange(&DevExt->ProtectionStateValidated, 0);
 	if (driverExt)
 		CdpRemoveProtectionRouteForSource(driverExt, DevExt);
-	CdpAuditProtectedReadSummary(DevExt, "protection-disable");
-
 	while (InterlockedCompareExchange(
 			&DevExt->DiskIoOutstanding, 0, 0) != 0)
 	{

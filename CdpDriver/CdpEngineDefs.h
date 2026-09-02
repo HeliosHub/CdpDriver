@@ -259,17 +259,6 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	// VolumeHandleMutex.
 	PCdp_VOLUME_HANDLE_ENTRY RedirectJournalEntry;
 	volatile LONG CaptureQueueDepth;
-	/* Low-volume protected-read audit. Reset when protection is enabled and
-	 * summarized when it is disabled. All byte counters are monotonic for one
-	 * protection session. */
-	volatile LONG64 AuditReadSeenCount;
-	volatile LONG64 AuditReadSeenBytes;
-	volatile LONG64 AuditReadCoreSuccessCount;
-	volatile LONG64 AuditReadCoreSuccessBytes;
-	volatile LONG64 AuditReadCoreFailureCount;
-	volatile LONG64 AuditReadSourceBypassCount;
-	volatile LONG64 AuditReadSourceBypassBytes;
-	volatile LONG AuditReadBypassReported;
 } Cdp_DEVICE_EXTENSION, *PCdp_DEVICE_EXTENSION;
 
 typedef struct _Cdp_CAPTURE_ITEM
