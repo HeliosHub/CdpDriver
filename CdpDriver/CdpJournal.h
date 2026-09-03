@@ -301,7 +301,7 @@ typedef struct _Cdp_JOURNAL
 	// One-sector write-through cache for 32-byte record headers. Header
 	// append is sequential, so retaining the current sector avoids a disk
 	// read and an allocation for every record while preserving the existing
-	// per-record sector write + flush durability boundary.
+	// per-record sector write boundary.
 	PVOID HeaderWriteAllocationBase;
 	PUCHAR HeaderWriteBuffer;
 	UINT64 HeaderWriteSectorOffset;
@@ -544,8 +544,6 @@ NTSTATUS CdpJournalAppendEx(
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
 
 // Serialize a durability barrier with journal append transactions.
-NTSTATUS CdpJournalFlushBuffers(_Inout_ PCdp_JOURNAL Journal);
-
 NTSTATUS CdpJournalQueryTimeRange(
 	_Inout_ PCdp_JOURNAL Journal,
 	_Out_ PUINT64 OldestTime100ns,

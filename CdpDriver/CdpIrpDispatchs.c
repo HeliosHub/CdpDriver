@@ -5309,28 +5309,6 @@ static NTSTATUS CdpRedirectJournalWrite(
 		}
 		chunkOffset += chunkLength;
 	}
-	if (InterlockedCompareExchange(
-			&SourceExt->ShutdownInProgress, 0, 0) != 0)
-	{
-		/* IRP_MJ_SHUTDOWN is not the end of filesystem traffic. Crash-dump
-		 * teardown can issue NTFS metadata I/O during the later power phase.
-		 * Keep the protected view active and make every such late write durable
-		 * before reporting success. The caller holds HistoryMutex. */
-		status = CdpJournalFlushBuffers(
-			&SourceExt->RedirectJournalEntry->Journal);
-		Cdp_LOG("[TERMINAL-IO] stage=late-write-flush source=%p disk=%lu offset=%llu len=%lu status=0x%08X\n",
-			SourceExt,
-			SourceExt->DiskNumber,
-			writeOffset,
-			writeLength,
-			status);
-		if (!NT_SUCCESS(status))
-		{
-			cdpfree(snapshot);
-			return CdpCompleteFailedRedirectWrite(SourceExt, Irp, status);
-		}
-	}
-
 	cdpfree(snapshot);
 
 	if (InterlockedCompareExchange(
@@ -5679,7 +5657,7 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 					CdpTryAcquireRedirectWrite(devExt))
 				{
 					/* Preserve FIFO visibility: the next item cannot start until
-					 * payload, header and flush complete and MetaTree is published. */
+					 * payload/header writes complete and MetaTree is published. */
 					KeWaitForSingleObject(
 						&devExt->HistoryMutex,
 						Executive,
@@ -5792,18 +5770,7 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 				else if (majorFunction == IRP_MJ_FLUSH_BUFFERS && captureActive &&
 					phase != (LONG)Cdp_PHASE_DRAINING)
 				{
-					NTSTATUS flushStatus;
-					KeWaitForSingleObject(&devExt->HistoryMutex,
-						Executive, KernelMode, FALSE, NULL);
-					flushStatus = devExt->RedirectJournalEntry ?
-						CdpJournalFlushBuffers(
-							&devExt->RedirectJournalEntry->Journal) :
-						STATUS_DEVICE_NOT_READY;
-					KeReleaseMutex(&devExt->HistoryMutex, FALSE);
-					if (!NT_SUCCESS(flushStatus))
-						Cdp_LOG("[ORDERED-IO] journal flush failed status=0x%08X\n",
-							flushStatus);
-					CdpCompleteIrp(item->Irp, flushStatus, 0);
+					CdpCompleteIrp(item->Irp, STATUS_SUCCESS, 0);
 				}
 				else if (majorFunction == IRP_MJ_WRITE && InterlockedCompareExchange(
 						&devExt->CaptureEnabled, 0, 0) != 0 &&
@@ -6260,11 +6227,10 @@ static NTSTATUS CdpPublishTerminalDurableIo(
 	if (previousState == 1)
 	{
 		/* A second filesystem stack can observe the same protected source while
-		 * the first shutdown caller is flushing. Do not wait on a per-device
+		 * the first shutdown caller owns the terminal transition. Do not wait on a per-device
 		 * event here: this path runs while NTFS is tearing volumes down, and an
 		 * event embedded in an extension is not a safe shutdown dependency. The
-		 * owner is already flushing under HistoryMutex; later redirected writes
-		 * observe state 1 and synchronously flush themselves. */
+		 * owner is already synchronized under HistoryMutex. */
 		Cdp_LOG("[TERMINAL-IO] stage=follower-pass hop=%llu source=%p disk=%lu\n",
 			HopId, SourceExt, SourceExt->DiskNumber);
 		return STATUS_SUCCESS;
@@ -6277,9 +6243,8 @@ static NTSTATUS CdpPublishTerminalDurableIo(
 		InterlockedCompareExchange(&SourceExt->DiskIoAccepting, 0, 0));
 
 	/* Do not close admission. I/O can legally arrive after IRP_MJ_SHUTDOWN
-	 * while crash-dump support is torn down. HistoryMutex places this flush
-	 * after any write already publishing, and all writers that observe state
-	 * 1 or 2 force their own flush before completing. */
+	 * while crash-dump support is torn down. HistoryMutex still places the
+	 * terminal transition after any write already publishing. */
 	diagnosticTimeout.QuadPart = -10LL * 1000LL * 1000LL * 10LL;
 	do
 	{
@@ -6300,8 +6265,6 @@ static NTSTATUS CdpPublishTerminalDurableIo(
 	} while (status == STATUS_TIMEOUT);
 	if (NT_SUCCESS(status))
 	{
-		status = CdpJournalFlushBuffers(
-			&SourceExt->RedirectJournalEntry->Journal);
 		KeReleaseMutex(&SourceExt->HistoryMutex, FALSE);
 	}
 	InterlockedExchange(&SourceExt->ShutdownInProgress, 2);
