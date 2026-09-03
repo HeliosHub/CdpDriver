@@ -10,6 +10,14 @@
 #pragma comment(lib, "ole32.lib")
 
 static UINT64 g_PreviewHandle = 0;
+/* Optional in-memory input used by CdpConsole_Param script mode.  Each
+ * command-line token represents exactly one line entered at the interactive
+ * prompt, so every existing console command keeps its original implementation. */
+static int g_ScriptArgIndex = 0;
+static int g_ScriptArgCount = 0;
+static wchar_t** g_ScriptArgs = NULL;
+static BOOL g_SuppressStartupHelp = FALSE;
+static BOOL g_ForceVolumeList = FALSE;
 
 static void ConOut(const wchar_t* text)
 {
@@ -117,6 +125,13 @@ static BOOL ReadLine(wchar_t* buf, DWORD cch)
 
 	if (!buf || cch == 0)
 		return FALSE;
+	if (g_ScriptArgs)
+	{
+		if (g_ScriptArgIndex >= g_ScriptArgCount)
+			return FALSE;
+		wcsncpy_s(buf, cch, g_ScriptArgs[g_ScriptArgIndex++], _TRUNCATE);
+		return TRUE;
+	}
 
 	if (ReadConsoleW(hIn, buf, cch - 1, &n, NULL))
 	{
@@ -189,7 +204,10 @@ static BOOL ParseGuid(const wchar_t* text, GUID* out)
 static void ListVolumes(void)
 {
 	wchar_t name[MAX_PATH];
-	HANDLE find = FindFirstVolumeW(name, MAX_PATH);
+	HANDLE find;
+	if (g_SuppressStartupHelp && !g_ForceVolumeList)
+		return;
+	find = FindFirstVolumeW(name, MAX_PATH);
 	if (find == INVALID_HANDLE_VALUE)
 	{
 		ConOut(L"FindFirstVolume failed.\n");
@@ -1781,7 +1799,287 @@ static wchar_t FirstCommandChar(const wchar_t* line)
 	return *line;
 }
 
-int wmain(void)
+static int RunInteractive(void);
+
+static BOOL ParseUInt64Arg(const wchar_t* text, UINT64* value)
+{
+	wchar_t* end = NULL;
+	unsigned __int64 parsed;
+
+	if (!text || !value || !*text)
+		return FALSE;
+	parsed = _wcstoui64(text, &end, 0);
+	if (!end || *end != L'\0')
+		return FALSE;
+	*value = parsed;
+	return TRUE;
+}
+
+static BOOL AuthenticatePasswordArg(HANDLE hDevice, const wchar_t* password)
+{
+	Cdp_AUTH_REQUEST request;
+	DWORD bytesReturned = 0;
+	int bytes;
+
+	if (!hDevice || hDevice == INVALID_HANDLE_VALUE || !password)
+		return FALSE;
+	ZeroMemory(&request, sizeof(request));
+	bytes = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, password, -1,
+		(char*)request.Password, Cdp_PASSWORD_MAX_UTF8_BYTES, NULL, NULL);
+	if (bytes <= 1)
+		return FALSE;
+	request.PasswordLength = (ULONG)(bytes - 1);
+	if (!DeviceIoControl(hDevice, IOCTL_Cdp_AUTHENTICATE,
+		&request, sizeof(request), NULL, 0, &bytesReturned, NULL))
+	{
+		ConOutFmt(L"Authentication failed (err=%lu).\n", GetLastError());
+		SecureZeroMemory(&request, sizeof(request));
+		return FALSE;
+	}
+	SecureZeroMemory(&request, sizeof(request));
+	return TRUE;
+}
+
+static int RunScriptTokens(int tokenCount, wchar_t** tokens)
+{
+	int result;
+	BOOL previousSuppress = g_SuppressStartupHelp;
+	g_ScriptArgs = tokens;
+	g_ScriptArgCount = tokenCount;
+	g_ScriptArgIndex = 0;
+	g_SuppressStartupHelp = TRUE;
+	result = RunInteractive();
+	g_ScriptArgs = NULL;
+	g_ScriptArgCount = 0;
+	g_ScriptArgIndex = 0;
+	g_SuppressStartupHelp = previousSuppress;
+	return result;
+}
+
+static int RunParamCommand(int argc, wchar_t** argv)
+{
+	HANDLE hDevice = INVALID_HANDLE_VALUE;
+	GUID sourceGuid;
+	DWORD bytesReturned = 0;
+	int result = 1;
+
+	if (argc < 2 || _wcsicmp(argv[1], L"--help") == 0 || _wcsicmp(argv[1], L"help") == 0)
+	{
+		ConOut(L"CdpConsole_Param commands:\n"
+			L"  script <interactive-command> [answers ...]  (all CdpConsole commands)\n"
+			L"  version\n"
+			L"  status <source-volume-guid>\n"
+			L"  usage <source-volume-guid>\n"
+			L"  time-range <source-volume-guid>\n"
+			L"  branches <source-volume-guid> <password>\n"
+			L"  checkpoints <source-volume-guid> <password>\n"
+			L"  preview-read <source-volume-guid> <password> <utc-unix-seconds> <volume-offset> <length>\n");
+		ConOut(L"  enable <source-guid> <journal-guid> <new-password>  (formats journal: yes)\n"
+			L"  stop <source-guid> <password>\n"
+			L"  merge <source-guid> <password>\n"
+			L"  set-restore-point <source-guid> <password> <utc-unix-seconds>\n"
+			L"  delete-restore-point <source-guid> <password>\n"
+			L"  recover <source-guid> <password> <utc-unix-seconds>\n"
+			L"  recover-reboot <source-guid> <password> <utc-unix-seconds>\n"
+			L"  recovery-commit <source-guid> <password>\n"
+			L"  recovery-cancel <source-guid> <password>\n");
+		return argc < 2 ? 1 : 0;
+	}
+	if (_wcsicmp(argv[1], L"script") == 0)
+	{
+		if (argc < 3)
+		{
+			ConOut(L"script requires an interactive command token.\n");
+			return 1;
+		}
+		return RunScriptTokens(argc - 2, argv + 2);
+	}
+	{
+		wchar_t commandEnable[] = L"1", commandStop[] = L"2", commandMerge[] = L"m", commandBranches[] = L"b", commandCheckpoints[] = L"k";
+		wchar_t commandSetRestore[] = L"o", commandDeleteRestore[] = L"x";
+		wchar_t commandRecover[] = L"e", commandCommit[] = L"r", commandCancel[] = L"c";
+		wchar_t yes[] = L"y", no[] = L"n", quit[] = L"q";
+		if (_wcsicmp(argv[1], L"enable") == 0 && argc == 5)
+		{
+			wchar_t* lines[] = { commandEnable, argv[2], argv[3], yes, argv[4], argv[4], quit };
+			return RunScriptTokens(_countof(lines), lines);
+		}
+		if (_wcsicmp(argv[1], L"stop") == 0 && argc == 4)
+		{
+			wchar_t* lines[] = { commandStop, argv[2], argv[3], quit };
+			return RunScriptTokens(_countof(lines), lines);
+		}
+		if (_wcsicmp(argv[1], L"merge") == 0 && argc == 4)
+		{
+			wchar_t* lines[] = { commandMerge, argv[2], argv[3], quit };
+			return RunScriptTokens(_countof(lines), lines);
+		}
+		if (_wcsicmp(argv[1], L"branches") == 0 && argc == 4)
+		{
+			wchar_t* lines[] = { commandBranches, argv[2], argv[3], quit };
+			return RunScriptTokens(_countof(lines), lines);
+		}
+		if (_wcsicmp(argv[1], L"checkpoints") == 0 && argc == 4)
+		{
+			wchar_t* lines[] = { commandCheckpoints, argv[2], argv[3], quit };
+			return RunScriptTokens(_countof(lines), lines);
+		}
+		if (_wcsicmp(argv[1], L"set-restore-point") == 0 && argc == 5)
+		{
+			wchar_t* lines[] = { commandSetRestore, argv[2], argv[3], argv[4], quit };
+			return RunScriptTokens(_countof(lines), lines);
+		}
+		if (_wcsicmp(argv[1], L"delete-restore-point") == 0 && argc == 4)
+		{
+			wchar_t* lines[] = { commandDeleteRestore, argv[2], argv[3], quit };
+			return RunScriptTokens(_countof(lines), lines);
+		}
+		if ((_wcsicmp(argv[1], L"recover") == 0 || _wcsicmp(argv[1], L"recover-reboot") == 0) && argc == 5)
+		{
+			wchar_t* reboot = _wcsicmp(argv[1], L"recover-reboot") == 0 ? yes : no;
+			wchar_t* lines[] = { commandRecover, argv[2], argv[3], argv[4], reboot, quit };
+			return RunScriptTokens(_countof(lines), lines);
+		}
+		if (_wcsicmp(argv[1], L"recovery-commit") == 0 && argc == 4)
+		{
+			wchar_t* lines[] = { commandCommit, argv[2], argv[3], quit };
+			return RunScriptTokens(_countof(lines), lines);
+		}
+		if (_wcsicmp(argv[1], L"recovery-cancel") == 0 && argc == 4)
+		{
+			wchar_t* lines[] = { commandCancel, argv[2], argv[3], quit };
+			return RunScriptTokens(_countof(lines), lines);
+		}
+	}
+
+	hDevice = OpenControlDevice();
+	if (hDevice == INVALID_HANDLE_VALUE)
+		return 2;
+
+	if (_wcsicmp(argv[1], L"version") == 0)
+	{
+		Cdp_VERSION_REPLY reply;
+		ZeroMemory(&reply, sizeof(reply));
+		if (DeviceIoControl(hDevice, IOCTL_Cdp_QUERY_VERSION, NULL, 0,
+			&reply, sizeof(reply), &bytesReturned, NULL) && bytesReturned >= sizeof(reply))
+		{
+			ConOutFmt(L"Version=%S\nBuild=%S\nJournalVersion=%lu\n",
+				reply.Version, reply.Build, reply.JournalVersion);
+			result = 0;
+		}
+		else ConOutFmt(L"Version query failed (err=%lu).\n", GetLastError());
+	}
+	else if ((_wcsicmp(argv[1], L"status") == 0 || _wcsicmp(argv[1], L"usage") == 0 ||
+		_wcsicmp(argv[1], L"time-range") == 0) && argc == 3)
+	{
+		if (!ParseGuid(argv[2], &sourceGuid))
+			ConOut(L"Invalid source volume GUID.\n");
+		else if (_wcsicmp(argv[1], L"status") == 0)
+		{
+			Cdp_PHASE_QUERY_REQUEST request;
+			Cdp_PHASE_QUERY_REPLY reply;
+			ZeroMemory(&request, sizeof(request));
+			ZeroMemory(&reply, sizeof(reply));
+			request.SourceVolumeGuid = sourceGuid;
+			if (DeviceIoControl(hDevice, IOCTL_Cdp_QUERY_PHASE, &request, sizeof(request),
+				&reply, sizeof(reply), &bytesReturned, NULL) && bytesReturned >= sizeof(reply))
+			{
+				wchar_t journalText[64];
+				StringFromGUID2(reply.JournalPartitionGuid, journalText, _countof(journalText));
+				ConOutFmt(L"Status=%ld\nJournalGuid=%s\nJournalDisk=%lu\nJournalPartition=%lu\nJournalBytes=%llu\n",
+					reply.Status, journalText, reply.JournalDiskNumber, reply.JournalPartitionNumber,
+					(unsigned long long)reply.JournalPartitionBytes);
+				result = reply.Status >= 0 ? 0 : 3;
+			}
+			else ConOutFmt(L"Status query failed (err=%lu).\n", GetLastError());
+		}
+		else if (_wcsicmp(argv[1], L"usage") == 0)
+		{
+			Cdp_JOURNAL_USAGE_QUERY_REQUEST request;
+			Cdp_JOURNAL_USAGE_QUERY_REPLY reply;
+			ZeroMemory(&request, sizeof(request));
+			ZeroMemory(&reply, sizeof(reply));
+			request.SourceVolumeGuid = sourceGuid;
+			if (DeviceIoControl(hDevice, IOCTL_Cdp_QUERY_JOURNAL_USAGE, &request, sizeof(request),
+				&reply, sizeof(reply), &bytesReturned, NULL) && bytesReturned >= sizeof(reply))
+			{
+				ConOutFmt(L"Records=%llu\nPayloadUsed=%llu\nPayloadFree=%llu\nJournalBytes=%llu\n",
+					(unsigned long long)reply.TotalRecords, (unsigned long long)reply.RecordPayloadBytesUsed,
+					(unsigned long long)reply.RecordPayloadBytesFree, (unsigned long long)reply.JournalPartitionBytes);
+				result = 0;
+			}
+			else ConOutFmt(L"Usage query failed (err=%lu).\n", GetLastError());
+		}
+		else
+		{
+			Cdp_TIME_RANGE_QUERY_REQUEST request;
+			Cdp_TIME_RANGE_QUERY_REPLY reply;
+			ZeroMemory(&request, sizeof(request));
+			ZeroMemory(&reply, sizeof(reply));
+			request.SourceVolumeGuid = sourceGuid;
+			if (DeviceIoControl(hDevice, IOCTL_Cdp_QUERY_TIME_RANGE, &request, sizeof(request),
+				&reply, sizeof(reply), &bytesReturned, NULL) && bytesReturned >= sizeof(reply))
+			{
+				ConOutFmt(L"HasRecords=%lu\nOldest=%llu\nNewest=%llu\n", reply.HasRecords,
+					(unsigned long long)reply.OldestRecord100ns, (unsigned long long)reply.NewestRecord100ns);
+				result = 0;
+			}
+			else ConOutFmt(L"Time-range query failed (err=%lu).\n", GetLastError());
+		}
+	}
+	else if (_wcsicmp(argv[1], L"preview-read") == 0 && argc == 7)
+	{
+		UINT64 targetTime, offset, length;
+		Cdp_PREVIEW_BEGIN_REQUEST begin;
+		Cdp_PREVIEW_BEGIN_REPLY beginReply;
+		Cdp_PREVIEW_READ_REQUEST read;
+		Cdp_PREVIEW_END_REQUEST end;
+		BYTE* buffer = NULL;
+
+		if (!ParseGuid(argv[2], &sourceGuid) || !ParseUInt64Arg(argv[4], &targetTime) ||
+			!ParseUInt64Arg(argv[5], &offset) || !ParseUInt64Arg(argv[6], &length) ||
+			length == 0 || length > Cdp_CMD3_MAX_READ_BYTES)
+			ConOut(L"Invalid preview-read argument.\n");
+		else if (AuthenticatePasswordArg(hDevice, argv[3]))
+		{
+			ZeroMemory(&begin, sizeof(begin));
+			ZeroMemory(&beginReply, sizeof(beginReply));
+			begin.SourceVolumeGuid = sourceGuid;
+			begin.TargetTime100ns = targetTime;
+			(void)DeviceIoControl(hDevice, IOCTL_Cdp_DISABLE_AUTO_DISCOVERY, NULL, 0, NULL, 0, &bytesReturned, NULL);
+			if (DeviceIoControl(hDevice, IOCTL_Cdp_BEGIN_PREVIEW, &begin, sizeof(begin), &beginReply,
+				sizeof(beginReply), &bytesReturned, NULL) && beginReply.PreviewHandle != 0)
+			{
+				buffer = (BYTE*)VirtualAlloc(NULL, (SIZE_T)length, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+				ZeroMemory(&read, sizeof(read));
+				read.PreviewHandle = beginReply.PreviewHandle;
+				read.ByteOffset = offset;
+				read.ByteLength = (ULONG)length;
+				if (buffer && DeviceIoControl(hDevice, IOCTL_Cdp_READ_PREVIEW, &read, sizeof(read), buffer,
+					(ULONG)length, &bytesReturned, NULL))
+				{
+					ConOutFmt(L"PreviewHandle=%llu\nTarget=%llu\nBytes=%lu\n", beginReply.PreviewHandle,
+						(unsigned long long)beginReply.TargetTime100ns, bytesReturned);
+					HexdumpC(offset, buffer, bytesReturned);
+					result = 0;
+				}
+				else ConOutFmt(L"Preview read failed (err=%lu).\n", GetLastError());
+				if (buffer) VirtualFree(buffer, 0, MEM_RELEASE);
+				ZeroMemory(&end, sizeof(end));
+				end.PreviewHandle = beginReply.PreviewHandle;
+				(void)DeviceIoControl(hDevice, IOCTL_Cdp_END_PREVIEW, &end, sizeof(end), NULL, 0, &bytesReturned, NULL);
+			}
+			else ConOutFmt(L"Preview begin failed or denied (err=%lu, status=%ld).\n", GetLastError(), beginReply.Status);
+		}
+	}
+	else
+		ConOut(L"Invalid command or argument count. Run CdpConsole_Param --help.\n");
+
+	CloseHandle(hDevice);
+	return result;
+}
+
+static int RunInteractive(void)
 {
 	HANDLE hDevice = INVALID_HANDLE_VALUE;
 	wchar_t line[128];
@@ -1794,13 +2092,16 @@ int wmain(void)
 	}
 	else
 	{
-		ConOutFmt(L"Connected: %s\n", Cdp_CONTROL_SYSTEM_LINK_NAME);
+		if (!g_SuppressStartupHelp)
+			ConOutFmt(L"Connected: %s\n", Cdp_CONTROL_SYSTEM_LINK_NAME);
 	}
-	PrintHelp();
+	if (!g_SuppressStartupHelp)
+		PrintHelp();
 
 	for (;;)
 	{
-		ConOut(L"> ");
+		if (!g_SuppressStartupHelp)
+			ConOut(L"> ");
 		if (!ReadLine(line, _countof(line)))
 			break;
 
@@ -1932,7 +2233,9 @@ int wmain(void)
 			break;
 		case L'v':
 		case L'V':
+			g_ForceVolumeList = TRUE;
 			ListVolumes();
+			g_ForceVolumeList = FALSE;
 			break;
 		case L'd':
 		case L'D':
@@ -1970,4 +2273,11 @@ done:
 	}
 	ConOut(L"Bye.\n");
 	return 0;
+}
+
+int wmain(int argc, wchar_t** argv)
+{
+	if (argc > 1)
+		return RunParamCommand(argc, argv);
+	return RunInteractive();
 }
