@@ -15,6 +15,16 @@ static NTSTATUS CdpStartMergeThread(
 	_In_ BOOLEAN IgnoreUsageThreshold);
 static VOID CdpStopMergeThread(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
 static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
+static VOID CdpSetRestorePointSpaceAlert(
+	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
+	_In_ BOOLEAN Active,
+	_In_ ULONG Reason,
+	_In_ NTSTATUS MergeStatus);
+static VOID CdpNotifyRestoreSpaceAlertWaiters(
+	_In_ PCdp_DEVICE_EXTENSION DevExt);
+static VOID CdpCancelRestoreSpaceAlertWait(
+	_In_ PDEVICE_OBJECT DeviceObject,
+	_Inout_ PIRP Irp);
 static NTSTATUS CdpStartManualMerge(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const Cdp_MANUAL_MERGE_REQUEST* Request);
@@ -80,6 +90,10 @@ static VOID CdpQuiesceJournalRawIoForDiskPower(
 static PCdp_DEVICE_EXTENSION CdpFindSourceExtensionByGuid(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const GUID* VolumeGuid);
+static PCdp_DEVICE_EXTENSION CdpFindRestoreSpaceAlertSource(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ const GUID* VolumeGuid,
+	_In_ UINT64 LastSeenGeneration);
 static PDEVICE_OBJECT CdpReferenceActiveSourceByPhysicalRange(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ ULONG DiskNumber,
@@ -992,6 +1006,63 @@ static PCdp_DEVICE_EXTENSION CdpFindSourceExtensionByGuid(
 	}
 	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
 	return found;
+}
+
+/* A zero GUID is the service's subscription to the single restore-point
+ * source managed by this product.  Prefer an active alert, then any active
+ * source whose generation differs so late service startup receives the
+ * current state immediately. */
+static PCdp_DEVICE_EXTENSION CdpFindRestoreSpaceAlertSource(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ const GUID* VolumeGuid,
+	_In_ UINT64 LastSeenGeneration)
+{
+	static const GUID zeroGuid = { 0 };
+	KIRQL oldIrql;
+	PLIST_ENTRY entry;
+	PCdp_DEVICE_EXTENSION changed = NULL;
+	BOOLEAN anySource;
+
+	if (!DriverExt || !VolumeGuid)
+		return NULL;
+	anySource = RtlCompareMemory(
+		VolumeGuid, &zeroGuid, sizeof(GUID)) == sizeof(GUID);
+	if (!anySource)
+		return CdpFindSourceExtensionByGuid(DriverExt, VolumeGuid);
+
+	KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &oldIrql);
+	for (entry = DriverExt->DeviceObjectListHead.Flink;
+		entry != &DriverExt->DeviceObjectListHead;
+		entry = entry->Flink)
+	{
+		PCdp_DEVICE_LIST_NODE node =
+			CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
+		PCdp_DEVICE_EXTENSION ext =
+			(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
+
+		if (!ext || (ext->DeviceKind != Cdp_DEVICE_KIND_VOLUME &&
+			ext->DeviceKind != Cdp_DEVICE_KIND_DISK &&
+			ext->DeviceKind != Cdp_DEVICE_KIND_SOURCE) ||
+			!ext->VolumeGuidValid || !ext->Core ||
+			InterlockedCompareExchange(&ext->CaptureEnabled, 0, 0) == 0)
+		{
+			continue;
+		}
+		if (InterlockedCompareExchange(
+				&ext->RestorePointSpaceAlertActive, 0, 0) != 0)
+		{
+			changed = ext;
+			break;
+		}
+		if (!changed && (UINT64)InterlockedCompareExchange64(
+				&ext->RestorePointSpaceAlertGeneration, 0, 0) !=
+			LastSeenGeneration)
+		{
+			changed = ext;
+		}
+	}
+	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
+	return changed;
 }
 
 /* A disk-start discovery can publish an internal SOURCE context before the
@@ -3058,6 +3129,71 @@ NTSTATUS CdpIrpDispatchDefault(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Ir
 	return CdpCompleteIrp(Irp, STATUS_SUCCESS, 0);
 }
 
+static VOID CdpCancelRestoreSpaceAlertWait(
+	_In_ PDEVICE_OBJECT DeviceObject,
+	_Inout_ PIRP Irp)
+{
+	PCdp_DRIVER_EXTENSION driverExt =
+		(PCdp_DRIVER_EXTENSION)Irp->Tail.Overlay.DriverContext[0];
+
+	UNREFERENCED_PARAMETER(DeviceObject);
+	if (driverExt)
+	{
+		RemoveEntryList(&Irp->Tail.Overlay.ListEntry);
+		InitializeListHead(&Irp->Tail.Overlay.ListEntry);
+		Irp->Tail.Overlay.DriverContext[0] = NULL;
+	}
+	IoReleaseCancelSpinLock(Irp->CancelIrql);
+	CdpCompleteIrp(Irp, STATUS_CANCELLED, 0);
+}
+
+static VOID CdpCancelRestoreSpaceAlertWaitsForFile(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_opt_ PFILE_OBJECT FileObject)
+{
+	LIST_ENTRY cancelled;
+	PLIST_ENTRY entry;
+	KIRQL cancelIrql;
+
+	if (!DriverExt)
+		return;
+	InitializeListHead(&cancelled);
+	IoAcquireCancelSpinLock(&cancelIrql);
+	entry = DriverExt->RestoreSpaceAlertWaitList.Flink;
+	while (entry != &DriverExt->RestoreSpaceAlertWaitList)
+	{
+		PIRP waitIrp = CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
+		PLIST_ENTRY next = entry->Flink;
+		PIO_STACK_LOCATION waitSp = IoGetCurrentIrpStackLocation(waitIrp);
+
+		if (!FileObject || waitSp->FileObject == FileObject)
+		{
+			(void)IoSetCancelRoutine(waitIrp, NULL);
+			RemoveEntryList(entry);
+			InitializeListHead(entry);
+			waitIrp->Tail.Overlay.DriverContext[0] = NULL;
+			InsertTailList(&cancelled, entry);
+		}
+		entry = next;
+	}
+	IoReleaseCancelSpinLock(cancelIrql);
+
+	while (!IsListEmpty(&cancelled))
+	{
+		entry = RemoveHeadList(&cancelled);
+		CdpCompleteIrp(
+			CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry),
+			STATUS_CANCELLED,
+			0);
+	}
+}
+
+VOID CdpCancelAllRestoreSpaceAlertWaits(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt)
+{
+	CdpCancelRestoreSpaceAlertWaitsForFile(DriverExt, NULL);
+}
+
 NTSTATUS CdpIrpDispatchCreateClose(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 {
 	PCdp_DRIVER_EXTENSION driverExt =
@@ -3085,6 +3221,12 @@ NTSTATUS CdpIrpDispatchCreateClose(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIR
 				RtlSecureZeroMemory(context, sizeof(*context));
 				cdpfree(context);
 			}
+		}
+		if (irpSp->MajorFunction == IRP_MJ_CLEANUP ||
+			irpSp->MajorFunction == IRP_MJ_CLOSE)
+		{
+			CdpCancelRestoreSpaceAlertWaitsForFile(
+				driverExt, irpSp->FileObject);
 		}
 		return CdpCompleteIrp(Irp, STATUS_SUCCESS, 0);
 	}
@@ -3416,6 +3558,8 @@ static NTSTATUS CdpSetRestorePoint(
 	Reply->NewestRecoverable100ns = newest;
 	Reply->WrittenRanges = ranges;
 	Reply->WrittenBytes = bytes;
+	CdpSetRestorePointSpaceAlert(
+		sourceExt, FALSE, Cdp_RESTORE_SPACE_ALERT_NONE, STATUS_SUCCESS);
 	Cdp_LOG("[RESTORE-POINT] set target=%llu sequence=%llu sourceRanges=%lu sourceBytes=%llu deletedRR=%lu tombstonedRecords=%lu persistent=1\n",
 		effective, targetSequence, ranges, bytes, deletedRegions, tombstonedRecords);
 
@@ -3477,7 +3621,12 @@ cleanup:
 	InterlockedExchange(&sourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
 	CdpStartMergeIfNeeded(sourceExt);
 	if (NT_SUCCESS(status))
+	{
+		CdpSetRestorePointSpaceAlert(
+			sourceExt, FALSE,
+			Cdp_RESTORE_SPACE_ALERT_NONE, STATUS_SUCCESS);
 		Cdp_LOG("[RESTORE-POINT] deleted; no automatic expiration\n");
+	}
 	return status;
 }
 
@@ -3628,6 +3777,155 @@ static NTSTATUS CdpQueryJournalUsage(
 		&Reply->RecordPayloadBytesUsed,
 		&Reply->RecordPayloadBytesFree,
 		&Reply->TotalRecords);
+}
+
+static NTSTATUS CdpQueryRestoreSpaceAlert(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ const Cdp_RESTORE_SPACE_ALERT_QUERY_REQUEST* Request,
+	_Out_ PCdp_RESTORE_SPACE_ALERT_QUERY_REPLY Reply)
+{
+	PCdp_DEVICE_EXTENSION sourceExt;
+	UINT64 partitionBytes = 0;
+	UINT64 metadataBytes = 0;
+	UINT64 totalRecords = 0;
+	NTSTATUS status;
+
+	RtlZeroMemory(Reply, sizeof(*Reply));
+	sourceExt = CdpFindSourceExtensionByGuid(
+		DriverExt, &Request->SourceVolumeGuid);
+	if (!sourceExt)
+		return STATUS_DEVICE_DOES_NOT_EXIST;
+	if (InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) == 0 ||
+		!sourceExt->Core || !sourceExt->RedirectJournalEntry)
+	{
+		return STATUS_DEVICE_NOT_READY;
+	}
+	status = CdpCoreQueryJournalUsage(
+		sourceExt->Core,
+		&partitionBytes,
+		&metadataBytes,
+		&Reply->RecordPayloadBytesUsed,
+		&Reply->RecordPayloadBytesFree,
+		&totalRecords);
+	UNREFERENCED_PARAMETER(partitionBytes);
+	UNREFERENCED_PARAMETER(metadataBytes);
+	UNREFERENCED_PARAMETER(totalRecords);
+	if (!NT_SUCCESS(status))
+		return status;
+
+	Reply->RestorePointSet =
+		sourceExt->RedirectJournalEntry->Journal.RestorePointSet ? 1UL : 0UL;
+	Reply->MergeRunning = InterlockedCompareExchange(
+		&sourceExt->MergeThreadRunning, 0, 0) != 0 ? 1UL : 0UL;
+	if (Reply->RestorePointSet && !Reply->MergeRunning)
+	{
+		Reply->AlertActive = InterlockedCompareExchange(
+			&sourceExt->RestorePointSpaceAlertActive, 0, 0) != 0 ? 1UL : 0UL;
+		Reply->AlertReason = (ULONG)InterlockedCompareExchange(
+			&sourceExt->RestorePointSpaceAlertReason, 0, 0);
+		Reply->MergeStatus = InterlockedCompareExchange(
+			&sourceExt->RestorePointSpaceAlertStatus, 0, 0);
+	}
+	return STATUS_SUCCESS;
+}
+
+static VOID CdpBuildRestoreSpaceAlertNotification(
+	_In_ PCdp_DEVICE_EXTENSION SourceExt,
+	_Out_ PCdp_RESTORE_SPACE_ALERT_NOTIFICATION Notification)
+{
+	UINT64 partitionBytes = 0;
+	UINT64 metadataBytes = 0;
+	UINT64 totalRecords = 0;
+
+	RtlZeroMemory(Notification, sizeof(*Notification));
+	Notification->SourceVolumeGuid = SourceExt->VolumeGuid;
+	Notification->Generation = (UINT64)InterlockedCompareExchange64(
+		&SourceExt->RestorePointSpaceAlertGeneration, 0, 0);
+	Notification->RestorePointSet = SourceExt->RedirectJournalEntry &&
+		SourceExt->RedirectJournalEntry->Journal.RestorePointSet ? 1UL : 0UL;
+	Notification->AlertActive = Notification->RestorePointSet &&
+		InterlockedCompareExchange(
+			&SourceExt->RestorePointSpaceAlertActive, 0, 0) != 0 ? 1UL : 0UL;
+	Notification->AlertReason = Notification->AlertActive ?
+		(ULONG)InterlockedCompareExchange(
+			&SourceExt->RestorePointSpaceAlertReason, 0, 0) :
+		Cdp_RESTORE_SPACE_ALERT_NONE;
+	Notification->MergeStatus = Notification->AlertActive ?
+		InterlockedCompareExchange(
+			&SourceExt->RestorePointSpaceAlertStatus, 0, 0) :
+		(LONG)STATUS_SUCCESS;
+	if (SourceExt->Core)
+	{
+		(void)CdpCoreQueryJournalUsage(
+			SourceExt->Core,
+			&partitionBytes,
+			&metadataBytes,
+			&Notification->RecordPayloadBytesUsed,
+			&Notification->RecordPayloadBytesFree,
+			&totalRecords);
+	}
+	UNREFERENCED_PARAMETER(partitionBytes);
+	UNREFERENCED_PARAMETER(metadataBytes);
+	UNREFERENCED_PARAMETER(totalRecords);
+}
+
+static NTSTATUS CdpWaitRestoreSpaceAlert(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_Inout_ PIRP Irp,
+	_In_ const Cdp_RESTORE_SPACE_ALERT_WAIT_REQUEST* Request)
+{
+	PCdp_DEVICE_EXTENSION sourceExt;
+	PCdp_RESTORE_SPACE_ALERT_NOTIFICATION notification;
+	KIRQL cancelIrql;
+	LONG64 generation;
+
+	sourceExt = CdpFindRestoreSpaceAlertSource(
+		DriverExt, &Request->SourceVolumeGuid,
+		Request->LastSeenGeneration);
+	if (sourceExt)
+	{
+		generation = InterlockedCompareExchange64(
+			&sourceExt->RestorePointSpaceAlertGeneration, 0, 0);
+		if ((UINT64)generation != Request->LastSeenGeneration)
+		{
+			notification = (PCdp_RESTORE_SPACE_ALERT_NOTIFICATION)
+				Irp->AssociatedIrp.SystemBuffer;
+			CdpBuildRestoreSpaceAlertNotification(sourceExt, notification);
+			return CdpCompleteIrp(
+				Irp, STATUS_SUCCESS, sizeof(*notification));
+		}
+	}
+
+	IoMarkIrpPending(Irp);
+	IoAcquireCancelSpinLock(&cancelIrql);
+	if (Irp->Cancel)
+	{
+		IoReleaseCancelSpinLock(cancelIrql);
+		return CdpCompleteIrp(Irp, STATUS_CANCELLED, 0);
+	}
+	/* Close the equality-check/queue race with alert publication. Alert state
+	 * is changed before the notifier takes this same cancel spin lock. */
+	if (sourceExt)
+	{
+		generation = InterlockedCompareExchange64(
+			&sourceExt->RestorePointSpaceAlertGeneration, 0, 0);
+		if ((UINT64)generation != Request->LastSeenGeneration)
+		{
+			IoReleaseCancelSpinLock(cancelIrql);
+			notification = (PCdp_RESTORE_SPACE_ALERT_NOTIFICATION)
+				Irp->AssociatedIrp.SystemBuffer;
+			CdpBuildRestoreSpaceAlertNotification(sourceExt, notification);
+			return CdpCompleteIrp(
+				Irp, STATUS_SUCCESS, sizeof(*notification));
+		}
+	}
+	Irp->Tail.Overlay.DriverContext[0] = DriverExt;
+	IoSetCancelRoutine(Irp, CdpCancelRestoreSpaceAlertWait);
+	InsertTailList(
+		&DriverExt->RestoreSpaceAlertWaitList,
+		&Irp->Tail.Overlay.ListEntry);
+	IoReleaseCancelSpinLock(cancelIrql);
+	return STATUS_PENDING;
 }
 
 static NTSTATUS CdpQueryJournalRecords(
@@ -4725,6 +5023,106 @@ static VOID CdpStopPreviewSessionForSource(
 	}
 }
 
+static VOID CdpSetRestorePointSpaceAlert(
+	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
+	_In_ BOOLEAN Active,
+	_In_ ULONG Reason,
+	_In_ NTSTATUS MergeStatus)
+{
+	LONG previous;
+	LONG previousReason;
+	LONG previousStatus;
+	BOOLEAN changed;
+
+	if (!DevExt)
+		return;
+	if (!Active)
+	{
+		previous = InterlockedExchange(
+			&DevExt->RestorePointSpaceAlertActive, 0);
+		previousReason = InterlockedExchange(
+			&DevExt->RestorePointSpaceAlertReason,
+			(LONG)Cdp_RESTORE_SPACE_ALERT_NONE);
+		previousStatus = InterlockedExchange(
+			&DevExt->RestorePointSpaceAlertStatus, (LONG)STATUS_SUCCESS);
+		changed = previous != 0;
+	}
+	else
+	{
+		previousReason = InterlockedExchange(
+			&DevExt->RestorePointSpaceAlertReason, (LONG)Reason);
+		previousStatus = InterlockedExchange(
+			&DevExt->RestorePointSpaceAlertStatus, (LONG)MergeStatus);
+		previous = InterlockedExchange(
+			&DevExt->RestorePointSpaceAlertActive, 1);
+		changed = previous == 0 || previousReason != (LONG)Reason ||
+			previousStatus != (LONG)MergeStatus;
+	}
+	if (changed)
+	{
+		InterlockedIncrement64(&DevExt->RestorePointSpaceAlertGeneration);
+		Cdp_LOG("[RESTORE-SPACE-ALERT] active=%lu reason=%lu mergeStatus=0x%08X source=%p\n",
+			Active ? 1UL : 0UL, Reason, MergeStatus, DevExt);
+		CdpNotifyRestoreSpaceAlertWaiters(DevExt);
+	}
+}
+
+static VOID CdpNotifyRestoreSpaceAlertWaiters(
+	_In_ PCdp_DEVICE_EXTENSION DevExt)
+{
+	PCdp_DRIVER_EXTENSION driverExt;
+	LIST_ENTRY ready;
+	PLIST_ENTRY entry;
+	KIRQL cancelIrql;
+
+	if (!DevExt || !DevExt->VolumeGuidValid)
+		return;
+	driverExt = IoGetDriverObjectExtension(g_DriverObject, &g_DriverObject);
+	if (!driverExt)
+		return;
+	InitializeListHead(&ready);
+	IoAcquireCancelSpinLock(&cancelIrql);
+	entry = driverExt->RestoreSpaceAlertWaitList.Flink;
+	while (entry != &driverExt->RestoreSpaceAlertWaitList)
+	{
+		static const GUID zeroGuid = { 0 };
+		PIRP waitIrp = CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
+		PLIST_ENTRY next = entry->Flink;
+		PCdp_RESTORE_SPACE_ALERT_WAIT_REQUEST request =
+			(PCdp_RESTORE_SPACE_ALERT_WAIT_REQUEST)
+			waitIrp->AssociatedIrp.SystemBuffer;
+
+		if (request &&
+			(RtlCompareMemory(&request->SourceVolumeGuid, &zeroGuid,
+				sizeof(GUID)) == sizeof(GUID) ||
+			 RtlCompareMemory(&request->SourceVolumeGuid,
+				&DevExt->VolumeGuid, sizeof(GUID)) == sizeof(GUID)))
+		{
+			(void)IoSetCancelRoutine(waitIrp, NULL);
+			RemoveEntryList(entry);
+			InitializeListHead(entry);
+			waitIrp->Tail.Overlay.DriverContext[0] = NULL;
+			InsertTailList(&ready, entry);
+		}
+		entry = next;
+	}
+	IoReleaseCancelSpinLock(cancelIrql);
+
+	while (!IsListEmpty(&ready))
+	{
+		PIRP waitIrp;
+		PCdp_RESTORE_SPACE_ALERT_NOTIFICATION notification;
+
+		entry = RemoveHeadList(&ready);
+		waitIrp = CONTAINING_RECORD(entry, IRP, Tail.Overlay.ListEntry);
+		notification = (PCdp_RESTORE_SPACE_ALERT_NOTIFICATION)
+			waitIrp->AssociatedIrp.SystemBuffer;
+		CdpBuildRestoreSpaceAlertNotification(DevExt, notification);
+		CdpCompleteIrp(
+			waitIrp, STATUS_SUCCESS, sizeof(*notification));
+	}
+}
+
 static VOID CdpMergeWorker(_In_ PVOID Context)
 {
 	PCdp_DEVICE_EXTENSION devExt = (PCdp_DEVICE_EXTENSION)Context;
@@ -4736,18 +5134,20 @@ static VOID CdpMergeWorker(_In_ PVOID Context)
 		&devExt->MergeIgnoreUsageThreshold, 0) != 0;
 	BOOLEAN restorePointMode = devExt->RedirectJournalEntry &&
 		devExt->RedirectJournalEntry->Journal.RestorePointSet;
+	ULONG mergeThreshold = restorePointMode ? 80UL : 90UL;
 
 	status = CdpCoreSetMergeActive(devExt->Core, TRUE);
 	if (!NT_SUCCESS(status))
 		goto done;
 	coreMergeActive = TRUE;
-	Cdp_LOG("[MERGE] start mode=%s strategy=%s source=%p disk=%lu part=%lu threshold=%s\n",
+	Cdp_LOG("[MERGE] start mode=%s strategy=%s source=%p disk=%lu part=%lu threshold=%lu-percent%s\n",
 		ignoreUsageThreshold ? "manual" : "automatic",
 		restorePointMode ? "runtime-checkpoint" : "source-materialize",
 		devExt,
 		devExt->DiskNumber,
 		devExt->PartitionNumber,
-		ignoreUsageThreshold ? "ignored" : "90-percent");
+		mergeThreshold,
+		ignoreUsageThreshold ? "-ignored" : "");
 
 	for (;;)
 	{
@@ -4762,9 +5162,18 @@ static VOID CdpMergeWorker(_In_ PVOID Context)
 		if (!ignoreUsageThreshold)
 		{
 			status = CdpCoreJournalUsageAtLeast(
-				devExt->Core, 90, &atLeast);
-			if (!NT_SUCCESS(status) || !atLeast)
+				devExt->Core, mergeThreshold, &atLeast);
+			if (!NT_SUCCESS(status))
 				break;
+			if (!atLeast)
+			{
+				if (restorePointMode)
+					CdpSetRestorePointSpaceAlert(
+						devExt, FALSE,
+						Cdp_RESTORE_SPACE_ALERT_NONE,
+						STATUS_SUCCESS);
+				break;
+			}
 		}
 		if (restorePointMode)
 		{
@@ -4788,24 +5197,45 @@ static VOID CdpMergeWorker(_In_ PVOID Context)
 			CdpStopPreviewSessionForSource(driverExt, devExt);
 		if (status == STATUS_NOT_FOUND)
 		{
+			if (restorePointMode && !ignoreUsageThreshold)
+			{
+				CdpSetRestorePointSpaceAlert(
+					devExt, TRUE,
+					Cdp_RESTORE_SPACE_ALERT_NO_COMPACTABLE_RR,
+					status);
+			}
 			if (ignoreUsageThreshold)
 				Cdp_LOG("[MERGE] manual request found no compactable header region\n");
 			break;
 		}
 		if (!NT_SUCCESS(status))
 		{
+			if (restorePointMode && !ignoreUsageThreshold)
+			{
+				ULONG reason = status == STATUS_DISK_FULL ?
+					Cdp_RESTORE_SPACE_ALERT_RESERVE_FAILED :
+					Cdp_RESTORE_SPACE_ALERT_MERGE_FAILED;
+				CdpSetRestorePointSpaceAlert(
+					devExt, TRUE, reason, status);
+			}
 			Cdp_LOG("[MERGE] compact failed mode=%s status=0x%08X\n",
 				ignoreUsageThreshold ? "manual" : "automatic", status);
 			break;
 		}
+		if (restorePointMode)
+		{
+			CdpSetRestorePointSpaceAlert(
+				devExt, FALSE,
+				Cdp_RESTORE_SPACE_ALERT_NONE,
+				STATUS_SUCCESS);
+		}
 		Cdp_LOG("[MERGE] oldest header region completed mode=%s strategy=%s\n",
 			ignoreUsageThreshold ? "manual" : "automatic",
 			restorePointMode ? "runtime-checkpoint" : "source-materialize");
-		/* A manual request may cause Core to reclaim contiguous tombstoned RRs
-		 * for newly invalid branches in this same pass.  Do not use manual mode
-		 * to advance into the next ordinary oldest RR; that is space-driven work
-		 * and remains the automatic merge thread's responsibility. */
-		if (ignoreUsageThreshold || restorePointMode)
+		/* A manual request processes one requested oldest RR. Automatic workers,
+		 * including restore-point checkpoint mode, continue until usage falls
+		 * below the threshold or Core proves that no more RR can be reclaimed. */
+		if (ignoreUsageThreshold)
 			break;
 	}
 
@@ -4905,6 +5335,7 @@ static VOID CdpStopMergeThread(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 {
 	BOOLEAN atLeast = FALSE;
+	BOOLEAN restorePointMode;
 	LONG phase;
 	ULONG threshold;
 	NTSTATUS status;
@@ -4914,11 +5345,22 @@ static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	{
 		return;
 	}
+	/* An automatic restore-point merge has already proved that the current
+	 * Journal state cannot reclaim another RR.  Do not let every subsequent
+	 * protected write create another worker and repeat the same failed scan.
+	 * Manual merge requests bypass this helper and remain available. */
+	if (InterlockedCompareExchange(
+			&DevExt->RestorePointSpaceAlertActive, 0, 0) != 0)
+	{
+		return;
+	}
+	restorePointMode = DevExt->RedirectJournalEntry &&
+		DevExt->RedirectJournalEntry->Journal.RestorePointSet;
 	phase = InterlockedCompareExchange(&DevExt->Phase, 0, 0);
 	if (phase == (LONG)Cdp_PHASE_GENERAL)
-		threshold = 90;
+		threshold = restorePointMode ? 80UL : 90UL;
 	else if (phase == (LONG)Cdp_PHASE_PREVIEW)
-		threshold = 95;
+		threshold = restorePointMode ? 80UL : 95UL;
 	else
 		return;
 	status = CdpCoreJournalUsageAtLeast(DevExt->Core, threshold, &atLeast);
@@ -4939,7 +5381,16 @@ static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	}
 	status = CdpStartMergeThread(DevExt, FALSE);
 	if (!NT_SUCCESS(status) && status != STATUS_DEVICE_BUSY)
+	{
 		Cdp_LOG("[MERGE] start failed status=0x%08X\n", status);
+		if (DevExt->RedirectJournalEntry &&
+			DevExt->RedirectJournalEntry->Journal.RestorePointSet)
+		{
+			CdpSetRestorePointSpaceAlert(
+				DevExt, TRUE,
+				Cdp_RESTORE_SPACE_ALERT_MERGE_FAILED, status);
+		}
+	}
 }
 
 static NTSTATUS CdpStartManualMerge(
@@ -5228,6 +5679,38 @@ static NTSTATUS CdpScatterReadMdlChain(
 	return copied == Length ? STATUS_SUCCESS : STATUS_BUFFER_TOO_SMALL;
 }
 
+// Called with HistoryMutex owned. A preceding write may have temporarily
+// released that mutex so the merge can run; keep later writes behind its retry.
+static VOID CdpWaitForMergeSpaceRetryGateLocked(
+	_Inout_ PCdp_DEVICE_EXTENSION SourceExt)
+{
+	while (InterlockedCompareExchange(
+		&SourceExt->MergeSpaceRetryOwner, 0, 0) != 0)
+	{
+		KeReleaseMutex(&SourceExt->HistoryMutex, FALSE);
+		(void)KeWaitForSingleObject(
+			&SourceExt->MergeSpaceRetryDoneEvent,
+			Executive,
+			KernelMode,
+			FALSE,
+			NULL);
+		(void)KeWaitForSingleObject(
+			&SourceExt->HistoryMutex,
+			Executive,
+			KernelMode,
+			FALSE,
+			NULL);
+	}
+}
+
+static VOID CdpReleaseMergeSpaceRetryGateLocked(
+	_Inout_ PCdp_DEVICE_EXTENSION SourceExt)
+{
+	InterlockedExchange(&SourceExt->MergeSpaceRetryOwner, 0);
+	KeSetEvent(
+		&SourceExt->MergeSpaceRetryDoneEvent, IO_NO_INCREMENT, FALSE);
+}
+
 static NTSTATUS CdpRedirectJournalWrite(
 	_In_ PCdp_DEVICE_EXTENSION SourceExt,
 	_Inout_ PCdp_CAPTURE_ITEM Item)
@@ -5241,6 +5724,8 @@ static NTSTATUS CdpRedirectJournalWrite(
 	ULONG mdlCount = 0;
 	UINT64 mdlBytes = 0;
 	UINT64 writeOffset;
+	BOOLEAN mergeWaitRetried = FALSE;
+	BOOLEAN ownsMergeSpaceRetryGate = FALSE;
 	NTSTATUS status;
 
 	/* The worker only calls this routine for a fully formed queued IRP.  Keep
@@ -5267,6 +5752,7 @@ static NTSTATUS CdpRedirectJournalWrite(
 	if (!SourceExt->RedirectJournalEntry)
 		return CdpCompleteFailedRedirectWrite(
 			SourceExt, Irp, STATUS_DEVICE_NOT_READY);
+	CdpWaitForMergeSpaceRetryGateLocked(SourceExt);
 	status = CdpSnapshotWriteMdlChain(
 		Irp, writeLength, &snapshot, &mdlCount, &mdlBytes);
 	if (!NT_SUCCESS(status))
@@ -5297,6 +5783,59 @@ static NTSTATUS CdpRedirectJournalWrite(
 			&record);
 		if (!NT_SUCCESS(status))
 		{
+			if (status == STATUS_DISK_FULL && !mergeWaitRetried &&
+				InterlockedCompareExchange(
+					&SourceExt->MergeThreadRunning, 0, 0) != 0)
+			{
+				NTSTATUS waitStatus;
+
+				/* The caller owns HistoryMutex. A normal merge may need the
+				 * same mutex to reclaim space, so never wait for the merge while
+				 * holding it. Keep the IRP, its MDLs and snapshot alive, then
+				 * reacquire the mutex before retrying this exact chunk. */
+				Cdp_LOG("[REDIRECT-WRITE-WAIT] stage=merge-space-wait-begin offset=%llu len=%lu chunkOffset=%lu chunkLen=%lu\n",
+					writeOffset, writeLength, chunkOffset, chunkLength);
+				KeClearEvent(&SourceExt->MergeSpaceRetryDoneEvent);
+				InterlockedExchange(&SourceExt->MergeSpaceRetryOwner, 1);
+				ownsMergeSpaceRetryGate = TRUE;
+				KeReleaseMutex(&SourceExt->HistoryMutex, FALSE);
+				waitStatus = KeWaitForSingleObject(
+					&SourceExt->MergeThreadDoneEvent,
+					Executive,
+					KernelMode,
+					FALSE,
+					NULL);
+				KeWaitForSingleObject(
+					&SourceExt->HistoryMutex,
+					Executive,
+					KernelMode,
+					FALSE,
+					NULL);
+				mergeWaitRetried = TRUE;
+				Cdp_LOG("[REDIRECT-WRITE-WAIT] stage=merge-space-wait-end offset=%llu len=%lu waitStatus=0x%08X enabled=%ld stopping=%ld phase=%ld\n",
+					writeOffset,
+					writeLength,
+					waitStatus,
+					InterlockedCompareExchange(
+						&SourceExt->CaptureEnabled, 0, 0),
+					InterlockedCompareExchange(
+						&SourceExt->CaptureStopping, 0, 0),
+					InterlockedCompareExchange(&SourceExt->Phase, 0, 0));
+				if (NT_SUCCESS(waitStatus) && SourceExt->Core &&
+					InterlockedCompareExchange(
+						&SourceExt->CaptureEnabled, 0, 0) != 0 &&
+					InterlockedCompareExchange(
+						&SourceExt->CaptureStopping, 0, 0) == 0 &&
+					InterlockedCompareExchange(&SourceExt->Phase, 0, 0) !=
+						(LONG)Cdp_PHASE_DRAINING)
+				{
+					Cdp_LOG("[REDIRECT-WRITE-WAIT] stage=merge-space-retry offset=%llu len=%lu chunkOffset=%lu chunkLen=%lu\n",
+						writeOffset, writeLength, chunkOffset, chunkLength);
+					continue;
+				}
+				status = NT_SUCCESS(waitStatus) ?
+					STATUS_DEVICE_NOT_READY : waitStatus;
+			}
 			Cdp_LOG("[REDIRECT-WRITE-FAIL] stage=append-publish status=0x%08X offset=%lld len=%lu chunkOffset=%lu chunkLen=%lu chunksCommitted=%lu\n",
 				status,
 				irpSp->Parameters.Write.ByteOffset.QuadPart,
@@ -5305,11 +5844,15 @@ static NTSTATUS CdpRedirectJournalWrite(
 				chunkLength,
 				chunkOffset / Cdp_JOURNAL_MAX_RECORD_DATA);
 			cdpfree(snapshot);
+			if (ownsMergeSpaceRetryGate)
+				CdpReleaseMergeSpaceRetryGateLocked(SourceExt);
 			return CdpCompleteFailedRedirectWrite(SourceExt, Irp, status);
 		}
 		chunkOffset += chunkLength;
 	}
 	cdpfree(snapshot);
+	if (ownsMergeSpaceRetryGate)
+		CdpReleaseMergeSpaceRetryGateLocked(SourceExt);
 
 	if (InterlockedCompareExchange(
 			&SourceExt->ShutdownInProgress, 0, 0) == 0)
@@ -7520,6 +8063,55 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 				Irp,
 				status,
 				NT_SUCCESS(status) ? sizeof(*reply) : 0);
+		}
+
+		case IOCTL_Cdp_QUERY_RESTORE_SPACE_ALERT:
+		{
+			Cdp_RESTORE_SPACE_ALERT_QUERY_REQUEST request;
+			PCdp_RESTORE_SPACE_ALERT_QUERY_REPLY reply;
+			ULONG inLen =
+				IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+			ULONG outLen =
+				IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
+			NTSTATUS status;
+
+			if (!DriverExt || !Irp->AssociatedIrp.SystemBuffer ||
+				inLen < sizeof(request) ||
+				outLen < sizeof(Cdp_RESTORE_SPACE_ALERT_QUERY_REPLY))
+			{
+				return CdpCompleteIrp(
+					Irp, STATUS_BUFFER_TOO_SMALL, 0);
+			}
+			request = *(PCdp_RESTORE_SPACE_ALERT_QUERY_REQUEST)
+				Irp->AssociatedIrp.SystemBuffer;
+			reply = (PCdp_RESTORE_SPACE_ALERT_QUERY_REPLY)
+				Irp->AssociatedIrp.SystemBuffer;
+			status = CdpQueryRestoreSpaceAlert(
+				DriverExt, &request, reply);
+			return CdpCompleteIrp(
+				Irp,
+				status,
+				NT_SUCCESS(status) ? sizeof(*reply) : 0);
+		}
+
+		case IOCTL_Cdp_WAIT_RESTORE_SPACE_ALERT:
+		{
+			Cdp_RESTORE_SPACE_ALERT_WAIT_REQUEST request;
+			ULONG inLen =
+				IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+			ULONG outLen =
+				IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
+
+			if (!DriverExt || !Irp->AssociatedIrp.SystemBuffer ||
+				inLen < sizeof(request) ||
+				outLen < sizeof(Cdp_RESTORE_SPACE_ALERT_NOTIFICATION))
+			{
+				return CdpCompleteIrp(
+					Irp, STATUS_BUFFER_TOO_SMALL, 0);
+			}
+			request = *(PCdp_RESTORE_SPACE_ALERT_WAIT_REQUEST)
+				Irp->AssociatedIrp.SystemBuffer;
+			return CdpWaitRestoreSpaceAlert(DriverExt, Irp, &request);
 		}
 
 		case IOCTL_Cdp_QUERY_JOURNAL_RECORDS:

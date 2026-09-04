@@ -2,10 +2,12 @@
 #include <objbase.h>
 #include <stdio.h>
 #include <strsafe.h>
+#include <WtsApi32.h>
 #include "..\CdpDriver\CdpIoctl.h"
 
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "Wtsapi32.lib")
 
 static const wchar_t kServiceName[] = L"CdpBootConfirm";
 static const wchar_t kServiceDisplayName[] = L"CDP Boot Confirmation";
@@ -199,35 +201,316 @@ static DWORD ConfirmSystemVolumeRestoreBoot(void)
 	return ERROR_SUCCESS;
 }
 
+static HANDLE OpenRestoreSpaceAlertChannel()
+{
+	return CreateFileW(
+		Cdp_CONTROL_SYSTEM_LINK_NAME,
+		GENERIC_READ | GENERIC_WRITE,
+		FILE_SHARE_READ | FILE_SHARE_WRITE,
+		NULL,
+		OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED,
+		NULL);
+}
+
+static DWORD BeginRestoreSpaceAlertWait(
+	HANDLE control,
+	const GUID& sourceVolumeGuid,
+	UINT64 lastSeenGeneration,
+	OVERLAPPED* overlapped,
+	Cdp_RESTORE_SPACE_ALERT_NOTIFICATION* notification)
+{
+	Cdp_RESTORE_SPACE_ALERT_WAIT_REQUEST request = {};
+	DWORD bytesReturned = 0;
+
+	if (control == INVALID_HANDLE_VALUE || !overlapped || !notification)
+		return ERROR_INVALID_PARAMETER;
+	request.SourceVolumeGuid = sourceVolumeGuid;
+	request.LastSeenGeneration = lastSeenGeneration;
+	ZeroMemory(notification, sizeof(*notification));
+	ResetEvent(overlapped->hEvent);
+	if (DeviceIoControl(
+		control,
+		IOCTL_Cdp_WAIT_RESTORE_SPACE_ALERT,
+		&request,
+		sizeof(request),
+		notification,
+		sizeof(*notification),
+		&bytesReturned,
+		overlapped))
+	{
+		/* The driver may return the initial/current state synchronously. */
+		SetEvent(overlapped->hEvent);
+		return ERROR_SUCCESS;
+	}
+	{
+		DWORD error = GetLastError();
+		return error == ERROR_IO_PENDING ? ERROR_SUCCESS : error;
+	}
+}
+
+static BOOL SendRestoreSpaceWarningToActiveSessions(
+	const Cdp_RESTORE_SPACE_ALERT_NOTIFICATION& reply,
+	DWORD* deliveryError)
+{
+	PWTS_SESSION_INFOW sessions = NULL;
+	DWORD sessionCount = 0;
+	DWORD index;
+	BOOL delivered = FALSE;
+	DWORD activeSessions = 0;
+	wchar_t message[768];
+	const wchar_t* reason;
+	double freePercent = 0.0;
+	UINT64 capacity = reply.RecordPayloadBytesUsed +
+		reply.RecordPayloadBytesFree;
+
+	if (capacity != 0)
+	{
+		freePercent = (double)reply.RecordPayloadBytesFree * 100.0 /
+			(double)capacity;
+	}
+	switch (reply.AlertReason)
+	{
+	case Cdp_RESTORE_SPACE_ALERT_NO_COMPACTABLE_RR:
+		reason = L"当前没有可继续合并的历史区域。";
+		break;
+	case Cdp_RESTORE_SPACE_ALERT_RESERVE_FAILED:
+		reason = L"合并所需的精确预留空间不足。";
+		break;
+	default:
+		reason = L"历史合并失败，当前无法继续释放空间。";
+		break;
+	}
+	swprintf_s(
+		message,
+		_countof(message),
+		L"已设置系统还原点，但保护存储空间即将不足。\n\n"
+		L"%s\n"
+		L"剩余空间：%.2f GB（%.1f%%）\n"
+		L"已用空间：%.2f GB\n"
+		L"合并状态：0x%08X\n\n"
+		L"如果空间耗尽，新的保护写入将失败。请尽快重启系统。",
+		reason,
+		(double)reply.RecordPayloadBytesFree / (1024.0 * 1024.0 * 1024.0),
+		freePercent,
+		(double)reply.RecordPayloadBytesUsed / (1024.0 * 1024.0 * 1024.0),
+		(ULONG)reply.MergeStatus);
+
+	if (deliveryError)
+		*deliveryError = ERROR_SUCCESS;
+	if (!WTSEnumerateSessionsW(
+		WTS_CURRENT_SERVER_HANDLE, 0, 1, &sessions, &sessionCount))
+	{
+		if (deliveryError)
+			*deliveryError = GetLastError();
+		return FALSE;
+	}
+	for (index = 0; index < sessionCount; ++index)
+	{
+		DWORD response = 0;
+		if (sessions[index].State != WTSActive)
+			continue;
+		activeSessions++;
+		if (WTSSendMessageW(
+			WTS_CURRENT_SERVER_HANDLE,
+			sessions[index].SessionId,
+			const_cast<LPWSTR>(L"还原点空间警告"),
+			(DWORD)(wcslen(L"还原点空间警告") * sizeof(wchar_t)),
+			message,
+			(DWORD)(wcslen(message) * sizeof(wchar_t)),
+			MB_OK | MB_ICONWARNING | MB_SYSTEMMODAL,
+			0,
+			&response,
+			FALSE))
+		{
+			delivered = TRUE;
+		}
+		else if (deliveryError)
+		{
+			*deliveryError = GetLastError();
+		}
+	}
+	WTSFreeMemory(sessions);
+	if (!delivered && activeSessions == 0 && deliveryError)
+		*deliveryError = ERROR_NO_SUCH_LOGON_SESSION;
+	return delivered;
+}
+
 static DWORD WINAPI BootConfirmWorker(void*)
 {
 	DWORD error = ERROR_RETRY;
+	DWORD lastMonitorError = ERROR_SUCCESS;
 	ULONGLONG deadline = GetTickCount64() + 10ULL * 60ULL * 1000ULL;
+	ULONGLONG nextConfirmAttempt = 0;
+	ULONGLONG nextMonitorConnect = 0;
+	ULONGLONG nextDeliveryAttempt = 0;
+	BOOL confirmationFinished = FALSE;
+	BOOL alertDelivered = FALSE;
+	BOOL alertWaitPending = FALSE;
+	/* Zero GUID subscribes to the product's protected restore-point source.
+	 * Boot confirmation still resolves the Windows volume independently. */
+	GUID alertSourceVolumeGuid = {};
+	HANDLE alertControl = INVALID_HANDLE_VALUE;
+	HANDLE alertEvent = NULL;
+	OVERLAPPED alertOverlapped = {};
+	UINT64 alertGeneration = 0;
+	Cdp_RESTORE_SPACE_ALERT_NOTIFICATION alert = {};
+	Cdp_RESTORE_SPACE_ALERT_NOTIFICATION pushedAlert = {};
+	BOOL haveAlertState = FALSE;
+	DWORD lastDeliveryError = ERROR_SUCCESS;
+	DWORD result = ERROR_SUCCESS;
 
-	Trace(L"worker started; confirmation retry window is 10 minutes", ERROR_SUCCESS);
+	Trace(L"worker started; boot confirmation retry is 10 minutes; space alerts use driver push", ERROR_SUCCESS);
+	alertEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+	if (!alertEvent)
+		return GetLastError();
+	alertOverlapped.hEvent = alertEvent;
 
-	/* SCM delayed-auto-start already places the service after early boot. Do
-	 * not add a second fixed delay: an unconfirmed restore boot must be marked
-	 * as soon as the service can reach the driver. */
+	/* Normal automatic startup places the service early in boot. Do not add a
+	 * fixed delay: confirmation and the pushed alert channel start as soon as the
+	 * driver control device becomes reachable. */
 	for (;;)
 	{
-		if (WaitForSingleObject(g_StopEvent, 0) == WAIT_OBJECT_0)
-			return ERROR_CANCELLED;
-		error = ConfirmSystemVolumeRestoreBoot();
-		if (error == ERROR_SUCCESS)
+		HANDLE waits[2] = { g_StopEvent, alertEvent };
+		DWORD waitCount;
+		DWORD waitResult;
+		ULONGLONG now = GetTickCount64();
+
+		if (!confirmationFinished && now >= nextConfirmAttempt)
 		{
-			Trace(L"system-volume restore boot confirmed", ERROR_SUCCESS);
-			return ERROR_SUCCESS;
+			error = ConfirmSystemVolumeRestoreBoot();
+			if (error == ERROR_SUCCESS)
+			{
+				Trace(L"system-volume restore boot confirmed", ERROR_SUCCESS);
+				confirmationFinished = TRUE;
+			}
+			else if (GetTickCount64() >= deadline)
+			{
+				Trace(L"confirmation retry window expired; leaving PENDING unchanged", error);
+				confirmationFinished = TRUE;
+			}
+			else
+			{
+				Trace(L"restore boot confirmation failed; retrying in 5 seconds", error);
+				nextConfirmAttempt = now + 5000;
+			}
 		}
-		Trace(L"restore boot confirmation failed; retrying in 5 seconds", error);
-		if (GetTickCount64() >= deadline)
+
+		if (!alertWaitPending && now >= nextMonitorConnect)
 		{
-			Trace(L"confirmation retry window expired; leaving PENDING unchanged", error);
-			return error;
+			DWORD monitorError;
+			if (alertControl == INVALID_HANDLE_VALUE)
+				alertControl = OpenRestoreSpaceAlertChannel();
+			if (alertControl == INVALID_HANDLE_VALUE)
+				monitorError = GetLastError();
+			else
+			{
+				monitorError = BeginRestoreSpaceAlertWait(
+					alertControl,
+					alertSourceVolumeGuid,
+					alertGeneration,
+					&alertOverlapped,
+					&pushedAlert);
+				if (monitorError == ERROR_SUCCESS)
+					alertWaitPending = TRUE;
+			}
+			if (monitorError == ERROR_SUCCESS)
+				lastMonitorError = ERROR_SUCCESS;
+			else
+			{
+				if (monitorError != lastMonitorError)
+				{
+					Trace(L"restore-point alert channel failed; reconnecting", monitorError);
+					lastMonitorError = monitorError;
+				}
+				if (alertControl != INVALID_HANDLE_VALUE)
+				{
+					CloseHandle(alertControl);
+					alertControl = INVALID_HANDLE_VALUE;
+				}
+				nextMonitorConnect = now + 5000;
+			}
 		}
-		if (WaitForSingleObject(g_StopEvent, 5000) == WAIT_OBJECT_0)
-			return ERROR_CANCELLED;
+
+		if (haveAlertState && alert.RestorePointSet && alert.AlertActive &&
+			!alertDelivered && now >= nextDeliveryAttempt)
+		{
+			DWORD deliveryError = ERROR_SUCCESS;
+			alertDelivered = SendRestoreSpaceWarningToActiveSessions(
+				alert, &deliveryError);
+			if (alertDelivered)
+			{
+				Trace(L"restore-point space warning delivered to active session", ERROR_SUCCESS);
+				lastDeliveryError = ERROR_SUCCESS;
+			}
+			else
+			{
+				if (deliveryError != lastDeliveryError)
+					Trace(L"restore-point space warning delivery failed; retrying", deliveryError);
+				lastDeliveryError = deliveryError;
+				nextDeliveryAttempt = now + 5000;
+			}
+		}
+
+		waitCount = alertWaitPending ? 2 : 1;
+		waitResult = WaitForMultipleObjects(waitCount, waits, FALSE, 5000);
+		if (waitResult == WAIT_OBJECT_0)
+			break;
+		if (alertWaitPending && waitResult == WAIT_OBJECT_0 + 1)
+		{
+			DWORD bytesReturned = 0;
+			if (GetOverlappedResult(
+					alertControl, &alertOverlapped, &bytesReturned, FALSE) &&
+				bytesReturned >= sizeof(alert))
+			{
+				alert = pushedAlert;
+				alertGeneration = alert.Generation;
+				haveAlertState = TRUE;
+				alertDelivered = FALSE;
+				nextDeliveryAttempt = 0;
+				lastMonitorError = ERROR_SUCCESS;
+				{
+					wchar_t traceText[256];
+					wchar_t guidText[40];
+					StringFromGUID2(alert.SourceVolumeGuid, guidText,
+						_countof(guidText));
+					swprintf_s(traceText, _countof(traceText),
+						L"space alert received source=%s generation=%llu active=%lu reason=%lu status=0x%08X",
+						guidText, alert.Generation, alert.AlertActive,
+						alert.AlertReason, (ULONG)alert.MergeStatus);
+					Trace(traceText, ERROR_SUCCESS);
+				}
+				if (!alert.RestorePointSet || !alert.AlertActive)
+					Trace(L"restore-point space alert state cleared", ERROR_SUCCESS);
+			}
+			else
+			{
+				DWORD monitorError = GetLastError();
+				if (monitorError == ERROR_SUCCESS)
+					monitorError = ERROR_INVALID_DATA;
+				if (monitorError != lastMonitorError)
+					Trace(L"restore-point pushed alert completion failed", monitorError);
+				lastMonitorError = monitorError;
+				CloseHandle(alertControl);
+				alertControl = INVALID_HANDLE_VALUE;
+				nextMonitorConnect = GetTickCount64() + 5000;
+			}
+			alertWaitPending = FALSE;
+		}
 	}
+
+	if (alertControl != INVALID_HANDLE_VALUE)
+	{
+		if (alertWaitPending)
+		{
+			CancelIoEx(alertControl, &alertOverlapped);
+			(void)GetOverlappedResult(
+				alertControl, &alertOverlapped, &result, TRUE);
+		}
+		CloseHandle(alertControl);
+	}
+	CloseHandle(alertEvent);
+	return ERROR_SUCCESS;
 }
 
 static DWORD WINAPI ServiceControlHandler(DWORD control, DWORD, void*, void*)
@@ -269,9 +552,7 @@ static void WINAPI ServiceMain(DWORD, LPWSTR*)
 	ReportServiceStatus(SERVICE_RUNNING, ERROR_SUCCESS, 0);
 	WaitForSingleObject(worker, INFINITE);
 	GetExitCodeThread(worker, &exitCode);
-	Trace(exitCode == ERROR_SUCCESS ?
-		L"service stopped after successful confirmation/query" :
-		L"service stopped without confirmation", exitCode);
+	Trace(L"service worker stopped", exitCode);
 	CloseHandle(worker);
 	CloseHandle(g_StopEvent);
 	g_StopEvent = NULL;

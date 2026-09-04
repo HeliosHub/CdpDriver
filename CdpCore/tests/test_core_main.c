@@ -2560,6 +2560,8 @@ static int TestRestorePointCheckpointMerge(void)
 	PUCHAR sourceBefore = NULL;
 	PUCHAR output = NULL;
 	UCHAR oldestValue[4096];
+	TEST_FAIL_STORE mergeIo;
+	BOOLEAN mergeIoInstalled = FALSE;
 	UINT64 oldestTime = 0;
 	UINT64 newestTime = 0;
 	NTSTATUS status;
@@ -2590,9 +2592,15 @@ static int TestRestorePointCheckpointMerge(void)
 		ctx.Core, oldestRecord.WallClock100ns)),
 		"enable persistent restore point for checkpoint strategy");
 
+	TestFailStoreInstall(ctx.Journal, &mergeIo);
+	mergeIoInstalled = TRUE;
 	status = CdpCoreCheckpointOldestRegion(ctx.Core);
 	Expect(NT_SUCCESS(status),
 		"checkpoint merge processes exactly one oldest complete RR");
+	Expect(mergeIo.HeaderRegionReadCount == 1,
+		"checkpoint planning and merge scan the oldest Record Header Region once");
+	TestFailStoreRemove(ctx.Journal, &mergeIo);
+	mergeIoInstalled = FALSE;
 	RtlZeroMemory(output, 4096);
 	Expect(NT_SUCCESS(ctx.Source->Read(ctx.Source, 0, 4096, output)) &&
 		memcmp(output, sourceBefore, 4096) == 0,
@@ -2632,6 +2640,8 @@ static int TestRestorePointCheckpointMerge(void)
 		"restore-point deletion preserves checkpoint baseline on source");
 
 cleanup:
+	if (mergeIoInstalled)
+		TestFailStoreRemove(ctx.Journal, &mergeIo);
 	if (output)
 		free(output);
 	if (sourceBefore)
@@ -2780,6 +2790,107 @@ static int TestRuntimeCheckpointReuseOrder(void)
 		&totalItems, &queryGeneration, &returnedItems), STATUS_RETRY,
 		"checkpoint record pagination rejects a changed generation");
 
+	CdpJournalClose(&journal);
+	CdpMemStoreDestroy(journalStore);
+	return g_caseFailed;
+}
+
+static int TestCheckpointMergeExactReservation(void)
+{
+	PCdp_STORE journalStore = NULL;
+	Cdp_JOURNAL journal;
+	GUID sourceGuid = { 0 };
+	Cdp_CHECKPOINT_MERGE_RANGE range;
+	Cdp_JOURNAL_RECORD normalRecord;
+	PCdp_CHECKPOINT_REMAP remaps = NULL;
+	ULONG remapCount = 0;
+	PUCHAR filler = NULL;
+	UCHAR oldestData[4096];
+	UCHAR mergeData[4096];
+	UCHAR normalData[512];
+	UINT64 regionOffset = 0;
+	UINT64 firstSequence = 0;
+	UINT64 endSequence = 0;
+	UINT64 newBytes = 0;
+	UINT64 relocationBytes = 0;
+	UINT64 wrapPadding = 0;
+	UINT64 reservedBytes = 0;
+	UINT64 reservedStart = 0;
+	UINT64 normalCursor = 0;
+	UINT64 checkpointId = 0;
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(CdpMemStoreCreate(
+		JNL_SIZE, SECTOR, &journalStore)),
+		"create journal for exact checkpoint reservation test");
+	if (!journalStore)
+		return g_caseFailed;
+	CdpJournalInitializeWithStore(
+		&journal, journalStore, &sourceGuid,
+		TestPointerTime100ns, (PVOID)(ULONG_PTR)360000);
+	Expect(NT_SUCCESS(CdpJournalFormat(&journal)),
+		"format exact checkpoint reservation journal");
+	filler = (PUCHAR)malloc(1024 * 1024);
+	if (!filler)
+		goto cleanup;
+	RtlFillMemory(oldestData, sizeof(oldestData), 0x41);
+	RtlFillMemory(mergeData, sizeof(mergeData), 0x52);
+	RtlFillMemory(normalData, sizeof(normalData), 0x63);
+	RtlFillMemory(filler, 1024 * 1024, 0x74);
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 0, sizeof(oldestData), oldestData, NULL)),
+		"append data to the oldest RR before exact reservation");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 8192, 1024 * 1024, filler, NULL)),
+		"rotate a newer RR before exact reservation");
+	Expect(NT_SUCCESS(CdpJournalSetRestorePoint(&journal, 360000)),
+		"enable restore point for exact reservation");
+	status = CdpJournalGetOldestCompactableRegion(
+		&journal, &regionOffset, &firstSequence, &endSequence);
+	Expect(NT_SUCCESS(status),
+		"locate oldest RR for exact reservation");
+
+	range.VolumeOffset = 0;
+	range.DataLength = sizeof(mergeData);
+	status = CdpJournalBeginCheckpointMergeReservation(
+		&journal, regionOffset, &range, 1,
+		&newBytes, &relocationBytes, &wrapPadding, &reservedBytes);
+	reservedStart = journal.CheckpointMergeReservedStart;
+	normalCursor = journal.PayloadRegionOff;
+	Expect(NT_SUCCESS(status) && newBytes == sizeof(mergeData) &&
+		relocationBytes == 0 && reservedBytes == sizeof(mergeData) &&
+		journal.CheckpointMergeReservedRemaining == sizeof(mergeData),
+		"planner reserves only the exact uncovered checkpoint payload");
+
+	status = CdpJournalAppend(
+		&journal, 16384, sizeof(normalData), normalData, &normalRecord);
+	Expect(NT_SUCCESS(status) && normalRecord.FileOffset >= normalCursor &&
+		normalRecord.FileOffset != reservedStart,
+		"ordinary append starts after the physical merge reservation");
+	status = CdpJournalMergeIntoRuntimeCheckpoints(
+		&journal, regionOffset, firstSequence, endSequence,
+		&checkpointId, range.VolumeOffset, range.DataLength, mergeData,
+		&remaps, &remapCount);
+	Expect(NT_SUCCESS(status) && remapCount == 1 &&
+		remaps[0].FileOffset == reservedStart &&
+		journal.CheckpointMergeReservedRemaining == 0,
+		"checkpoint merge consumes its private reservation exactly");
+	Expect(NT_SUCCESS(
+		CdpJournalValidateCheckpointMergeReservationConsumed(
+			&journal, regionOffset)),
+		"oldest RR cannot be deleted until the exact reservation is consumed");
+	CdpJournalFreeCheckpointRemaps(remaps);
+	remaps = NULL;
+	CdpJournalEndCheckpointMergeReservation(&journal);
+	Expect(!journal.CheckpointMergeReservationActive,
+		"exact checkpoint reservation is released after merge");
+
+cleanup:
+	if (journal.CheckpointMergeReservationActive)
+		CdpJournalEndCheckpointMergeReservation(&journal);
+	CdpJournalFreeCheckpointRemaps(remaps);
+	if (filler)
+		free(filler);
 	CdpJournalClose(&journal);
 	CdpMemStoreDestroy(journalStore);
 	return g_caseFailed;
@@ -3267,6 +3378,8 @@ int main(void)
 		TestRestorePointCheckpointMerge);
 	failed += RunCase("Runtime checkpoint reuse order",
 		TestRuntimeCheckpointReuseOrder);
+	failed += RunCase("Checkpoint merge exact reservation",
+		TestCheckpointMergeExactReservation);
 	failed += RunCase("Auto discovery skips restore-point records",
 		TestAutoDiscoverySkipsRestorePointRecords);
 	failed += RunCase("Graceful disable drains MetaTree",

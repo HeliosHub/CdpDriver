@@ -60,6 +60,9 @@ VOID CdpCloseAllVolumeHandles(_In_ PCdp_DRIVER_EXTENSION DriverExt);
 
 VOID CdpCloseAllPreviewSessions(_In_ PCdp_DRIVER_EXTENSION DriverExt);
 
+VOID CdpCancelAllRestoreSpaceAlertWaits(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt);
+
 NTSTATUS CdpStartCaptureWorker(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
 
 VOID CdpStopCaptureWorker(_Inout_ PCdp_DEVICE_EXTENSION DevExt);

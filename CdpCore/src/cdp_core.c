@@ -435,6 +435,26 @@ static PCdp_PREVIEW_TREE_NODE CdpCoreFindMetaNodeBySequenceRange(
 		Node->Right, FirstSequence, EndSequence);
 }
 
+static VOID CdpCoreCollectCheckpointMergeRanges(
+	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
+	_Out_writes_(Capacity) PCdp_CHECKPOINT_MERGE_RANGE Ranges,
+	_In_ ULONG Capacity,
+	_Inout_ PULONG Count)
+{
+	if (!Node || *Count >= Capacity)
+		return;
+	CdpCoreCollectCheckpointMergeRanges(
+		Node->Left, Ranges, Capacity, Count);
+	if (!Node->Invalid && *Count < Capacity)
+	{
+		Ranges[*Count].VolumeOffset = Node->Start;
+		Ranges[*Count].DataLength = Node->DataLength;
+		(*Count)++;
+	}
+	CdpCoreCollectCheckpointMergeRanges(
+		Node->Right, Ranges, Capacity, Count);
+}
+
 static NTSTATUS CdpCoreCheckpointRegionNodes(
 	_Inout_ PCdp_CORE Core,
 	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
@@ -522,8 +542,15 @@ NTSTATUS CdpCoreCheckpointOldestRegion(_Inout_ PCdp_CORE Core)
 	PCdp_CHECKPOINT_REMAP relocated = NULL;
 	ULONG relocatedCount = 0;
 	ULONG relocatedIndex;
+	PCdp_CHECKPOINT_MERGE_RANGE mergeRanges = NULL;
+	ULONG mergeRangeCount = 0;
+	UINT64 newCheckpointBytes = 0;
+	UINT64 relocationBytes = 0;
+	UINT64 wrapPaddingBytes = 0;
+	UINT64 reservedBytes = 0;
 	BOOLEAN previewTargetDeleted = FALSE;
 	BOOLEAN treeInitialized = FALSE;
+	BOOLEAN reservationActive = FALSE;
 	NTSTATUS status;
 
 	if (!Core || !Core->Journal || !Core->Journal->RestorePointSet)
@@ -560,6 +587,42 @@ NTSTATUS CdpCoreCheckpointOldestRegion(_Inout_ PCdp_CORE Core)
 	if (!NT_SUCCESS(status))
 		return status;
 	treeInitialized = TRUE;
+	if (regionTree.NodeCount != 0)
+	{
+		if (regionTree.NodeCount > MAXULONG /
+			sizeof(Cdp_CHECKPOINT_MERGE_RANGE))
+		{
+			status = STATUS_INTEGER_OVERFLOW;
+			goto cleanup;
+		}
+		mergeRanges = (PCdp_CHECKPOINT_MERGE_RANGE)Cdp_ALLOC(
+			regionTree.NodeCount * sizeof(*mergeRanges));
+		if (!mergeRanges)
+		{
+			status = STATUS_INSUFFICIENT_RESOURCES;
+			goto cleanup;
+		}
+		CdpCoreCollectCheckpointMergeRanges(
+			regionTree.Root, mergeRanges, regionTree.NodeCount,
+			&mergeRangeCount);
+	}
+	status = CdpJournalBeginCheckpointMergeReservation(
+		Core->Journal,
+		regionOffset,
+		mergeRanges,
+		mergeRangeCount,
+		&newCheckpointBytes,
+		&relocationBytes,
+		&wrapPaddingBytes,
+		&reservedBytes);
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+	reservationActive = TRUE;
+#ifndef Cdp_USERMODE
+	Cdp_LOG("[CHECKPOINT-MERGE-RESERVE] rrOffset=%llu ranges=%lu newBytes=%llu relocationBytes=%llu wrapPadding=%llu reserved=%llu\n",
+		regionOffset, mergeRangeCount, newCheckpointBytes,
+		relocationBytes, wrapPaddingBytes, reservedBytes);
+#endif
 
 	status = CdpCoreCheckpointRegionNodes(
 		Core, regionTree.Root, regionOffset, firstSequence, endSequence,
@@ -592,6 +655,10 @@ NTSTATUS CdpCoreCheckpointOldestRegion(_Inout_ PCdp_CORE Core)
 		if (!NT_SUCCESS(status))
 			goto cleanup;
 	}
+	status = CdpJournalValidateCheckpointMergeReservationConsumed(
+		Core->Journal, regionOffset);
+	if (!NT_SUCCESS(status))
+		goto cleanup;
 
 	// Payloads and MetaTree remaps are complete.  The short final switch is
 	// the only point at which the old RR becomes reclaimable.
@@ -615,6 +682,20 @@ NTSTATUS CdpCoreCheckpointOldestRegion(_Inout_ PCdp_CORE Core)
 #endif
 
 cleanup:
+	if (reservationActive)
+	{
+#ifndef Cdp_USERMODE
+		Cdp_LOG("[CHECKPOINT-MERGE-RESERVE] rrOffset=%llu consumed=%llu remaining=%llu status=0x%08X\n",
+			regionOffset,
+			Core->Journal->CheckpointMergeReservedBytes -
+				Core->Journal->CheckpointMergeReservedRemaining,
+			Core->Journal->CheckpointMergeReservedRemaining,
+			status);
+#endif
+		CdpJournalEndCheckpointMergeReservation(Core->Journal);
+	}
+	if (mergeRanges)
+		Cdp_FREE(mergeRanges);
 	CdpJournalFreeCheckpointRemaps(relocated);
 	if (treeInitialized)
 		CdpPreviewTreeFree(&regionTree);

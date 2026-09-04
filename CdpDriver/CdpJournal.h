@@ -238,6 +238,15 @@ typedef struct _Cdp_CHECKPOINT_REMAP
 	ULONG DataLength;
 } Cdp_CHECKPOINT_REMAP, *PCdp_CHECKPOINT_REMAP;
 
+// One live logical range produced by the single oldest-RR header scan.  The
+// reservation planner compares these ranges with runtime checkpoint metadata;
+// it never reads Record Headers itself.
+typedef struct _Cdp_CHECKPOINT_MERGE_RANGE
+{
+	UINT64 VolumeOffset;
+	ULONG DataLength;
+} Cdp_CHECKPOINT_MERGE_RANGE, *PCdp_CHECKPOINT_MERGE_RANGE;
+
 typedef struct _Cdp_RUNTIME_CHECKPOINT_TREE_INFO
 {
 	UINT64 CheckpointId;
@@ -317,7 +326,6 @@ typedef struct _Cdp_JOURNAL
 	// One-RR compaction snapshot. BuildCurrentBranchRegionTree fills this while
 	// performing the only permitted Record Header scan; DeleteOldestRegion
 	// consumes it instead of scanning the same RR again.
-	UINT64 CompactScanGeneration;
 	UINT64 CompactScanRegionOffset;
 	UINT64 CompactScanFirstSequence;
 	UINT64 CompactScanEndSequence;
@@ -341,6 +349,15 @@ typedef struct _Cdp_JOURNAL
 	ULONG CheckpointCount;
 	ULONG CheckpointRecordCount;
 	UINT64 CheckpointPayloadBytes;
+	// Exact physical payload span carved out for the active restore-point
+	// merge. PayloadRegionOff already points beyond it, so ordinary appends can
+	// never consume it. Checkpoint creation/relocation use the private cursor.
+	BOOLEAN CheckpointMergeReservationActive;
+	UINT64 CheckpointMergeRegionOffset;
+	UINT64 CheckpointMergeReservedStart;
+	UINT64 CheckpointMergeReservedCursor;
+	UINT64 CheckpointMergeReservedBytes;
+	UINT64 CheckpointMergeReservedRemaining;
 	BOOLEAN RecoveryPending;
 	BOOLEAN RestorePointSet;
 	BOOLEAN RestoreBootPending;
@@ -573,6 +590,23 @@ NTSTATUS CdpJournalGetOldestCompactableRegion(
 NTSTATUS CdpJournalDeleteOldestRegion(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 ExpectedRegionOffset);
+
+NTSTATUS CdpJournalBeginCheckpointMergeReservation(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 RegionOffset,
+	_In_reads_(RangeCount) const Cdp_CHECKPOINT_MERGE_RANGE* Ranges,
+	_In_ ULONG RangeCount,
+	_Out_ PUINT64 NewCheckpointBytes,
+	_Out_ PUINT64 RelocationBytes,
+	_Out_ PUINT64 WrapPaddingBytes,
+	_Out_ PUINT64 ReservedBytes);
+
+VOID CdpJournalEndCheckpointMergeReservation(
+	_Inout_ PCdp_JOURNAL Journal);
+
+NTSTATUS CdpJournalValidateCheckpointMergeReservationConsumed(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 RegionOffset);
 
 // Merge one already-deduplicated logical range into runtime checkpoints.
 // Existing checkpoints are inspected in creation order and consume matching

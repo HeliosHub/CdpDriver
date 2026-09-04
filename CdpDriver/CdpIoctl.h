@@ -64,6 +64,8 @@
 // In-memory only. The preview UI calls this before creating its first VHD;
 // reboot resets the gate and preserves normal persistent-Journal discovery.
 #define IOCTL_Cdp_DISABLE_AUTO_DISCOVERY     CTL_CODE(Cdp_IOCTL_TYPE, 0x81A, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_Cdp_QUERY_RESTORE_SPACE_ALERT  CTL_CODE(Cdp_IOCTL_TYPE, 0x81B, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_Cdp_WAIT_RESTORE_SPACE_ALERT   CTL_CODE(Cdp_IOCTL_TYPE, 0x81C, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define Cdp_PHASE_GENERAL  0UL
 #define Cdp_PHASE_PREVIEW  1UL
@@ -439,6 +441,53 @@ typedef struct _Cdp_RESTORE_POINT_QUERY_REPLY
 	ULONG BootConfirmed;
 	UINT64 TargetTime100ns;
 } Cdp_RESTORE_POINT_QUERY_REPLY, *PCdp_RESTORE_POINT_QUERY_REPLY;
+
+#define Cdp_RESTORE_SPACE_ALERT_NONE              0UL
+#define Cdp_RESTORE_SPACE_ALERT_NO_COMPACTABLE_RR 1UL
+#define Cdp_RESTORE_SPACE_ALERT_RESERVE_FAILED    2UL
+#define Cdp_RESTORE_SPACE_ALERT_MERGE_FAILED      3UL
+
+typedef struct _Cdp_RESTORE_SPACE_ALERT_QUERY_REQUEST
+{
+	GUID SourceVolumeGuid;
+} Cdp_RESTORE_SPACE_ALERT_QUERY_REQUEST,
+	*PCdp_RESTORE_SPACE_ALERT_QUERY_REQUEST;
+
+typedef struct _Cdp_RESTORE_SPACE_ALERT_QUERY_REPLY
+{
+	ULONG RestorePointSet;
+	ULONG AlertActive;
+	ULONG AlertReason;
+	LONG MergeStatus;
+	ULONG MergeRunning;
+	ULONG Reserved;
+	UINT64 RecordPayloadBytesUsed;
+	UINT64 RecordPayloadBytesFree;
+} Cdp_RESTORE_SPACE_ALERT_QUERY_REPLY,
+	*PCdp_RESTORE_SPACE_ALERT_QUERY_REPLY;
+
+/* Inverted-call notification. LastSeenGeneration makes registration and
+ * notification race-free: a stale caller completes immediately, otherwise
+ * the driver holds the IRP until this source's alert state changes. */
+typedef struct _Cdp_RESTORE_SPACE_ALERT_WAIT_REQUEST
+{
+	GUID SourceVolumeGuid;
+	UINT64 LastSeenGeneration;
+} Cdp_RESTORE_SPACE_ALERT_WAIT_REQUEST,
+	*PCdp_RESTORE_SPACE_ALERT_WAIT_REQUEST;
+
+typedef struct _Cdp_RESTORE_SPACE_ALERT_NOTIFICATION
+{
+	GUID SourceVolumeGuid;
+	UINT64 Generation;
+	ULONG RestorePointSet;
+	ULONG AlertActive;
+	ULONG AlertReason;
+	LONG MergeStatus;
+	UINT64 RecordPayloadBytesUsed;
+	UINT64 RecordPayloadBytesFree;
+} Cdp_RESTORE_SPACE_ALERT_NOTIFICATION,
+	*PCdp_RESTORE_SPACE_ALERT_NOTIFICATION;
 
 #pragma pack(pop)
 // Persist this recovery request in the journal.  After a system restart the

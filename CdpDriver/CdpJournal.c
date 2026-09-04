@@ -2992,6 +2992,308 @@ static NTSTATUS CdpJournalAppendCheckpointRemap(
 	return STATUS_SUCCESS;
 }
 
+static BOOLEAN CdpJournalOffsetInRingSpan(
+	_In_ UINT64 Offset,
+	_In_ UINT64 SpanStart,
+	_In_ UINT64 SpanEnd)
+{
+	if (SpanStart < SpanEnd)
+		return Offset >= SpanStart && Offset < SpanEnd;
+	if (SpanStart > SpanEnd)
+		return Offset >= SpanStart || Offset < SpanEnd;
+	return FALSE;
+}
+
+// Measure the union of existing checkpoint coverage without reading any
+// Record Header or payload. Each uncovered run remains a separate allocation,
+// matching CdpJournalMergeIntoRuntimeCheckpoints exactly.
+static NTSTATUS CdpJournalMeasureCheckpointGapsLocked(
+	_In_ PCdp_JOURNAL Journal,
+	_In_reads_(RangeCount) const Cdp_CHECKPOINT_MERGE_RANGE* Ranges,
+	_In_ ULONG RangeCount,
+	_Out_ PUINT64 NewCheckpointBytes)
+{
+	UINT64 total = 0;
+	ULONG rangeIndex;
+
+	for (rangeIndex = 0; rangeIndex < RangeCount; ++rangeIndex)
+	{
+		UINT64 rangeStart = Ranges[rangeIndex].VolumeOffset;
+		UINT64 rangeEnd;
+		UINT64 cursor;
+
+		if (Ranges[rangeIndex].DataLength == 0 ||
+			rangeStart > MAXUINT64 - Ranges[rangeIndex].DataLength)
+		{
+			return STATUS_INVALID_PARAMETER;
+		}
+		rangeEnd = rangeStart + Ranges[rangeIndex].DataLength;
+		if (rangeIndex != 0)
+		{
+			UINT64 previousEnd = Ranges[rangeIndex - 1].VolumeOffset +
+				Ranges[rangeIndex - 1].DataLength;
+			if (rangeStart < previousEnd)
+				return STATUS_INVALID_PARAMETER;
+		}
+
+		cursor = rangeStart;
+		while (cursor < rangeEnd)
+		{
+			PCdp_RUNTIME_CHECKPOINT checkpoint;
+			UINT64 coveredEnd = cursor;
+			UINT64 nextCoveredStart = rangeEnd;
+
+			for (checkpoint = Journal->CheckpointFirst;
+				checkpoint;
+				checkpoint = checkpoint->Next)
+			{
+				UINT64 checkpointEnd;
+				if (checkpoint->VolumeOffset >
+					MAXUINT64 - checkpoint->DataLength)
+				{
+					return STATUS_DISK_CORRUPT_ERROR;
+				}
+				checkpointEnd = checkpoint->VolumeOffset +
+					checkpoint->DataLength;
+				if (checkpoint->VolumeOffset <= cursor &&
+					checkpointEnd > cursor)
+				{
+					if (checkpointEnd > coveredEnd)
+						coveredEnd = checkpointEnd;
+				}
+				else if (checkpoint->VolumeOffset > cursor &&
+					checkpoint->VolumeOffset < nextCoveredStart)
+				{
+					nextCoveredStart = checkpoint->VolumeOffset;
+				}
+			}
+
+			if (coveredEnd > cursor)
+			{
+				cursor = coveredEnd < rangeEnd ? coveredEnd : rangeEnd;
+			}
+			else
+			{
+				UINT64 gapEnd = nextCoveredStart < rangeEnd ?
+					nextCoveredStart : rangeEnd;
+				UINT64 alignedLength = CdpAlignUp64(
+					gapEnd - cursor, Journal->SectorSize);
+				if (total > MAXUINT64 - alignedLength)
+					return STATUS_INTEGER_OVERFLOW;
+				total += alignedLength;
+				cursor = gapEnd;
+			}
+		}
+	}
+
+	*NewCheckpointBytes = total;
+	return STATUS_SUCCESS;
+}
+
+NTSTATUS CdpJournalBeginCheckpointMergeReservation(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 RegionOffset,
+	_In_reads_(RangeCount) const Cdp_CHECKPOINT_MERGE_RANGE* Ranges,
+	_In_ ULONG RangeCount,
+	_Out_ PUINT64 NewCheckpointBytes,
+	_Out_ PUINT64 RelocationBytes,
+	_Out_ PUINT64 WrapPaddingBytes,
+	_Out_ PUINT64 ReservedBytes)
+{
+	Cdp_HEADER_REGION_LINK link;
+	PCdp_RUNTIME_CHECKPOINT checkpoint;
+	UINT64 newBytes = 0;
+	UINT64 relocationBytes = 0;
+	UINT64 total;
+	UINT64 wrapPadding = 0;
+	UINT64 usableEnd;
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Journal || (!Ranges && RangeCount != 0) || !NewCheckpointBytes ||
+		!RelocationBytes || !WrapPaddingBytes || !ReservedBytes)
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+	*NewCheckpointBytes = 0;
+	*RelocationBytes = 0;
+	*WrapPaddingBytes = 0;
+	*ReservedBytes = 0;
+
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted || !Journal->RestorePointSet ||
+		Journal->CheckpointMergeReservationActive ||
+		RegionOffset != Journal->OldestHeaderRegionOff ||
+		RegionOffset == Journal->LastHeaderRegionOff)
+	{
+		status = STATUS_INVALID_DEVICE_STATE;
+		goto cleanup_locked;
+	}
+	status = CdpJournalReadRegionLink(Journal, RegionOffset, &link);
+	if (!NT_SUCCESS(status) || !CdpJournalRegionLinkValid(Journal, &link) ||
+		link.NextRegionOff == RegionOffset)
+	{
+		status = STATUS_DISK_CORRUPT_ERROR;
+		goto cleanup_locked;
+	}
+
+	status = CdpJournalMeasureCheckpointGapsLocked(
+		Journal, Ranges, RangeCount, &newBytes);
+	if (!NT_SUCCESS(status))
+		goto cleanup_locked;
+
+	for (checkpoint = Journal->CheckpointFirst;
+		checkpoint;
+		checkpoint = checkpoint->Next)
+	{
+		UINT64 alignedLength;
+		if (!CdpJournalOffsetInRingSpan(
+				checkpoint->FileOffset,
+				RegionOffset + Cdp_JOURNAL_HEADER_REGION_SIZE,
+				link.NextRegionOff))
+		{
+			continue;
+		}
+		alignedLength = CdpAlignUp64(
+			checkpoint->DataLength, Journal->SectorSize);
+		if (relocationBytes > MAXUINT64 - alignedLength)
+		{
+			status = STATUS_INTEGER_OVERFLOW;
+			goto cleanup_locked;
+		}
+		relocationBytes += alignedLength;
+	}
+	if (newBytes > MAXUINT64 - relocationBytes)
+	{
+		status = STATUS_INTEGER_OVERFLOW;
+		goto cleanup_locked;
+	}
+	total = newBytes + relocationBytes;
+	usableEnd = CdpJournalUsableEnd(Journal);
+	if (total != 0 && total > usableEnd - CdpJournalUsableStart(Journal))
+	{
+		status = STATUS_DISK_FULL;
+		goto cleanup_locked;
+	}
+	if (total != 0 && total > usableEnd - Journal->PayloadRegionOff)
+		wrapPadding = usableEnd - Journal->PayloadRegionOff;
+	if (Journal->PayloadBytesUsed > MAXUINT64 - wrapPadding ||
+		Journal->PayloadBytesUsed + wrapPadding > MAXUINT64 - total)
+	{
+		status = STATUS_INTEGER_OVERFLOW;
+		goto cleanup_locked;
+	}
+	if (total != 0)
+	{
+		status = CdpJournalEnsureContiguousLocked(Journal, total);
+		if (!NT_SUCCESS(status))
+			goto cleanup_locked;
+	}
+
+	Journal->CheckpointMergeReservationActive = TRUE;
+	Journal->CheckpointMergeRegionOffset = RegionOffset;
+	Journal->CheckpointMergeReservedStart = Journal->PayloadRegionOff;
+	Journal->CheckpointMergeReservedCursor = Journal->PayloadRegionOff;
+	Journal->CheckpointMergeReservedBytes = total;
+	Journal->CheckpointMergeReservedRemaining = total;
+	Journal->PayloadRegionOff += total;
+	Journal->PayloadBytesUsed += total;
+	*NewCheckpointBytes = newBytes;
+	*RelocationBytes = relocationBytes;
+	*WrapPaddingBytes = wrapPadding;
+	*ReservedBytes = total;
+
+cleanup_locked:
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
+VOID CdpJournalEndCheckpointMergeReservation(
+	_Inout_ PCdp_JOURNAL Journal)
+{
+	if (!Journal)
+		return;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	Journal->CheckpointMergeReservationActive = FALSE;
+	Journal->CheckpointMergeRegionOffset = 0;
+	Journal->CheckpointMergeReservedStart = 0;
+	Journal->CheckpointMergeReservedCursor = 0;
+	Journal->CheckpointMergeReservedBytes = 0;
+	Journal->CheckpointMergeReservedRemaining = 0;
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+}
+
+NTSTATUS CdpJournalValidateCheckpointMergeReservationConsumed(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 RegionOffset)
+{
+	NTSTATUS status;
+
+	if (!Journal)
+		return STATUS_INVALID_PARAMETER;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->CheckpointMergeReservationActive ||
+		Journal->CheckpointMergeRegionOffset != RegionOffset)
+	{
+		status = STATUS_INVALID_DEVICE_STATE;
+	}
+	else if (Journal->CheckpointMergeReservedRemaining != 0)
+	{
+		status = STATUS_DISK_CORRUPT_ERROR;
+	}
+	else
+	{
+		status = STATUS_SUCCESS;
+	}
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
+static NTSTATUS CdpJournalPrepareCheckpointAllocationLocked(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 SourceRegionOffset,
+	_In_ UINT64 AlignedLength,
+	_Out_ PUINT64 PayloadOffset,
+	_Out_ PBOOLEAN UsesReservation)
+{
+	NTSTATUS status;
+
+	if (Journal->CheckpointMergeReservationActive)
+	{
+		if (SourceRegionOffset != Journal->CheckpointMergeRegionOffset ||
+			AlignedLength > Journal->CheckpointMergeReservedRemaining)
+		{
+			return STATUS_DISK_CORRUPT_ERROR;
+		}
+		*PayloadOffset = Journal->CheckpointMergeReservedCursor;
+		*UsesReservation = TRUE;
+		return STATUS_SUCCESS;
+	}
+
+	status = CdpJournalEnsureContiguousLocked(Journal, AlignedLength);
+	if (!NT_SUCCESS(status))
+		return status;
+	*PayloadOffset = Journal->PayloadRegionOff;
+	*UsesReservation = FALSE;
+	return STATUS_SUCCESS;
+}
+
+static VOID CdpJournalCommitCheckpointAllocationLocked(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 AlignedLength,
+	_In_ BOOLEAN UsesReservation)
+{
+	if (UsesReservation)
+	{
+		Journal->CheckpointMergeReservedCursor += AlignedLength;
+		Journal->CheckpointMergeReservedRemaining -= AlignedLength;
+	}
+	else
+	{
+		Journal->PayloadRegionOff += AlignedLength;
+		Journal->PayloadBytesUsed += AlignedLength;
+	}
+}
+
 NTSTATUS CdpJournalMergeIntoRuntimeCheckpoints(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 SourceRegionOffset,
@@ -3111,6 +3413,7 @@ NTSTATUS CdpJournalMergeIntoRuntimeCheckpoints(
 			UINT64 payloadOffset;
 			UINT64 assignedCheckpointId;
 			BOOLEAN createsCheckpoint;
+			BOOLEAN usesReservation;
 			PCdp_RUNTIME_CHECKPOINT added;
 			PVOID allocationBase = NULL;
 			PUCHAR writeBuffer;
@@ -3124,7 +3427,9 @@ NTSTATUS CdpJournalMergeIntoRuntimeCheckpoints(
 				cursor++;
 			runLength = cursor - runStart;
 			alignedLength = CdpAlignUp64(runLength, Journal->SectorSize);
-			status = CdpJournalEnsureContiguousLocked(Journal, alignedLength);
+			status = CdpJournalPrepareCheckpointAllocationLocked(
+				Journal, SourceRegionOffset, alignedLength,
+				&payloadOffset, &usesReservation);
 			if (!NT_SUCCESS(status))
 				goto cleanup_locked;
 			createsCheckpoint = *CheckpointId == 0;
@@ -3133,14 +3438,14 @@ NTSTATUS CdpJournalMergeIntoRuntimeCheckpoints(
 					 Journal->NextCheckpointId == MAXUINT64)) ||
 				Journal->CheckpointRecordCount == MAXULONG ||
 				Journal->CheckpointPayloadBytes > MAXUINT64 - alignedLength ||
-				Journal->PayloadBytesUsed > MAXUINT64 - alignedLength)
+				(!usesReservation &&
+				 Journal->PayloadBytesUsed > MAXUINT64 - alignedLength))
 			{
 				status = STATUS_INTEGER_OVERFLOW;
 				goto cleanup_locked;
 			}
 			assignedCheckpointId = createsCheckpoint ?
 				Journal->NextCheckpointId + 1 : *CheckpointId;
-			payloadOffset = Journal->PayloadRegionOff;
 			added = (PCdp_RUNTIME_CHECKPOINT)cdpalloc(sizeof(*added));
 			if (!added)
 			{
@@ -3187,8 +3492,8 @@ NTSTATUS CdpJournalMergeIntoRuntimeCheckpoints(
 			}
 			Journal->CheckpointRecordCount++;
 			Journal->CheckpointPayloadBytes += alignedLength;
-			Journal->PayloadRegionOff += alignedLength;
-			Journal->PayloadBytesUsed += alignedLength;
+			CdpJournalCommitCheckpointAllocationLocked(
+				Journal, alignedLength, usesReservation);
 			Journal->CheckpointGeneration++;
 			status = CdpJournalAppendCheckpointRemap(
 				&remaps, &remapCount, &remapCapacity,
@@ -3219,18 +3524,6 @@ VOID CdpJournalFreeCheckpointRemaps(
 {
 	if (Remaps)
 		cdpfree(Remaps);
-}
-
-static BOOLEAN CdpJournalOffsetInRingSpan(
-	_In_ UINT64 Offset,
-	_In_ UINT64 SpanStart,
-	_In_ UINT64 SpanEnd)
-{
-	if (SpanStart < SpanEnd)
-		return Offset >= SpanStart && Offset < SpanEnd;
-	if (SpanStart > SpanEnd)
-		return Offset >= SpanStart || Offset < SpanEnd;
-	return FALSE;
 }
 
 NTSTATUS CdpJournalRelocateCheckpointsFromRegion(
@@ -3275,6 +3568,7 @@ NTSTATUS CdpJournalRelocateCheckpointsFromRegion(
 	{
 		UINT64 alignedLength;
 		UINT64 newOffset;
+		BOOLEAN usesReservation;
 		PVOID allocationBase = NULL;
 		PUCHAR buffer;
 
@@ -3283,15 +3577,17 @@ NTSTATUS CdpJournalRelocateCheckpointsFromRegion(
 			continue;
 		alignedLength = CdpAlignUp64(
 			checkpoint->DataLength, Journal->SectorSize);
-		status = CdpJournalEnsureContiguousLocked(Journal, alignedLength);
+		status = CdpJournalPrepareCheckpointAllocationLocked(
+			Journal, RegionOffset, alignedLength,
+			&newOffset, &usesReservation);
 		if (!NT_SUCCESS(status))
 			goto cleanup_locked;
-		if (Journal->PayloadBytesUsed > MAXUINT64 - alignedLength)
+		if (!usesReservation &&
+			Journal->PayloadBytesUsed > MAXUINT64 - alignedLength)
 		{
 			status = STATUS_INTEGER_OVERFLOW;
 			goto cleanup_locked;
 		}
-		newOffset = Journal->PayloadRegionOff;
 		buffer = (PUCHAR)CdpAllocateAligned(
 			Journal, (SIZE_T)alignedLength, &allocationBase);
 		if (!buffer)
@@ -3319,8 +3615,8 @@ NTSTATUS CdpJournalRelocateCheckpointsFromRegion(
 			goto cleanup_locked;
 		remaps[remapCount - 1].PreviousFileOffset = checkpoint->FileOffset;
 		checkpoint->FileOffset = newOffset;
-		Journal->PayloadRegionOff += alignedLength;
-		Journal->PayloadBytesUsed += alignedLength;
+		CdpJournalCommitCheckpointAllocationLocked(
+			Journal, alignedLength, usesReservation);
 	}
 	if (remapCount != 0)
 	{
@@ -5029,7 +5325,6 @@ NTSTATUS CdpJournalDeleteOldestRegion(
 	else
 	{
 		if (!Journal->CompactScanValid ||
-			Journal->CompactScanGeneration != Journal->RecordGeneration ||
 			Journal->CompactScanRegionOffset != ExpectedRegionOffset)
 		{
 			status = STATUS_RETRY;
@@ -7020,7 +7315,6 @@ NTSTATUS CdpJournalBuildCurrentBranchRegionTree(
 				goto cleanup;
 		}
 	}
-	Journal->CompactScanGeneration = Journal->RecordGeneration;
 	Journal->CompactScanRegionOffset = regionOff;
 	Journal->CompactScanFirstSequence = FirstSequence;
 	Journal->CompactScanEndSequence = EndSequence;

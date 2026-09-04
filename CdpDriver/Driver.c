@@ -113,6 +113,13 @@ NTSTATUS CdpCreateInternalSourceDevice(
 		&ext->RedirectWritesDrainedEvent, NotificationEvent, TRUE);
 	KeInitializeEvent(&ext->DiskIoDrainedEvent, NotificationEvent, TRUE);
 	KeInitializeEvent(&ext->MergeThreadDoneEvent, NotificationEvent, TRUE);
+	KeInitializeEvent(
+		&ext->MergeSpaceRetryDoneEvent, NotificationEvent, TRUE);
+	InterlockedExchange(&ext->MergeSpaceRetryOwner, 0);
+	InterlockedExchange(&ext->RestorePointSpaceAlertActive, 0);
+	InterlockedExchange(&ext->RestorePointSpaceAlertReason, 0);
+	InterlockedExchange(&ext->RestorePointSpaceAlertStatus, 0);
+	InterlockedExchange64(&ext->RestorePointSpaceAlertGeneration, 1);
 	KeInitializeMutex(&ext->HistoryMutex, 0);
 	InterlockedExchange(&ext->Phase, Cdp_PHASE_GENERAL);
 	InterlockedExchange(&ext->Started, 1);
@@ -391,6 +398,14 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 	InterlockedExchange64(&DeviceExtension->PowerIrpCompletionCount, 0);
 	KeInitializeEvent(&DeviceExtension->MergeThreadDoneEvent,
 		NotificationEvent, TRUE);
+	KeInitializeEvent(&DeviceExtension->MergeSpaceRetryDoneEvent,
+		NotificationEvent, TRUE);
+	InterlockedExchange(&DeviceExtension->MergeSpaceRetryOwner, 0);
+	InterlockedExchange(&DeviceExtension->RestorePointSpaceAlertActive, 0);
+	InterlockedExchange(&DeviceExtension->RestorePointSpaceAlertReason, 0);
+	InterlockedExchange(&DeviceExtension->RestorePointSpaceAlertStatus, 0);
+	InterlockedExchange64(
+		&DeviceExtension->RestorePointSpaceAlertGeneration, 1);
 	KeInitializeMutex(&DeviceExtension->HistoryMutex, 0);
 	DeviceExtension->SectorSize = Cdp_SECTOR_SIZE_DEFAULT;
 	InterlockedExchange(&DeviceExtension->Phase, Cdp_PHASE_GENERAL);
@@ -470,6 +485,7 @@ VOID CdpDriverUnload(_In_ PDRIVER_OBJECT DriverObject)
 
 	// Preview sessions own source-volume handles and can call into Core.  Tear
 	// them down before any filter device/Core is removed.
+	CdpCancelAllRestoreSpaceAlertWaits(DriverExtension);
 	CdpCloseAllPreviewSessions(DriverExtension);
 
 	while (TRUE)
@@ -528,6 +544,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 	InitializeListHead(&DriverExtension->PreviewSessionList);
 	ExInitializeFastMutex(&DriverExtension->PreviewSessionMutex);
 	DriverExtension->PreviewSessionNextId = 0;
+	InitializeListHead(&DriverExtension->RestoreSpaceAlertWaitList);
 
 	Status = CdpCreateControlDevice(DriverObject);
 	if (!NT_SUCCESS(Status))
@@ -545,6 +562,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 	DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = CdpIrpDispatchDeviceControl;
 	DriverObject->MajorFunction[IRP_MJ_CREATE] = CdpIrpDispatchCreateClose;
 	DriverObject->MajorFunction[IRP_MJ_CLOSE] = CdpIrpDispatchCreateClose;
+	DriverObject->MajorFunction[IRP_MJ_CLEANUP] = CdpIrpDispatchCreateClose;
 	DriverObject->DriverExtension->AddDevice = CdpAddDevice;
 
 cleanup:

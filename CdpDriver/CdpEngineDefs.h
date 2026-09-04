@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.6.10-test55"
-#define Cdp_DRIVER_BUILD_STRING   "20260902.160-restore-boot-service"
+#define Cdp_DRIVER_VERSION_STRING "1.6.10-test60"
+#define Cdp_DRIVER_BUILD_STRING   "20260904.174-restore-merge-at-80"
 
 // Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.
 // Cdp_DBG: Debug builds only — verbose I/O and path tracing.
@@ -110,6 +110,9 @@ typedef struct _Cdp_DRIVER_EXTENSION
 
 	volatile LONG AuthFailureCount;
 	volatile LONGLONG AuthBlockedUntil100ns;
+	// Pending inverted-call IOCTLs from CdpBootService. The I/O manager cancel
+	// spin lock serializes this list with each IRP's cancel routine.
+	LIST_ENTRY RestoreSpaceAlertWaitList;
 } Cdp_DRIVER_EXTENSION, *PCdp_DRIVER_EXTENSION;
 
 typedef struct _Cdp_CONTROL_FILE_CONTEXT
@@ -250,6 +253,16 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	// That Core pass still reclaims any branch-invalidated tombstone RRs.
 	volatile LONG MergeIgnoreUsageThreshold;
 	KEVENT MergeThreadDoneEvent;
+	// Serializes the one write that releases HistoryMutex while waiting for a
+	// running merge. Later writes wait here so they cannot overtake its retry.
+	volatile LONG MergeSpaceRetryOwner;
+	KEVENT MergeSpaceRetryDoneEvent;
+	// Raised only for restore-point mode after the 80-percent automatic merge
+	// proves that no RR can currently be reclaimed.
+	volatile LONG RestorePointSpaceAlertActive;
+	volatile LONG RestorePointSpaceAlertReason;
+	volatile LONG RestorePointSpaceAlertStatus;
+	volatile LONG64 RestorePointSpaceAlertGeneration;
 	KMUTEX HistoryMutex;
 	PCdp_CORE Core;
 	// Journal VolumeHandleList entry used while CaptureEnabled is set.
