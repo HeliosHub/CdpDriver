@@ -83,3 +83,6 @@ Desktop.ini
 *.snk
 *.p12
 *.key
+
+# Installer build staging (the final setup executable is written to cdpgui\bin).
+installer/work/

@@ -8,7 +8,6 @@ CdpDriver 同时注册为 `Volume` 与 `DiskDrive` 类 Upper Filter。卷层负�
 - `CdpCore`：当前视图、Preview、Recovery、还原点物化和空间回收协调。
 - `CdpJournal`：v15 磁盘格式、Record、分支树、区间树及持久化状态。
 - `CdpConsole`：安装、保护配置、查询、Preview、Recovery 和还原点管理。
-- `CdpDiskFilter` / `CdpDiskCtl`：独立的最小磁盘层验证工程，主驱动不依赖它们。
 
 磁盘自动发现可创建不附着设备栈的 `SOURCE` 上下文。已启动卷按磁盘号、分区起始位置和长度绑定到对应保护上下文；若磁盘层已发布该上下文，卷层直接绑定而不重新挂载或扫描同一 Journal。卷 I/O 不需要遍历全部分区。
 

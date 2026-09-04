@@ -4899,8 +4899,8 @@ static NTSTATUS CdpQueueDiskCaptureIrp(
 	ObReferenceObject(item->OriginLowerReference);
 	/* Keep a disk READ IRP exactly as it arrived.  In particular, do not
 	 * replace its absolute disk ByteOffset with a source-relative offset.
-	 * The known-good CdpDiskFilter path treats the IRP as an opaque carrier
-	 * and performs all address translation in worker-local variables. */
+	 * Treat the IRP as an opaque carrier and perform all address translation
+	 * in worker-local variables. */
 	/* READ and WRITE both retain their original absolute disk ByteOffset.
 	 * Journal records and MetaTree keys use this same coordinate system. */
 
