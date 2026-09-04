@@ -1870,6 +1870,7 @@ static int RunParamCommand(int argc, wchar_t** argv)
 			L"  version\n"
 			L"  status <source-volume-guid>\n"
 			L"  usage <source-volume-guid>\n"
+			L"  u <source-volume-guid>  (alias for usage)\n"
 			L"  time-range <source-volume-guid>\n"
 			L"  branches <source-volume-guid> <password>\n"
 			L"  checkpoints <source-volume-guid> <password>\n"
@@ -1969,7 +1970,7 @@ static int RunParamCommand(int argc, wchar_t** argv)
 		}
 		else ConOutFmt(L"Version query failed (err=%lu).\n", GetLastError());
 	}
-	else if ((_wcsicmp(argv[1], L"status") == 0 || _wcsicmp(argv[1], L"usage") == 0 ||
+	else if ((_wcsicmp(argv[1], L"status") == 0 || _wcsicmp(argv[1], L"usage") == 0 || _wcsicmp(argv[1], L"u") == 0 ||
 		_wcsicmp(argv[1], L"time-range") == 0) && argc == 3)
 	{
 		if (!ParseGuid(argv[2], &sourceGuid))
@@ -1993,7 +1994,7 @@ static int RunParamCommand(int argc, wchar_t** argv)
 			}
 			else ConOutFmt(L"Status query failed (err=%lu).\n", GetLastError());
 		}
-		else if (_wcsicmp(argv[1], L"usage") == 0)
+		else if (_wcsicmp(argv[1], L"usage") == 0 || _wcsicmp(argv[1], L"u") == 0)
 		{
 			Cdp_JOURNAL_USAGE_QUERY_REQUEST request;
 			Cdp_JOURNAL_USAGE_QUERY_REPLY reply;
