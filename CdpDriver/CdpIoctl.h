@@ -66,6 +66,7 @@
 #define IOCTL_Cdp_DISABLE_AUTO_DISCOVERY     CTL_CODE(Cdp_IOCTL_TYPE, 0x81A, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_QUERY_RESTORE_SPACE_ALERT  CTL_CODE(Cdp_IOCTL_TYPE, 0x81B, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_WAIT_RESTORE_SPACE_ALERT   CTL_CODE(Cdp_IOCTL_TYPE, 0x81C, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_Cdp_QUERY_DRAIN_PROGRESS       CTL_CODE(Cdp_IOCTL_TYPE, 0x81D, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define Cdp_PHASE_GENERAL  0UL
 #define Cdp_PHASE_PREVIEW  1UL
@@ -76,6 +77,11 @@
 // callers must wait before starting Preview.
 #define Cdp_PHASE_MERGING  4UL
 #define Cdp_STATUS_UNPROTECTED (-1L)
+
+#define Cdp_DRAIN_PROGRESS_IDLE      0UL
+#define Cdp_DRAIN_PROGRESS_RUNNING   1UL
+#define Cdp_DRAIN_PROGRESS_COMPLETED 2UL
+#define Cdp_DRAIN_PROGRESS_FAILED    3UL
 
 #define Cdp_CMD_1 1
 #define Cdp_CMD_2 2
@@ -139,6 +145,23 @@ typedef struct _Cdp_CMD2_REQUEST
 	ULONG Code;
 	GUID SourceVolumeGuid; // stop CDP for this protected source only
 } Cdp_CMD2_REQUEST, *PCdp_CMD2_REQUEST;
+
+typedef struct _Cdp_DRAIN_PROGRESS_QUERY_REQUEST
+{
+	GUID SourceVolumeGuid;
+} Cdp_DRAIN_PROGRESS_QUERY_REQUEST,
+	*PCdp_DRAIN_PROGRESS_QUERY_REQUEST;
+
+typedef struct _Cdp_DRAIN_PROGRESS_QUERY_REPLY
+{
+	ULONG State;       // Cdp_DRAIN_PROGRESS_*
+	LONG Status;       // STATUS_PENDING / final NTSTATUS
+	UINT64 TotalBytes; // de-duplicated MetaTree coverage at drain start
+	UINT64 CompletedBytes;
+} Cdp_DRAIN_PROGRESS_QUERY_REPLY,
+	*PCdp_DRAIN_PROGRESS_QUERY_REPLY;
+
+C_ASSERT(sizeof(Cdp_DRAIN_PROGRESS_QUERY_REPLY) == 24);
 
 typedef struct _Cdp_COMMAND_REPLY
 {

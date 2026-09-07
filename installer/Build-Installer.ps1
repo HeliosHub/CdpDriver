@@ -1,20 +1,30 @@
-[CmdletBinding()]
+﻿[CmdletBinding()]
 param(
     [string]$GuiRoot = 'C:\Users\Administrator\Desktop\cdpgui',
-    [string]$OutputDirectory = 'C:\Users\Administrator\Desktop\cdpgui\bin'
+    [string]$OutputDirectory = ''
 )
 
 $ErrorActionPreference = 'Stop'
 
 $installerRoot = Split-Path -Parent $PSCommandPath
+if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
+    $OutputDirectory = $installerRoot
+}
 $driverRoot = Split-Path -Parent $installerRoot
 $driverOutput = Join-Path $driverRoot 'x64\Release'
 $guiOutput = Join-Path $GuiRoot 'bin\x64\Release'
+$guiExecutableCandidates = @(
+    (Join-Path $guiOutput '原点恢复.exe'),
+    (Join-Path $guiOutput 'CDPCorePro.exe')
+)
+$guiExecutable = $guiExecutableCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
 $workRoot = Join-Path $installerRoot 'work'
 $payloadRoot = Join-Path $workRoot 'payload'
 $archivePath = Join-Path $workRoot 'payload.zip'
-$outputPath = Join-Path $OutputDirectory 'CdpDriverSetup-x64.exe'
-$localOutputPath = Join-Path $workRoot 'out\CdpDriverSetup-x64.exe'
+$outputPath = Join-Path $OutputDirectory 'RecoverySetup-x64.exe'
+$localOutputPath = Join-Path $workRoot 'out\RecoverySetup-x64.exe'
+$previousOutputPath = Join-Path $OutputDirectory '原点恢复安装程序-x64.exe'
+$legacyOutputPath = Join-Path $OutputDirectory 'CdpDriverSetup-x64.exe'
 $makensisCandidates = @(
     (Join-Path $installerRoot 'tools\nsis\makensis.exe'),
     'C:\Program Files (x86)\NSIS\makensis.exe',
@@ -35,8 +45,12 @@ function Copy-ReleaseFile([string]$Source, [string]$Destination) {
     Copy-Item -LiteralPath $Source -Destination $Destination -Force
 }
 
+if (-not $guiExecutable) {
+    throw "找不到 GUI 发布文件。已检查: $($guiExecutableCandidates -join ', ')"
+}
+
 foreach ($file in @(
-    (Join-Path $guiOutput 'CDPCorePro.exe'),
+    $guiExecutable,
     (Join-Path $guiOutput 'handle.exe'),
     (Join-Path $guiOutput 'iscsi_target_dotnet.dll'),
     (Join-Path $driverOutput 'CdpBootService.exe'),
@@ -48,9 +62,21 @@ foreach ($file in @(
 
 $msbuild = 'C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe'
 Require-File $msbuild
-& $msbuild (Join-Path $installerRoot 'CdpDriverInstallHelper.vcxproj') /m /t:Build /p:Configuration=Release /p:Platform=x64 /v:minimal /nologo
-if ($LASTEXITCODE -ne 0) {
-    throw "生成驱动安装助手失败 (exit code $LASTEXITCODE)。"
+$savedProcessPath = $env:PATH
+try {
+    # Some launchers provide both `Path` and `PATH` in the native environment
+    # block. MSBuild's ToolTask imports variables into a case-insensitive
+    # dictionary and then fails before CL.exe starts. Removing the inherited
+    # entry for this child build avoids that duplicate; MSBuild resolves the
+    # selected VC toolchain through its own absolute installation paths.
+    Remove-Item Env:Path -ErrorAction SilentlyContinue
+    & $msbuild (Join-Path $installerRoot 'CdpDriverInstallHelper.vcxproj') /m /t:Build /p:Configuration=Release /p:Platform=x64 /v:minimal /nologo
+    $msbuildExitCode = $LASTEXITCODE
+} finally {
+    $env:Path = $savedProcessPath
+}
+if ($msbuildExitCode -ne 0) {
+    throw "生成驱动安装助手失败 (exit code $msbuildExitCode)。"
 }
 Require-File (Join-Path $driverOutput 'CdpDriverInstallHelper.exe')
 
@@ -62,7 +88,7 @@ Remove-Item -LiteralPath $workRoot -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $payloadRoot | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $workRoot 'out') | Out-Null
 
-Copy-ReleaseFile (Join-Path $guiOutput 'CDPCorePro.exe') (Join-Path $payloadRoot 'CDPCorePro.exe')
+Copy-ReleaseFile $guiExecutable (Join-Path $payloadRoot '原点恢复.exe')
 Copy-ReleaseFile (Join-Path $guiOutput 'handle.exe') (Join-Path $payloadRoot 'handle.exe')
 Copy-ReleaseFile (Join-Path $guiOutput 'iscsi_target_dotnet.dll') (Join-Path $payloadRoot 'iscsi_target_dotnet.dll')
 Copy-Item -LiteralPath (Join-Path $guiOutput 'Web') -Destination (Join-Path $payloadRoot 'Web') -Recurse -Force
@@ -99,6 +125,12 @@ do {
 } while ($copyError -and (Get-Date) -lt $copyDeadline)
 if ($copyError) {
     throw "无法替换安装包；请关闭正在运行的旧安装程序后重试。$copyError"
+}
+if (Test-Path -LiteralPath $legacyOutputPath -PathType Leaf) {
+    Remove-Item -LiteralPath $legacyOutputPath -Force
+}
+if (Test-Path -LiteralPath $previousOutputPath -PathType Leaf) {
+    Remove-Item -LiteralPath $previousOutputPath -Force
 }
 
 $excluded = @('CdpConsole.exe', 'CdpConsole_Param.exe', 'CdpCore.Tests.exe', 'VolHexdump.exe')

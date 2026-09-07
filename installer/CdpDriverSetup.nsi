@@ -6,29 +6,36 @@ RequestExecutionLevel admin
 !include "LogicLib.nsh"
 !include "x64.nsh"
 
-!define PRODUCT_NAME "CdpDriver"
+!define PRODUCT_NAME "原点恢复"
 !define PRODUCT_VERSION "1.6.8.44"
-!define PRODUCT_PUBLISHER "CdpDriver"
-!define PRODUCT_EXE "CDPCorePro.exe"
+!define PRODUCT_PUBLISHER "原点恢复"
+!define PRODUCT_EXE "原点恢复.exe"
 
 Name "${PRODUCT_NAME}"
-OutFile "work\out\CdpDriverSetup-x64.exe"
-InstallDir "$PROGRAMFILES64\CdpDriver"
-InstallDirRegKey HKLM "Software\CdpDriver" "InstallDir"
-BrandingText "CdpDriver 安装向导"
+OutFile "work\out\RecoverySetup-x64.exe"
+InstallDir "$PROGRAMFILES64\原点恢复"
+InstallDirRegKey HKLM "Software\原点恢复" "InstallDir"
+BrandingText "原点恢复安装向导"
 Icon "work\app.ico"
 UninstallIcon "work\app.ico"
 ShowInstDetails show
 ShowUninstDetails show
+VIProductVersion "${PRODUCT_VERSION}"
+VIAddVersionKey /LANG=2052 "ProductName" "${PRODUCT_NAME}"
+VIAddVersionKey /LANG=2052 "FileDescription" "原点恢复安装程序"
+VIAddVersionKey /LANG=2052 "CompanyName" "${PRODUCT_PUBLISHER}"
+VIAddVersionKey /LANG=2052 "LegalCopyright" "Copyright (C) 2026 原点恢复"
+VIAddVersionKey /LANG=2052 "FileVersion" "${PRODUCT_VERSION}"
+VIAddVersionKey /LANG=2052 "ProductVersion" "${PRODUCT_VERSION}"
 
 !define MUI_ABORTWARNING
 !define MUI_ICON "work\app.ico"
 !define MUI_UNICON "work\app.ico"
-!define MUI_WELCOMEPAGE_TITLE "欢迎安装 CdpDriver"
-!define MUI_WELCOMEPAGE_TEXT "安装向导将安装 CdpDriver 图形管理工具、卷筛选驱动和启动服务。$\r$\n$\r$\n继续前请关闭正在运行的 CdpDriver 程序。"
-!define MUI_DIRECTORYPAGE_TEXT_TOP "请选择 CdpDriver 的安装位置。"
-!define MUI_FINISHPAGE_TITLE "CdpDriver 安装完成"
-!define MUI_FINISHPAGE_TEXT "CdpDriver 已成功安装。必须重启 Windows 才能加载卷筛选驱动。"
+!define MUI_WELCOMEPAGE_TITLE "欢迎安装原点恢复"
+!define MUI_WELCOMEPAGE_TEXT "安装向导将安装原点恢复、卷筛选驱动和启动服务。$\r$\n$\r$\n继续前请关闭正在运行的原点恢复程序。"
+!define MUI_DIRECTORYPAGE_TEXT_TOP "请选择原点恢复的安装位置。"
+!define MUI_FINISHPAGE_TITLE "原点恢复安装完成"
+!define MUI_FINISHPAGE_TEXT "原点恢复已成功安装。必须重启 Windows 才能加载卷筛选驱动。"
 !define MUI_FINISHPAGE_REBOOTLATER_DEFAULT
 
 !insertmacro MUI_PAGE_WELCOME
@@ -50,7 +57,7 @@ Function .onInit
     SetRegView 64
 FunctionEnd
 
-Section "安装 CdpDriver" SEC_MAIN
+Section "安装原点恢复" SEC_MAIN
     SectionIn RO
     SetShellVarContext all
 
@@ -82,19 +89,19 @@ Section "安装 CdpDriver" SEC_MAIN
     Delete "$INSTDIR\CdpDriverInstallHelper.exe"
 
     DetailPrint "正在创建开始菜单和桌面快捷方式..."
-    CreateDirectory "$SMPROGRAMS\CdpDriver"
-    CreateShortcut "$SMPROGRAMS\CdpDriver\CdpDriver.lnk" "$INSTDIR\${PRODUCT_EXE}" "" "$INSTDIR\${PRODUCT_EXE}" 0
-    CreateShortcut "$DESKTOP\CdpDriver.lnk" "$INSTDIR\${PRODUCT_EXE}" "" "$INSTDIR\${PRODUCT_EXE}" 0
+    CreateDirectory "$SMPROGRAMS\原点恢复"
+    CreateShortcut "$SMPROGRAMS\原点恢复\原点恢复.lnk" "$INSTDIR\${PRODUCT_EXE}" "" "$INSTDIR\${PRODUCT_EXE}" 0
+    CreateShortcut "$DESKTOP\原点恢复.lnk" "$INSTDIR\${PRODUCT_EXE}" "" "$INSTDIR\${PRODUCT_EXE}" 0
 
     WriteUninstaller "$INSTDIR\Uninstall.exe"
-    WriteRegStr HKLM "Software\CdpDriver" "InstallDir" "$INSTDIR"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\CdpDriver" "DisplayName" "CdpDriver"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\CdpDriver" "DisplayVersion" "${PRODUCT_VERSION}"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\CdpDriver" "Publisher" "${PRODUCT_PUBLISHER}"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\CdpDriver" "DisplayIcon" "$INSTDIR\${PRODUCT_EXE}"
-    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\CdpDriver" "UninstallString" '"$INSTDIR\Uninstall.exe"'
-    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\CdpDriver" "NoModify" 1
-    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\CdpDriver" "NoRepair" 1
+    WriteRegStr HKLM "Software\原点恢复" "InstallDir" "$INSTDIR"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\原点恢复" "DisplayName" "原点恢复"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\原点恢复" "DisplayVersion" "${PRODUCT_VERSION}"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\原点恢复" "Publisher" "${PRODUCT_PUBLISHER}"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\原点恢复" "DisplayIcon" "$INSTDIR\${PRODUCT_EXE}"
+    WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\原点恢复" "UninstallString" '"$INSTDIR\Uninstall.exe"'
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\原点恢复" "NoModify" 1
+    WriteRegDWORD HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\原点恢复" "NoRepair" 1
 
     DetailPrint "安装完成，等待重启后加载驱动。"
     SetRebootFlag true
@@ -110,10 +117,10 @@ Section "Uninstall"
     DetailPrint "正在注销 CdpDriver 卷筛选驱动..."
     ExecWait '"$SYSDIR\rundll32.exe" setupapi.dll,InstallHinfSection DefaultUninstall 132 "$INSTDIR\driver\CdpDriver.inf"'
 
-    Delete "$DESKTOP\CdpDriver.lnk"
-    RMDir /r "$SMPROGRAMS\CdpDriver"
-    DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\CdpDriver"
-    DeleteRegKey HKLM "Software\CdpDriver"
+    Delete "$DESKTOP\原点恢复.lnk"
+    RMDir /r "$SMPROGRAMS\原点恢复"
+    DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\原点恢复"
+    DeleteRegKey HKLM "Software\原点恢复"
     RMDir /r "$INSTDIR"
     SetRebootFlag true
 SectionEnd

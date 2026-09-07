@@ -1590,6 +1590,11 @@ static NTSTATUS CdpConfigureCaptureInternal(
 	}
 
 	CdpCacheProtectionRouteForSource(DriverExt, sourceExt);
+	InterlockedExchange(&sourceExt->DrainProgressState,
+		(LONG)Cdp_DRAIN_PROGRESS_IDLE);
+	InterlockedExchange(&sourceExt->DrainProgressStatus, (LONG)STATUS_SUCCESS);
+	InterlockedExchange64(&sourceExt->DrainProgressTotalBytes, 0);
+	InterlockedExchange64(&sourceExt->DrainProgressCompletedBytes, 0);
 	InterlockedExchange(&sourceExt->DiskIoAccepting, 1);
 	InterlockedExchange(&sourceExt->ProtectionStateValidated, 1);
 	InterlockedExchange(&sourceExt->CaptureEnabled, 1);
@@ -1885,6 +1890,11 @@ static NTSTATUS CdpActivateAutoJournal(
 		}
 	}
 	CdpCacheProtectionRouteForSource(DriverExt, sourceExt);
+	InterlockedExchange(&sourceExt->DrainProgressState,
+		(LONG)Cdp_DRAIN_PROGRESS_IDLE);
+	InterlockedExchange(&sourceExt->DrainProgressStatus, (LONG)STATUS_SUCCESS);
+	InterlockedExchange64(&sourceExt->DrainProgressTotalBytes, 0);
+	InterlockedExchange64(&sourceExt->DrainProgressCompletedBytes, 0);
 	InterlockedExchange(&sourceExt->DiskIoAccepting, 1);
 	InterlockedExchange(&sourceExt->ProtectionStateValidated, 1);
 	InterlockedExchange(&sourceExt->CaptureEnabled, 1);
@@ -3777,6 +3787,64 @@ static NTSTATUS CdpQueryJournalUsage(
 		&Reply->RecordPayloadBytesUsed,
 		&Reply->RecordPayloadBytesFree,
 		&Reply->TotalRecords);
+}
+
+static NTSTATUS CdpQueryDrainProgress(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ const Cdp_DRAIN_PROGRESS_QUERY_REQUEST* Request,
+	_Out_ PCdp_DRAIN_PROGRESS_QUERY_REPLY Reply)
+{
+	KIRQL oldIrql;
+	PLIST_ENTRY entry;
+	BOOLEAN found = FALSE;
+	ULONG bestPriority = 0;
+
+	if (!DriverExt || !Request || !Reply)
+		return STATUS_INVALID_PARAMETER;
+	RtlZeroMemory(Reply, sizeof(*Reply));
+	Reply->Status = (LONG)STATUS_SUCCESS;
+
+	/* Copy while each candidate device is protected by the driver list lock.
+	 * Prefer the active drain owner, then its retained final result, over an
+	 * idle volume attachment that carries the same source GUID. */
+	KeAcquireSpinLock(&DriverExt->DeviceObjectListLock, &oldIrql);
+	for (entry = DriverExt->DeviceObjectListHead.Flink;
+		entry != &DriverExt->DeviceObjectListHead;
+		entry = entry->Flink)
+	{
+		PCdp_DEVICE_LIST_NODE node =
+			CONTAINING_RECORD(entry, Cdp_DEVICE_LIST_NODE, Entry);
+		PCdp_DEVICE_EXTENSION ext =
+			(PCdp_DEVICE_EXTENSION)node->DeviceObject->DeviceExtension;
+		ULONG state;
+		ULONG priority;
+
+		if (!ext || !ext->VolumeGuidValid ||
+			RtlCompareMemory(&ext->VolumeGuid, &Request->SourceVolumeGuid,
+				sizeof(GUID)) != sizeof(GUID))
+		{
+			continue;
+		}
+		state = (ULONG)InterlockedCompareExchange(
+			&ext->DrainProgressState, 0, 0);
+		priority = state == Cdp_DRAIN_PROGRESS_RUNNING ? 3UL :
+			(state == Cdp_DRAIN_PROGRESS_COMPLETED ||
+			 state == Cdp_DRAIN_PROGRESS_FAILED ? 2UL : 1UL);
+		if (!found || priority > bestPriority)
+		{
+			Reply->State = state;
+			Reply->Status = InterlockedCompareExchange(
+				&ext->DrainProgressStatus, 0, 0);
+			Reply->TotalBytes = (UINT64)InterlockedCompareExchange64(
+				&ext->DrainProgressTotalBytes, 0, 0);
+			Reply->CompletedBytes = (UINT64)InterlockedCompareExchange64(
+				&ext->DrainProgressCompletedBytes, 0, 0);
+			found = TRUE;
+			bestPriority = priority;
+		}
+	}
+	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
+	return found ? STATUS_SUCCESS : STATUS_DEVICE_DOES_NOT_EXIST;
 }
 
 static NTSTATUS CdpQueryRestoreSpaceAlert(
@@ -6533,6 +6601,11 @@ static NTSTATUS CdpDrainAndDisableCapture(
 	if (previousPhase != (LONG)Cdp_PHASE_GENERAL)
 		return STATUS_INVALID_DEVICE_STATE;
 	InterlockedExchange(&DevExt->DrainFailureStatus, 0);
+	InterlockedExchange64(&DevExt->DrainProgressTotalBytes, 0);
+	InterlockedExchange64(&DevExt->DrainProgressCompletedBytes, 0);
+	InterlockedExchange(&DevExt->DrainProgressStatus, (LONG)STATUS_PENDING);
+	InterlockedExchange(&DevExt->DrainProgressState,
+		(LONG)Cdp_DRAIN_PROGRESS_RUNNING);
 	Cdp_LOG("[DRAIN-DIAG] stage=stop-merge-begin source=%p\n", DevExt);
 	CdpStopMergeThread(DevExt);
 	Cdp_LOG("[DRAIN-DIAG] stage=stop-merge-end source=%p\n", DevExt);
@@ -6552,6 +6625,37 @@ static NTSTATUS CdpDrainAndDisableCapture(
 					&DevExt->RedirectWritesInFlight, 0, 0));
 	}
 	Cdp_LOG("[DRAIN] graceful protection shutdown begin\n");
+	do
+	{
+		waitStatus = KeWaitForSingleObject(&DevExt->HistoryMutex,
+			Executive, KernelMode, FALSE, &diagnosticTimeout);
+		if (waitStatus == STATUS_TIMEOUT)
+			Cdp_LOG("[DRAIN-DIAG] stage=progress-total-wait-still-blocked source=%p\n",
+				DevExt);
+	} while (waitStatus == STATUS_TIMEOUT);
+	status = DevExt->Core ? CdpCoreQueryMetaCoverageBytes(
+		DevExt->Core, &drainedBytes) : STATUS_DEVICE_NOT_READY;
+	if (NT_SUCCESS(status))
+	{
+		InterlockedExchange64(&DevExt->DrainProgressTotalBytes,
+			(LONG64)drainedBytes);
+		Cdp_LOG("[DRAIN-PROGRESS] state=running totalBytes=%llu completedBytes=0\n",
+			drainedBytes);
+		drainedBytes = 0;
+	}
+	KeReleaseMutex(&DevExt->HistoryMutex, FALSE);
+	if (!NT_SUCCESS(status))
+	{
+		InterlockedExchange(&DevExt->Phase, (LONG)Cdp_PHASE_GENERAL);
+		InterlockedExchange(&DevExt->DrainFailureStatus, 0);
+		InterlockedExchange(&DevExt->DrainProgressStatus, (LONG)status);
+		InterlockedExchange(&DevExt->DrainProgressState,
+			(LONG)Cdp_DRAIN_PROGRESS_FAILED);
+		CdpStartMergeIfNeeded(DevExt);
+		Cdp_LOG("[DRAIN] progress total query failed status=0x%08X; protection remains active\n",
+			status);
+		return status;
+	}
 
 	while (!complete)
 	{
@@ -6592,6 +6696,9 @@ static NTSTATUS CdpDrainAndDisableCapture(
 			if (NT_SUCCESS(status) && length != 0)
 			{
 				drainedBytes += length;
+				InterlockedExchange64(
+					&DevExt->DrainProgressCompletedBytes,
+					(LONG64)drainedBytes);
 				drainedRanges++;
 				Cdp_DBG("[DRAIN] range committed offset=%llu len=%lu\n",
 					offset, length);
@@ -6616,6 +6723,9 @@ static NTSTATUS CdpDrainAndDisableCapture(
 
 	if (!NT_SUCCESS(status))
 	{
+		InterlockedExchange(&DevExt->DrainProgressStatus, (LONG)status);
+		InterlockedExchange(&DevExt->DrainProgressState,
+			(LONG)Cdp_DRAIN_PROGRESS_FAILED);
 		InterlockedExchange(&DevExt->Phase, (LONG)Cdp_PHASE_GENERAL);
 		InterlockedExchange(&DevExt->DrainFailureStatus, 0);
 		CdpStartMergeIfNeeded(DevExt);
@@ -6623,6 +6733,12 @@ static NTSTATUS CdpDrainAndDisableCapture(
 			status, drainedRanges, drainedBytes);
 		return status;
 	}
+	InterlockedExchange64(&DevExt->DrainProgressCompletedBytes,
+		InterlockedCompareExchange64(
+			&DevExt->DrainProgressTotalBytes, 0, 0));
+	InterlockedExchange(&DevExt->DrainProgressStatus, (LONG)STATUS_SUCCESS);
+	InterlockedExchange(&DevExt->DrainProgressState,
+		(LONG)Cdp_DRAIN_PROGRESS_COMPLETED);
 
 	Cdp_LOG("[DRAIN] graceful shutdown complete ranges=%lu bytes=%llu\n",
 		drainedRanges, drainedBytes);
@@ -8411,6 +8527,30 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 			}
 			status = CdpStartManualMerge(DriverExt, &request);
 			return CdpCompleteIrp(Irp, status, 0);
+		}
+
+		case IOCTL_Cdp_QUERY_DRAIN_PROGRESS:
+		{
+			Cdp_DRAIN_PROGRESS_QUERY_REQUEST request;
+			PCdp_DRAIN_PROGRESS_QUERY_REPLY reply;
+			ULONG inLen =
+				IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+			ULONG outLen =
+				IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
+			NTSTATUS status;
+
+			if (!DriverExt || !Irp->AssociatedIrp.SystemBuffer ||
+				inLen < sizeof(request) || outLen < sizeof(*reply))
+			{
+				return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+			}
+			request = *(PCdp_DRAIN_PROGRESS_QUERY_REQUEST)
+				Irp->AssociatedIrp.SystemBuffer;
+			reply = (PCdp_DRAIN_PROGRESS_QUERY_REPLY)
+				Irp->AssociatedIrp.SystemBuffer;
+			status = CdpQueryDrainProgress(DriverExt, &request, reply);
+			return CdpCompleteIrp(Irp, status,
+				NT_SUCCESS(status) ? sizeof(*reply) : 0);
 		}
 
 		case IOCTL_Cdp_QUERY_VERSION:

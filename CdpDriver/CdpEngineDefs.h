@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.6.10-test60"
-#define Cdp_DRIVER_BUILD_STRING   "20260904.174-restore-merge-at-80"
+#define Cdp_DRIVER_VERSION_STRING "1.6.10-test61"
+#define Cdp_DRIVER_BUILD_STRING   "20260907.175-drain-progress-query"
 
 // Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.
 // Cdp_DBG: Debug builds only — verbose I/O and path tracing.
@@ -245,6 +245,12 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	// First failure observed while graceful disable is writing/punching the
 	// current MetaTree. Zero means the drain may continue.
 	volatile LONG DrainFailureStatus;
+	// Queryable graceful-disable progress. Byte fields are atomically published
+	// and remain available after Core is destroyed until protection starts again.
+	volatile LONG DrainProgressState;
+	volatile LONG DrainProgressStatus;
+	volatile LONG64 DrainProgressTotalBytes;
+	volatile LONG64 DrainProgressCompletedBytes;
 	HANDLE MergeThreadHandle;
 	volatile LONG MergeThreadRunning;
 	volatile LONG MergeThreadStopping;

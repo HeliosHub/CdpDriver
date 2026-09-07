@@ -2986,6 +2986,7 @@ static int TestGracefulDisableDrainsMetaTree(void)
 	UCHAR output[1024];
 	BOOLEAN complete = FALSE;
 	ULONG iterations = 0;
+	UINT64 coverageBytes = 0;
 	NTSTATUS status;
 
 	Expect(NT_SUCCESS(TestCtxCreate(
@@ -3005,6 +3006,9 @@ static int TestGracefulDisableDrainsMetaTree(void)
 	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
 		ctx.Core, 512, sizeof(journalB), journalB, NULL)),
 		"append second protected value before graceful disable");
+	Expect(NT_SUCCESS(CdpCoreQueryMetaCoverageBytes(
+		ctx.Core, &coverageBytes)) && coverageBytes == 1024,
+		"drain progress totals de-duplicated MetaTree coverage");
 
 	/* Model the DRAINING write worker: source write completes first while
 	 * HistoryMutex excludes reads/backfill, then its MetaTree range is punched. */
@@ -3014,6 +3018,9 @@ static int TestGracefulDisableDrainsMetaTree(void)
 	Expect(NT_SUCCESS(CdpCorePunchMetaRange(
 		ctx.Core, 0, sizeof(applicationWrite))),
 		"draining application write holes matching MetaTree coverage");
+	Expect(NT_SUCCESS(CdpCoreQueryMetaCoverageBytes(
+		ctx.Core, &coverageBytes)) && coverageBytes == 512,
+		"drain progress total follows remaining MetaTree coverage");
 	RtlCopyMemory(expected, applicationWrite, sizeof(applicationWrite));
 	RtlCopyMemory(expected + 512, journalB, sizeof(journalB));
 	RtlZeroMemory(output, sizeof(output));
@@ -3044,6 +3051,9 @@ static int TestGracefulDisableDrainsMetaTree(void)
 	}
 	Expect(NT_SUCCESS(status) && complete,
 		"graceful disable drains all remaining MetaTree coverage");
+	Expect(NT_SUCCESS(CdpCoreQueryMetaCoverageBytes(
+		ctx.Core, &coverageBytes)) && coverageBytes == 0,
+		"drain completion leaves zero MetaTree coverage");
 	Expect(memcmp(CdpMemStoreData(ctx.Source), expected, sizeof(expected)) == 0,
 		"drain materializes the final current view into source");
 	RtlZeroMemory(output, sizeof(output));

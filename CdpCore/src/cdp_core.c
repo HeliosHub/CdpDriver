@@ -1298,6 +1298,49 @@ NTSTATUS CdpCorePunchMetaRange(
 	return status;
 }
 
+static NTSTATUS CdpCoreAccumulateMetaCoverage(
+	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
+	_Inout_ PUINT64 CoverageBytes)
+{
+	NTSTATUS status;
+	UINT64 length;
+
+	if (!Node)
+		return STATUS_SUCCESS;
+	status = CdpCoreAccumulateMetaCoverage(Node->Left, CoverageBytes);
+	if (!NT_SUCCESS(status))
+		return status;
+	if (!Node->Invalid)
+	{
+		if (Node->End < Node->Start)
+			return STATUS_DATA_ERROR;
+		length = Node->End - Node->Start;
+		if (*CoverageBytes > MAXUINT64 - length)
+			return STATUS_INTEGER_OVERFLOW;
+		*CoverageBytes += length;
+	}
+	return CdpCoreAccumulateMetaCoverage(Node->Right, CoverageBytes);
+}
+
+NTSTATUS CdpCoreQueryMetaCoverageBytes(
+	_Inout_ PCdp_CORE Core,
+	_Out_ PUINT64 CoverageBytes)
+{
+	NTSTATUS status;
+
+	if (!Core || !CoverageBytes)
+		return STATUS_INVALID_PARAMETER;
+	*CoverageBytes = 0;
+	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	if (!Core->MetaTreeReady)
+		status = STATUS_DEVICE_NOT_READY;
+	else
+		status = CdpCoreAccumulateMetaCoverage(
+			Core->MetaTree.Root, CoverageBytes);
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	return status;
+}
+
 static NTSTATUS CdpCoreSynthesizeRead(
 	_Inout_ PCdp_CORE Core,
 	_In_ PCdp_PREVIEW_TREE Tree,

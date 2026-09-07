@@ -159,6 +159,12 @@ NTSTATUS CdpCorePunchMetaRange(
 	_In_ UINT64 Offset,
 	_In_ ULONG Length);
 
+// Return the de-duplicated byte coverage currently held by MetaTree. This is
+// an in-memory AVL-tree walk; it does not scan persistent Record Headers.
+NTSTATUS CdpCoreQueryMetaCoverageBytes(
+	_Inout_ PCdp_CORE Core,
+	_Out_ PUINT64 CoverageBytes);
+
 NTSTATUS CdpCoreRead(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,
