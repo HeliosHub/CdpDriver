@@ -14,7 +14,7 @@ $driverRoot = Split-Path -Parent $installerRoot
 $driverOutput = Join-Path $driverRoot 'x64\Release'
 $guiOutput = Join-Path $GuiRoot 'bin\x64\Release'
 $guiExecutableCandidates = @(
-    (Join-Path $guiOutput '原点恢复.exe'),
+    (Join-Path $guiOutput '源点恢复.exe'),
     (Join-Path $guiOutput 'CDPCorePro.exe')
 )
 $guiExecutable = $guiExecutableCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
@@ -23,7 +23,7 @@ $payloadRoot = Join-Path $workRoot 'payload'
 $archivePath = Join-Path $workRoot 'payload.zip'
 $outputPath = Join-Path $OutputDirectory 'RecoverySetup-x64.exe'
 $localOutputPath = Join-Path $workRoot 'out\RecoverySetup-x64.exe'
-$previousOutputPath = Join-Path $OutputDirectory '原点恢复安装程序-x64.exe'
+$previousOutputPath = Join-Path $OutputDirectory '源点恢复安装程序-x64.exe'
 $legacyOutputPath = Join-Path $OutputDirectory 'CdpDriverSetup-x64.exe'
 $makensisCandidates = @(
     (Join-Path $installerRoot 'tools\nsis\makensis.exe'),
@@ -88,7 +88,7 @@ Remove-Item -LiteralPath $workRoot -Recurse -Force -ErrorAction SilentlyContinue
 New-Item -ItemType Directory -Force -Path $payloadRoot | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $workRoot 'out') | Out-Null
 
-Copy-ReleaseFile $guiExecutable (Join-Path $payloadRoot '原点恢复.exe')
+Copy-ReleaseFile $guiExecutable (Join-Path $payloadRoot '源点恢复.exe')
 Copy-ReleaseFile (Join-Path $guiOutput 'handle.exe') (Join-Path $payloadRoot 'handle.exe')
 Copy-ReleaseFile (Join-Path $guiOutput 'iscsi_target_dotnet.dll') (Join-Path $payloadRoot 'iscsi_target_dotnet.dll')
 Copy-Item -LiteralPath (Join-Path $guiOutput 'Web') -Destination (Join-Path $payloadRoot 'Web') -Recurse -Force
