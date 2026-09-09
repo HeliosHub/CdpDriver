@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.6.10-test61"
-#define Cdp_DRIVER_BUILD_STRING   "20260907.175-drain-progress-query"
+#define Cdp_DRIVER_VERSION_STRING "1.6.10-test63"
+#define Cdp_DRIVER_BUILD_STRING   "20260909.177-preview-read-throttle"
 
 // Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.
 // Cdp_DBG: Debug builds only — verbose I/O and path tracing.
@@ -270,6 +270,11 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	volatile LONG RestorePointSpaceAlertStatus;
 	volatile LONG64 RestorePointSpaceAlertGeneration;
 	KMUTEX HistoryMutex;
+	// Preview reads use this gate exclusively so Windows cannot flood the lower
+	// disk with parallel history/source reads while a Journal write is pending.
+	// Ordinary protected writes intentionally do not take it, so a slow Preview
+	// read never blocks the capture worker before the Journal IRP is submitted.
+	EX_PUSH_LOCK PreviewAccessLock;
 	PCdp_CORE Core;
 	// Journal VolumeHandleList entry used while CaptureEnabled is set.
 	UINT64 JournalHandleId;

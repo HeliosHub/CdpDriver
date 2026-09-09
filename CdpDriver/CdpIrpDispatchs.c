@@ -87,6 +87,9 @@ static VOID CdpQuiesceJournalRawIoForDiskPower(
 	_In_ PCdp_DEVICE_EXTENSION DiskExt,
 	_In_ UINT64 HopId,
 	_In_ ULONG DevicePowerState);
+static VOID CdpResumeJournalRawIoForDiskPower(
+	_In_ PCdp_DEVICE_EXTENSION DiskExt,
+	_In_ UINT64 HopId);
 static PCdp_DEVICE_EXTENSION CdpFindSourceExtensionByGuid(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const GUID* VolumeGuid);
@@ -2922,7 +2925,11 @@ static NTSTATUS CdpBeginPreviewSession(
 		ExReleaseFastMutex(&DriverExt->PreviewSessionMutex);
 		goto cleanup;
 	}
+	KeEnterCriticalRegion();
+	ExAcquirePushLockExclusive(&sourceExt->PreviewAccessLock);
 	status = CdpCorePreviewBegin(sourceExt->Core, targetTime);
+	ExReleasePushLockExclusive(&sourceExt->PreviewAccessLock);
+	KeLeaveCriticalRegion();
 	if (status == STATUS_DEVICE_BUSY)
 	{
 		Reply->Status = (LONG)Cdp_PHASE_MERGING;
@@ -2957,9 +2964,13 @@ cleanup:
 	}
 	if (phaseTransitioned && sourceExt)
 	{
+		KeEnterCriticalRegion();
+		ExAcquirePushLockExclusive(&sourceExt->PreviewAccessLock);
 		if (sourceExt->Core)
 			(void)CdpCorePreviewEnd(sourceExt->Core);
 		InterlockedExchange(&sourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
+		ExReleasePushLockExclusive(&sourceExt->PreviewAccessLock);
+		KeLeaveCriticalRegion();
 	}
 	if (sourceHandleId)
 		(void)CdpCloseVolumeHandle(DriverExt, sourceHandleId);
@@ -2997,9 +3008,13 @@ static NTSTATUS CdpEndPreviewSession(
 			CdpFindSourceExtensionByGuid(DriverExt, &sourceGuid);
 		if (sourceExt)
 		{
+			KeEnterCriticalRegion();
+			ExAcquirePushLockExclusive(&sourceExt->PreviewAccessLock);
 			if (sourceExt->Core)
 				(void)CdpCorePreviewEnd(sourceExt->Core);
 			InterlockedExchange(&sourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
+			ExReleasePushLockExclusive(&sourceExt->PreviewAccessLock);
+			KeLeaveCriticalRegion();
 		}
 	}
 
@@ -3032,19 +3047,26 @@ VOID CdpCloseAllPreviewSessions(_In_ PCdp_DRIVER_EXTENSION DriverExt)
 		if (!session)
 			break;
 
+		/* Closing is already published, so no new read can reference this
+		 * session. Wait for existing reads before freeing PreviewTree. */
+		CdpDestroyPreviewSession(DriverExt, session);
+		session = NULL;
+
 		if (haveGuid)
 		{
 			PCdp_DEVICE_EXTENSION sourceExt =
 				CdpFindSourceExtensionByGuid(DriverExt, &sourceGuid);
 			if (sourceExt)
 			{
+				KeEnterCriticalRegion();
+				ExAcquirePushLockExclusive(&sourceExt->PreviewAccessLock);
 				if (sourceExt->Core)
 					(void)CdpCorePreviewEnd(sourceExt->Core);
 				InterlockedExchange(&sourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
+				ExReleasePushLockExclusive(&sourceExt->PreviewAccessLock);
+				KeLeaveCriticalRegion();
 			}
 		}
-
-		CdpDestroyPreviewSession(DriverExt, session);
 	}
 }
 
@@ -3055,7 +3077,7 @@ static NTSTATUS CdpReadPreviewSession(
 {
 	PCdp_PREVIEW_SESSION session;
 	PCdp_DEVICE_EXTENSION sourceExt = NULL;
-	BOOLEAN historyLocked = FALSE;
+	BOOLEAN previewAccessLocked = FALSE;
 	NTSTATUS status;
 
 	if (!Request->ByteLength ||
@@ -3086,13 +3108,19 @@ static NTSTATUS CdpReadPreviewSession(
 		goto cleanup;
 	}
 
-	KeWaitForSingleObject(
-		&sourceExt->HistoryMutex,
-		Executive,
-		KernelMode,
-		FALSE,
-		NULL);
-	historyLocked = TRUE;
+	/* PreviewTree and its payload locations are stable until teardown or merge.
+	 * Use the dedicated gate, not HistoryMutex: protected Journal writes must
+	 * remain able to reach the lower disk while Windows reads the preview LUN.
+	 * Take it exclusively to bound Preview to one lower-disk read at a time;
+	 * otherwise mount-time parallel reads can starve a pending Journal write. */
+	KeEnterCriticalRegion();
+	ExAcquirePushLockExclusive(&sourceExt->PreviewAccessLock);
+	previewAccessLocked = TRUE;
+	if (session->StoppedByMerge)
+	{
+		status = STATUS_DEVICE_BUSY;
+		goto cleanup;
+	}
 
 	if (Request->ByteOffset > sourceExt->PartitionSize ||
 		Request->ByteLength > sourceExt->PartitionSize - Request->ByteOffset ||
@@ -3117,8 +3145,11 @@ static NTSTATUS CdpReadPreviewSession(
 	}
 
 cleanup:
-	if (historyLocked && sourceExt)
-		KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
+	if (previewAccessLocked && sourceExt)
+	{
+		ExReleasePushLockExclusive(&sourceExt->PreviewAccessLock);
+		KeLeaveCriticalRegion();
+	}
 	CdpReleasePreviewSession(session);
 	return status;
 }
@@ -3459,6 +3490,19 @@ static NTSTATUS CdpCancelRecovery(
 	return STATUS_DEVICE_BUSY;
 }
 
+static VOID CdpRestorePointMaterializeProgress(
+	_In_opt_ PVOID Context,
+	_In_ UINT64 CompletedBytes,
+	_In_ UINT64 TotalBytes)
+{
+	PCdp_DEVICE_EXTENSION sourceExt = (PCdp_DEVICE_EXTENSION)Context;
+
+	if (!sourceExt)
+		return;
+	InterlockedExchange64(&sourceExt->DrainProgressTotalBytes, (LONG64)TotalBytes);
+	InterlockedExchange64(&sourceExt->DrainProgressCompletedBytes, (LONG64)CompletedBytes);
+}
+
 static NTSTATUS CdpSetRestorePoint(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const Cdp_RESTORE_POINT_SET_REQUEST* Request,
@@ -3497,6 +3541,11 @@ static NTSTATUS CdpSetRestorePoint(
 		(LONG)Cdp_PHASE_GENERAL);
 	if (previousPhase != (LONG)Cdp_PHASE_GENERAL)
 		return STATUS_INVALID_DEVICE_STATE;
+	InterlockedExchange64(&sourceExt->DrainProgressTotalBytes, 0);
+	InterlockedExchange64(&sourceExt->DrainProgressCompletedBytes, 0);
+	InterlockedExchange(&sourceExt->DrainProgressStatus, (LONG)STATUS_PENDING);
+	InterlockedExchange(&sourceExt->DrainProgressState,
+		(LONG)Cdp_DRAIN_PROGRESS_RUNNING);
 	status = CdpCoreQueryTimeRange(sourceExt->Core, &oldest, &newest);
 	if (!NT_SUCCESS(status))
 		goto phase_cleanup;
@@ -3522,10 +3571,12 @@ static NTSTATUS CdpSetRestorePoint(
 		status = STATUS_DEVICE_NOT_READY;
 		goto cleanup;
 	}
-	status = CdpCoreMaterializeTimeWithWriter(
+	status = CdpCoreMaterializeTimeWithWriterProgress(
 		sourceExt->Core,
 		materializeTarget,
 		CdpDiskBackfillWriteAbsolute,
+		sourceExt,
+		CdpRestorePointMaterializeProgress,
 		sourceExt,
 		&effective,
 		&targetSequence,
@@ -3579,6 +3630,20 @@ cleanup:
 	KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
 
 phase_cleanup:
+	if (NT_SUCCESS(status))
+	{
+		InterlockedExchange64(&sourceExt->DrainProgressCompletedBytes,
+			InterlockedCompareExchange64(&sourceExt->DrainProgressTotalBytes, 0, 0));
+		InterlockedExchange(&sourceExt->DrainProgressStatus, (LONG)STATUS_SUCCESS);
+		InterlockedExchange(&sourceExt->DrainProgressState,
+			(LONG)Cdp_DRAIN_PROGRESS_COMPLETED);
+	}
+	else
+	{
+		InterlockedExchange(&sourceExt->DrainProgressStatus, (LONG)status);
+		InterlockedExchange(&sourceExt->DrainProgressState,
+			(LONG)Cdp_DRAIN_PROGRESS_FAILED);
+	}
 	InterlockedExchange(&sourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
 	if (!NT_SUCCESS(status))
 		CdpStartMergeIfNeeded(sourceExt);
@@ -4200,8 +4265,9 @@ static NTSTATUS CdpQueryPhase(
 	return STATUS_SUCCESS;
 }
 
-/* The caller holds HistoryMutex.  CdpCore operates on sector-aligned ranges,
- * while preview/recovery clients may request an arbitrary byte subrange. */
+/* CdpCore operates on sector-aligned ranges, while preview/recovery clients
+ * may request an arbitrary byte subrange.  The caller owns the appropriate
+ * Core lifetime gate (PreviewAccessLock for preview, HistoryMutex otherwise). */
 static NTSTATUS CdpCoreReadAlignedView(
 	_In_ PCdp_DEVICE_EXTENSION DevExt,
 	_In_ BOOLEAN Preview,
@@ -4729,6 +4795,52 @@ static VOID CdpQuiesceJournalRawIoForDiskPower(
 		HopId, DiskExt->DiskNumber, DevicePowerState, count);
 }
 
+/* Raw journal I/O may resume only after the lower disk stack has completed a
+ * successful D0 transition.  Clearing this before forwarding SET_POWER would
+ * race journal traffic against a disk that is still powered down. */
+static VOID CdpResumeJournalRawIoForDiskPower(
+	_In_ PCdp_DEVICE_EXTENSION DiskExt,
+	_In_ UINT64 HopId)
+{
+	PCdp_DRIVER_EXTENSION driverExt;
+	PLIST_ENTRY entry;
+	KIRQL oldIrql;
+	ULONG count = 0;
+
+	if (!DiskExt || DiskExt->DeviceKind != Cdp_DEVICE_KIND_DISK)
+		return;
+	driverExt = IoGetDriverObjectExtension(g_DriverObject, &g_DriverObject);
+	if (!driverExt)
+		return;
+	KeAcquireSpinLock(&driverExt->DeviceObjectListLock, &oldIrql);
+	for (entry = driverExt->DeviceObjectListHead.Flink;
+		entry != &driverExt->DeviceObjectListHead;
+		entry = entry->Flink)
+	{
+		PCdp_DEVICE_LIST_NODE node = CONTAINING_RECORD(entry,
+			Cdp_DEVICE_LIST_NODE, Entry);
+		PDEVICE_OBJECT sourceDevice = node->DeviceObject;
+		PCdp_DEVICE_EXTENSION sourceExt =
+			(PCdp_DEVICE_EXTENSION)sourceDevice->DeviceExtension;
+
+		if (!sourceExt || (sourceExt->DeviceKind != Cdp_DEVICE_KIND_SOURCE &&
+			sourceExt->DeviceKind != Cdp_DEVICE_KIND_VOLUME) ||
+			sourceExt->DiskNumber != DiskExt->DiskNumber ||
+			!sourceExt->RedirectJournalEntry)
+		{
+			continue;
+		}
+		if (InterlockedExchange(
+			&sourceExt->RedirectJournalEntry->Journal.RawIoQuiesced, 0) != 0)
+		{
+			++count;
+		}
+	}
+	KeReleaseSpinLock(&driverExt->DeviceObjectListLock, oldIrql);
+	Cdp_LOG("[POWER-TRACE] stage=journal-raw-io-resumed hop=%llu disk=%lu sources=%lu\n",
+		HopId, DiskExt->DiskNumber, count);
+}
+
 static PCdp_DEVICE_EXTENSION CdpReferenceProtectionForVolumeIo(
 	_In_ PCdp_DEVICE_EXTENSION VolumeExt,
 	_Out_ PDEVICE_OBJECT* SourceReference)
@@ -5081,9 +5193,15 @@ static VOID CdpStopPreviewSessionForSource(
 	}
 	ExReleaseFastMutex(&DriverExt->PreviewSessionMutex);
 
+	/* Wait for every in-flight preview read before Core frees PreviewTree.
+	 * Protected source writes deliberately do not take this lock. */
+	KeEnterCriticalRegion();
+	ExAcquirePushLockExclusive(&SourceExt->PreviewAccessLock);
 	if (SourceExt->Core)
 		(void)CdpCorePreviewEnd(SourceExt->Core);
 	InterlockedExchange(&SourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
+	ExReleasePushLockExclusive(&SourceExt->PreviewAccessLock);
+	KeLeaveCriticalRegion();
 	if (session)
 	{
 		Cdp_LOG("[MERGE] preview stopped by compaction handle=%llu; END_PREVIEW remains valid\n",
@@ -6806,7 +6924,16 @@ VOID CdpDisableAndDestroyCapture(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	KeReleaseMutex(&DevExt->HistoryMutex, FALSE);
 
 	if (core)
+	{
+		/* Core was unpublished above, so no new preview read can enter it.
+		 * Wait for reads that already captured it before releasing its trees and
+		 * device stores. */
+		KeEnterCriticalRegion();
+		ExAcquirePushLockExclusive(&DevExt->PreviewAccessLock);
 		CdpCoreDestroy(core);
+		ExReleasePushLockExclusive(&DevExt->PreviewAccessLock);
+		KeLeaveCriticalRegion();
+	}
 }
 
 NTSTATUS CdpIrpDispatchFlush(
@@ -7321,6 +7448,15 @@ static NTSTATUS CdpPowerLowerCompletion(
 		entered,
 		completed,
 		entered - completed);
+	if (trace && NT_SUCCESS(Irp->IoStatus.Status) &&
+		trace->DeviceKind == Cdp_DEVICE_KIND_DISK &&
+		trace->MinorFunction == IRP_MN_SET_POWER &&
+		trace->PowerType == DevicePowerState &&
+		trace->PowerState == (ULONG)PowerDeviceD0)
+	{
+		CdpResumeJournalRawIoForDiskPower(
+			trace->DeviceExt, trace->HopId);
+	}
 	if (trace)
 		cdpfree(trace);
 	if (Irp->PendingReturned)

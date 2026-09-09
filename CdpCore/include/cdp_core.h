@@ -142,6 +142,11 @@ typedef NTSTATUS (*Cdp_CORE_DRAIN_WRITE_ROUTINE)(
 	_In_ ULONG Length,
 	_In_reads_bytes_(Length) const VOID* Buffer);
 
+typedef VOID (*Cdp_CORE_MATERIALIZE_PROGRESS_ROUTINE)(
+	_In_opt_ PVOID Context,
+	_In_ UINT64 CompletedBytes,
+	_In_ UINT64 TotalBytes);
+
 // Driver-owned shutdown path. Core supplies the latest payload and punches the
 // MetaTree only after WriteRoutine has committed it to the physical source.
 NTSTATUS CdpCoreDrainOneMetaRangeWithWriter(
@@ -250,6 +255,18 @@ NTSTATUS CdpCoreMaterializeTimeWithWriter(
 	_In_ UINT64 TargetTime100ns,
 	_In_ Cdp_CORE_DRAIN_WRITE_ROUTINE WriteRoutine,
 	_In_opt_ PVOID WriteContext,
+	_Out_opt_ PUINT64 EffectiveTime100ns,
+	_Out_opt_ PUINT64 TargetSequence,
+	_Out_opt_ PULONG WrittenRanges,
+	_Out_opt_ PUINT64 WrittenBytes);
+
+NTSTATUS CdpCoreMaterializeTimeWithWriterProgress(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 TargetTime100ns,
+	_In_ Cdp_CORE_DRAIN_WRITE_ROUTINE WriteRoutine,
+	_In_opt_ PVOID WriteContext,
+	_In_opt_ Cdp_CORE_MATERIALIZE_PROGRESS_ROUTINE ProgressRoutine,
+	_In_opt_ PVOID ProgressContext,
 	_Out_opt_ PUINT64 EffectiveTime100ns,
 	_Out_opt_ PUINT64 TargetSequence,
 	_Out_opt_ PULONG WrittenRanges,

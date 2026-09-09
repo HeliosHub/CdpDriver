@@ -2038,11 +2038,34 @@ NTSTATUS CdpCoreRebuildCurrentView(_Inout_ PCdp_CORE Core)
 	return CdpCoreBuildMetaTree(Core);
 }
 
+static NTSTATUS CdpCoreAccumulateMaterializeBytes(
+	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
+	_Inout_ PUINT64 TotalBytes)
+{
+	NTSTATUS status;
+
+	if (!Node)
+		return STATUS_SUCCESS;
+	status = CdpCoreAccumulateMaterializeBytes(Node->Left, TotalBytes);
+	if (!NT_SUCCESS(status))
+		return status;
+	if (!Node->Invalid)
+	{
+		if (*TotalBytes > MAXUINT64 - Node->DataLength)
+			return STATUS_INTEGER_OVERFLOW;
+		*TotalBytes += Node->DataLength;
+	}
+	return CdpCoreAccumulateMaterializeBytes(Node->Right, TotalBytes);
+}
+
 static NTSTATUS CdpCoreMaterializeTreeWithWriter(
 	_Inout_ PCdp_CORE Core,
 	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
 	_In_ Cdp_CORE_DRAIN_WRITE_ROUTINE WriteRoutine,
 	_In_opt_ PVOID WriteContext,
+	_In_opt_ Cdp_CORE_MATERIALIZE_PROGRESS_ROUTINE ProgressRoutine,
+	_In_opt_ PVOID ProgressContext,
+	_In_ UINT64 TotalBytes,
 	_Inout_ PULONG WrittenRanges,
 	_Inout_ PUINT64 WrittenBytes)
 {
@@ -2053,6 +2076,7 @@ static NTSTATUS CdpCoreMaterializeTreeWithWriter(
 		return STATUS_SUCCESS;
 	status = CdpCoreMaterializeTreeWithWriter(
 		Core, Node->Left, WriteRoutine, WriteContext,
+		ProgressRoutine, ProgressContext, TotalBytes,
 		WrittenRanges, WrittenBytes);
 	if (!NT_SUCCESS(status))
 		return status;
@@ -2071,17 +2095,22 @@ static NTSTATUS CdpCoreMaterializeTreeWithWriter(
 			return status;
 		(*WrittenRanges)++;
 		*WrittenBytes += Node->DataLength;
+		if (ProgressRoutine)
+			ProgressRoutine(ProgressContext, *WrittenBytes, TotalBytes);
 	}
 	return CdpCoreMaterializeTreeWithWriter(
 		Core, Node->Right, WriteRoutine, WriteContext,
+		ProgressRoutine, ProgressContext, TotalBytes,
 		WrittenRanges, WrittenBytes);
 }
 
-NTSTATUS CdpCoreMaterializeTimeWithWriter(
+NTSTATUS CdpCoreMaterializeTimeWithWriterProgress(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 TargetTime100ns,
 	_In_ Cdp_CORE_DRAIN_WRITE_ROUTINE WriteRoutine,
 	_In_opt_ PVOID WriteContext,
+	_In_opt_ Cdp_CORE_MATERIALIZE_PROGRESS_ROUTINE ProgressRoutine,
+	_In_opt_ PVOID ProgressContext,
 	_Out_opt_ PUINT64 EffectiveTime100ns,
 	_Out_opt_ PUINT64 TargetSequence,
 	_Out_opt_ PULONG WrittenRanges,
@@ -2092,6 +2121,7 @@ NTSTATUS CdpCoreMaterializeTimeWithWriter(
 	UINT64 targetSequence = 0;
 	ULONG ranges = 0;
 	UINT64 bytes = 0;
+	UINT64 totalBytes = 0;
 	NTSTATUS status;
 
 	if (!Core || !WriteRoutine || TargetTime100ns == 0)
@@ -2108,8 +2138,13 @@ NTSTATUS CdpCoreMaterializeTimeWithWriter(
 	if (status == STATUS_NOT_FOUND)
 		status = STATUS_SUCCESS;
 	if (NT_SUCCESS(status))
+		status = CdpCoreAccumulateMaterializeBytes(tree.Root, &totalBytes);
+	if (NT_SUCCESS(status) && ProgressRoutine)
+		ProgressRoutine(ProgressContext, 0, totalBytes);
+	if (NT_SUCCESS(status))
 		status = CdpCoreMaterializeTreeWithWriter(
-			Core, tree.Root, WriteRoutine, WriteContext, &ranges, &bytes);
+			Core, tree.Root, WriteRoutine, WriteContext,
+			ProgressRoutine, ProgressContext, totalBytes, &ranges, &bytes);
 done:
 	CdpPreviewTreeFree(&tree);
 	if (EffectiveTime100ns)
@@ -2121,6 +2156,22 @@ done:
 	if (WrittenBytes)
 		*WrittenBytes = bytes;
 	return status;
+}
+
+NTSTATUS CdpCoreMaterializeTimeWithWriter(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 TargetTime100ns,
+	_In_ Cdp_CORE_DRAIN_WRITE_ROUTINE WriteRoutine,
+	_In_opt_ PVOID WriteContext,
+	_Out_opt_ PUINT64 EffectiveTime100ns,
+	_Out_opt_ PUINT64 TargetSequence,
+	_Out_opt_ PULONG WrittenRanges,
+	_Out_opt_ PUINT64 WrittenBytes)
+{
+	return CdpCoreMaterializeTimeWithWriterProgress(
+		Core, TargetTime100ns, WriteRoutine, WriteContext,
+		NULL, NULL, EffectiveTime100ns, TargetSequence,
+		WrittenRanges, WrittenBytes);
 }
 
 NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns)

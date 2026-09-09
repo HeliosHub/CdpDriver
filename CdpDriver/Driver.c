@@ -121,6 +121,7 @@ NTSTATUS CdpCreateInternalSourceDevice(
 	InterlockedExchange(&ext->RestorePointSpaceAlertStatus, 0);
 	InterlockedExchange64(&ext->RestorePointSpaceAlertGeneration, 1);
 	KeInitializeMutex(&ext->HistoryMutex, 0);
+	ExInitializePushLock(&ext->PreviewAccessLock);
 	InterlockedExchange(&ext->Phase, Cdp_PHASE_GENERAL);
 	InterlockedExchange(&ext->Started, 1);
 
@@ -407,6 +408,7 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 	InterlockedExchange64(
 		&DeviceExtension->RestorePointSpaceAlertGeneration, 1);
 	KeInitializeMutex(&DeviceExtension->HistoryMutex, 0);
+	ExInitializePushLock(&DeviceExtension->PreviewAccessLock);
 	DeviceExtension->SectorSize = Cdp_SECTOR_SIZE_DEFAULT;
 	InterlockedExchange(&DeviceExtension->Phase, Cdp_PHASE_GENERAL);
 	if (deviceKind == Cdp_DEVICE_KIND_DISK)

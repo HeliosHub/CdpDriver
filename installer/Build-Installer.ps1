@@ -92,6 +92,26 @@ Copy-ReleaseFile $guiExecutable (Join-Path $payloadRoot '源点恢复.exe')
 Copy-ReleaseFile (Join-Path $guiOutput 'handle.exe') (Join-Path $payloadRoot 'handle.exe')
 Copy-ReleaseFile (Join-Path $guiOutput 'iscsi_target_dotnet.dll') (Join-Path $payloadRoot 'iscsi_target_dotnet.dll')
 Copy-Item -LiteralPath (Join-Path $guiOutput 'Web') -Destination (Join-Path $payloadRoot 'Web') -Recurse -Force
+$guiFileVersion = [version](Get-Item -LiteralPath $guiExecutable).VersionInfo.FileVersion
+$guiDisplayVersion = "v$($guiFileVersion.Major).$($guiFileVersion.Minor).$($guiFileVersion.Build)"
+$payloadIndexPath = Join-Path $payloadRoot 'Web\index.html'
+# Windows PowerShell 5.1 treats UTF-8 files without a BOM as ANSI when
+# Get-Content has no explicit encoding.  Reading index.html that way corrupts
+# every Chinese string before the version replacement.  Use the .NET UTF-8
+# APIs so packaging behaves identically in Windows PowerShell and PowerShell 7.
+$utf8NoBom = New-Object System.Text.UTF8Encoding($false, $true)
+$payloadIndex = [System.IO.File]::ReadAllText($payloadIndexPath, $utf8NoBom)
+if ($payloadIndex -notmatch '<span class="version">v[^<]+</span>') {
+    throw "GUI 页面中找不到版本标签: $payloadIndexPath"
+}
+$payloadIndex = $payloadIndex -replace '<span class="version">v[^<]+</span>',
+    "<span class=`"version`">$guiDisplayVersion</span>"
+[System.IO.File]::WriteAllText($payloadIndexPath, $payloadIndex, $utf8NoBom)
+$verifiedPayloadIndex = [System.IO.File]::ReadAllText($payloadIndexPath, $utf8NoBom)
+if ($verifiedPayloadIndex -notmatch '<title>源点恢复</title>') {
+    throw "GUI 页面 UTF-8 校验失败，已停止生成安装包: $payloadIndexPath"
+}
+Write-Host "GUI 页面版本已同步: $guiDisplayVersion"
 Copy-ReleaseFile (Join-Path $driverOutput 'CdpBootService.exe') (Join-Path $payloadRoot 'CdpBootService.exe')
 Copy-ReleaseFile (Join-Path $driverOutput 'CdpDriverInstallHelper.exe') (Join-Path $payloadRoot 'CdpDriverInstallHelper.exe')
 Copy-ReleaseFile (Join-Path $driverOutput 'CdpDriver.cer') (Join-Path $payloadRoot 'driver\CdpDriver.cer')

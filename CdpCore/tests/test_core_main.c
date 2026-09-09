@@ -46,6 +46,13 @@ typedef struct _TEST_DRAIN_WRITER
 	BOOLEAN FailNext;
 } TEST_DRAIN_WRITER, *PTEST_DRAIN_WRITER;
 
+typedef struct _TEST_MATERIALIZE_PROGRESS
+{
+	UINT64 CompletedBytes;
+	UINT64 TotalBytes;
+	ULONG Calls;
+} TEST_MATERIALIZE_PROGRESS, *PTEST_MATERIALIZE_PROGRESS;
+
 static NTSTATUS TestDrainAbsoluteWriter(
 	_In_opt_ PVOID Context,
 	_In_ UINT64 AbsoluteOffset,
@@ -65,6 +72,20 @@ static NTSTATUS TestDrainAbsoluteWriter(
 	}
 	return writer->Store->Write(
 		writer->Store, AbsoluteOffset, Length, Buffer);
+}
+
+static VOID TestMaterializeProgress(
+	_In_opt_ PVOID Context,
+	_In_ UINT64 CompletedBytes,
+	_In_ UINT64 TotalBytes)
+{
+	PTEST_MATERIALIZE_PROGRESS progress =
+		(PTEST_MATERIALIZE_PROGRESS)Context;
+	if (!progress)
+		return;
+	progress->CompletedBytes = CompletedBytes;
+	progress->TotalBytes = TotalBytes;
+	progress->Calls++;
 }
 
 static void FillPattern(PUCHAR buf, ULONG len, UCHAR seed)
@@ -2393,6 +2414,7 @@ static int TestPersistentRestorePoint(void)
 {
 	TEST_CTX ctx;
 	TEST_DRAIN_WRITER writer;
+	TEST_MATERIALIZE_PROGRESS progress;
 	PCdp_JOURNAL_SUPERBLOCK superblock;
 	Cdp_JOURNAL_RECORD targetRecord;
 	Cdp_JOURNAL_RECORD records[8];
@@ -2434,10 +2456,12 @@ static int TestPersistentRestorePoint(void)
 		"append value newer than restore point");
 
 	RtlZeroMemory(&writer, sizeof(writer));
+	RtlZeroMemory(&progress, sizeof(progress));
 	writer.Store = ctx.Source;
-	status = CdpCoreMaterializeTimeWithWriter(
+	status = CdpCoreMaterializeTimeWithWriterProgress(
 		ctx.Core, targetRecord.WallClock100ns,
 		TestDrainAbsoluteWriter, &writer,
+		TestMaterializeProgress, &progress,
 		&effective, &targetSequence, &writtenRanges, &writtenBytes);
 	RtlZeroMemory(output, sizeof(output));
 	Expect(NT_SUCCESS(status) && effective == targetRecord.WallClock100ns &&
@@ -2446,6 +2470,10 @@ static int TestPersistentRestorePoint(void)
 		NT_SUCCESS(ctx.Source->Read(ctx.Source, 0, sizeof(output), output)) &&
 		memcmp(output, target, sizeof(output)) == 0,
 		"setting point materializes exact target view into source");
+	Expect(progress.Calls >= 2 &&
+		progress.TotalBytes == sizeof(target) &&
+		progress.CompletedBytes == sizeof(target),
+		"restore-point materialization reports exact byte progress");
 	Expect(NT_SUCCESS(CdpCoreSetRestorePointMarker(
 		ctx.Core, targetRecord.WallClock100ns)),
 		"persist restore-point marker in superblock");
