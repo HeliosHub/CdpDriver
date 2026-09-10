@@ -53,6 +53,7 @@ struct _Cdp_CORE
 	LONG Phase;
 	UINT64 Time100ns;
 	Cdp_PREVIEW_TREE PreviewTree;
+	Cdp_LOCK PreviewTreeLock;
 	Cdp_PREVIEW_TREE MetaTree;
 	Cdp_LOCK TreeLock;
 	BOOLEAN MetaTreeReady;
@@ -98,6 +99,7 @@ static VOID CdpCoreInitCommon(_Inout_ PCdp_CORE Core)
 	Core->Time100ns = 1;
 	Core->Phase = Cdp_CORE_PHASE_GENERAL;
 	CdpPreviewTreeInitialize(&Core->PreviewTree);
+	Cdp_LOCK_INIT(&Core->PreviewTreeLock);
 	CdpPreviewTreeInitialize(&Core->MetaTree);
 	Cdp_LOCK_INIT(&Core->TreeLock);
 }
@@ -202,6 +204,7 @@ NTSTATUS CdpCoreBind(
 		{
 			CdpPreviewTreeFree(&core->MetaTree);
 			CdpPreviewTreeFree(&core->PreviewTree);
+			Cdp_LOCK_DELETE(&core->PreviewTreeLock);
 			Cdp_LOCK_DELETE(&core->TreeLock);
 			Cdp_FREE(core);
 			return status;
@@ -221,6 +224,7 @@ VOID CdpCoreDestroy(_Inout_opt_ PCdp_CORE Core)
 		CdpJournalClose(Core->Journal);
 	CdpPreviewTreeFree(&Core->PreviewTree);
 	CdpPreviewTreeFree(&Core->MetaTree);
+	Cdp_LOCK_DELETE(&Core->PreviewTreeLock);
 	Cdp_LOCK_DELETE(&Core->TreeLock);
 #ifndef Cdp_USERMODE
 	if (Core->Source)
@@ -798,8 +802,10 @@ NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
 		Core->PreviewTargetSequence >= firstSequence &&
 		Core->PreviewTargetSequence < endSequence)
 	{
+		Cdp_LOCK_ACQUIRE(&Core->PreviewTreeLock);
 		CdpPreviewTreeFree(&Core->PreviewTree);
 		CdpPreviewTreeInitialize(&Core->PreviewTree);
+		Cdp_LOCK_RELEASE(&Core->PreviewTreeLock);
 		Core->Building = 0;
 		Core->PreviewTargetSequence = 0;
 		Core->Phase = Cdp_CORE_PHASE_GENERAL;
@@ -817,8 +823,10 @@ NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
 		goto cleanup;
 	if (previewTargetDeleted && Core->Phase == Cdp_CORE_PHASE_PREVIEW)
 	{
+		Cdp_LOCK_ACQUIRE(&Core->PreviewTreeLock);
 		CdpPreviewTreeFree(&Core->PreviewTree);
 		CdpPreviewTreeInitialize(&Core->PreviewTree);
+		Cdp_LOCK_RELEASE(&Core->PreviewTreeLock);
 		Core->Building = 0;
 		Core->PreviewTargetSequence = 0;
 		Core->Phase = Cdp_CORE_PHASE_GENERAL;
@@ -874,6 +882,7 @@ NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
 	// pointing into this region; newer retained preview records stay overlaid.
 	if (Core->Phase == Cdp_CORE_PHASE_PREVIEW)
 	{
+		Cdp_LOCK_ACQUIRE(&Core->PreviewTreeLock);
 		for (;;)
 		{
 			PCdp_PREVIEW_TREE_NODE node =
@@ -888,8 +897,12 @@ NTSTATUS CdpCoreCompactOldestRegion(_Inout_ PCdp_CORE Core)
 			status = CdpPreviewTreePunchRange(
 				&Core->PreviewTree, start, length);
 			if (!NT_SUCCESS(status))
+			{
+				Cdp_LOCK_RELEASE(&Core->PreviewTreeLock);
 				goto cleanup;
+			}
 		}
+		Cdp_LOCK_RELEASE(&Core->PreviewTreeLock);
 	}
 
 	// The source now contains every live value referenced by this region.
@@ -1349,6 +1362,8 @@ static NTSTATUS CdpCoreSynthesizeRead(
 	_Out_writes_bytes_(Length) PVOID Buffer,
 	_In_ BOOLEAN ReadSourceBaseline)
 {
+	Cdp_LOCK* treeLock;
+	BOOLEAN holdTreeLockAcrossIo;
 	PUCHAR coveredMask = NULL;
 	ULONG coveredCount = 0;
 	NTSTATUS status;
@@ -1365,10 +1380,14 @@ static NTSTATUS CdpCoreSynthesizeRead(
 	/* Resolve the current-value map first. Only holes are fetched from the
 	 * source. This is the DiskDrive-upper fast path: a fully covered request
 	 * never touches the source partition. */
-	status = CdpJournalApplyPreviewTree(
+	treeLock = Tree == &Core->PreviewTree ?
+		&Core->PreviewTreeLock : &Core->TreeLock;
+	holdTreeLockAcrossIo = Tree == &Core->PreviewTree;
+	status = CdpJournalApplyPreviewTreeEx(
 		Core->Journal,
 		Tree,
-		&Core->TreeLock,
+		treeLock,
+		holdTreeLockAcrossIo,
 		Offset,
 		Length,
 		Buffer,
@@ -1549,6 +1568,7 @@ NTSTATUS CdpCoreQueryCurrentReadCoverage(
 	_Out_ PULONG SourceLength)
 {
 	PCdp_PREVIEW_TREE tree;
+	Cdp_LOCK* treeLock;
 	Cdp_CORE_COVERAGE_SCAN scan;
 	NTSTATUS status = STATUS_SUCCESS;
 
@@ -1564,22 +1584,30 @@ NTSTATUS CdpCoreQueryCurrentReadCoverage(
 	scan.Start = Offset;
 	scan.End = Offset + Length;
 	scan.Cursor = Offset;
+	/* Select the view under the state lock, then release it before waiting on
+	 * the independent PreviewTree lock. A slow preview payload read must never
+	 * indirectly pin TreeLock and block journal append. */
 	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
 	if (Core->Phase == Cdp_CORE_PHASE_PREVIEW)
 	{
 		tree = &Core->PreviewTree;
+		treeLock = &Core->PreviewTreeLock;
 	}
 	else if (!Core->MetaTreeReady)
 	{
 		status = STATUS_DEVICE_NOT_READY;
 		tree = NULL;
+		treeLock = NULL;
 	}
 	else
 	{
 		tree = &Core->MetaTree;
+		treeLock = &Core->TreeLock;
 	}
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
 	if (tree)
 	{
+		Cdp_LOCK_ACQUIRE(treeLock);
 		CdpCoreScanTreeCoverage(tree->Root, &scan);
 		if (scan.Cursor < scan.End)
 			CdpCoreRecordCoverageGap(&scan, scan.Cursor, scan.End);
@@ -1607,8 +1635,8 @@ NTSTATUS CdpCoreQueryCurrentReadCoverage(
 				*SourceLength = Length;
 			}
 		}
+		Cdp_LOCK_RELEASE(treeLock);
 	}
-	Cdp_LOCK_RELEASE(&Core->TreeLock);
 	return status;
 }
 
@@ -1702,9 +1730,11 @@ NTSTATUS CdpCorePreviewBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns
 	Core->PreviewStoppedByMerge = FALSE;
 	Core->TargetTime100ns = effectiveTargetTime100ns;
 	Core->PreviewTargetSequence = 0;
+	Cdp_LOCK_RELEASE(&Core->TreeLock);
+
+	Cdp_LOCK_ACQUIRE(&Core->PreviewTreeLock);
 	CdpPreviewTreeFree(&Core->PreviewTree);
 	CdpPreviewTreeInitialize(&Core->PreviewTree);
-	Cdp_LOCK_RELEASE(&Core->TreeLock);
 
 	RtlZeroMemory(&targetLocation, sizeof(targetLocation));
 	status = CdpJournalBuildSettledPreviewTree(
@@ -1716,6 +1746,7 @@ NTSTATUS CdpCorePreviewBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns
 		&effectiveTargetTime100ns,
 		&targetRecordSequence,
 		&targetLocation);
+	Cdp_LOCK_RELEASE(&Core->PreviewTreeLock);
 	if (!NT_SUCCESS(status) && status != STATUS_NOT_FOUND)
 	{
 		Cdp_LOCK_ACQUIRE(&Core->TreeLock);
@@ -1751,8 +1782,10 @@ NTSTATUS CdpCorePreviewEnd(_Inout_ PCdp_CORE Core)
 		Cdp_LOCK_RELEASE(&Core->TreeLock);
 		return STATUS_INVALID_DEVICE_STATE;
 	}
+	Cdp_LOCK_ACQUIRE(&Core->PreviewTreeLock);
 	CdpPreviewTreeFree(&Core->PreviewTree);
 	CdpPreviewTreeInitialize(&Core->PreviewTree);
+	Cdp_LOCK_RELEASE(&Core->PreviewTreeLock);
 	Core->PreviewTargetSequence = 0;
 	Core->Phase = Cdp_CORE_PHASE_GENERAL;
 	Cdp_LOCK_RELEASE(&Core->TreeLock);

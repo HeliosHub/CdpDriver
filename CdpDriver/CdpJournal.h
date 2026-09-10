@@ -789,6 +789,18 @@ NTSTATUS CdpJournalApplyPreviewTree(
 	_Out_writes_bytes_((DataLength + 7) / 8) PUCHAR CoveredMask,
 	_Out_ PULONG CoveredCount);
 
+NTSTATUS CdpJournalApplyPreviewTreeEx(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ PCdp_PREVIEW_TREE Tree,
+	_Inout_ Cdp_LOCK* TreeLock,
+	_In_ BOOLEAN HoldTreeLockAcrossIo,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_Out_writes_bytes_(DataLength) PVOID Buffer,
+	// One bit per output byte; caller supplies (DataLength + 7) / 8 bytes.
+	_Out_writes_bytes_((DataLength + 7) / 8) PUCHAR CoveredMask,
+	_Out_ PULONG CoveredCount);
+
 // Read a single record payload from the journal (FileOffset from record header).
 NTSTATUS CdpJournalReadPayload(
 	_Inout_ PCdp_JOURNAL Journal,

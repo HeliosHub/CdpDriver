@@ -8,6 +8,7 @@
 
 static volatile LONG64 g_CdpShutdownHopSequence = 0;
 static volatile LONG64 g_CdpPowerHopSequence = 0;
+static volatile LONG64 g_CdpPreviewBeginSequence = 0;
 
 static VOID CdpDisableAllCaptureSources(_In_ PCdp_DRIVER_EXTENSION DriverExt);
 static NTSTATUS CdpStartMergeThread(
@@ -2795,11 +2796,19 @@ static NTSTATUS CdpBeginPreviewSession(
 	UINT64 oldestTime = 0;
 	UINT64 newestTime = 0;
 	UINT64 targetTime = Request->TargetTime100ns;
+	LONG64 previewSequence;
+	ULONGLONG buildStart100ns;
+	ULONGLONG buildEnd100ns;
 	BOOLEAN phaseTransitioned = FALSE;
 	NTSTATUS status;
 
 	RtlZeroMemory(Reply, sizeof(*Reply));
 	Reply->Status = Cdp_STATUS_UNPROTECTED;
+	previewSequence = InterlockedIncrement64(&g_CdpPreviewBeginSequence);
+	Cdp_LOG("[PREVIEW-DIAG] stage=request-received seq=%lld requested=%llu thread=%p\n",
+		previewSequence,
+		Request->TargetTime100ns,
+		PsGetCurrentThread());
 	sourceExt = CdpFindSourceExtensionByGuid(
 		DriverExt,
 		&Request->SourceVolumeGuid);
@@ -2927,7 +2936,23 @@ static NTSTATUS CdpBeginPreviewSession(
 	}
 	KeEnterCriticalRegion();
 	ExAcquirePushLockExclusive(&sourceExt->PreviewAccessLock);
+	buildStart100ns = KeQueryInterruptTime();
+	Cdp_LOG("[PREVIEW-DIAG] stage=tree-build-begin seq=%lld source=%p target=%llu journalTarget=%p journalBase=%llu thread=%p\n",
+		previewSequence,
+		sourceExt,
+		targetTime,
+		journalEntry->TargetLowerDevice,
+		journalEntry->TargetBaseOffset,
+		PsGetCurrentThread());
 	status = CdpCorePreviewBegin(sourceExt->Core, targetTime);
+	buildEnd100ns = KeQueryInterruptTime();
+	Cdp_LOG("[PREVIEW-DIAG] stage=tree-build-end seq=%lld status=0x%08X elapsedMs=%llu settled=%llu thread=%p\n",
+		previewSequence,
+		status,
+		(buildEnd100ns - buildStart100ns) / 10000ULL,
+		NT_SUCCESS(status) ?
+			CdpCoreGetTargetTime100ns(sourceExt->Core) : 0,
+		PsGetCurrentThread());
 	ExReleasePushLockExclusive(&sourceExt->PreviewAccessLock);
 	KeLeaveCriticalRegion();
 	if (status == STATUS_DEVICE_BUSY)
@@ -3109,12 +3134,10 @@ static NTSTATUS CdpReadPreviewSession(
 	}
 
 	/* PreviewTree and its payload locations are stable until teardown or merge.
-	 * Use the dedicated gate, not HistoryMutex: protected Journal writes must
-	 * remain able to reach the lower disk while Windows reads the preview LUN.
-	 * Take it exclusively to bound Preview to one lower-disk read at a time;
-	 * otherwise mount-time parallel reads can starve a pending Journal write. */
+	 * Use the dedicated shared gate, not HistoryMutex: protected Journal writes
+	 * must remain able to complete while Windows reads the preview LUN. */
 	KeEnterCriticalRegion();
-	ExAcquirePushLockExclusive(&sourceExt->PreviewAccessLock);
+	ExAcquirePushLockShared(&sourceExt->PreviewAccessLock);
 	previewAccessLocked = TRUE;
 	if (session->StoppedByMerge)
 	{
@@ -3147,7 +3170,7 @@ static NTSTATUS CdpReadPreviewSession(
 cleanup:
 	if (previewAccessLocked && sourceExt)
 	{
-		ExReleasePushLockExclusive(&sourceExt->PreviewAccessLock);
+		ExReleasePushLockShared(&sourceExt->PreviewAccessLock);
 		KeLeaveCriticalRegion();
 	}
 	CdpReleasePreviewSession(session);

@@ -8293,6 +8293,29 @@ NTSTATUS CdpJournalApplyPreviewTree(
 	_Out_writes_bytes_((DataLength + 7) / 8) PUCHAR CoveredMask,
 	_Out_ PULONG CoveredCount)
 {
+	return CdpJournalApplyPreviewTreeEx(
+		Journal,
+		Tree,
+		TreeLock,
+		FALSE,
+		VolumeOffset,
+		DataLength,
+		Buffer,
+		CoveredMask,
+		CoveredCount);
+}
+
+NTSTATUS CdpJournalApplyPreviewTreeEx(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ PCdp_PREVIEW_TREE Tree,
+	_Inout_ Cdp_LOCK* TreeLock,
+	_In_ BOOLEAN HoldTreeLockAcrossIo,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_Out_writes_bytes_(DataLength) PVOID Buffer,
+	_Out_writes_bytes_((DataLength + 7) / 8) PUCHAR CoveredMask,
+	_Out_ PULONG CoveredCount)
+{
 	NTSTATUS status = STATUS_SUCCESS;
 	PCdp_PREVIEW_HIT hits = NULL;
 	ULONG hitCount = 0;
@@ -8351,10 +8374,14 @@ NTSTATUS CdpJournalApplyPreviewTree(
 		hits,
 		&hitCount,
 		hitCapacity);
-	// Hits contain value copies.  The tree may now be modified or replaced
-	// without keeping a mutex held across journal I/O.
-	Cdp_LOCK_RELEASE(TreeLock);
-	treeLocked = FALSE;
+	// MetaTree callers use copied hits and release before journal I/O. Preview
+	// callers retain their independent lock so merge cannot remap or reclaim a
+	// payload while this read is consuming it.
+	if (!HoldTreeLockAcrossIo)
+	{
+		Cdp_LOCK_RELEASE(TreeLock);
+		treeLocked = FALSE;
+	}
 	Cdp_JOURNAL_DIAG(
 		"collect end volumeOff=%llu len=%lu hits=%lu\n",
 		VolumeOffset,
