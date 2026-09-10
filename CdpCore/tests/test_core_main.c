@@ -53,6 +53,17 @@ typedef struct _TEST_MATERIALIZE_PROGRESS
 	ULONG Calls;
 } TEST_MATERIALIZE_PROGRESS, *PTEST_MATERIALIZE_PROGRESS;
 
+typedef struct _TEST_PAYLOAD_WRITER
+{
+	PCdp_STORE Store;
+	const VOID* Buffer;
+	UINT64 LastJournalOffset;
+	ULONG LastDataLength;
+	ULONG LastAlignedLength;
+	ULONG Calls;
+	BOOLEAN FailNext;
+} TEST_PAYLOAD_WRITER, *PTEST_PAYLOAD_WRITER;
+
 static NTSTATUS TestDrainAbsoluteWriter(
 	_In_opt_ PVOID Context,
 	_In_ UINT64 AbsoluteOffset,
@@ -72,6 +83,32 @@ static NTSTATUS TestDrainAbsoluteWriter(
 	}
 	return writer->Store->Write(
 		writer->Store, AbsoluteOffset, Length, Buffer);
+}
+
+static NTSTATUS TestJournalPayloadWriter(
+	_In_opt_ PVOID Context,
+	_In_ UINT64 JournalOffset,
+	_In_ ULONG DataLength,
+	_In_ ULONG AlignedLength)
+{
+	PTEST_PAYLOAD_WRITER writer = (PTEST_PAYLOAD_WRITER)Context;
+
+	if (!writer || !writer->Store || !writer->Buffer ||
+		DataLength != AlignedLength)
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+	writer->Calls++;
+	writer->LastJournalOffset = JournalOffset;
+	writer->LastDataLength = DataLength;
+	writer->LastAlignedLength = AlignedLength;
+	if (writer->FailNext)
+	{
+		writer->FailNext = FALSE;
+		return STATUS_IO_DEVICE_ERROR;
+	}
+	return writer->Store->Write(
+		writer->Store, JournalOffset, AlignedLength, writer->Buffer);
 }
 
 static VOID TestMaterializeProgress(
@@ -703,6 +740,72 @@ static int TestAfterImagePayloadZeroCopyAndFallback(void)
 	CdpJournalClose(&journal);
 	_aligned_free(alignedInput);
 	CdpMemStoreDestroy(store);
+	return g_caseFailed;
+}
+
+static int TestAfterImageCallerPayloadWriter(void)
+{
+	TEST_CTX ctx;
+	TEST_PAYLOAD_WRITER writer;
+	Cdp_JOURNAL_RECORD record;
+	UCHAR payload[SECTOR];
+	UCHAR readBack[SECTOR];
+	UINT64 partitionBytes;
+	UINT64 metadataBytes;
+	UINT64 payloadBytesUsed;
+	UINT64 payloadBytesFree;
+	UINT64 recordsBeforeFailure;
+	UINT64 recordsAfterFailure;
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(TestCtxCreate(
+		&ctx, SRC_SIZE, JNL_SIZE, 92300)),
+		"setup caller-owned payload writer test");
+	if (!ctx.Core)
+		return g_caseFailed;
+	RtlZeroMemory(&writer, sizeof(writer));
+	FillPattern(payload, sizeof(payload), 0x4E);
+	writer.Store = ctx.Journal;
+	writer.Buffer = payload;
+
+	status = CdpCoreAppendAfterImageWithWriter(
+		ctx.Core, 12288, sizeof(payload), TestJournalPayloadWriter,
+		&writer, &record);
+	Expect(NT_SUCCESS(status),
+		"caller-owned payload writer appends one record");
+	Expect(writer.Calls == 1 &&
+		writer.LastJournalOffset == record.FileOffset &&
+		writer.LastDataLength == sizeof(payload) &&
+		writer.LastAlignedLength == sizeof(payload),
+		"payload writer receives the reserved journal extent");
+	RtlZeroMemory(readBack, sizeof(readBack));
+	Expect(NT_SUCCESS(CdpCoreRead(
+		ctx.Core, 12288, sizeof(readBack), readBack)) &&
+		memcmp(readBack, payload, sizeof(payload)) == 0,
+		"writer payload is published through MetaTree");
+
+	Expect(NT_SUCCESS(CdpCoreQueryJournalUsage(
+		ctx.Core, &partitionBytes, &metadataBytes, &payloadBytesUsed,
+		&payloadBytesFree, &recordsBeforeFailure)),
+		"query record count before writer failure");
+	writer.FailNext = TRUE;
+	status = CdpCoreAppendAfterImageWithWriter(
+		ctx.Core, 16384, sizeof(payload), TestJournalPayloadWriter,
+		&writer, NULL);
+	Expect(status == STATUS_IO_DEVICE_ERROR,
+		"payload writer failure aborts append");
+	Expect(NT_SUCCESS(CdpCoreQueryJournalUsage(
+		ctx.Core, &partitionBytes, &metadataBytes, &payloadBytesUsed,
+		&payloadBytesFree, &recordsAfterFailure)) &&
+		recordsAfterFailure == recordsBeforeFailure,
+		"failed payload writer publishes no record header");
+	RtlZeroMemory(readBack, sizeof(readBack));
+	Expect(NT_SUCCESS(CdpCoreRead(
+		ctx.Core, 16384, sizeof(readBack), readBack)) &&
+		memcmp(readBack, payload, sizeof(payload)) != 0,
+		"failed payload writer publishes no MetaTree coverage");
+
+	TestCtxDestroy(&ctx);
 	return g_caseFailed;
 }
 
@@ -3376,6 +3479,8 @@ int main(void)
 		TestAfterImageJournalFailureDoesNotBypassSource);
 	failed += RunCase("After-image payload zero-copy and fallback",
 		TestAfterImagePayloadZeroCopyAndFallback);
+	failed += RunCase("After-image caller-owned payload writer",
+		TestAfterImageCallerPayloadWriter);
 	failed += RunCase("Record-header sector write cache",
 		TestRecordHeaderWriteReusesSectorCache);
 	failed += RunCase("After-image branch numbers increase",

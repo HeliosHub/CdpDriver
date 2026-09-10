@@ -5671,14 +5671,13 @@ static BOOLEAN CdpTryAcquireRedirectWrite(
 	return FALSE;
 }
 
-static NTSTATUS CdpCompleteFailedRedirectWrite(
+static NTSTATUS CdpFinishRedirectWrite(
 	_Inout_ PCdp_DEVICE_EXTENSION SourceExt,
-	_Inout_ PIRP Irp,
 	_In_ NTSTATUS Status)
 {
 	if (SourceExt)
 		CdpReleaseRedirectWrite(SourceExt);
-	return CdpCompleteIrp(Irp, Status, 0);
+	return Status;
 }
 
 static NTSTATUS CdpSnapshotWriteMdlChain(
@@ -5920,6 +5919,108 @@ static VOID CdpReleaseMergeSpaceRetryGateLocked(
 		&SourceExt->MergeSpaceRetryDoneEvent, IO_NO_INCREMENT, FALSE);
 }
 
+typedef struct _Cdp_ORIGINAL_IRP_PAYLOAD_CONTEXT
+{
+	PIRP Irp;
+	PDEVICE_OBJECT TargetDevice;
+	UINT64 TargetBaseOffset;
+	BOOLEAN Forwarded;
+} Cdp_ORIGINAL_IRP_PAYLOAD_CONTEXT, *PCdp_ORIGINAL_IRP_PAYLOAD_CONTEXT;
+
+static NTSTATUS CdpOriginalIrpPayloadCompletion(
+	_In_ PDEVICE_OBJECT DeviceObject,
+	_In_ PIRP Irp,
+	_In_ PVOID Context)
+{
+	UNREFERENCED_PARAMETER(DeviceObject);
+	UNREFERENCED_PARAMETER(Irp);
+	KeSetEvent((PKEVENT)Context, IO_NO_INCREMENT, FALSE);
+	return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+static BOOLEAN CdpCanRedirectOriginalWriteIrp(
+	_In_ PCdp_DEVICE_EXTENSION SourceExt,
+	_In_ PCdp_CAPTURE_ITEM Item,
+	_In_ ULONG Length)
+{
+	PCdp_VOLUME_HANDLE_ENTRY journalEntry;
+	PCdp_JOURNAL journal;
+	PMDL mdl;
+	UINT64 mdlBytes = 0;
+
+	if (!SourceExt || !Item || !Item->Irp || Length == 0 ||
+		Length > Cdp_JOURNAL_MAX_RECORD_DATA || !Item->Irp->MdlAddress ||
+		Item->Irp->CurrentLocation <= 1)
+	{
+		return FALSE;
+	}
+	journalEntry = SourceExt->RedirectJournalEntry;
+	if (!journalEntry)
+		return FALSE;
+	journal = &journalEntry->Journal;
+	if (!journal->Mounted || journal->Store || journal->RawDiskHandle ||
+		!journal->TargetDevice ||
+		journal->TargetDevice != Item->OriginLowerReference ||
+		journal->TargetBaseOffset != journalEntry->TargetBaseOffset ||
+		journal->SectorSize == 0 || (Length % journal->SectorSize) != 0 ||
+		InterlockedCompareExchange(&journal->RawIoQuiesced, 0, 0) != 0)
+	{
+		return FALSE;
+	}
+	for (mdl = Item->Irp->MdlAddress; mdl; mdl = mdl->Next)
+	{
+		ULONG bytes = MmGetMdlByteCount(mdl);
+		if (mdlBytes > MAXUINT64 - bytes)
+			return FALSE;
+		mdlBytes += bytes;
+	}
+	return mdlBytes >= Length;
+}
+
+static NTSTATUS CdpWriteJournalPayloadWithOriginalIrp(
+	_In_opt_ PVOID Context,
+	_In_ UINT64 JournalOffset,
+	_In_ ULONG DataLength,
+	_In_ ULONG AlignedLength)
+{
+	PCdp_ORIGINAL_IRP_PAYLOAD_CONTEXT ctx =
+		(PCdp_ORIGINAL_IRP_PAYLOAD_CONTEXT)Context;
+	PIO_STACK_LOCATION nextSp;
+	KEVENT event;
+	NTSTATUS status;
+	UINT64 absoluteOffset;
+
+	if (!ctx || !ctx->Irp || !ctx->TargetDevice || ctx->Forwarded ||
+		DataLength == 0 || DataLength != AlignedLength ||
+		ctx->TargetBaseOffset > MAXUINT64 - JournalOffset)
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+	absoluteOffset = ctx->TargetBaseOffset + JournalOffset;
+	if (absoluteOffset > MAXLONGLONG)
+		return STATUS_INTEGER_OVERFLOW;
+
+	KeInitializeEvent(&event, NotificationEvent, FALSE);
+	IoCopyCurrentIrpStackLocationToNext(ctx->Irp);
+	nextSp = IoGetNextIrpStackLocation(ctx->Irp);
+	nextSp->Parameters.Write.ByteOffset.QuadPart = (LONGLONG)absoluteOffset;
+	nextSp->Parameters.Write.Length = DataLength;
+	IoSetCompletionRoutine(
+		ctx->Irp,
+		CdpOriginalIrpPayloadCompletion,
+		&event,
+		TRUE,
+		TRUE,
+		TRUE);
+	ctx->Forwarded = TRUE;
+	(void)IoCallDriver(ctx->TargetDevice, ctx->Irp);
+	KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+	status = ctx->Irp->IoStatus.Status;
+	if (NT_SUCCESS(status) && ctx->Irp->IoStatus.Information != DataLength)
+		status = STATUS_UNEXPECTED_IO_ERROR;
+	return status;
+}
+
 static NTSTATUS CdpRedirectJournalWrite(
 	_In_ PCdp_DEVICE_EXTENSION SourceExt,
 	_Inout_ PCdp_CAPTURE_ITEM Item)
@@ -5935,64 +6036,92 @@ static NTSTATUS CdpRedirectJournalWrite(
 	UINT64 writeOffset;
 	BOOLEAN mergeWaitRetried = FALSE;
 	BOOLEAN ownsMergeSpaceRetryGate = FALSE;
+	BOOLEAN useOriginalIrp = FALSE;
+	Cdp_ORIGINAL_IRP_PAYLOAD_CONTEXT originalIrpContext;
 	NTSTATUS status;
 
-	/* The worker only calls this routine for a fully formed queued IRP.  Keep
-	 * the validation split so an unexpected bad queue item is never passed to
-	 * CdpCompleteIrp as a NULL IRP. */
+	/* The caller owns HistoryMutex and completes the IRP only after releasing
+	 * it. This routine owns only the redirect-write reference and append work. */
 	if (!SourceExt || !Item || !Item->Irp)
-		return STATUS_INVALID_PARAMETER;
+		return CdpFinishRedirectWrite(SourceExt, STATUS_INVALID_PARAMETER);
 
 	Irp = Item->Irp;
 	if (!SourceExt->Core || !Item->OriginLowerReference)
-		return CdpCompleteFailedRedirectWrite(
-			SourceExt, Irp, STATUS_DEVICE_NOT_READY);
+		return CdpFinishRedirectWrite(SourceExt, STATUS_DEVICE_NOT_READY);
 
 	irpSp = IoGetCurrentIrpStackLocation(Irp);
 	writeLength = irpSp->Parameters.Write.Length;
 	if (irpSp->Parameters.Write.ByteOffset.QuadPart < 0 || writeLength == 0)
-		return CdpCompleteFailedRedirectWrite(
-			SourceExt, Irp, STATUS_INVALID_PARAMETER);
+		return CdpFinishRedirectWrite(SourceExt, STATUS_INVALID_PARAMETER);
 	writeOffset = Item->OriginalDiskOffset;
 	if (writeOffset > MAXUINT64 - writeLength)
-		return CdpCompleteFailedRedirectWrite(
-			SourceExt, Irp, STATUS_INVALID_PARAMETER);
+		return CdpFinishRedirectWrite(SourceExt, STATUS_INVALID_PARAMETER);
 
 	if (!SourceExt->RedirectJournalEntry)
-		return CdpCompleteFailedRedirectWrite(
-			SourceExt, Irp, STATUS_DEVICE_NOT_READY);
+		return CdpFinishRedirectWrite(SourceExt, STATUS_DEVICE_NOT_READY);
 	CdpWaitForMergeSpaceRetryGateLocked(SourceExt);
-	status = CdpSnapshotWriteMdlChain(
-		Irp, writeLength, &snapshot, &mdlCount, &mdlBytes);
-	if (!NT_SUCCESS(status))
+	RtlZeroMemory(&originalIrpContext, sizeof(originalIrpContext));
+	useOriginalIrp = CdpCanRedirectOriginalWriteIrp(
+		SourceExt, Item, writeLength);
+	if (useOriginalIrp)
 	{
-		Cdp_LOG("[VERIFY-FAIL] stage=mdl status=0x%08X sourceOffset=%lld len=%lu mdlCount=%lu mdlBytes=%llu\n",
-			status,
-			irpSp->Parameters.Write.ByteOffset.QuadPart,
-			writeLength,
-			mdlCount,
-			mdlBytes);
-		return CdpCompleteFailedRedirectWrite(SourceExt, Irp, status);
+		originalIrpContext.Irp = Irp;
+		originalIrpContext.TargetDevice =
+			SourceExt->RedirectJournalEntry->Journal.TargetDevice;
+		originalIrpContext.TargetBaseOffset =
+			SourceExt->RedirectJournalEntry->Journal.TargetBaseOffset;
+		Cdp_DBG("[REDIRECT-WRITE-ZEROCOPY] original IRP selected offset=%llu len=%lu irp=%p mdl=%p target=%p\n",
+			writeOffset, writeLength, Irp, Irp->MdlAddress,
+			originalIrpContext.TargetDevice);
+	}
+	else
+	{
+		status = CdpSnapshotWriteMdlChain(
+			Irp, writeLength, &snapshot, &mdlCount, &mdlBytes);
+		if (!NT_SUCCESS(status))
+		{
+			Cdp_LOG("[VERIFY-FAIL] stage=mdl status=0x%08X sourceOffset=%lld len=%lu mdlCount=%lu mdlBytes=%llu\n",
+				status,
+				irpSp->Parameters.Write.ByteOffset.QuadPart,
+				writeLength,
+				mdlCount,
+				mdlBytes);
+			return CdpFinishRedirectWrite(SourceExt, status);
+		}
 	}
 	/* A source IRP may be much larger than one on-disk record. Commit every
 	 * real application-data chunk to the journal and never write the source. */
 	for (chunkOffset = 0; chunkOffset < writeLength; )
 	{
 		ULONG chunkLength = writeLength - chunkOffset;
-		PUCHAR chunkData = snapshot + chunkOffset;
+		PUCHAR chunkData = snapshot ? snapshot + chunkOffset : NULL;
 		UINT64 chunkVolumeOffset = Item->OriginalDiskOffset + chunkOffset;
 
 		if (chunkLength > Cdp_JOURNAL_MAX_RECORD_DATA)
 			chunkLength = Cdp_JOURNAL_MAX_RECORD_DATA;
-		status = CdpCoreAppendAfterImage(
-			SourceExt->Core,
-			chunkVolumeOffset,
-			chunkLength,
-			chunkData,
-			&record);
+		if (useOriginalIrp)
+		{
+			status = CdpCoreAppendAfterImageWithWriter(
+				SourceExt->Core,
+				chunkVolumeOffset,
+				chunkLength,
+				CdpWriteJournalPayloadWithOriginalIrp,
+				&originalIrpContext,
+				&record);
+		}
+		else
+		{
+			status = CdpCoreAppendAfterImage(
+				SourceExt->Core,
+				chunkVolumeOffset,
+				chunkLength,
+				chunkData,
+				&record);
+		}
 		if (!NT_SUCCESS(status))
 		{
 			if (status == STATUS_DISK_FULL && !mergeWaitRetried &&
+				!originalIrpContext.Forwarded &&
 				InterlockedCompareExchange(
 					&SourceExt->MergeThreadRunning, 0, 0) != 0)
 			{
@@ -6052,14 +6181,16 @@ static NTSTATUS CdpRedirectJournalWrite(
 				chunkOffset,
 				chunkLength,
 				chunkOffset / Cdp_JOURNAL_MAX_RECORD_DATA);
-			cdpfree(snapshot);
+			if (snapshot)
+				cdpfree(snapshot);
 			if (ownsMergeSpaceRetryGate)
 				CdpReleaseMergeSpaceRetryGateLocked(SourceExt);
-			return CdpCompleteFailedRedirectWrite(SourceExt, Irp, status);
+			return CdpFinishRedirectWrite(SourceExt, status);
 		}
 		chunkOffset += chunkLength;
 	}
-	cdpfree(snapshot);
+	if (snapshot)
+		cdpfree(snapshot);
 	if (ownsMergeSpaceRetryGate)
 		CdpReleaseMergeSpaceRetryGateLocked(SourceExt);
 
@@ -6069,7 +6200,7 @@ static NTSTATUS CdpRedirectJournalWrite(
 		CdpStartMergeIfNeeded(SourceExt);
 	}
 	CdpReleaseRedirectWrite(SourceExt);
-	return CdpCompleteIrp(Irp, STATUS_SUCCESS, writeLength);
+	return STATUS_SUCCESS;
 }
 
 static NTSTATUS CdpDispatchProtectedVolumeRead(
@@ -6298,13 +6429,17 @@ static NTSTATUS CdpDispatchProtectedDiskWrite(
 	if (InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) != 0 &&
 		CdpTryAcquireRedirectWrite(sourceExt))
 	{
+		NTSTATUS completeStatus;
+
 		KeWaitForSingleObject(&sourceExt->HistoryMutex,
 			Executive, KernelMode, FALSE, NULL);
 		status = CdpRedirectJournalWrite(sourceExt, &directItem);
 		KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
 		CdpReleaseDiskIoOutstanding(sourceExt);
 		ObDereferenceObject(sourceReference);
-		return status;
+		completeStatus = CdpCompleteIrp(
+			Irp, status, NT_SUCCESS(status) ? length : 0);
+		return completeStatus;
 	}
 
 	phase = InterlockedCompareExchange(&sourceExt->Phase, 0, 0);
@@ -6416,8 +6551,15 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 						KernelMode,
 						FALSE,
 						NULL);
-					(void)CdpRedirectJournalWrite(devExt, item);
-					KeReleaseMutex(&devExt->HistoryMutex, FALSE);
+					{
+						NTSTATUS writeStatus =
+							CdpRedirectJournalWrite(devExt, item);
+						KeReleaseMutex(&devExt->HistoryMutex, FALSE);
+						CdpCompleteIrp(
+							item->Irp,
+							writeStatus,
+							NT_SUCCESS(writeStatus) ? ioLength : 0);
+					}
 				}
 				else if (majorFunction == IRP_MJ_READ && captureActive)
 				{

@@ -134,6 +134,17 @@ NTSTATUS CdpCoreAppendAfterImage(
 	_In_reads_bytes_(Length) const VOID* AfterImage,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
 
+// Variant for a caller-owned synchronous payload transport. Used by the disk
+// filter to publish an MDL-backed original IRP directly into journal payload
+// space while preserving the same Header-then-MetaTree commit ordering.
+NTSTATUS CdpCoreAppendAfterImageWithWriter(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_In_ Cdp_JOURNAL_PAYLOAD_WRITE_ROUTINE PayloadWriter,
+	_In_opt_ PVOID PayloadContext,
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
+
 // Graceful protection shutdown: materialize one current-view interval to the
 // source and punch it from MetaTree. Complete is TRUE when no coverage remains.
 typedef NTSTATUS (*Cdp_CORE_DRAIN_WRITE_ROUTINE)(

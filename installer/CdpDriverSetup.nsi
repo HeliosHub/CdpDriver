@@ -4,7 +4,10 @@ RequestExecutionLevel admin
 
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
+!include "WordFunc.nsh"
 !include "x64.nsh"
+
+!insertmacro VersionCompare
 
 !define PRODUCT_NAME "源点恢复"
 !define PRODUCT_VERSION "1.6.8.44"
@@ -78,6 +81,40 @@ FunctionEnd
 Section "安装源点恢复" SEC_MAIN
     SectionIn RO
     SetShellVarContext all
+
+    DetailPrint "正在检查 Microsoft Visual C++ x64 运行库..."
+    StrCpy $2 1
+    ReadRegDWORD $0 HKLM "SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" "Installed"
+    ${If} $0 == 1
+        ReadRegStr $1 HKLM "SOFTWARE\Microsoft\VisualStudio\14.0\VC\Runtimes\x64" "Version"
+        ${If} $1 != ""
+            StrCpy $1 $1 "" 1
+            ${VersionCompare} $1 "14.42.34438.0" $3
+            ${If} $3 != 2
+                StrCpy $2 0
+            ${EndIf}
+        ${EndIf}
+    ${EndIf}
+
+    ${If} $2 == 1
+        DetailPrint "未检测到所需版本的运行库，正在安装..."
+        SetOutPath "$PLUGINSDIR"
+        File /oname=VC_redist.x64.exe "VC_redist.x64.exe"
+        nsExec::ExecToLog '"$PLUGINSDIR\VC_redist.x64.exe" /install /quiet /norestart'
+        Pop $1
+        ${If} $1 == 3010
+            SetRebootFlag true
+        ${ElseIf} $1 == 1641
+            SetRebootFlag true
+        ${ElseIf} $1 == 1638
+            DetailPrint "系统中已安装兼容的更新版本。"
+        ${ElseIf} $1 != 0
+            MessageBox MB_OK|MB_ICONSTOP "Microsoft Visual C++ x64 运行库安装失败，错误码：$1。"
+            Abort
+        ${EndIf}
+    ${Else}
+        DetailPrint "已检测到兼容的 Microsoft Visual C++ x64 运行库，跳过安装。"
+    ${EndIf}
 
     DetailPrint "正在复制图形管理工具..."
     SetOutPath "$INSTDIR"

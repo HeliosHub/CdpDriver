@@ -4971,12 +4971,14 @@ NTSTATUS CdpJournalAppend(
 		WrittenRecord);
 }
 
-NTSTATUS CdpJournalAppendEx(
+static NTSTATUS CdpJournalAppendCommonEx(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 VolumeOffset,
 	_In_ ULONG DataLength,
-	_In_reads_bytes_(DataLength) const VOID* AfterImage,
+	_In_opt_ const VOID* AfterImage,
 	_In_ ULONG RecordFlags,
+	_In_opt_ Cdp_JOURNAL_PAYLOAD_WRITE_ROUTINE PayloadWriter,
+	_In_opt_ PVOID PayloadContext,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord)
 {
 	Cdp_JOURNAL_RECORD_HEADER header;
@@ -4990,7 +4992,8 @@ NTSTATUS CdpJournalAppendEx(
 	BOOLEAN rotateHeaderRegion;
 	NTSTATUS status = STATUS_SUCCESS;
 
-	if (!Journal->Mounted || !AfterImage || RecordFlags != 0 ||
+	if (!Journal->Mounted ||
+		(AfterImage == NULL) == (PayloadWriter == NULL) || RecordFlags != 0 ||
 		DataLength == 0 || DataLength > Cdp_JOURNAL_MAX_RECORD_DATA)
 	{
 		return STATUS_INVALID_PARAMETER;
@@ -5050,35 +5053,56 @@ NTSTATUS CdpJournalAppendEx(
 		goto cleanup;
 
 	payloadOff = Journal->PayloadRegionOff;
-	// The queued write IRP remains alive and its MDL remains locked until this
-	// synchronous journal write completes. Reuse that mapping when it already
-	// satisfies the journal device's transfer alignment. Only the partial-
-	// sector/address-misaligned path needs a temporary buffer and zero padding.
-	if (alignedSize == DataLength &&
-		CdpJournalBufferMeetsIoAlignment(Journal, AfterImage))
+	if (!PayloadWriter)
 	{
-		payloadBuffer = (PUCHAR)AfterImage;
+		// Reuse a naturally aligned contiguous caller buffer. Only the partial-
+		// sector/address-misaligned path needs a temporary buffer and zero padding.
+		if (alignedSize == DataLength &&
+			CdpJournalBufferMeetsIoAlignment(Journal, AfterImage))
+		{
+			payloadBuffer = (PUCHAR)AfterImage;
+		}
+		else
+		{
+			payloadBuffer = (PUCHAR)CdpAllocateAligned(Journal,
+				(SIZE_T)alignedSize,
+				&allocationBase);
+			if (!payloadBuffer)
+			{
+				status = STATUS_INSUFFICIENT_RESOURCES;
+				goto cleanup;
+			}
+			RtlZeroMemory(payloadBuffer, (SIZE_T)alignedSize);
+			RtlCopyMemory(payloadBuffer, AfterImage, DataLength);
+		}
+	}
+
+	if (PayloadWriter)
+	{
+#ifndef Cdp_USERMODE
+		if (InterlockedCompareExchange(&Journal->RawIoQuiesced, 0, 0) != 0)
+		{
+			status = STATUS_DEVICE_NOT_READY;
+			goto cleanup;
+		}
+#endif
+		CdpJournalInvalidateHeaderWriteCacheRangeLocked(
+			Journal, payloadOff, (ULONG)alignedSize);
+		status = PayloadWriter(
+			PayloadContext,
+			payloadOff,
+			DataLength,
+			(ULONG)alignedSize);
 	}
 	else
 	{
-		payloadBuffer = (PUCHAR)CdpAllocateAligned(Journal,
-			(SIZE_T)alignedSize,
-			&allocationBase);
-		if (!payloadBuffer)
-		{
-			status = STATUS_INSUFFICIENT_RESOURCES;
-			goto cleanup;
-		}
-		RtlZeroMemory(payloadBuffer, (SIZE_T)alignedSize);
-		RtlCopyMemory(payloadBuffer, AfterImage, DataLength);
+		status = CdpJournalRawIo(
+			Journal,
+			IRP_MJ_WRITE,
+			payloadOff,
+			(ULONG)alignedSize,
+			payloadBuffer);
 	}
-
-	status = CdpJournalRawIo(
-		Journal,
-		IRP_MJ_WRITE,
-		payloadOff,
-		(ULONG)alignedSize,
-		payloadBuffer);
 	if (!NT_SUCCESS(status))
 		goto cleanup;
 
@@ -5408,6 +5432,33 @@ NTSTATUS CdpJournalDeleteContiguousTombstonedRegions(
 cleanup:
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	return status;
+}
+
+NTSTATUS CdpJournalAppendEx(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_In_reads_bytes_(DataLength) const VOID* AfterImage,
+	_In_ ULONG RecordFlags,
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord)
+{
+	return CdpJournalAppendCommonEx(
+		Journal, VolumeOffset, DataLength, AfterImage, RecordFlags,
+		NULL, NULL, WrittenRecord);
+}
+
+NTSTATUS CdpJournalAppendWithWriterEx(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_In_ ULONG RecordFlags,
+	_In_ Cdp_JOURNAL_PAYLOAD_WRITE_ROUTINE PayloadWriter,
+	_In_opt_ PVOID PayloadContext,
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord)
+{
+	return CdpJournalAppendCommonEx(
+		Journal, VolumeOffset, DataLength, NULL, RecordFlags,
+		PayloadWriter, PayloadContext, WrittenRecord);
 }
 
 NTSTATUS CdpJournalDeleteRecordsThroughSequence(

@@ -21,6 +21,7 @@ $guiExecutable = $guiExecutableCandidates | Where-Object { Test-Path -LiteralPat
 $workRoot = Join-Path $installerRoot 'work'
 $payloadRoot = Join-Path $workRoot 'payload'
 $archivePath = Join-Path $workRoot 'payload.zip'
+$runtimeInstaller = Join-Path $installerRoot 'VC_redist.x64.exe'
 $outputPath = Join-Path $OutputDirectory 'RecoverySetup-x64.exe'
 $localOutputPath = Join-Path $workRoot 'out\RecoverySetup-x64.exe'
 $previousOutputPath = Join-Path $OutputDirectory '源点恢复安装程序-x64.exe'
@@ -48,12 +49,12 @@ function Copy-ReleaseFile([string]$Source, [string]$Destination) {
 if (-not $guiExecutable) {
     throw "找不到 GUI 发布文件。已检查: $($guiExecutableCandidates -join ', ')"
 }
+Require-File $runtimeInstaller
 
 foreach ($file in @(
     $guiExecutable,
     (Join-Path $guiOutput 'handle.exe'),
     (Join-Path $guiOutput 'iscsi_target_dotnet.dll'),
-    (Join-Path $driverOutput 'CdpBootService.exe'),
     (Join-Path $driverOutput 'CdpDriver.cer'),
     (Join-Path $driverOutput 'driver\CdpDriver.inf'),
     (Join-Path $driverOutput 'driver\CdpDriver.sys'),
@@ -70,14 +71,20 @@ try {
     # entry for this child build avoids that duplicate; MSBuild resolves the
     # selected VC toolchain through its own absolute installation paths.
     Remove-Item Env:Path -ErrorAction SilentlyContinue
+    & $msbuild (Join-Path $driverRoot 'CdpBootService\CdpBootService.vcxproj') /m /t:Build /p:Configuration=Release /p:Platform=x64 /v:minimal /nologo
+    $bootServiceBuildExitCode = $LASTEXITCODE
     & $msbuild (Join-Path $installerRoot 'CdpDriverInstallHelper.vcxproj') /m /t:Build /p:Configuration=Release /p:Platform=x64 /v:minimal /nologo
-    $msbuildExitCode = $LASTEXITCODE
+    $helperBuildExitCode = $LASTEXITCODE
 } finally {
     $env:Path = $savedProcessPath
 }
-if ($msbuildExitCode -ne 0) {
-    throw "生成驱动安装助手失败 (exit code $msbuildExitCode)。"
+if ($bootServiceBuildExitCode -ne 0) {
+    throw "生成启动服务失败 (exit code $bootServiceBuildExitCode)。"
 }
+if ($helperBuildExitCode -ne 0) {
+    throw "生成驱动安装助手失败 (exit code $helperBuildExitCode)。"
+}
+Require-File (Join-Path $driverOutput 'CdpBootService.exe')
 Require-File (Join-Path $driverOutput 'CdpDriverInstallHelper.exe')
 
 if (-not (Test-Path -LiteralPath (Join-Path $guiOutput 'Web') -PathType Container)) {

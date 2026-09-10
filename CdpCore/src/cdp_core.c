@@ -1127,18 +1127,20 @@ static NTSTATUS CdpCoreMaterializePendingRestoreResetLocked(
 	return STATUS_SUCCESS;
 }
 
-NTSTATUS CdpCoreAppendAfterImage(
+static NTSTATUS CdpCoreAppendAfterImageCommon(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
-	_In_reads_bytes_(Length) const VOID* AfterImage,
+	_In_opt_ const VOID* AfterImage,
+	_In_opt_ Cdp_JOURNAL_PAYLOAD_WRITE_ROUTINE PayloadWriter,
+	_In_opt_ PVOID PayloadContext,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord)
 {
 	NTSTATUS status;
 	Cdp_JOURNAL_RECORD record;
 	ULONG nodeCountBefore = 0;
 	ULONG nodeCountAfter = 0;
-	if (!Core || !AfterImage || Length == 0 ||
+	if (!Core || (AfterImage == NULL) == (PayloadWriter == NULL) || Length == 0 ||
 		Length > Cdp_JOURNAL_MAX_RECORD_DATA)
 	{
 		return STATUS_INVALID_PARAMETER;
@@ -1167,13 +1169,27 @@ NTSTATUS CdpCoreAppendAfterImage(
 		Cdp_LOCK_RELEASE(&Core->TreeLock);
 		return status;
 	}
-	status = CdpJournalAppendEx(
-		Core->Journal,
-		Offset,
-		Length,
-		AfterImage,
-		0,
-		&record);
+	if (PayloadWriter)
+	{
+		status = CdpJournalAppendWithWriterEx(
+			Core->Journal,
+			Offset,
+			Length,
+			0,
+			PayloadWriter,
+			PayloadContext,
+			&record);
+	}
+	else
+	{
+		status = CdpJournalAppendEx(
+			Core->Journal,
+			Offset,
+			Length,
+			AfterImage,
+			0,
+			&record);
+	}
 	if (!NT_SUCCESS(status))
 	{
 #ifndef Cdp_USERMODE
@@ -1202,6 +1218,30 @@ NTSTATUS CdpCoreAppendAfterImage(
 			*WrittenRecord = record;
 	}
 	return status;
+}
+
+NTSTATUS CdpCoreAppendAfterImage(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_In_reads_bytes_(Length) const VOID* AfterImage,
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord)
+{
+	return CdpCoreAppendAfterImageCommon(
+		Core, Offset, Length, AfterImage, NULL, NULL, WrittenRecord);
+}
+
+NTSTATUS CdpCoreAppendAfterImageWithWriter(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_In_ Cdp_JOURNAL_PAYLOAD_WRITE_ROUTINE PayloadWriter,
+	_In_opt_ PVOID PayloadContext,
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord)
+{
+	return CdpCoreAppendAfterImageCommon(
+		Core, Offset, Length, NULL, PayloadWriter, PayloadContext,
+		WrittenRecord);
 }
 
 static PCdp_PREVIEW_TREE_NODE CdpCoreFindFirstValidMetaNode(

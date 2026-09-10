@@ -155,6 +155,16 @@ typedef struct _Cdp_JOURNAL_RECORD
 	ULONG Flags; // Cdp_JOURNAL_RECORD_FLAG_* from the header high 16 bits
 } Cdp_JOURNAL_RECORD, *PCdp_JOURNAL_RECORD;
 
+// Optional payload transport for callers that already own a stable I/O
+// request. JournalOffset is relative to the journal partition. DataLength is
+// the logical record length; AlignedLength is the sector-rounded transfer
+// length reserved by the journal. The callback must complete synchronously.
+typedef NTSTATUS (*Cdp_JOURNAL_PAYLOAD_WRITE_ROUTINE)(
+	_In_opt_ PVOID Context,
+	_In_ UINT64 JournalOffset,
+	_In_ ULONG DataLength,
+	_In_ ULONG AlignedLength);
+
 C_ASSERT(sizeof(Cdp_JOURNAL_RECORD) == 40);
 
 typedef struct _Cdp_JOURNAL_RECORD_LOCATION
@@ -558,6 +568,19 @@ NTSTATUS CdpJournalAppendEx(
 	_In_ ULONG DataLength,
 	_In_reads_bytes_(DataLength) const VOID* AfterImage,
 	_In_ ULONG RecordFlags,
+	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
+
+// Append using caller-owned payload transport. This permits the disk filter
+// to retarget an existing write IRP without copying its MDL-backed payload.
+// Header publication and journal cursor advancement remain journal-owned and
+// occur only after PayloadWriter reports a complete successful transfer.
+NTSTATUS CdpJournalAppendWithWriterEx(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 VolumeOffset,
+	_In_ ULONG DataLength,
+	_In_ ULONG RecordFlags,
+	_In_ Cdp_JOURNAL_PAYLOAD_WRITE_ROUTINE PayloadWriter,
+	_In_opt_ PVOID PayloadContext,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
 
 // Serialize a durability barrier with journal append transactions.
