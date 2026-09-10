@@ -22,6 +22,8 @@ BOOL CdpInstallBootConfirmService(void);
 
 BOOL CdpInstallDriverPackage(void);
 
+BOOL CdpUninstallDriverPackage(void);
+
 const wchar_t* CdpGetInstallFailureStage(void);
 
 #ifdef __cplusplus

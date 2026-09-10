@@ -359,6 +359,150 @@ BOOL CdpRegisterDiskUpperFilter(void)
 		L"{4d36e967-e325-11ce-bfc1-08002be10318}");
 }
 
+static BOOL CdpUnregisterClassUpperFilter(_In_ const wchar_t* classKey)
+{
+	wchar_t existing[4096] = {};
+	wchar_t updated[4096] = {};
+	wchar_t* out = updated;
+	DWORD existingSize = sizeof(existing);
+	DWORD type = 0;
+	LONG result;
+	HKEY hKey;
+	BOOL removed = FALSE;
+	const wchar_t* filterName = L"CdpDriver";
+
+	result = RegOpenKeyExW(
+		HKEY_LOCAL_MACHINE, classKey, 0, KEY_READ | KEY_SET_VALUE, &hKey);
+	if (result != ERROR_SUCCESS)
+	{
+		SetLastError((DWORD)result);
+		return FALSE;
+	}
+
+	result = RegQueryValueExW(
+		hKey, L"UpperFilters", NULL, &type, (LPBYTE)existing, &existingSize);
+	if (result == ERROR_FILE_NOT_FOUND)
+	{
+		RegCloseKey(hKey);
+		return TRUE;
+	}
+	if (result != ERROR_SUCCESS || type != REG_MULTI_SZ)
+	{
+		RegCloseKey(hKey);
+		SetLastError(result == ERROR_SUCCESS ? ERROR_INVALID_DATATYPE : (DWORD)result);
+		return FALSE;
+	}
+
+	existing[_countof(existing) - 1] = L'\0';
+	existing[_countof(existing) - 2] = L'\0';
+	for (const wchar_t* value = existing; *value; value += wcslen(value) + 1)
+	{
+		size_t length = wcslen(value);
+		if (_wcsicmp(value, filterName) == 0)
+		{
+			removed = TRUE;
+			continue;
+		}
+		if ((size_t)(out - updated) + length + 2 > _countof(updated))
+		{
+			RegCloseKey(hKey);
+			SetLastError(ERROR_BUFFER_OVERFLOW);
+			return FALSE;
+		}
+		wcscpy_s(out, _countof(updated) - (out - updated), value);
+		out += length + 1;
+	}
+	*out = L'\0';
+
+	if (!removed)
+	{
+		RegCloseKey(hKey);
+		return TRUE;
+	}
+
+	if (out == updated)
+		result = RegDeleteValueW(hKey, L"UpperFilters");
+	else
+		result = RegSetValueExW(
+			hKey, L"UpperFilters", 0, REG_MULTI_SZ, (const BYTE*)updated,
+			(DWORD)((out - updated + 1) * sizeof(wchar_t)));
+
+	RegCloseKey(hKey);
+	if (result != ERROR_SUCCESS && result != ERROR_FILE_NOT_FOUND)
+	{
+		SetLastError((DWORD)result);
+		return FALSE;
+	}
+	return TRUE;
+}
+
+static BOOL CdpDeleteDriverService(void)
+{
+	SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+	if (!scm)
+		return FALSE;
+
+	SC_HANDLE svc = OpenServiceW(
+		scm, L"CdpDriver", DELETE | SERVICE_STOP | SERVICE_QUERY_STATUS);
+	if (!svc)
+	{
+		DWORD error = GetLastError();
+		CloseServiceHandle(scm);
+		if (error == ERROR_SERVICE_DOES_NOT_EXIST)
+			return TRUE;
+		SetLastError(error);
+		return FALSE;
+	}
+
+	SERVICE_STATUS status = {};
+	(void)ControlService(svc, SERVICE_CONTROL_STOP, &status);
+	BOOL deleted = DeleteService(svc);
+	DWORD error = deleted ? ERROR_SUCCESS : GetLastError();
+	CloseServiceHandle(svc);
+	CloseServiceHandle(scm);
+	if (!deleted && error != ERROR_SERVICE_MARKED_FOR_DELETE)
+	{
+		SetLastError(error);
+		return FALSE;
+	}
+	return TRUE;
+}
+
+BOOL CdpUninstallDriverPackage(void)
+{
+	g_CdpInstallFailureStage = L"removing Volume UpperFilter";
+	if (!CdpUnregisterClassUpperFilter(
+		L"SYSTEM\\CurrentControlSet\\Control\\Class\\"
+		L"{71a27cdd-812a-11d0-bec7-08002be2092f}"))
+		return FALSE;
+
+	g_CdpInstallFailureStage = L"removing DiskDrive UpperFilter";
+	if (!CdpUnregisterClassUpperFilter(
+		L"SYSTEM\\CurrentControlSet\\Control\\Class\\"
+		L"{4d36e967-e325-11ce-bfc1-08002be10318}"))
+		return FALSE;
+
+	g_CdpInstallFailureStage = L"deleting CdpDriver service";
+	if (!CdpDeleteDriverService())
+		return FALSE;
+
+	wchar_t winDir[MAX_PATH];
+	wchar_t driverPath[MAX_PATH];
+	if (!GetWindowsDirectoryW(winDir, _countof(winDir)) ||
+		FAILED(StringCchPrintfW(
+			driverPath, _countof(driverPath), L"%s\\System32\\drivers\\CdpDriver.sys", winDir)))
+	{
+		SetLastError(ERROR_FILENAME_EXCED_RANGE);
+		return FALSE;
+	}
+	if (CdpFileExists(driverPath) &&
+		!MoveFileExW(driverPath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT))
+		return FALSE;
+
+	g_CdpInstallFailureStage = L"none";
+	return TRUE;
+}
+
 BOOL CdpInstallBootConfirmService(void)
 {
 	wchar_t exeDir[MAX_PATH];

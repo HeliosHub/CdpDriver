@@ -57,6 +57,24 @@ Function .onInit
     SetRegView 64
 FunctionEnd
 
+Function un.onInit
+    SetShellVarContext all
+    SetRegView 64
+
+protection_check:
+    nsExec::ExecToLog '"$INSTDIR\CdpDriverInstallHelper.exe" --check-protection'
+    Pop $0
+    ${If} $0 == 10
+        MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "检测到仍有分区处于保护状态。$\r$\n$\r$\n请先打开“源点恢复”，关闭所有分区保护并等待操作完成，然后点击“重试”。" IDRETRY protection_check IDCANCEL cancel_uninstall
+    ${ElseIf} $0 != 0
+        MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "暂时无法检查分区保护状态。$\r$\n$\r$\n请关闭正在运行的“源点恢复”，然后点击“重试”。" IDRETRY protection_check IDCANCEL cancel_uninstall
+    ${EndIf}
+    Return
+
+cancel_uninstall:
+    Abort
+FunctionEnd
+
 Section "安装源点恢复" SEC_MAIN
     SectionIn RO
     SetShellVarContext all
@@ -86,8 +104,6 @@ Section "安装源点恢复" SEC_MAIN
         MessageBox MB_OK|MB_ICONSTOP "卷筛选驱动安装失败，错误码：$0。请查看安装进度中的详细信息。"
         Abort
     ${EndIf}
-    Delete "$INSTDIR\CdpDriverInstallHelper.exe"
-
     DetailPrint "正在创建开始菜单和桌面快捷方式..."
     CreateDirectory "$SMPROGRAMS\源点恢复"
     CreateShortcut "$SMPROGRAMS\源点恢复\源点恢复.lnk" "$INSTDIR\${PRODUCT_EXE}" "" "$INSTDIR\${PRODUCT_EXE}" 0
@@ -115,7 +131,11 @@ Section "Uninstall"
     ExecWait '"$INSTDIR\CdpBootService.exe" --uninstall'
 
     DetailPrint "正在注销 CdpDriver 卷筛选驱动..."
-    ExecWait '"$SYSDIR\rundll32.exe" setupapi.dll,InstallHinfSection DefaultUninstall 132 "$INSTDIR\driver\CdpDriver.inf"'
+    nsExec::ExecToLog '"$INSTDIR\CdpDriverInstallHelper.exe" --uninstall'
+    Pop $0
+    ${If} $0 != 0
+        DetailPrint "警告：驱动注销未完全完成，错误码：$0。文件卸载将继续。"
+    ${EndIf}
 
     Delete "$DESKTOP\源点恢复.lnk"
     RMDir /r "$SMPROGRAMS\源点恢复"
