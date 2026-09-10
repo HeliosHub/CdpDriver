@@ -112,6 +112,9 @@ NTSTATUS CdpCreateInternalSourceDevice(
 	KeInitializeEvent(
 		&ext->RedirectWritesDrainedEvent, NotificationEvent, TRUE);
 	KeInitializeEvent(&ext->DiskIoDrainedEvent, NotificationEvent, TRUE);
+	KeInitializeEvent(
+		&ext->CurrentViewReadsDrainedEvent, NotificationEvent, TRUE);
+	InterlockedExchange(&ext->CurrentViewReadsInFlight, 0);
 	KeInitializeEvent(&ext->MergeThreadDoneEvent, NotificationEvent, TRUE);
 	KeInitializeEvent(
 		&ext->MergeSpaceRetryDoneEvent, NotificationEvent, TRUE);
@@ -392,6 +395,9 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 		NotificationEvent, TRUE);
 	InterlockedExchange(&DeviceExtension->DiskIoAccepting, 0);
 	InterlockedExchange(&DeviceExtension->DiskIoOutstanding, 0);
+	KeInitializeEvent(&DeviceExtension->CurrentViewReadsDrainedEvent,
+		NotificationEvent, TRUE);
+	InterlockedExchange(&DeviceExtension->CurrentViewReadsInFlight, 0);
 	InterlockedExchange(&DeviceExtension->ShutdownInProgress, 0);
 	InterlockedExchange64(&DeviceExtension->ShutdownIrpEntryCount, 0);
 	InterlockedExchange64(&DeviceExtension->ShutdownIrpCompletionCount, 0);

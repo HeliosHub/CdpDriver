@@ -187,6 +187,12 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	volatile LONG DiskIoAccepting;
 	volatile LONG DiskIoOutstanding;
 	KEVENT DiskIoDrainedEvent;
+	/* Normal current-view reads pin immutable Journal payload locations while
+	 * performing slow source/Journal I/O without HistoryMutex. Merge, drain and
+	 * recovery transitions wait for this count to reach zero before changing or
+	 * reclaiming the view. */
+	volatile LONG CurrentViewReadsInFlight;
+	KEVENT CurrentViewReadsDrainedEvent;
 	/* Protected source objects use 0=normal, 1=publishing the terminal durable
 	 * barrier, 2=terminal durable I/O. State 2 keeps capture admission open;
 	 * every later redirected write is flushed before it completes. The state is

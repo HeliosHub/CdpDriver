@@ -16,6 +16,8 @@ static NTSTATUS CdpStartMergeThread(
 	_In_ BOOLEAN IgnoreUsageThreshold);
 static VOID CdpStopMergeThread(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
 static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
+static VOID CdpWaitForCurrentViewReads(
+	_Inout_ PCdp_DEVICE_EXTENSION SourceExt);
 static VOID CdpSetRestorePointSpaceAlert(
 	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
 	_In_ BOOLEAN Active,
@@ -1662,6 +1664,7 @@ static NTSTATUS CdpPreparePersistentRestoreBootForSource(
 		return STATUS_INVALID_PARAMETER;
 	KeWaitForSingleObject(
 		&SourceExt->HistoryMutex, Executive, KernelMode, FALSE, NULL);
+	CdpWaitForCurrentViewReads(SourceExt);
 	status = CdpCorePreparePersistentRestoreBoot(
 		SourceExt->Core,
 		CdpDiskBackfillWriteAbsolute,
@@ -2888,6 +2891,9 @@ static NTSTATUS CdpBeginPreviewSession(
 		goto cleanup;
 	}
 	phaseTransitioned = TRUE;
+	/* PREVIEW is now visible, so new current-view reads cannot take the fast
+	 * pin. Drain readers which selected GENERAL before rebuilding the view. */
+	CdpWaitForCurrentViewReads(sourceExt);
 
 	if (CdpAnyPreviewSessionActive(DriverExt))
 	{
@@ -3402,6 +3408,7 @@ static NTSTATUS CdpBeginRecovery(
 		KernelMode,
 		FALSE,
 		NULL);
+	CdpWaitForCurrentViewReads(sourceExt);
 	status = CdpCoreRecoveryBegin(sourceExt->Core, targetTime);
 	if (NT_SUCCESS(status))
 	{
@@ -3457,6 +3464,7 @@ static NTSTATUS CdpCommitRecovery(
 		KernelMode,
 		FALSE,
 		NULL);
+	CdpWaitForCurrentViewReads(sourceExt);
 	targetTime = CdpCoreGetTargetTime100ns(sourceExt->Core);
 	status = CdpCoreRecoveryCommitStep(sourceExt->Core, &complete);
 	KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
@@ -3588,6 +3596,7 @@ static NTSTATUS CdpSetRestorePoint(
 	CdpStopMergeThread(sourceExt);
 	KeWaitForSingleObject(
 		&sourceExt->HistoryMutex, Executive, KernelMode, FALSE, NULL);
+	CdpWaitForCurrentViewReads(sourceExt);
 	journalEntry = CdpAcquireJournalForSource(DriverExt, sourceExt);
 	if (!journalEntry)
 	{
@@ -3701,6 +3710,7 @@ static NTSTATUS CdpDeleteRestorePoint(
 	CdpStopMergeThread(sourceExt);
 	KeWaitForSingleObject(
 		&sourceExt->HistoryMutex, Executive, KernelMode, FALSE, NULL);
+	CdpWaitForCurrentViewReads(sourceExt);
 	journalEntry = CdpAcquireJournalForSource(DriverExt, sourceExt);
 	if (!journalEntry)
 	{
@@ -4946,6 +4956,73 @@ static VOID CdpReleaseDiskIoOutstanding(
 	}
 }
 
+/* Called with HistoryMutex owned. MergeThreadRunning is published before the
+ * merge worker starts, and non-merge view transitions publish a non-GENERAL
+ * phase before acquiring HistoryMutex. Therefore a successful pin cannot race
+ * past a transition which is about to reclaim or rewrite the current view. */
+static BOOLEAN CdpTryPinCurrentViewReadLocked(
+	_Inout_ PCdp_DEVICE_EXTENSION SourceExt)
+{
+	LONG inFlight;
+
+	if (!SourceExt || !SourceExt->Core ||
+		InterlockedCompareExchange(&SourceExt->CaptureEnabled, 0, 0) == 0 ||
+		InterlockedCompareExchange(&SourceExt->Phase, 0, 0) !=
+			(LONG)Cdp_PHASE_GENERAL ||
+		InterlockedCompareExchange(&SourceExt->MergeThreadRunning, 0, 0) != 0)
+	{
+		return FALSE;
+	}
+	inFlight = InterlockedIncrement(&SourceExt->CurrentViewReadsInFlight);
+	if (inFlight == 1)
+		KeClearEvent(&SourceExt->CurrentViewReadsDrainedEvent);
+	/* Close the check/increment race with a transition which publishes its
+	 * phase or MergeThreadRunning without taking HistoryMutex first. */
+	if (InterlockedCompareExchange(&SourceExt->CaptureEnabled, 0, 0) == 0 ||
+		InterlockedCompareExchange(&SourceExt->Phase, 0, 0) !=
+			(LONG)Cdp_PHASE_GENERAL ||
+		InterlockedCompareExchange(&SourceExt->MergeThreadRunning, 0, 0) != 0)
+	{
+		if (InterlockedDecrement(&SourceExt->CurrentViewReadsInFlight) == 0)
+		{
+			KeSetEvent(
+				&SourceExt->CurrentViewReadsDrainedEvent,
+				IO_NO_INCREMENT,
+				FALSE);
+		}
+		return FALSE;
+	}
+	return TRUE;
+}
+
+static VOID CdpReleaseCurrentViewRead(
+	_Inout_ PCdp_DEVICE_EXTENSION SourceExt)
+{
+	if (SourceExt &&
+		InterlockedDecrement(&SourceExt->CurrentViewReadsInFlight) == 0)
+	{
+		KeSetEvent(
+			&SourceExt->CurrentViewReadsDrainedEvent,
+			IO_NO_INCREMENT,
+			FALSE);
+	}
+}
+
+static VOID CdpWaitForCurrentViewReads(
+	_Inout_ PCdp_DEVICE_EXTENSION SourceExt)
+{
+	while (InterlockedCompareExchange(
+			&SourceExt->CurrentViewReadsInFlight, 0, 0) != 0)
+	{
+		KeWaitForSingleObject(
+			&SourceExt->CurrentViewReadsDrainedEvent,
+			Executive,
+			KernelMode,
+			FALSE,
+			NULL);
+	}
+}
+
 static NTSTATUS CdpReadDiskLowerSynchronously(
 	_In_ PDEVICE_OBJECT LowerDevice,
 	_In_ UINT64 AbsoluteOffset,
@@ -5345,6 +5422,10 @@ static VOID CdpMergeWorker(_In_ PVOID Context)
 		devExt->RedirectJournalEntry->Journal.RestorePointSet;
 	ULONG mergeThreshold = restorePointMode ? 80UL : 90UL;
 
+	/* MergeThreadRunning was published before this worker was created. New
+	 * current-view reads therefore take the mutex fallback, while this drains
+	 * the fast reads which pinned pre-merge payload locations. */
+	CdpWaitForCurrentViewReads(devExt);
 	status = CdpCoreSetMergeActive(devExt->Core, TRUE);
 	if (!NT_SUCCESS(status))
 		goto done;
@@ -6576,6 +6657,8 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 					UINT64 sourceReadOffset = readOffset;
 					ULONG sourceReadLength = ioLength;
 					NTSTATUS readStatus;
+					BOOLEAN fastReadPinned = FALSE;
+					BOOLEAN historyMutexOwned = FALSE;
 					if (readOffset < devExt->PartitionStart ||
 						devExt->PartitionStart >
 							MAXUINT64 - devExt->PartitionSize ||
@@ -6597,6 +6680,8 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 					 * the original IRP; only a hit uses a private baseline read. */
 					KeWaitForSingleObject(&devExt->HistoryMutex,
 						Executive, KernelMode, FALSE, NULL);
+					historyMutexOwned = TRUE;
+					fastReadPinned = CdpTryPinCurrentViewReadLocked(devExt);
 					readStatus = devExt->Core ?
 						CdpCoreQueryCurrentReadCoverage(
 							devExt->Core, readOffset, ioLength, &coverage,
@@ -6606,9 +6691,20 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 						coverage == Cdp_CORE_READ_COVERAGE_NONE)
 					{
 						KeReleaseMutex(&devExt->HistoryMutex, FALSE);
+						historyMutexOwned = FALSE;
+						if (fastReadPinned)
+							CdpReleaseCurrentViewRead(devExt);
 						(void)CdpForwardQueuedDiskIrpSynchronously(item);
 						IoCompleteRequest(item->Irp, IO_NO_INCREMENT);
 						goto capture_item_done;
+					}
+					/* In the append-only GENERAL state, the pin keeps copied Journal
+					 * locations alive while writes continue publishing new immutable
+					 * payloads. Exceptional states retain the original mutex path. */
+					if (fastReadPinned)
+					{
+						KeReleaseMutex(&devExt->HistoryMutex, FALSE);
+						historyMutexOwned = FALSE;
 					}
 					buffer = NT_SUCCESS(readStatus) ?
 						(PUCHAR)cdpalloc(ioLength) : NULL;
@@ -6639,7 +6735,10 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 							ioLength,
 							buffer);
 					}
-					KeReleaseMutex(&devExt->HistoryMutex, FALSE);
+					if (historyMutexOwned)
+						KeReleaseMutex(&devExt->HistoryMutex, FALSE);
+					if (fastReadPinned)
+						CdpReleaseCurrentViewRead(devExt);
 					if (NT_SUCCESS(readStatus))
 					{
 						readStatus = CdpScatterReadMdlChain(
@@ -6892,6 +6991,9 @@ static NTSTATUS CdpDrainAndDisableCapture(
 	Cdp_LOG("[DRAIN-DIAG] stage=stop-merge-begin source=%p\n", DevExt);
 	CdpStopMergeThread(DevExt);
 	Cdp_LOG("[DRAIN-DIAG] stage=stop-merge-end source=%p\n", DevExt);
+	/* DRAINING was published before this wait, so no new fast read can pin the
+	 * append-only view. Finish old readers before source writeback/punching. */
+	CdpWaitForCurrentViewReads(DevExt);
 	diagnosticTimeout.QuadPart = -10LL * 1000LL * 1000LL * 10LL;
 	while (InterlockedCompareExchange(
 			&DevExt->RedirectWritesInFlight, 0, 0) != 0)
