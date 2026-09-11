@@ -1,16 +1,19 @@
 ﻿[CmdletBinding()]
 param(
-    [string]$GuiRoot = 'C:\Users\Administrator\Desktop\cdpgui',
+    [string]$GuiRoot = '',
     [string]$OutputDirectory = ''
 )
 
 $ErrorActionPreference = 'Stop'
 
 $installerRoot = Split-Path -Parent $PSCommandPath
+$driverRoot = Split-Path -Parent $installerRoot
+if ([string]::IsNullOrWhiteSpace($GuiRoot)) {
+    $GuiRoot = Join-Path (Split-Path -Parent $driverRoot) 'cdpgui'
+}
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = $installerRoot
 }
-$driverRoot = Split-Path -Parent $installerRoot
 $driverOutput = Join-Path $driverRoot 'x64\Release'
 $guiOutput = Join-Path $GuiRoot 'bin\x64\Release'
 $guiExecutableCandidates = @(
