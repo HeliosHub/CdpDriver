@@ -106,8 +106,11 @@ if __name__ == "__main__":
         run_program(["python", gen_file_script, "-n", "10", "-o", protected_disk_path + "\\"])
         
         t1_file_list = get_file_names(protected_disk_path)
-        print("--- 睡眠10秒继续执行 ---")
-        time.sleep(10)
+        print("--- 持久化 ---")
+        run_program(["mountvol", protected_disk_path, "/P"])
+        time.sleep(1)
+        run_program(["mountvol", protected_disk_path, protected_disk_guid_full])
+        time.sleep(1)
         t1 = get_current_utc_seconds()
         print("t1:", t1)
         time.sleep(2)

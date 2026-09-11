@@ -2432,11 +2432,13 @@ static int TestDeferredRebootRecoveryBranch(void)
 	TEST_FAIL_STORE journalFail;
 	Cdp_JOURNAL_RECORD targetRecord;
 	Cdp_JOURNAL_RECORD writtenRecord;
+	Cdp_JOURNAL_RECORD secondWrittenRecord;
 	Cdp_JOURNAL_RECORD headers[8];
 	UCHAR source[512];
 	UCHAR target[512];
 	UCHAR latest[512];
 	UCHAR firstWrite[512];
+	UCHAR secondWrite[512];
 	UCHAR output[512];
 	UINT64 total = 0;
 	UINT64 generation = 0;
@@ -2450,6 +2452,7 @@ static int TestDeferredRebootRecoveryBranch(void)
 	RtlFillMemory(target, sizeof(target), 0x20);
 	RtlFillMemory(latest, sizeof(latest), 0x30);
 	RtlFillMemory(firstWrite, sizeof(firstWrite), 0x40);
+	RtlFillMemory(secondWrite, sizeof(secondWrite), 0x50);
 	Expect(NT_SUCCESS(ctx.Source->Write(
 		ctx.Source, 0, sizeof(source), source)),
 		"seed deferred recovery source");
@@ -2508,6 +2511,34 @@ static int TestDeferredRebootRecoveryBranch(void)
 		ctx.Core, 0, sizeof(output), output)) &&
 		memcmp(output, firstWrite, sizeof(output)) == 0,
 		"first write updates the recovered MetaTree on the new branch");
+
+	/* Recover the now-current branch 2 back to a target on branch 1. The
+	 * deferred first write must be allowed to create branch 3 from that older
+	 * parent even though CurrentBranchNumber is still 2. */
+	Expect(NT_SUCCESS(CdpCorePrepareRebootRecovery(
+		ctx.Core, targetRecord.WallClock100ns)) &&
+		CdpCoreHasPendingRecoveryBranch(ctx.Core),
+		"second boot recovery can target an older parent branch");
+	CdpCoreSetTime100ns(ctx.Core, 190000);
+	status = CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(secondWrite), secondWrite,
+		&secondWrittenRecord);
+	Expect(NT_SUCCESS(status) &&
+		!CdpCoreHasPendingRecoveryBranch(ctx.Core),
+		"second recovery first write materializes a sibling branch");
+	returned = 0;
+	status = CdpCoreQueryRecordHeaders(
+		ctx.Core, 0, 0, headers, RTL_NUMBER_OF(headers),
+		&total, &generation, &returned);
+	Expect(NT_SUCCESS(status) && total == 7 && returned == 7 &&
+		headers[5].Flags == Cdp_JOURNAL_RECORD_FLAG_BRANCH &&
+		headers[6].Sequence == secondWrittenRecord.Sequence,
+		"second recovery commits branch 3 before its first payload");
+	RtlZeroMemory(output, sizeof(output));
+	Expect(NT_SUCCESS(CdpCoreRead(
+		ctx.Core, 0, sizeof(output), output)) &&
+		memcmp(output, secondWrite, sizeof(output)) == 0,
+		"second recovery write updates the sibling branch view");
 
 	TestCtxDestroy(&ctx);
 	return g_caseFailed;

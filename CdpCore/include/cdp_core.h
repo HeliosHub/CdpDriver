@@ -261,16 +261,6 @@ NTSTATUS CdpCoreRebuildCurrentView(_Inout_ PCdp_CORE Core);
 
 /* Build the exact target view and write each latest interval through the
  * caller's source-volume writer. The live MetaTree/branch is not changed. */
-NTSTATUS CdpCoreMaterializeTimeWithWriter(
-	_Inout_ PCdp_CORE Core,
-	_In_ UINT64 TargetTime100ns,
-	_In_ Cdp_CORE_DRAIN_WRITE_ROUTINE WriteRoutine,
-	_In_opt_ PVOID WriteContext,
-	_Out_opt_ PUINT64 EffectiveTime100ns,
-	_Out_opt_ PUINT64 TargetSequence,
-	_Out_opt_ PULONG WrittenRanges,
-	_Out_opt_ PUINT64 WrittenBytes);
-
 NTSTATUS CdpCoreMaterializeTimeWithWriterProgress(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 TargetTime100ns,

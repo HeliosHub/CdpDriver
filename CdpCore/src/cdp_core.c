@@ -1054,9 +1054,13 @@ static NTSTATUS CdpCoreMaterializePendingRecoveryBranchLocked(
 	currentBranch = Core->Journal->CurrentBranchNumber;
 	if (currentBranch != Core->PendingRecoveryBranchNumber)
 	{
-		if (currentBranch != Core->PendingRecoveryParentBranch ||
-			Core->Journal->HighestBranchNumber + 1 !=
-				Core->PendingRecoveryBranchNumber)
+		/* A recovery may fork from any retained historical branch. After a
+		 * previous recovery, CurrentBranchNumber names that newer branch and
+		 * therefore need not match the selected target's parent. The journal
+		 * append path validates that the parent exists; here only reject a
+		 * stale/conflicting reservation. */
+		if (Core->Journal->HighestBranchNumber + 1 !=
+			Core->PendingRecoveryBranchNumber)
 		{
 			return STATUS_INVALID_DEVICE_STATE;
 		}
@@ -2229,22 +2233,6 @@ done:
 	if (WrittenBytes)
 		*WrittenBytes = bytes;
 	return status;
-}
-
-NTSTATUS CdpCoreMaterializeTimeWithWriter(
-	_Inout_ PCdp_CORE Core,
-	_In_ UINT64 TargetTime100ns,
-	_In_ Cdp_CORE_DRAIN_WRITE_ROUTINE WriteRoutine,
-	_In_opt_ PVOID WriteContext,
-	_Out_opt_ PUINT64 EffectiveTime100ns,
-	_Out_opt_ PUINT64 TargetSequence,
-	_Out_opt_ PULONG WrittenRanges,
-	_Out_opt_ PUINT64 WrittenBytes)
-{
-	return CdpCoreMaterializeTimeWithWriterProgress(
-		Core, TargetTime100ns, WriteRoutine, WriteContext,
-		NULL, NULL, EffectiveTime100ns, TargetSequence,
-		WrittenRanges, WrittenBytes);
 }
 
 NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns)

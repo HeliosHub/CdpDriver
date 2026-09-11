@@ -6006,122 +6006,6 @@ cleanup:
 	return status;
 }
 
-NTSTATUS CdpJournalFindRecordLocationBySequence(
-	_Inout_ PCdp_JOURNAL Journal,
-	_In_ UINT64 RecordSequence,
-	_Out_ PUINT64 RecordIndex,
-	_Out_ PUINT64 RecordTime100ns,
-	_Out_ PUINT64 HeaderRegionOffset,
-	_Out_ PULONG HeaderIndex)
-{
-	PUCHAR region = NULL;
-	UINT64 regionOff;
-	UINT64 liveIndex = 0;
-	ULONG guard = 0;
-	NTSTATUS status = STATUS_NOT_FOUND;
-
-	if (!Journal || !RecordIndex || !RecordTime100ns ||
-		!HeaderRegionOffset || !HeaderIndex)
-	{
-		return STATUS_INVALID_PARAMETER;
-	}
-	*RecordIndex = 0;
-	*RecordTime100ns = 0;
-	*HeaderRegionOffset = 0;
-	*HeaderIndex = 0;
-
-	Cdp_LOCK_ACQUIRE(&Journal->Lock);
-	if (!Journal->Mounted)
-	{
-		status = STATUS_DEVICE_NOT_READY;
-		goto cleanup;
-	}
-	if (CdpJournalIsEmptyLocked(Journal))
-		goto cleanup;
-	status = CdpJournalGetHeaderScanBufferLocked(Journal, &region);
-	if (!NT_SUCCESS(status))
-		goto cleanup;
-
-	regionOff = Journal->OldestHeaderRegionOff;
-	for (;;)
-	{
-		Cdp_HEADER_REGION_LINK link;
-		ULONG limit;
-		ULONG startIndex;
-		ULONG index;
-		BOOLEAN isLast;
-
-		if (++guard > 100000UL)
-		{
-			status = STATUS_DISK_CORRUPT_ERROR;
-			goto cleanup;
-		}
-		status = CdpJournalReadHeaderRegion(Journal, regionOff, region);
-		if (!NT_SUCCESS(status))
-			goto cleanup;
-		RtlCopyMemory(
-			&link,
-			region + Cdp_JOURNAL_HEADER_REGION_SIZE -
-				Cdp_JOURNAL_HEADER_LINK_SIZE,
-			sizeof(link));
-		if (!CdpJournalRegionLinkValid(Journal, &link))
-		{
-			status = STATUS_DISK_CORRUPT_ERROR;
-			goto cleanup;
-		}
-		status = CdpJournalGetRegionHeaderLimitLocked(
-			Journal, regionOff, &link, &limit, NULL);
-		if (!NT_SUCCESS(status))
-			goto cleanup;
-		isLast = regionOff == Journal->LastHeaderRegionOff;
-		startIndex = regionOff == Journal->OldestHeaderRegionOff ?
-			Journal->OldestHeaderIndex : 0;
-
-		for (index = startIndex; index < limit; ++index)
-		{
-			Cdp_JOURNAL_RECORD_HEADER header;
-			UINT64 globalSequence;
-
-			RtlCopyMemory(
-				&header,
-				region + index * sizeof(header),
-				sizeof(header));
-			if ((header.Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) != index ||
-				link.StartSequence > MAXUINT64 - index)
-			{
-				status = STATUS_DISK_CORRUPT_ERROR;
-				goto cleanup;
-			}
-			if (CdpJournalHeaderIsDeleted(&header))
-				continue;
-			globalSequence = link.StartSequence + index;
-			if (globalSequence == RecordSequence)
-			{
-				*RecordIndex = liveIndex;
-				*RecordTime100ns = header.WallClock100ns;
-				*HeaderRegionOffset = regionOff;
-				*HeaderIndex = index;
-				status = STATUS_SUCCESS;
-				goto cleanup;
-			}
-			liveIndex++;
-		}
-		if (isLast)
-			break;
-		if (link.NextRegionOff == regionOff)
-		{
-			status = STATUS_DISK_CORRUPT_ERROR;
-			goto cleanup;
-		}
-		regionOff = link.NextRegionOff;
-	}
-	status = STATUS_NOT_FOUND;
-
-cleanup:
-	Cdp_LOCK_RELEASE(&Journal->Lock);
-	return status;
-}
-
 NTSTATUS CdpJournalQueryBranches(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 StartIndex,
@@ -6948,56 +6832,6 @@ NTSTATUS CdpPreviewTreeRemapPayloadRange(
 		cursor = mappedEnd;
 	}
 	return STATUS_SUCCESS;
-}
-
-BOOLEAN CdpPreviewTreeValidateMapping(
-	_In_ PCdp_PREVIEW_TREE Tree,
-	_In_ UINT64 VolumeOffset,
-	_In_ ULONG DataLength,
-	_In_ UINT64 ExpectedSequence,
-	_In_ UINT64 ExpectedFileOffset,
-	_Out_ PUINT64 FirstMismatch,
-	_Out_opt_ PUINT64 ActualSequence,
-	_Out_opt_ PUINT64 ActualFileOffset)
-{
-	UINT64 cursor;
-	UINT64 end;
-
-	if (!Tree || !FirstMismatch || DataLength == 0 ||
-		VolumeOffset > MAXUINT64 - DataLength)
-	{
-		return FALSE;
-	}
-	if (ActualSequence)
-		*ActualSequence = 0;
-	if (ActualFileOffset)
-		*ActualFileOffset = 0;
-	cursor = VolumeOffset;
-	end = VolumeOffset + DataLength;
-	while (cursor < end)
-	{
-		PCdp_PREVIEW_TREE_NODE node = CdpPreviewTreeFindFirstOverlap(
-			Tree->Root, cursor, end);
-		UINT64 expectedAtCursor = ExpectedFileOffset +
-			(cursor - VolumeOffset);
-		if (!node || node->Start > cursor || node->End <= cursor ||
-			node->Sequence != ExpectedSequence ||
-			node->FileOffset + (cursor - node->Start) != expectedAtCursor)
-		{
-			*FirstMismatch = cursor;
-			if (node && node->Start <= cursor && node->End > cursor)
-			{
-				if (ActualSequence)
-					*ActualSequence = node->Sequence;
-				if (ActualFileOffset)
-					*ActualFileOffset = node->FileOffset +
-						(cursor - node->Start);
-			}
-			return FALSE;
-		}
-		cursor = node->End < end ? node->End : end;
-	}
-	return TRUE;
 }
 
 static NTSTATUS CdpJournalBuildCurrentBranchTreeInternal(
@@ -8332,28 +8166,6 @@ NTSTATUS CdpJournalBuildPreviewTree(
 		NULL,
 		TargetRecordSequence,
 		NULL);
-}
-
-NTSTATUS CdpJournalApplyPreviewTree(
-	_Inout_ PCdp_JOURNAL Journal,
-	_In_ PCdp_PREVIEW_TREE Tree,
-	_Inout_ Cdp_LOCK* TreeLock,
-	_In_ UINT64 VolumeOffset,
-	_In_ ULONG DataLength,
-	_Out_writes_bytes_(DataLength) PVOID Buffer,
-	_Out_writes_bytes_((DataLength + 7) / 8) PUCHAR CoveredMask,
-	_Out_ PULONG CoveredCount)
-{
-	return CdpJournalApplyPreviewTreeEx(
-		Journal,
-		Tree,
-		TreeLock,
-		FALSE,
-		VolumeOffset,
-		DataLength,
-		Buffer,
-		CoveredMask,
-		CoveredCount);
 }
 
 NTSTATUS CdpJournalApplyPreviewTreeEx(

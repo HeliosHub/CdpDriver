@@ -730,16 +730,6 @@ NTSTATUS CdpJournalQueryRecordHeaders(
 	_Out_ PUINT64 Generation,
 	_Out_ PULONG ReturnedCount);
 
-// Resolve a live record's global Sequence to the same zero-based logical
-// Index printed by CdpConsole command 'l', plus its physical RR location.
-NTSTATUS CdpJournalFindRecordLocationBySequence(
-	_Inout_ PCdp_JOURNAL Journal,
-	_In_ UINT64 RecordSequence,
-	_Out_ PUINT64 RecordIndex,
-	_Out_ PUINT64 RecordTime100ns,
-	_Out_ PUINT64 HeaderRegionOffset,
-	_Out_ PULONG HeaderIndex);
-
 // Query the retained in-memory branch topology in creation order. Generation
 // is the journal record generation and makes multi-page snapshots coherent.
 NTSTATUS CdpJournalQueryBranches(
@@ -801,17 +791,6 @@ NTSTATUS CdpJournalBuildSettledPreviewTree(
 	_Out_opt_ PUINT64 TargetRecordSequence,
 	_Out_opt_ PCdp_JOURNAL_RECORD_LOCATION TargetLocation);
 
-NTSTATUS CdpJournalApplyPreviewTree(
-	_Inout_ PCdp_JOURNAL Journal,
-	_In_ PCdp_PREVIEW_TREE Tree,
-	_Inout_ Cdp_LOCK* TreeLock,
-	_In_ UINT64 VolumeOffset,
-	_In_ ULONG DataLength,
-	_Out_writes_bytes_(DataLength) PVOID Buffer,
-	// One bit per output byte; caller supplies (DataLength + 7) / 8 bytes.
-	_Out_writes_bytes_((DataLength + 7) / 8) PUCHAR CoveredMask,
-	_Out_ PULONG CoveredCount);
-
 NTSTATUS CdpJournalApplyPreviewTreeEx(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ PCdp_PREVIEW_TREE Tree,
@@ -867,17 +846,5 @@ NTSTATUS CdpPreviewTreeRemapPayloadRange(
 	_In_ ULONG DataLength,
 	_In_ UINT64 ExpectedFileOffset,
 	_In_ UINT64 NewFileOffset);
-
-// Caller serializes Tree. Verify that every byte in [VolumeOffset, end) maps
-// to the expected record identity and consecutive payload bytes.
-BOOLEAN CdpPreviewTreeValidateMapping(
-	_In_ PCdp_PREVIEW_TREE Tree,
-	_In_ UINT64 VolumeOffset,
-	_In_ ULONG DataLength,
-	_In_ UINT64 ExpectedSequence,
-	_In_ UINT64 ExpectedFileOffset,
-	_Out_ PUINT64 FirstMismatch,
-	_Out_opt_ PUINT64 ActualSequence,
-	_Out_opt_ PUINT64 ActualFileOffset);
 
 VOID CdpJournalClose(_Inout_ PCdp_JOURNAL Journal);

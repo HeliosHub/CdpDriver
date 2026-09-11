@@ -22,7 +22,7 @@ CdpCore 是驱动与用户态单元测试共用的 after-image Journal 引擎。
 ## Drain 与持久还原点
 
 - `CdpCoreDrainOneMetaRangeWithWriter` 每次选择一个当前覆盖范围，通过调用方提供的绝对偏移 writer 写回，成功后从 `MetaTree` 删除该覆盖。
-- `CdpCoreMaterializeTimeWithWriter` 构建指定时间视图，并通过同一类 writer 将完整目标视图物化到源存储。
+- `CdpCoreMaterializeTimeWithWriterProgress` 构建指定时间视图，通过同一类 writer 将完整目标视图物化到源存储，并可报告已完成字节数。
 - 实际内核 writer 由驱动实现：直接向物理磁盘过滤层下方发送带 `SL_FORCE_DIRECT_WRITE` 的绝对偏移 WRITE；CdpCore 不依赖设备栈细节。
 - 持久还原点启动时可跳过旧 Record 扫描，直接使用已物化源数据；第一笔 after-image append 前重置旧历史并建立新根分支。
 
@@ -35,7 +35,7 @@ CdpCore 是驱动与用户态单元测试共用的 after-image Journal 引擎。
 - 查询：`CdpCoreQueryTimeRange`、`CdpCoreQueryJournalUsage`、`CdpCoreQueryRecordHeaders`
 - Preview：`CdpCorePreviewBegin`、`CdpCorePreviewRead`、`CdpCorePreviewEnd`
 - Recovery：`CdpCoreRecoveryBegin`、`CdpCoreRecoveryCommitStep`、`CdpCoreRecoveryCommit`
-- Drain/物化：`CdpCoreDrainOneMetaRangeWithWriter`、`CdpCoreMaterializeTimeWithWriter`
+- Drain/物化：`CdpCoreDrainOneMetaRangeWithWriter`、`CdpCoreMaterializeTimeWithWriterProgress`
 - 持久还原点：`CdpCorePreparePersistentRestoreBoot`、`CdpCoreCancelPersistentRestoreBoot`
 - 合并：`CdpCoreSetMergeActive`、`CdpCoreCompactOldestRegion`（自动模式按 90% 阈值循环；手动模式跳过阈值回收一个最旧 RR，并在该 Core 回收事务内清理由失效分支产生的连续 tombstone RR）
 
