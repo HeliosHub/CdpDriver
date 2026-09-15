@@ -181,6 +181,8 @@ NTSTATUS CdpCoreQueryMetaCoverageBytes(
 	_Inout_ PCdp_CORE Core,
 	_Out_ PUINT64 CoverageBytes);
 
+// Read the live current view. Preview state never changes this routing;
+// historical data is exposed only by CdpCorePreviewRead.
 NTSTATUS CdpCoreRead(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,
@@ -203,7 +205,8 @@ typedef enum _Cdp_CORE_READ_COVERAGE
 	Cdp_CORE_READ_COVERAGE_FULL = 2
 } Cdp_CORE_READ_COVERAGE;
 
-// Pure in-memory routing query. For PARTIAL coverage with one source hole,
+// Pure in-memory routing query for the live MetaTree. Preview state never
+// changes this routing. For PARTIAL coverage with one source hole,
 // SourceOffset/Length describes that hole. With multiple separated holes it
 // returns the original request range, keeping source I/O to one simple read.
 // FULL returns SourceLength == 0.

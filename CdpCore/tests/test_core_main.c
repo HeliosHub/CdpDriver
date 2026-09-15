@@ -2218,6 +2218,92 @@ cleanup:
 	return g_caseFailed;
 }
 
+static int TestPreviewIsolationFromCurrentView(void)
+{
+	TEST_CTX ctx;
+	Cdp_JOURNAL_RECORD historicalRecord;
+	Cdp_CORE_READ_COVERAGE coverage = Cdp_CORE_READ_COVERAGE_NONE;
+	UINT64 sourceOffset = 0;
+	ULONG sourceLength = 0;
+	UCHAR source[1024];
+	UCHAR historicalFirst[512];
+	UCHAR currentFirst[512];
+	UCHAR currentSecond[512];
+	UCHAR previewExpected[1024];
+	UCHAR currentExpected[1024];
+	UCHAR output[1024];
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(TestCtxCreate(
+		&ctx, SRC_SIZE, JNL_SIZE, 100000000)),
+		"setup Preview/current-view isolation test");
+	FillPattern(source, sizeof(source), 0x10);
+	RtlFillMemory(historicalFirst, sizeof(historicalFirst), 0x41);
+	RtlFillMemory(currentFirst, sizeof(currentFirst), 0x52);
+	RtlFillMemory(currentSecond, sizeof(currentSecond), 0x63);
+	Expect(NT_SUCCESS(ctx.Source->Write(
+		ctx.Source, 0, sizeof(source), source)),
+		"seed source for Preview/current-view isolation");
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(historicalFirst), historicalFirst,
+		&historicalRecord)),
+		"append historical first sector");
+	CdpCoreSetTime100ns(ctx.Core, 120000000);
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 512, sizeof(currentSecond), currentSecond, NULL)),
+		"append current second sector after Preview target");
+
+	status = CdpCorePreviewBegin(
+		ctx.Core, historicalRecord.WallClock100ns);
+	Expect(NT_SUCCESS(status), "begin isolated historical Preview");
+	if (!NT_SUCCESS(status))
+	{
+		TestCtxDestroy(&ctx);
+		return g_caseFailed;
+	}
+
+	CdpCoreSetTime100ns(ctx.Core, 130000000);
+	Expect(NT_SUCCESS(CdpCoreAppendAfterImage(
+		ctx.Core, 0, sizeof(currentFirst), currentFirst, NULL)),
+		"publish a live write while Preview is active");
+
+	RtlCopyMemory(previewExpected, historicalFirst, sizeof(historicalFirst));
+	RtlCopyMemory(previewExpected + 512, source + 512, 512);
+	RtlCopyMemory(currentExpected, currentFirst, sizeof(currentFirst));
+	RtlCopyMemory(currentExpected + 512, currentSecond, sizeof(currentSecond));
+
+	RtlZeroMemory(output, sizeof(output));
+	status = CdpCorePreviewRead(ctx.Core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(output, previewExpected, sizeof(output)) == 0,
+		"Preview handle continues to expose the historical PreviewTree");
+
+	RtlZeroMemory(output, sizeof(output));
+	status = CdpCoreRead(ctx.Core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(output, currentExpected, sizeof(output)) == 0,
+		"live reads remain on MetaTree while Preview is active");
+
+	RtlCopyMemory(output, source, sizeof(output));
+	status = CdpCoreOverlayCurrentRead(
+		ctx.Core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(output, currentExpected, sizeof(output)) == 0,
+		"disk read overlay remains on MetaTree while Preview is active");
+
+	status = CdpCoreQueryCurrentReadCoverage(
+		ctx.Core, 0, sizeof(output), &coverage, &sourceOffset, &sourceLength);
+	Expect(NT_SUCCESS(status) &&
+		coverage == Cdp_CORE_READ_COVERAGE_FULL && sourceOffset == 0 &&
+		sourceLength == 0,
+		"live read routing ignores partial historical PreviewTree coverage");
+
+	Expect(NT_SUCCESS(CdpCorePreviewEnd(ctx.Core)),
+		"end isolated historical Preview");
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
 static int TestAfterImagePreviewMergeCoordination(void)
 {
 	TEST_CTX ctx;
@@ -3540,6 +3626,8 @@ int main(void)
 		TestAfterImageBranchInfoTree);
 	failed += RunCase("After-image preview branch path",
 		TestAfterImagePreviewBranchPath);
+	failed += RunCase("Preview is isolated from current view",
+		TestPreviewIsolationFromCurrentView);
 	failed += RunCase("After-image preview/merge coordination",
 		TestAfterImagePreviewMergeCoordination);
 	failed += RunCase("After-image recovery branch switch",

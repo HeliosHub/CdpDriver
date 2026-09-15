@@ -1517,12 +1517,13 @@ NTSTATUS CdpCoreRead(
 {
 	if (!Core || !Buffer || Length == 0)
 		return STATUS_INVALID_PARAMETER;
-	if (Core->Phase == Cdp_CORE_PHASE_PREVIEW)
-		return CdpCoreSynthesizeRead(
-			Core, &Core->PreviewTree, Offset, Length, Buffer, TRUE);
 	if (!Core->MetaTreeReady)
 		return STATUS_DEVICE_NOT_READY;
 
+	/* The live source volume must always observe MetaTree. PreviewTree is an
+	 * isolated historical view and is reachable only through
+	 * CdpCorePreviewRead; switching live reads to it corrupts paging and file
+	 * system consistency as soon as Preview begins. */
 	return CdpCoreSynthesizeRead(
 		Core, &Core->MetaTree, Offset, Length, Buffer, TRUE);
 }
@@ -1535,9 +1536,6 @@ NTSTATUS CdpCoreOverlayCurrentRead(
 {
 	if (!Core || !Buffer || Length == 0)
 		return STATUS_INVALID_PARAMETER;
-	if (Core->Phase == Cdp_CORE_PHASE_PREVIEW)
-		return CdpCoreSynthesizeRead(
-			Core, &Core->PreviewTree, Offset, Length, Buffer, FALSE);
 	if (!Core->MetaTreeReady)
 		return STATUS_DEVICE_NOT_READY;
 
@@ -1628,16 +1626,10 @@ NTSTATUS CdpCoreQueryCurrentReadCoverage(
 	scan.Start = Offset;
 	scan.End = Offset + Length;
 	scan.Cursor = Offset;
-	/* Select the view under the state lock, then release it before waiting on
-	 * the independent PreviewTree lock. A slow preview payload read must never
-	 * indirectly pin TreeLock and block journal append. */
+	/* This is the routing query for the live source volume. PreviewTree is
+	 * deliberately excluded; only CdpCorePreviewRead may expose it. */
 	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
-	if (Core->Phase == Cdp_CORE_PHASE_PREVIEW)
-	{
-		tree = &Core->PreviewTree;
-		treeLock = &Core->PreviewTreeLock;
-	}
-	else if (!Core->MetaTreeReady)
+	if (!Core->MetaTreeReady)
 	{
 		status = STATUS_DEVICE_NOT_READY;
 		tree = NULL;
