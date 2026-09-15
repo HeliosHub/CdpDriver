@@ -73,7 +73,7 @@ PayloadRegion 达到 Journal 容量的 `1/10` 或 HeaderRegion 写满时切换�
 - Recovery 是分支切换：确定父分支与继承点、追加新分支 Record、构建并原子发布新 `MetaTree`，不写回源分区。
 - 重启 Recovery 先持久化意图；下次启动构建目标视图，恢复后的第一笔受保护写在追加 payload 前持久化延迟创建的分支。
 
-Preview 与 Recovery 互斥。普通自动合并在 90% 使用率时仅于 General 阶段启动；Preview 阶段达到 95% 时，驱动中止该 Preview 并启动自动合并。被中止的 Preview 句柄仍可正常执行结束操作，但其后续读取返回“因合并中止”的忙碌状态，GUI 应明确提示该原因。
+Preview 与 Recovery 互斥。除持久还原点模式外，普通自动合并在 Journal 可用 payload 空间降至 500 MiB 或以下时启动，General 与 Preview 阶段均适用。合并不会预先中止 Preview：已回收且仍对目标视图有效的覆盖会下沉到源盘基线；只有回收触及 Preview 的目标锚点时才停止该 Preview。被中止的 Preview 句柄仍可正常执行结束操作，但其后续读取返回“因合并中止”的忙碌状态，GUI 应明确提示该原因。
 
 ## 8. 持久还原点
 
@@ -87,7 +87,7 @@ Preview 与 Recovery 互斥。普通自动合并在 90% 使用率时仅于 Gener
 
 ## 9. 空间合并
 
-Journal 使用率达到 90% 时启动唯一合并线程。Console 的认证命令 `m` 跳过一次最旧 RR 的 90% 使用率判定；同一 Core 回收事务会照常标记并删除由该 RR 导致失效分支的连续 tombstone RR，但手动命令不会再处理下一个普通 RR。普通模式把该区域中当前分支仍有效的最新值通过磁盘下层的 `SL_FORCE_DIRECT_WRITE` 写回源分区，再清理对应覆盖与不可达分支数据。分支是否失效只取决于其继承基线能否由合并后的源盘基线重建；一个仍有效分支在当前分支另行分叉后的 tail 仍是该分支可预览/可继续分支的历史，不能仅因它不在当前祖先路径上而删除。日志会记录合并模式、RR 偏移和序号范围。跨区域删除使用 tombstone，已分配 Sequence 不复用。任一步失败都会停止本轮合并并保留可重试状态。
+除持久还原点模式外，Journal 可用 payload 空间降至 500 MiB 时启动唯一合并线程。Console 的认证命令 `m` 跳过一次最旧 RR 的自动空间判定；同一 Core 回收事务会照常标记并删除由该 RR 导致失效分支的连续 tombstone RR，但手动命令不会再处理下一个普通 RR。普通模式把该区域中当前分支仍有效的最新值通过磁盘下层的 `SL_FORCE_DIRECT_WRITE` 写回源分区，再清理对应覆盖与不可达分支数据。分支是否失效只取决于其继承基线能否由合并后的源盘基线重建；一个仍有效分支在当前分支另行分叉后的 tail 仍是该分支可预览/可继续分支的历史，不能仅因它不在当前祖先路径上而删除。日志会记录合并模式、RR 偏移和序号范围。跨区域删除使用 tombstone，已分配 Sequence 不复用。任一步失败都会停止本轮合并并保留可重试状态。
 
 持久还原点模式改用运行期 checkpoint，绝不回填源盘。每次只取一个最旧完整 RR，在 RR 内得到去重后的有效区间后逐个处理。每个区间按 checkpoint 创建顺序检查重叠：命中部分直接覆写并从剩余集合扣除；剩余为空立即结束；遍历完仍有碎片时才从当前 Journal 空闲游标分配新 checkpoint record。同一次 RR 遍历新分配的所有 record 共用一个 `CheckpointId`，checkpoint 汇总同时保存来源 RR 偏移和 Sequence 范围；若全部数据均被旧 checkpoint record 接收，本次不会创建空 checkpoint。`MetaTree` 仍只保存最新映射，仅把命中原 Record Sequence 的节点（含部分节点拆分）改到 checkpoint payload；PreviewTree 构建时先铺 checkpoint 基线，再按保留 RR 的时间顺序覆盖。checkpoint 列表和 record 归属只在内存保存，不修改 v15 Superblock。若待回收 RR 的物理 payload span 中已有 checkpoint，会先将其搬到当前空闲区并按旧 payload 精确更新 `MetaTree`，之后才回收 RR。删除还原点前先把 checkpoint 基线物化到源盘并重建最新树。诊断 IOCTL 使用 generation 分页快照，Console `k` 输出全部 checkpoint 汇总，`n` 输出指定 checkpoint 的每条 record。
 

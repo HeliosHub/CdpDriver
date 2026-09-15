@@ -121,16 +121,16 @@ Recovery Begin 根据目标时间确定父分支和继承点，追加一个新�
 
 ## 手动合并
 
-`m` 会异步合并一个最旧的可合并 HeaderRegion，忽略自动合并要求的 90% Journal 使用率。若该次回收使某些分支失效，Core 会在同一回收事务中标记并继续删除连续的 tombstone RR；但不会因此再进入下一个普通 RR，后者仍由后续合并处理。命令需要认证，并且仅在保护处于 General 阶段、没有 Preview、也没有正在运行的合并线程时可接受。存在持久还原点时，命令改走运行期 checkpoint 合并，不回填源盘。合并期间，开始 Preview 的返回数据直接带 `MERGING` 状态和空句柄；GUI 据此提示等待合并完成，无需额外查询。完成结果记录在驱动 `[MERGE]` / `[CHECKPOINT-MERGE]` 日志中。
+`m` 会异步合并一个最旧的可合并 HeaderRegion，忽略自动合并的 Journal 剩余空间阈值。若该次回收使某些分支失效，Core 会在同一回收事务中标记并继续删除连续的 tombstone RR；但不会因此再进入下一个普通 RR，后者仍由后续合并处理。命令需要认证，并且仅在保护处于 General 阶段、没有 Preview、也没有正在运行的合并线程时可接受。存在持久还原点时，命令改走运行期 checkpoint 合并，不回填源盘。合并期间，开始 Preview 的返回数据直接带 `MERGING` 状态和空句柄；GUI 据此提示等待合并完成，无需额外查询。完成结果记录在驱动 `[MERGE]` / `[CHECKPOINT-MERGE]` 日志中。
 
-自动合并在 General 阶段的阈值为 90%。若存在 Preview，则仅在使用率达到 95% 时紧急中止该 Preview 并开始合并；预览读取会返回“预览已因 Journal 使用率达到 95% 而被自动合并中止”的明确错误，CdpGui 检测到该读取错误后会立即结束对应 Preview 会话。持久还原点模式每个合并线程只处理一个最旧 RR：先在该 RR 内生成去重后的有效区间，按创建顺序复用所有已有 checkpoint，数据全部消耗后立即停止扫描，检查完仍剩余的碎片才分配新 checkpoint。
+除持久还原点模式外，自动合并在 Journal 可用 payload 空间降至 **500 MiB 或以下**时启动，适用于 General 与 Preview 阶段。自动合并不再预先中止 Preview：Core 逐个回收最旧 Region，并将仍对 Preview 有效的已回收映射下沉到源盘基线；只有实际回收触及 Preview 的目标锚点，才会中止该 Preview。持久还原点模式仍按 80% 使用率执行，每个合并线程只处理一个最旧 RR：先在该 RR 内生成去重后的有效区间，按创建顺序复用所有已有 checkpoint，数据全部消耗后立即停止扫描，检查完仍剩余的碎片才分配新 checkpoint。
 
 ## Journal 空间与磁盘格式
 
 当前开发格式为 v15：一个 Superblock，随后是若干 `1 MiB HeaderRegion + PayloadRegion`。单条磁盘 Record Header 为 32 字节，HeaderRegion 末尾 32 字节是 RegionLink。
 
 - 单个 PayloadRegion 的跨度达到 Journal 容量的 `1/10` 时，即使 HeaderRegion 未写满也会切换新区域。
-- 日志使用率达到90%时启动唯一合并线程。删除最旧 HeaderRegion 前，先把其中当前分支仍有效的最新值通过磁盘下层的 `SL_FORCE_DIRECT_WRITE` 写入源卷；仅继承基线已不可重建的分支及其后代会被标记删除。仍有效分支在后续分叉点之后的 tail 也必须保留，供 Preview 或继续创建分支。合并日志会输出模式、RR 偏移和序号范围。
+- 普通模式在 Journal 可用 payload 空间降至 500 MiB 时启动唯一合并线程。删除最旧 HeaderRegion 前，先把其中当前分支仍有效的最新值通过磁盘下层的 `SL_FORCE_DIRECT_WRITE` 写入源卷；仅继承基线已不可重建的分支及其后代会被标记删除。仍有效分支在后续分叉点之后的 tail 也必须保留，供 Preview 或继续创建分支。合并日志会输出模式、RR 偏移和序号范围。
 - 存在持久还原点时不执行源盘回填：有效数据迁移到运行期 checkpoint；命中已有 checkpoint record 的部分直接覆写，未覆盖碎片才作为本次 RR checkpoint 的新 record 占用空间。每个实际分配过新 record 的 RR 合并对应一个运行时 `CheckpointId`，并记录来源 RR 和 Sequence 范围。当前 `MetaTree` 仅更新仍指向被合并 Record 的 payload，Preview 以 checkpoint 作为已回收历史的基础层。checkpoint 元数据不写 Superblock，重启仍由持久还原点源盘基线接管。Console 的 `k`/`n` 可分页查看这些内存元数据，但不返回 payload 内容。
 - 删除还原点时若存在运行期 checkpoint，会先把 checkpoint 基线写入源盘，再清理内存映射和重建最新 `MetaTree`，随后才清除 Superblock 标记。
 - 淘汰空间通过相邻 RegionLink 和最后一条 Record 的 `FileOffset + DataLength` 计算，不扫描整个 1 MiB HeaderRegion。

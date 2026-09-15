@@ -8,7 +8,7 @@ CdpCore 是驱动与用户态单元测试共用的 after-image Journal 引擎。
 - 当前分支的 `MetaTree` 保存每个卷区间的最新日志位置；读取命中树时取日志 payload，空缺区间取源卷。
 - Journal 格式版本为 v15。Record Header 的 `Sequence` 低16位为区域内索引，最高位 `BRANCH` 表示分支记录；新分支固定从新 HeaderRegion 的索引0开始，全局 Sequence 跨分支持续递增。
 - 普通挂载扫描保留记录，重建分支信息树和当前分支 `MetaTree`；启动自动发现会在文件系统挂载源卷前完成保护对象图发布。
-- 日志使用率达到90%后可启动唯一合并线程。合并仅回填待删除区域中当前分支仍有效的最新值；区域包含继承点时会 tombstone 无效父分支后缀，并只递归删除继承点 Record 已被丢弃的分支。继承自有效 Record 的兄弟分支保留到合并到达其自身区域，且所有被删除 Sequence 均不复用。
+- 普通模式在日志可用 payload 空间降至 500 MiB 后可启动唯一合并线程；持久还原点模式仍按 80% 使用率。合并仅回填待删除区域中当前分支仍有效的最新值；区域包含继承点时会 tombstone 无效父分支后缀，并只递归删除继承点 Record 已被丢弃的分支。继承自有效 Record 的兄弟分支保留到合并到达其自身区域，且所有被删除 Sequence 均不复用。
 
 ## Preview 与 Recovery
 
@@ -37,7 +37,7 @@ CdpCore 是驱动与用户态单元测试共用的 after-image Journal 引擎。
 - Recovery：`CdpCoreRecoveryBegin`、`CdpCoreRecoveryCommitStep`、`CdpCoreRecoveryCommit`
 - Drain/物化：`CdpCoreDrainOneMetaRangeWithWriter`、`CdpCoreMaterializeTimeWithWriterProgress`
 - 持久还原点：`CdpCorePreparePersistentRestoreBoot`、`CdpCoreCancelPersistentRestoreBoot`
-- 合并：`CdpCoreSetMergeActive`、`CdpCoreCompactOldestRegion`（自动模式按 90% 阈值循环；手动模式跳过阈值回收一个最旧 RR，并在该 Core 回收事务内清理由失效分支产生的连续 tombstone RR）
+- 合并：`CdpCoreSetMergeActive`、`CdpCoreCompactOldestRegion`（普通自动模式在可用 payload 空间不超过 500 MiB 时循环；持久还原点模式按 80% 使用率；手动模式跳过阈值回收一个最旧 RR，并在该 Core 回收事务内清理由失效分支产生的连续 tombstone RR）
 
 ## 构建与测试
 

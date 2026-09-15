@@ -5492,6 +5492,45 @@ static VOID CdpNotifyRestoreSpaceAlertWaiters(
 	}
 }
 
+/* Normal Journal compaction is based on remaining payload capacity so the
+ * system always retains a fixed write reserve, regardless of Journal size.
+ * Restore-point mode uses its separate percentage-based checkpoint policy. */
+#define Cdp_AUTO_MERGE_FREE_SPACE_RESERVE_BYTES \
+	(500ULL * 1024ULL * 1024ULL)
+
+static NTSTATUS CdpAutomaticMergeNeeded(
+	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
+	_In_ BOOLEAN RestorePointMode,
+	_Out_ PBOOLEAN Needed)
+{
+	UINT64 partitionBytes;
+	UINT64 metadataBytes;
+	UINT64 payloadBytesUsed;
+	UINT64 payloadBytesFree;
+	UINT64 totalRecords;
+	NTSTATUS status;
+
+	if (!DevExt || !DevExt->Core || !Needed)
+		return STATUS_INVALID_PARAMETER;
+	if (RestorePointMode)
+		return CdpCoreJournalUsageAtLeast(DevExt->Core, 80UL, Needed);
+	*Needed = FALSE;
+	status = CdpCoreQueryJournalUsage(
+		DevExt->Core,
+		&partitionBytes,
+		&metadataBytes,
+		&payloadBytesUsed,
+		&payloadBytesFree,
+		&totalRecords);
+	UNREFERENCED_PARAMETER(partitionBytes);
+	UNREFERENCED_PARAMETER(metadataBytes);
+	UNREFERENCED_PARAMETER(payloadBytesUsed);
+	UNREFERENCED_PARAMETER(totalRecords);
+	if (NT_SUCCESS(status))
+		*Needed = payloadBytesFree <= Cdp_AUTO_MERGE_FREE_SPACE_RESERVE_BYTES;
+	return status;
+}
+
 static VOID CdpMergeWorker(_In_ PVOID Context)
 {
 	PCdp_DEVICE_EXTENSION devExt = (PCdp_DEVICE_EXTENSION)Context;
@@ -5503,7 +5542,6 @@ static VOID CdpMergeWorker(_In_ PVOID Context)
 		&devExt->MergeIgnoreUsageThreshold, 0) != 0;
 	BOOLEAN restorePointMode = devExt->RedirectJournalEntry &&
 		devExt->RedirectJournalEntry->Journal.RestorePointSet;
-	ULONG mergeThreshold = restorePointMode ? 80UL : 90UL;
 
 	/* MergeThreadRunning was published before this worker was created. New
 	 * current-view reads therefore take the mutex fallback, while this drains
@@ -5513,13 +5551,13 @@ static VOID CdpMergeWorker(_In_ PVOID Context)
 	if (!NT_SUCCESS(status))
 		goto done;
 	coreMergeActive = TRUE;
-	Cdp_LOG("[MERGE] start mode=%s strategy=%s source=%p disk=%lu part=%lu threshold=%lu-percent%s\n",
+	Cdp_LOG("[MERGE] start mode=%s strategy=%s source=%p disk=%lu part=%lu threshold=%s%s\n",
 		ignoreUsageThreshold ? "manual" : "automatic",
 		restorePointMode ? "runtime-checkpoint" : "source-materialize",
 		devExt,
 		devExt->DiskNumber,
 		devExt->PartitionNumber,
-		mergeThreshold,
+		restorePointMode ? "80-percent" : "500-MiB-free",
 		ignoreUsageThreshold ? "-ignored" : "");
 
 	for (;;)
@@ -5534,8 +5572,8 @@ static VOID CdpMergeWorker(_In_ PVOID Context)
 		}
 		if (!ignoreUsageThreshold)
 		{
-			status = CdpCoreJournalUsageAtLeast(
-				devExt->Core, mergeThreshold, &atLeast);
+			status = CdpAutomaticMergeNeeded(
+				devExt, restorePointMode, &atLeast);
 			if (!NT_SUCCESS(status))
 				break;
 			if (!atLeast)
@@ -5710,7 +5748,6 @@ static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	BOOLEAN atLeast = FALSE;
 	BOOLEAN restorePointMode;
 	LONG phase;
-	ULONG threshold;
 	NTSTATUS status;
 
 	if (!DevExt || !DevExt->Core ||
@@ -5730,13 +5767,10 @@ static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	restorePointMode = DevExt->RedirectJournalEntry &&
 		DevExt->RedirectJournalEntry->Journal.RestorePointSet;
 	phase = InterlockedCompareExchange(&DevExt->Phase, 0, 0);
-	if (phase == (LONG)Cdp_PHASE_GENERAL)
-		threshold = restorePointMode ? 80UL : 90UL;
-	else if (phase == (LONG)Cdp_PHASE_PREVIEW)
-		threshold = restorePointMode ? 80UL : 95UL;
-	else
+	if (phase != (LONG)Cdp_PHASE_GENERAL &&
+		phase != (LONG)Cdp_PHASE_PREVIEW)
 		return;
-	status = CdpCoreJournalUsageAtLeast(DevExt->Core, threshold, &atLeast);
+	status = CdpAutomaticMergeNeeded(DevExt, restorePointMode, &atLeast);
 	if (!NT_SUCCESS(status))
 	{
 		Cdp_LOG("[MERGE] usage query failed status=0x%08X\n", status);
@@ -5744,14 +5778,6 @@ static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	}
 	if (!atLeast)
 		return;
-	if (phase == (LONG)Cdp_PHASE_PREVIEW)
-	{
-		PCdp_DRIVER_EXTENSION driverExt =
-			IoGetDriverObjectExtension(g_DriverObject, &g_DriverObject);
-		Cdp_LOG("[MERGE] usage reached %lu percent; aborting Preview before automatic compaction source=%p\n",
-			threshold, DevExt);
-		CdpStopPreviewSessionForSource(driverExt, DevExt);
-	}
 	status = CdpStartMergeThread(DevExt, FALSE);
 	if (!NT_SUCCESS(status) && status != STATUS_DEVICE_BUSY)
 	{

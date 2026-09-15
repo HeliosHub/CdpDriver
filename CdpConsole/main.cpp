@@ -200,6 +200,58 @@ static BOOL ReadLine(wchar_t* buf, DWORD cch)
 	}
 }
 
+/* Loads a text license file and normalizes its Base64 payload into one line.
+ * Wrapped Base64 and a UTF-8 BOM are accepted; other content is rejected so a
+ * file path can never be mistaken for a license blob. */
+static BOOL LoadLicenseFileBase64(const wchar_t* path, wchar_t* out, DWORD cch)
+{
+	HANDLE file = INVALID_HANDLE_VALUE;
+	LARGE_INTEGER size = { 0 };
+	BYTE input[8192];
+	DWORD read = 0, i = 0, written = 0;
+	BOOL ok = FALSE;
+
+	if (!path || !out || cch == 0)
+	{
+		SetLastError(ERROR_INVALID_PARAMETER);
+		return FALSE;
+	}
+	out[0] = L'\0';
+	file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL, NULL);
+	if (file == INVALID_HANDLE_VALUE)
+		return FALSE;
+	if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 || size.QuadPart > (LONGLONG)sizeof(input) ||
+		!ReadFile(file, input, (DWORD)size.QuadPart, &read, NULL) || read != (DWORD)size.QuadPart)
+	{
+		if (GetLastError() == ERROR_SUCCESS) SetLastError(ERROR_INVALID_DATA);
+		goto done;
+	}
+	if (read >= 3 && input[0] == 0xEF && input[1] == 0xBB && input[2] == 0xBF)
+		i = 3;
+	for (; i < read; ++i)
+	{
+		BYTE ch = input[i];
+		if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+			(ch >= '0' && ch <= '9') || ch == '+' || ch == '/' || ch == '=')
+		{
+			if (written + 1 >= cch) { SetLastError(ERROR_BUFFER_OVERFLOW); goto done; }
+			out[written++] = (wchar_t)ch;
+		}
+		else if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n')
+		{
+			SetLastError(ERROR_INVALID_DATA);
+			goto done;
+		}
+	}
+	out[written] = L'\0';
+	if (written == 0) { SetLastError(ERROR_INVALID_DATA); goto done; }
+	ok = TRUE;
+done:
+	CloseHandle(file);
+	return ok;
+}
+
 static BOOL ParseGuid(const wchar_t* text, GUID* out)
 {
 	wchar_t tmp[80];
@@ -1991,7 +2043,7 @@ static int RunParamCommand(int argc, wchar_t** argv)
 			L"  branches <source-volume-guid> <password>\n"
 			L"  checkpoints <source-volume-guid> <password>\n"
 			L"  license-query\n"
-			L"  license-import <base64-license>\n"
+			L"  license-import <license-file>\n"
 			L"  license-apply <mode> <days-or-credits> [credits]  (mode: 1=time, 2=counter, 3=hybrid)\n"
 			L"  license-trial-apply\n"
 			L"  preview-read <source-volume-guid> <password> <utc-unix-seconds> <volume-offset> <length>\n");
@@ -2053,8 +2105,17 @@ static int RunParamCommand(int argc, wchar_t** argv)
 		}
 		if (_wcsicmp(argv[1], L"license-import") == 0 && argc == 3)
 		{
-			wchar_t* lines[] = { commandLicense, actionLicenseImport, argv[2], quit };
-			return RunScriptTokens(_countof(lines), lines);
+			wchar_t licenseBase64[4096] = { 0 };
+			int result;
+			if (!LoadLicenseFileBase64(argv[2], licenseBase64, _countof(licenseBase64)))
+			{
+				ConOutFmt(L"Could not read license file (err=%lu).\n", GetLastError());
+				return 1;
+			}
+			{ wchar_t* lines[] = { commandLicense, actionLicenseImport, licenseBase64, quit };
+				result = RunScriptTokens(_countof(lines), lines); }
+			SecureZeroMemory(licenseBase64, sizeof(licenseBase64));
+			return result;
 		}
 		if (_wcsicmp(argv[1], L"license-apply") == 0 && argc == 4 &&
 			(_wcsicmp(argv[2], L"1") == 0 || _wcsicmp(argv[2], L"2") == 0))
