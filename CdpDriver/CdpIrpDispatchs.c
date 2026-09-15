@@ -5,6 +5,9 @@
 #include <ntdddisk.h>
 #include <ntddstor.h>
 #include <ntstrsafe.h>
+#ifdef CDP_LICENSE
+#include "CdpLicenseGate.h"
+#endif
 
 static volatile LONG64 g_CdpShutdownHopSequence = 0;
 static volatile LONG64 g_CdpPowerHopSequence = 0;
@@ -66,7 +69,7 @@ static NTSTATUS CdpDispatchProtectedVolumeRead(
 static PCdp_VOLUME_HANDLE_ENTRY CdpAcquireJournalForSource(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ PCdp_DEVICE_EXTENSION SourceExt);
-static VOID CdpReleaseVolumeHandleEntry(_In_ PCdp_VOLUME_HANDLE_ENTRY Item);
+VOID CdpReleaseVolumeHandleEntry(_In_ PCdp_VOLUME_HANDLE_ENTRY Item);
 static NTSTATUS CdpCloseVolumeHandle(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ UINT64 HandleId);
@@ -621,7 +624,7 @@ static PCdp_DEVICE_EXTENSION CdpFindSourceByJournalHandle(
 	return found;
 }
 
-static VOID CdpReleaseVolumeHandleEntry(_In_ PCdp_VOLUME_HANDLE_ENTRY Item)
+VOID CdpReleaseVolumeHandleEntry(_In_ PCdp_VOLUME_HANDLE_ENTRY Item)
 {
 	if (InterlockedDecrement(&Item->ReferenceCount) == 0)
 		KeSetEvent(&Item->NoReferences, IO_NO_INCREMENT, FALSE);
@@ -1012,6 +1015,27 @@ static PCdp_DEVICE_EXTENSION CdpFindSourceExtensionByGuid(
 	}
 	KeReleaseSpinLock(&DriverExt->DeviceObjectListLock, oldIrql);
 	return found;
+}
+
+NTSTATUS CdpPinMountedJournals(PCdp_DRIVER_EXTENSION DriverExt,
+	PCdp_VOLUME_HANDLE_ENTRY** Journals, PULONG JournalCount)
+{
+	PLIST_ENTRY entry;
+	PCdp_VOLUME_HANDLE_ENTRY* items = NULL;
+	ULONG count = 0, index = 0;
+	if (!DriverExt || !Journals || !JournalCount) return STATUS_INVALID_PARAMETER;
+	*Journals = NULL; *JournalCount = 0;
+	ExAcquireFastMutex(&DriverExt->VolumeHandleMutex);
+	for (entry = DriverExt->VolumeHandleList.Flink; entry != &DriverExt->VolumeHandleList; entry = entry->Flink) ++count;
+	if (count) items = (PCdp_VOLUME_HANDLE_ENTRY*)cdpalloc(sizeof(*items) * count);
+	if (count && !items) { ExReleaseFastMutex(&DriverExt->VolumeHandleMutex); return STATUS_INSUFFICIENT_RESOURCES; }
+	for (entry = DriverExt->VolumeHandleList.Flink; entry != &DriverExt->VolumeHandleList; entry = entry->Flink) {
+		PCdp_VOLUME_HANDLE_ENTRY item = CONTAINING_RECORD(entry, Cdp_VOLUME_HANDLE_ENTRY, Entry);
+		if (!item->Closing && item->Journal.Mounted) { InterlockedIncrement(&item->ReferenceCount); items[index++] = item; }
+	}
+	ExReleaseFastMutex(&DriverExt->VolumeHandleMutex);
+	*Journals = items; *JournalCount = index;
+	return STATUS_SUCCESS;
 }
 
 /* A zero GUID is the service's subscription to the single restore-point
@@ -1517,6 +1541,16 @@ static NTSTATUS CdpConfigureCaptureInternal(
 	status = FormatJournal ?
 		CdpJournalFormat(&journalEntry->Journal) :
 		CdpJournalMount(&journalEntry->Journal);
+#ifdef CDP_LICENSE
+	if (NT_SUCCESS(status) && !FormatJournal)
+		(void)CdpLicenseOnJournalMounted(DriverExt, &journalEntry->Journal);
+	if (NT_SUCCESS(status) && FormatJournal)
+	{
+		NTSTATUS persistStatus = CdpLicensePersistIfLoaded(DriverExt);
+		if (!NT_SUCCESS(persistStatus))
+			status = persistStatus;
+	}
+#endif
 	if (NT_SUCCESS(status) && !journalEntry->Journal.CredentialConfigured)
 		status = STATUS_PASSWORD_RESTRICTION;
 	if (NT_SUCCESS(status) && !FormatJournal &&
@@ -2234,6 +2268,10 @@ static NTSTATUS CdpDiscoverJournalForStartedDisk(
 			cdpfree(journalEntry);
 			continue;
 		}
+#ifdef CDP_LICENSE
+		if (journalEntry->Journal.LicenseConfigured)
+			CdpLicenseScheduleDeferredRestore(DriverExt);
+#endif
 
 		/* Locate both the persisted source extent and the immediately preceding
 		 * allocated partition.  They must be the same entry. */
@@ -2649,6 +2687,10 @@ static NTSTATUS CdpDiscoverAdjacentJournalForStartedVolume(
 		cdpfree(journalEntry);
 		return status == STATUS_DISK_CORRUPT_ERROR ? STATUS_NOT_FOUND : status;
 	}
+#ifdef CDP_LICENSE
+	if (journalEntry->Journal.LicenseConfigured)
+		CdpLicenseScheduleDeferredRestore(DriverExt);
+#endif
 
 	guidMatches = guidAvailable && CdpGuidIsEqual(
 		&queriedSourceGuid, &journalEntry->Journal.SourceVolumeGuid);
@@ -3315,6 +3357,10 @@ static NTSTATUS CdpBeginRecovery(
 	UINT64 targetTime = Request->TargetTime100ns;
 	LONG previousPhase;
 	NTSTATUS status;
+#ifdef CDP_LICENSE
+	Cdp_LICENSE_LOCAL_STATE licenseLocal;
+	BOOLEAN licenseHeld = FALSE;
+#endif
 
 	RtlZeroMemory(Reply, sizeof(*Reply));
 	if ((Request->Flags & ~Cdp_RECOVERY_BEGIN_FLAG_ON_REBOOT) != 0)
@@ -3370,6 +3416,16 @@ static NTSTATUS CdpBeginRecovery(
 		(LONG)Cdp_PHASE_GENERAL);
 	if (previousPhase != (LONG)Cdp_PHASE_GENERAL)
 		return STATUS_INVALID_DEVICE_STATE;
+#ifdef CDP_LICENSE
+	RtlZeroMemory(&licenseLocal, sizeof(licenseLocal));
+	status = CdpLicenseGateBeforeOp(DriverExt, &licenseLocal);
+	if (!NT_SUCCESS(status))
+	{
+		InterlockedExchange(&sourceExt->Phase, previousPhase);
+		return status;
+	}
+	licenseHeld = TRUE;
+#endif
 	// Phase closes the merge restart window first. New read/write IRPs remain
 	// queued behind HistoryMutex while the existing merge worker is stopped.
 	CdpStopMergeThread(sourceExt);
@@ -3386,12 +3442,20 @@ static NTSTATUS CdpBeginRecovery(
 	}
 	else if (!NT_SUCCESS(status))
 	{
+#ifdef CDP_LICENSE
+		if (licenseHeld)
+			CdpLicenseGateAbortOp();
+#endif
 		InterlockedExchange(&sourceExt->Phase, previousPhase);
 		return status;
 	}
 	journalEntry = CdpAcquireJournalForSource(DriverExt, sourceExt);
 	if (!journalEntry)
 	{
+#ifdef CDP_LICENSE
+		if (licenseHeld)
+			CdpLicenseGateAbortOp();
+#endif
 		InterlockedExchange(&sourceExt->Phase, previousPhase);
 		return STATUS_DEVICE_NOT_READY;
 	}
@@ -3409,6 +3473,16 @@ static NTSTATUS CdpBeginRecovery(
 		FALSE,
 		NULL);
 	CdpWaitForCurrentViewReads(sourceExt);
+#ifdef CDP_LICENSE
+	status = CdpLicenseGateArmOp(DriverExt, &licenseLocal);
+	if (!NT_SUCCESS(status))
+	{
+		CdpLicenseGateAbortOp();
+		KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
+		InterlockedExchange(&sourceExt->Phase, previousPhase);
+		return status;
+	}
+#endif
 	status = CdpCoreRecoveryBegin(sourceExt->Core, targetTime);
 	if (NT_SUCCESS(status))
 	{
@@ -3423,9 +3497,18 @@ static NTSTATUS CdpBeginRecovery(
 	KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
 	if (!NT_SUCCESS(status))
 	{
+#ifdef CDP_LICENSE
+		if (licenseHeld)
+			CdpLicenseGateAbortOp();
+#endif
 		InterlockedExchange(&sourceExt->Phase, previousPhase);
 		return status;
 	}
+#ifdef CDP_LICENSE
+	status = CdpLicenseGateAfterOpSuccess(DriverExt, &licenseLocal);
+	if (!NT_SUCCESS(status))
+		return status;
+#endif
 
 	Reply->Phase = Cdp_PHASE_GENERAL;
 	targetTime = CdpCoreGetTargetTime100ns(sourceExt->Core);
@@ -8984,6 +9067,66 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 				Cdp_DRIVER_BUILD_STRING);
 			return CdpCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*reply));
 		}
+
+#ifdef CDP_LICENSE
+		case IOCTL_Cdp_SET_LICENSE:
+		{
+			PCdp_SET_LICENSE_REQUEST request;
+			ULONG inLen = IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+			NTSTATUS status;
+
+			if (!DriverExt || !Irp->AssociatedIrp.SystemBuffer ||
+				inLen < sizeof(*request))
+				return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+			request = (PCdp_SET_LICENSE_REQUEST)Irp->AssociatedIrp.SystemBuffer;
+			if (request->LicenseLength == 0 ||
+				request->LicenseLength > Cdp_LICENSE_BLOB_MAX)
+				return CdpCompleteIrp(Irp, STATUS_INVALID_PARAMETER, 0);
+			status = CdpLicenseSetFromBlob(
+				DriverExt, request->LicenseBlob, request->LicenseLength);
+			return CdpCompleteIrp(Irp, status, 0);
+		}
+
+		case IOCTL_Cdp_QUERY_LICENSE:
+		{
+			ULONG written = 0;
+			NTSTATUS status;
+			if (!Irp->AssociatedIrp.SystemBuffer)
+				return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+			status = CdpLicenseQueryStatus(Irp->AssociatedIrp.SystemBuffer,
+				IrpSp->Parameters.DeviceIoControl.OutputBufferLength, &written);
+			return CdpCompleteIrp(Irp, status, written);
+		}
+
+		case IOCTL_Cdp_EXPORT_RECEIPT:
+		{
+			ULONG written = 0;
+			NTSTATUS status;
+			if (!Irp->AssociatedIrp.SystemBuffer)
+				return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+			status = CdpLicenseExportReceipt(Irp->AssociatedIrp.SystemBuffer,
+				IrpSp->Parameters.DeviceIoControl.OutputBufferLength, &written);
+			return CdpCompleteIrp(Irp, status, written);
+		}
+
+		case IOCTL_Cdp_BUILD_APPLY_QR:
+		{
+			Cdp_BUILD_APPLY_QR_REQUEST request;
+			ULONG inLen = IrpSp->Parameters.DeviceIoControl.InputBufferLength;
+			ULONG outLen = IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
+			ULONG written = 0;
+			NTSTATUS status;
+
+			if (!Irp->AssociatedIrp.SystemBuffer || inLen < sizeof(request) ||
+				outLen < sizeof(Cdp_LICENSE_APPLY_QR_REPLY))
+				return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
+			request = *(PCdp_BUILD_APPLY_QR_REQUEST)Irp->AssociatedIrp.SystemBuffer;
+			status = CdpLicenseBuildApplyQrPayload(request.DesiredDurationSec,
+				request.DesiredCredits, request.Mode, request.Kind, request.QrPrefix,
+				Irp->AssociatedIrp.SystemBuffer, outLen, &written);
+			return CdpCompleteIrp(Irp, status, written);
+		}
+#endif
 
 		default:
 			Cdp_LOG("unknown IOCTL 0x%08X on control device\n",

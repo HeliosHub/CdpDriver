@@ -1,6 +1,9 @@
 ﻿#include "CdpEngineDefs.h"
 #include "CdpIrpDispatchs.h"
 #include "..\CdpCore\include\cdp_core.h"
+#ifdef CDP_LICENSE
+#include "CdpLicenseGate.h"
+#endif
 
 PDRIVER_OBJECT g_DriverObject = NULL;
 
@@ -495,6 +498,9 @@ VOID CdpDriverUnload(_In_ PDRIVER_OBJECT DriverObject)
 	// them down before any filter device/Core is removed.
 	CdpCancelAllRestoreSpaceAlertWaits(DriverExtension);
 	CdpCloseAllPreviewSessions(DriverExtension);
+#ifdef CDP_LICENSE
+	CdpLicenseShutdown(DriverExtension);
+#endif
 
 	while (TRUE)
 	{
@@ -553,6 +559,9 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 	ExInitializeFastMutex(&DriverExtension->PreviewSessionMutex);
 	DriverExtension->PreviewSessionNextId = 0;
 	InitializeListHead(&DriverExtension->RestoreSpaceAlertWaitList);
+#ifdef CDP_LICENSE
+	CdpLicenseInitialize(DriverObject, DriverExtension);
+#endif
 
 	Status = CdpCreateControlDevice(DriverObject);
 	if (!NT_SUCCESS(Status))

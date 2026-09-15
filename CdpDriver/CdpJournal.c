@@ -623,7 +623,12 @@ static NTSTATUS CdpJournalGetHeaderScanBufferLocked(
 
 static UINT64 CdpJournalUsableStart(_In_ PCdp_JOURNAL Journal)
 {
+	#ifdef CDP_LICENSE
+	UNREFERENCED_PARAMETER(Journal);
+	return Cdp_JOURNAL_SUPERBLOCK_RESERVE;
+	#else
 	return Journal->SectorSize;
+	#endif
 }
 
 static UINT64 CdpJournalUsableEnd(_In_ PCdp_JOURNAL Journal)
@@ -1097,13 +1102,11 @@ static NTSTATUS CdpJournalWriteSuperblockLocked(_Inout_ PCdp_JOURNAL Journal)
 	PCdp_JOURNAL_SUPERBLOCK superblock;
 	NTSTATUS status;
 
-	sector = (PUCHAR)CdpAllocateAligned(Journal,
-		Journal->SectorSize,
-		&allocationBase);
+	sector = (PUCHAR)CdpAllocateAligned(Journal, Cdp_JOURNAL_SUPERBLOCK_BYTES, &allocationBase);
 	if (!sector)
 		return STATUS_INSUFFICIENT_RESOURCES;
 
-	RtlZeroMemory(sector, Journal->SectorSize);
+	RtlZeroMemory(sector, Cdp_JOURNAL_SUPERBLOCK_BYTES);
 	superblock = (PCdp_JOURNAL_SUPERBLOCK)sector;
 	superblock->Magic = Cdp_JOURNAL_MAGIC;
 	superblock->Version = Cdp_JOURNAL_VERSION;
@@ -1120,6 +1123,16 @@ static NTSTATUS CdpJournalWriteSuperblockLocked(_Inout_ PCdp_JOURNAL Journal)
 	}
 	if (Journal->RestoreBootPending)
 		superblock->Flags |= Cdp_JOURNAL_FLAG_RESTORE_BOOT_PENDING;
+#ifdef CDP_LICENSE
+	if (Journal->LicenseConfigured)
+	{
+		superblock->Flags |= Cdp_JOURNAL_FLAG_LICENSE_CONFIGURED;
+		superblock->LicenseBlobLength = Journal->LicenseBlobLength;
+		superblock->E0Length = Journal->E0Length;
+		RtlCopyMemory(superblock->LicenseBlob, Journal->LicenseBlob, Journal->LicenseBlobLength);
+		RtlCopyMemory(superblock->E0, Journal->E0, Journal->E0Length);
+	}
+#endif
 	superblock->PartitionSize = Journal->PartitionSize;
 	superblock->LastHeaderRegionOff = Journal->LastHeaderRegionOff;
 	superblock->SourceVolumeGuid = Journal->SourceVolumeGuid;
@@ -1152,12 +1165,16 @@ static NTSTATUS CdpJournalWriteSuperblockLocked(_Inout_ PCdp_JOURNAL Journal)
 		0,
 		superblock,
 		FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, RestorePointCrc32c));
+#ifdef CDP_LICENSE
+	superblock->LicenseCrc32c = CdpCrc32c(0, superblock,
+		FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, LicenseCrc32c));
+#endif
 
 	status = CdpJournalMetadataRawIo(
 		Journal,
 		IRP_MJ_WRITE,
 		0,
-		Journal->SectorSize,
+		Cdp_JOURNAL_SUPERBLOCK_BYTES,
 		sector);
 	cdpfree(allocationBase);
 	if (NT_SUCCESS(status))
@@ -1221,13 +1238,20 @@ static BOOLEAN CdpJournalSuperblockValid(
 	{
 		return FALSE;
 	}
+#ifdef CDP_LICENSE
+	if ((Superblock->Flags & Cdp_JOURNAL_FLAG_LICENSE_CONFIGURED) != 0 &&
+		(Superblock->LicenseBlobLength == 0 || Superblock->LicenseBlobLength > Cdp_LICENSE_BLOB_MAX ||
+		 Superblock->E0Length == 0 || Superblock->E0Length > Cdp_E0_SEAL_MAX ||
+		 CdpCrc32c(0, Superblock, FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, LicenseCrc32c)) != Superblock->LicenseCrc32c))
+		return FALSE;
+#endif
 	if (Superblock->CurrentBranchNumber <= 0 ||
 		Superblock->HighestBranchNumber < Superblock->CurrentBranchNumber)
 	{
 		return FALSE;
 	}
 
-	usableStart = Journal->SectorSize;
+	usableStart = CdpJournalUsableStart(Journal);
 	usableEnd = Journal->PartitionSize;
 	if (Superblock->LastHeaderRegionOff < usableStart ||
 		Superblock->LastHeaderRegionOff + Cdp_JOURNAL_HEADER_REGION_SIZE > usableEnd ||
@@ -4029,7 +4053,7 @@ NTSTATUS CdpJournalResetHistoryPreserveRestorePoint(
 
 	if (!Journal)
 		return STATUS_INVALID_PARAMETER;
-	minSize = (UINT64)Journal->SectorSize +
+	minSize = (UINT64)CdpJournalUsableStart(Journal) +
 		Cdp_JOURNAL_HEADER_REGION_SIZE + (UINT64)Journal->SectorSize;
 	if (!CdpJournalHasBackend(Journal) || !Journal->Mounted ||
 		(Journal->SectorSize != 512 && Journal->SectorSize != 4096) ||
@@ -4140,9 +4164,7 @@ static NTSTATUS CdpJournalMountInternal(
 #ifndef Cdp_USERMODE
 	mountStart100ns = KeQueryInterruptTime();
 #endif
-	sector = (PUCHAR)CdpAllocateAligned(Journal,
-		Journal->SectorSize,
-		&allocationBase);
+	sector = (PUCHAR)CdpAllocateAligned(Journal, Cdp_JOURNAL_SUPERBLOCK_BYTES, &allocationBase);
 	if (!sector)
 	{
 		status = STATUS_INSUFFICIENT_RESOURCES;
@@ -4153,7 +4175,7 @@ static NTSTATUS CdpJournalMountInternal(
 		Journal,
 		IRP_MJ_READ,
 		0,
-		Journal->SectorSize,
+		Cdp_JOURNAL_SUPERBLOCK_BYTES,
 		sector);
 	if (!NT_SUCCESS(status))
 		goto cleanup;
@@ -4183,6 +4205,16 @@ static NTSTATUS CdpJournalMountInternal(
 		(superblock->Flags & Cdp_JOURNAL_FLAG_RECOVERY_FS_REPAIR_PENDING) != 0;
 	Journal->RecoveryTargetTime100ns = Journal->RecoveryPending ?
 		superblock->RecoveryTargetTime100ns : 0;
+#ifdef CDP_LICENSE
+	Journal->LicenseConfigured = (superblock->Flags & Cdp_JOURNAL_FLAG_LICENSE_CONFIGURED) != 0;
+	if (Journal->LicenseConfigured)
+	{
+		Journal->LicenseBlobLength = superblock->LicenseBlobLength;
+		Journal->E0Length = superblock->E0Length;
+		RtlCopyMemory(Journal->LicenseBlob, superblock->LicenseBlob, Journal->LicenseBlobLength);
+		RtlCopyMemory(Journal->E0, superblock->E0, Journal->E0Length);
+	}
+#endif
 	Journal->RestorePointSet =
 		(superblock->Version >= Cdp_JOURNAL_VERSION) &&
 		((superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_POINT_SET) != 0);
@@ -4909,6 +4941,47 @@ BOOLEAN CdpJournalGetCredential(
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	return configured;
 }
+
+#ifdef CDP_LICENSE
+NTSTATUS CdpJournalSetLicenseState(PCdp_JOURNAL Journal, const UCHAR* LicenseBlob,
+	ULONG LicenseLength, const UCHAR* E0, ULONG E0Length)
+{
+	NTSTATUS status = STATUS_SUCCESS;
+	if (!Journal || !LicenseBlob || !E0 || LicenseLength == 0 ||
+		LicenseLength > Cdp_LICENSE_BLOB_MAX || E0Length == 0 || E0Length > Cdp_E0_SEAL_MAX)
+		return STATUS_INVALID_PARAMETER;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	RtlCopyMemory(Journal->LicenseBlob, LicenseBlob, LicenseLength);
+	Journal->LicenseBlobLength = LicenseLength;
+	RtlCopyMemory(Journal->E0, E0, E0Length);
+	Journal->E0Length = E0Length;
+	Journal->LicenseConfigured = TRUE;
+	if (Journal->Mounted)
+	{
+		Journal->SuperblockDirty = TRUE;
+		status = CdpJournalWriteSuperblockLocked(Journal);
+	}
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
+BOOLEAN CdpJournalGetLicenseState(PCdp_JOURNAL Journal, UCHAR* LicenseBlob,
+	ULONG LicenseCapacity, PULONG LicenseLength, UCHAR* E0, ULONG E0Capacity, PULONG E0Length)
+{
+	BOOLEAN configured;
+	if (!Journal || !LicenseLength || !E0Length) return FALSE;
+	*LicenseLength = *E0Length = 0;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	configured = Journal->LicenseConfigured;
+	if (configured && LicenseBlob && E0 && LicenseCapacity >= Journal->LicenseBlobLength && E0Capacity >= Journal->E0Length) {
+		RtlCopyMemory(LicenseBlob, Journal->LicenseBlob, Journal->LicenseBlobLength);
+		RtlCopyMemory(E0, Journal->E0, Journal->E0Length);
+		*LicenseLength = Journal->LicenseBlobLength; *E0Length = Journal->E0Length;
+	} else if (configured) configured = FALSE;
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return configured;
+}
+#endif
 
 NTSTATUS CdpJournalInvalidate(_Inout_ PCdp_JOURNAL Journal)
 {

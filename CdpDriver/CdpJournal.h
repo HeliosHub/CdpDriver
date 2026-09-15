@@ -8,8 +8,12 @@
 #include "..\CdpCore\include\cdp_store.h"
 #endif
 
+#ifdef CDP_LICENSE
+#include "CdpLicenseDefs.h"
+#endif
+
 #define Cdp_JOURNAL_MAGIC            0x4C4E4A51UL /* 'QJNL' */
-#define Cdp_JOURNAL_VERSION          17UL
+#define Cdp_JOURNAL_VERSION          18UL
 #define Cdp_JOURNAL_MAX_RECORD_DATA  (2UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_REGION_SIZE (1UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_LINK_SIZE 32UL
@@ -27,6 +31,12 @@
 // bit on the next boot means that the previous boot was not acknowledged and
 // its current Journal view must first be materialized to the source baseline.
 #define Cdp_JOURNAL_FLAG_RESTORE_BOOT_PENDING 0x00000010UL
+#define Cdp_JOURNAL_FLAG_LICENSE_CONFIGURED    0x00000020UL
+#ifdef CDP_LICENSE
+#define Cdp_JOURNAL_SUPERBLOCK_BYTES Cdp_JOURNAL_SUPERBLOCK_RESERVE
+#else
+#define Cdp_JOURNAL_SUPERBLOCK_BYTES (Journal->SectorSize)
+#endif
 #define Cdp_JOURNAL_RECORD_INDEX_MASK     0x0000FFFFUL
 #define Cdp_JOURNAL_RECORD_FLAGS_MASK     0xFFFF0000UL
 // Highest Sequence bit selects the branch-record interpretation.
@@ -138,6 +148,13 @@ typedef struct _Cdp_JOURNAL_SUPERBLOCK
 	/* Appended in v15 so every v14 field and CRC retains its old offset. */
 	UINT64 RestorePointTime100ns;
 	ULONG RestorePointCrc32c;
+#ifdef CDP_LICENSE
+	ULONG LicenseBlobLength;
+	UCHAR LicenseBlob[Cdp_LICENSE_BLOB_MAX];
+	ULONG E0Length;
+	UCHAR E0[Cdp_E0_SEAL_MAX];
+	ULONG LicenseCrc32c;
+#endif
 } Cdp_JOURNAL_SUPERBLOCK, *PCdp_JOURNAL_SUPERBLOCK;
 
 #pragma pack(pop)
@@ -383,6 +400,13 @@ typedef struct _Cdp_JOURNAL
 	UINT64 RestorePointTime100ns;
 	BOOLEAN CredentialConfigured;
 	Cdp_CREDENTIAL_DESCRIPTOR Credential;
+#ifdef CDP_LICENSE
+	BOOLEAN LicenseConfigured;
+	ULONG LicenseBlobLength;
+	UCHAR LicenseBlob[Cdp_LICENSE_BLOB_MAX];
+	ULONG E0Length;
+	UCHAR E0[Cdp_E0_SEAL_MAX];
+#endif
 	GUID SourceVolumeGuid;
 	ULONG DiskPartitionStyle;
 	ULONG MbrSignature;
@@ -551,6 +575,15 @@ NTSTATUS CdpJournalSetCredential(
 BOOLEAN CdpJournalGetCredential(
 	_In_ PCdp_JOURNAL Journal,
 	_Out_ PCdp_CREDENTIAL_DESCRIPTOR Credential);
+
+#ifdef CDP_LICENSE
+NTSTATUS CdpJournalSetLicenseState(_Inout_ PCdp_JOURNAL Journal,
+	_In_reads_bytes_(LicenseLength) const UCHAR* LicenseBlob, _In_ ULONG LicenseLength,
+	_In_reads_bytes_(E0Length) const UCHAR* E0, _In_ ULONG E0Length);
+BOOLEAN CdpJournalGetLicenseState(_In_ PCdp_JOURNAL Journal,
+	_Out_writes_bytes_to_(LicenseCapacity, *LicenseLength) UCHAR* LicenseBlob, _In_ ULONG LicenseCapacity, _Out_ PULONG LicenseLength,
+	_Out_writes_bytes_to_(E0Capacity, *E0Length) UCHAR* E0, _In_ ULONG E0Capacity, _Out_ PULONG E0Length);
+#endif
 
 // Clear on-disk superblock magic so auto-discovery will not remount this journal.
 NTSTATUS CdpJournalInvalidate(_Inout_ PCdp_JOURNAL Journal);

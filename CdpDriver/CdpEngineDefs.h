@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.6.10-test66"
-#define Cdp_DRIVER_BUILD_STRING   "20260910.180-preview-read-diag-off"
+#define Cdp_DRIVER_VERSION_STRING "1.6.10-test67"
+#define Cdp_DRIVER_BUILD_STRING   "20260914.181-release"
 
 // Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.
 // Cdp_DBG: Debug builds only — verbose I/O and path tracing.
@@ -114,6 +114,11 @@ typedef struct _Cdp_DRIVER_EXTENSION
 	// spin lock serializes this list with each IRP's cancel routine.
 	LIST_ENTRY RestoreSpaceAlertWaitList;
 } Cdp_DRIVER_EXTENSION, *PCdp_DRIVER_EXTENSION;
+
+NTSTATUS CdpPinMountedJournals(_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_Outptr_result_buffer_(*JournalCount) PCdp_VOLUME_HANDLE_ENTRY** Journals,
+	_Out_ PULONG JournalCount);
+VOID CdpReleaseVolumeHandleEntry(_In_ PCdp_VOLUME_HANDLE_ENTRY Item);
 
 typedef struct _Cdp_CONTROL_FILE_CONTEXT
 {

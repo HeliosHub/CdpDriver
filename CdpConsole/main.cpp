@@ -2,12 +2,44 @@
 #include <stdlib.h>
 #include <stdarg.h>
 #include <time.h>
+#include <string.h>
 #include <Windows.h>
+#include <wincrypt.h>
 #include <objbase.h>
 #include "..\CdpDriver\CdpIoctl.h"
 #include "cdp_driver_install.h"
 
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "crypt32.lib")
+
+/* License IOCTLs intentionally use the range reserved by the current driver.
+ * Do not use 0x812-0x815: those are restore/branch operations in this tree. */
+#define CONSOLE_IOCTL_SET_LICENSE      CTL_CODE(Cdp_IOCTL_TYPE, 0x81E, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define CONSOLE_IOCTL_QUERY_LICENSE    CTL_CODE(Cdp_IOCTL_TYPE, 0x81F, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define CONSOLE_IOCTL_BUILD_APPLY_QR   CTL_CODE(Cdp_IOCTL_TYPE, 0x821, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define CONSOLE_LICENSE_BLOB_MAX       2048u
+#define CONSOLE_APPLY_QR_PREFIX_MAX    256u
+#define CONSOLE_APPLY_QR_PAYLOAD_MAX   4096u
+#define CONSOLE_APPLY_CIPHERTEXT_MAX   3072u
+
+#pragma pack(push, 8)
+typedef struct _CONSOLE_LICENSE_QUERY_REPLY {
+	ULONG HasLicense, Mode; UINT64 T0_100ns, T_EXP_100ns;
+	ULONG C0, OPS_T, OPS_S, A_MOD, IsTrial, Reserved;
+} CONSOLE_LICENSE_QUERY_REPLY;
+typedef struct _CONSOLE_SET_LICENSE_REQUEST {
+	ULONG LicenseLength, Reserved; UCHAR LicenseBlob[CONSOLE_LICENSE_BLOB_MAX];
+} CONSOLE_SET_LICENSE_REQUEST;
+typedef struct _CONSOLE_BUILD_APPLY_QR_REQUEST {
+	ULONG DesiredDurationSec, DesiredCredits, Mode, Kind;
+	CHAR QrPrefix[CONSOLE_APPLY_QR_PREFIX_MAX];
+} CONSOLE_BUILD_APPLY_QR_REQUEST;
+typedef struct _CONSOLE_LICENSE_APPLY_QR_REPLY {
+	ULONG CiphertextLength, Reserved; UCHAR DeviceFingerprint[32];
+	UCHAR Ciphertext[CONSOLE_APPLY_CIPHERTEXT_MAX];
+	CHAR QrPayload[CONSOLE_APPLY_QR_PAYLOAD_MAX];
+} CONSOLE_LICENSE_APPLY_QR_REPLY;
+#pragma pack(pop)
 
 static UINT64 g_PreviewHandle = 0;
 /* Optional in-memory input used by CdpConsole_Param script mode.  Each
@@ -1255,7 +1287,7 @@ static BOOL DoListRuntimeCheckpoints(HANDLE hDevice)
 		{
 			DWORD err = GetLastError();
 			ConOut(err == ERROR_RETRY ?
-				L"Checkpoints changed while listing; run k again.\n" :
+				L"Checkpoints changed while listing; run j again.\n" :
 				L"List runtime checkpoints failed.\n");
 			if (err != ERROR_RETRY)
 				ConOutFmt(L"Win32 error=%lu.\n", err);
@@ -1284,7 +1316,7 @@ static BOOL DoListRuntimeCheckpoints(HANDLE hDevice)
 		else if (reply->TotalCheckpoints != totalCheckpoints ||
 			reply->Generation != generation)
 		{
-			ConOut(L"Checkpoints changed while listing; run k again.\n");
+			ConOut(L"Checkpoints changed while listing; run j again.\n");
 			free(buffer);
 			return FALSE;
 		}
@@ -1755,6 +1787,89 @@ static BOOL DoInstallDriver(void)
 	return TRUE;
 }
 
+static BOOL PromptPaidLicenseApplyParams(ULONG* modeOut, ULONG* durationOut, ULONG* creditsOut)
+{
+	wchar_t line[64] = { 0 };
+	ULONG mode = 1, days = 365, credits = 0;
+	ConOut(L"Usage mode (1=time, 2=counter, 3=hybrid) [1]: ");
+	if (!ReadLine(line, _countof(line))) return FALSE;
+	if (line[0]) mode = (ULONG)wcstoul(line, NULL, 10);
+	if (mode < 1 || mode > 3) { ConOut(L"Invalid mode.\n"); return FALSE; }
+	if (mode == 1 || mode == 3)
+	{
+		ConOut(L"Duration in days [365]: ");
+		if (!ReadLine(line, _countof(line))) return FALSE;
+		if (line[0]) days = (ULONG)wcstoul(line, NULL, 10);
+		if (!days || days > 36500) { ConOut(L"Invalid duration (1-36500 days).\n"); return FALSE; }
+	}
+	else days = 0;
+	if (mode == 2 || mode == 3)
+	{
+		ConOut(L"Credits: ");
+		if (!ReadLine(line, _countof(line))) return FALSE;
+		credits = (ULONG)wcstoul(line, NULL, 10);
+		if (!credits) { ConOut(L"Invalid credits.\n"); return FALSE; }
+	}
+	*modeOut = mode; *durationOut = days * 86400UL; *creditsOut = credits;
+	return TRUE;
+}
+
+static BOOL DoLicenseManagement(HANDLE hDevice)
+{
+	wchar_t action[16] = { 0 };
+	DWORD returned = 0;
+	ConOut(L"License: q=query, i=import Base64, a=paid application, t=trial application, Enter=back\nlicense> ");
+	if (!ReadLine(action, _countof(action)) || action[0] == L'\0') return TRUE;
+	if (action[0] == L'q' || action[0] == L'Q')
+	{
+		CONSOLE_LICENSE_QUERY_REPLY reply = { 0 };
+		if (!DeviceIoControl(hDevice, CONSOLE_IOCTL_QUERY_LICENSE, NULL, 0,
+			&reply, sizeof(reply), &returned, NULL))
+		{
+			ConOutFmt(L"Query license failed (err=%lu).\n", GetLastError()); return FALSE;
+		}
+		if (!reply.HasLicense) { ConOut(L"License: NOT ACTIVATED\n"); return TRUE; }
+		ConOutFmt(L"License: ACTIVE%s, mode=%lu, expiry=%llu, attempts=%lu, successes=%lu, remaining=%lu\n",
+			reply.IsTrial ? L" (TRIAL)" : L"", reply.Mode, reply.T_EXP_100ns,
+			reply.OPS_T, reply.OPS_S, reply.C0 > reply.OPS_S ? reply.C0 - reply.OPS_S : 0);
+		return TRUE;
+	}
+	if (action[0] == L'i' || action[0] == L'I')
+	{
+		wchar_t text[4096] = { 0 }; char base64[4096] = { 0 };
+		DWORD bytes = 0; CONSOLE_SET_LICENSE_REQUEST request = { 0 };
+		ConOut(L"Paste license blob (Base64, one line): ");
+		if (!ReadLine(text, _countof(text)) ||
+			WideCharToMultiByte(CP_ACP, 0, text, -1, base64, sizeof(base64), NULL, NULL) <= 1 ||
+			!CryptStringToBinaryA(base64, 0, CRYPT_STRING_BASE64, NULL, &bytes, NULL, NULL) ||
+			bytes == 0 || bytes > CONSOLE_LICENSE_BLOB_MAX)
+		{ ConOut(L"Invalid license blob.\n"); return FALSE; }
+		request.LicenseLength = bytes;
+		if (!CryptStringToBinaryA(base64, 0, CRYPT_STRING_BASE64, request.LicenseBlob, &bytes, NULL, NULL) ||
+			!DeviceIoControl(hDevice, CONSOLE_IOCTL_SET_LICENSE, &request, sizeof(request), NULL, 0, &returned, NULL))
+		{ ConOutFmt(L"Import license failed (err=%lu).\n", GetLastError()); SecureZeroMemory(&request, sizeof(request)); return FALSE; }
+		SecureZeroMemory(&request, sizeof(request)); ConOut(L"License imported.\n"); return TRUE;
+	}
+	if (action[0] == L'a' || action[0] == L'A' || action[0] == L't' || action[0] == L'T')
+	{
+		CONSOLE_BUILD_APPLY_QR_REQUEST request = { 0 };
+		CONSOLE_LICENSE_APPLY_QR_REPLY reply = { 0 };
+		BOOL trial = action[0] == L't' || action[0] == L'T';
+		strcpy_s(request.QrPrefix, "http://127.0.0.1:8080/v1/apply#c=");
+		request.Kind = trial ? 1 : 0;
+		if (trial) request.Mode = 1;
+		else if (!PromptPaidLicenseApplyParams(&request.Mode, &request.DesiredDurationSec, &request.DesiredCredits)) return FALSE;
+		if (!DeviceIoControl(hDevice, CONSOLE_IOCTL_BUILD_APPLY_QR, &request, sizeof(request),
+			&reply, sizeof(reply), &returned, NULL))
+		{ ConOutFmt(L"Build application URL failed (err=%lu).\n", GetLastError()); return FALSE; }
+		{ wchar_t url[CONSOLE_APPLY_QR_PAYLOAD_MAX] = { 0 };
+			MultiByteToWideChar(CP_UTF8, 0, reply.QrPayload, -1, url, _countof(url));
+			ConOut(L"License application URL:\n"); ConOut(url); ConOut(L"\n"); }
+		return TRUE;
+	}
+	ConOut(L"Unknown license action.\n"); return FALSE;
+}
+
 static void PrintHelp(void)
 {
 	ConOut(L"\nCommands:\n");
@@ -1769,7 +1884,8 @@ static void PrintHelp(void)
 	ConOut(L"  9  - query journal oldest/newest record time (source GUID)\n");
 	ConOut(L"  u  - query journal record payload usage/free space (source GUID)\n");
 	ConOut(L"  l  - list current journal record metadata (source GUID; no payload)\n");
-	ConOut(L"  k  - list all runtime checkpoint summaries (source GUID)\n");
+	ConOut(L"  j  - list all runtime checkpoint summaries (source GUID)\n");
+	ConOut(L"  k  - license management (query / import / application URL)\n");
 	ConOut(L"  n  - list every checkpoint record in one runtime checkpoint\n");
 	ConOut(L"  b  - print retained journal branch topology and inheritance points (source GUID)\n");
 	ConOut(L"  s  - query protect status (source GUID -> status + journal GUID)\n");
@@ -1874,6 +1990,10 @@ static int RunParamCommand(int argc, wchar_t** argv)
 			L"  time-range <source-volume-guid>\n"
 			L"  branches <source-volume-guid> <password>\n"
 			L"  checkpoints <source-volume-guid> <password>\n"
+			L"  license-query\n"
+			L"  license-import <base64-license>\n"
+			L"  license-apply <mode> <days-or-credits> [credits]  (mode: 1=time, 2=counter, 3=hybrid)\n"
+			L"  license-trial-apply\n"
 			L"  preview-read <source-volume-guid> <password> <utc-unix-seconds> <volume-offset> <length>\n");
 		ConOut(L"  enable <source-guid> <journal-guid> <new-password>  (formats journal: yes)\n"
 			L"  stop <source-guid> <password>\n"
@@ -1896,7 +2016,8 @@ static int RunParamCommand(int argc, wchar_t** argv)
 		return RunScriptTokens(argc - 2, argv + 2);
 	}
 	{
-		wchar_t commandEnable[] = L"1", commandStop[] = L"2", commandMerge[] = L"m", commandBranches[] = L"b", commandCheckpoints[] = L"k";
+		wchar_t commandEnable[] = L"1", commandStop[] = L"2", commandMerge[] = L"m", commandBranches[] = L"b", commandCheckpoints[] = L"j";
+		wchar_t commandLicense[] = L"k", actionLicenseQuery[] = L"q", actionLicenseImport[] = L"i", actionLicenseApply[] = L"a";
 		wchar_t commandSetRestore[] = L"o", commandDeleteRestore[] = L"x";
 		wchar_t commandRecover[] = L"e", commandCommit[] = L"r", commandCancel[] = L"c";
 		wchar_t yes[] = L"y", no[] = L"n", quit[] = L"q";
@@ -1923,6 +2044,33 @@ static int RunParamCommand(int argc, wchar_t** argv)
 		if (_wcsicmp(argv[1], L"checkpoints") == 0 && argc == 4)
 		{
 			wchar_t* lines[] = { commandCheckpoints, argv[2], argv[3], quit };
+			return RunScriptTokens(_countof(lines), lines);
+		}
+		if (_wcsicmp(argv[1], L"license-query") == 0 && argc == 2)
+		{
+			wchar_t* lines[] = { commandLicense, actionLicenseQuery, quit };
+			return RunScriptTokens(_countof(lines), lines);
+		}
+		if (_wcsicmp(argv[1], L"license-import") == 0 && argc == 3)
+		{
+			wchar_t* lines[] = { commandLicense, actionLicenseImport, argv[2], quit };
+			return RunScriptTokens(_countof(lines), lines);
+		}
+		if (_wcsicmp(argv[1], L"license-apply") == 0 && argc == 4 &&
+			(_wcsicmp(argv[2], L"1") == 0 || _wcsicmp(argv[2], L"2") == 0))
+		{
+			wchar_t* lines[] = { commandLicense, actionLicenseApply, argv[2], argv[3], quit };
+			return RunScriptTokens(_countof(lines), lines);
+		}
+		if (_wcsicmp(argv[1], L"license-apply") == 0 && argc == 5 && _wcsicmp(argv[2], L"3") == 0)
+		{
+			wchar_t* lines[] = { commandLicense, actionLicenseApply, argv[2], argv[3], argv[4], quit };
+			return RunScriptTokens(_countof(lines), lines);
+		}
+		if (_wcsicmp(argv[1], L"license-trial-apply") == 0 && argc == 2)
+		{
+			wchar_t actionLicenseTrial[] = L"t";
+			wchar_t* lines[] = { commandLicense, actionLicenseTrial, quit };
 			return RunScriptTokens(_countof(lines), lines);
 		}
 		if (_wcsicmp(argv[1], L"set-restore-point") == 0 && argc == 5)
@@ -2160,11 +2308,17 @@ static int RunInteractive(void)
 			if (hDevice != INVALID_HANDLE_VALUE)
 				DoListJournalRecords(hDevice);
 			break;
+		case L'j':
+		case L'J':
+			hDevice = EnsureControlDevice(hDevice);
+			if (hDevice != INVALID_HANDLE_VALUE)
+				DoListRuntimeCheckpoints(hDevice);
+			break;
 		case L'k':
 		case L'K':
 			hDevice = EnsureControlDevice(hDevice);
 			if (hDevice != INVALID_HANDLE_VALUE)
-				DoListRuntimeCheckpoints(hDevice);
+				DoLicenseManagement(hDevice);
 			break;
 		case L'n':
 		case L'N':

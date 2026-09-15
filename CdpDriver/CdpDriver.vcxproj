@@ -5,12 +5,20 @@
       <Configuration>Debug</Configuration>
       <Platform>x64</Platform>
     </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug-Lic|x64">
+      <Configuration>Debug-Lic</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
     <ProjectConfiguration Include="Release|x64">
       <Configuration>Release</Configuration>
       <Platform>x64</Platform>
     </ProjectConfiguration>
     <ProjectConfiguration Include="Debug|ARM64">
       <Configuration>Debug</Configuration>
+      <Platform>ARM64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Debug-Lic|ARM64">
+      <Configuration>Debug-Lic</Configuration>
       <Platform>ARM64</Platform>
     </ProjectConfiguration>
     <ProjectConfiguration Include="Release|ARM64">
@@ -35,6 +43,13 @@
     <ConfigurationType>Driver</ConfigurationType>
     <DriverType>WDM</DriverType>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug-Lic|x64'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+  </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
     <TargetVersion>Windows10</TargetVersion>
     <UseDebugLibraries>false</UseDebugLibraries>
@@ -43,6 +58,13 @@
     <DriverType>WDM</DriverType>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug-Lic|ARM64'" Label="Configuration">
     <TargetVersion>Windows10</TargetVersion>
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
@@ -69,10 +91,16 @@
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug-Lic|x64'">
+    <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
+  </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'">
+    <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug-Lic|ARM64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
@@ -87,6 +115,31 @@
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug-Lic|x64'">
+    <DriverSign>
+      <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
+    </DriverSign>
+    <ClCompile>
+      <PreprocessorDefinitions>CDP_LICENSE;CDP_LICENSE_OBFUSCATE;LIC_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <WarningLevel>Level3</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug-Lic|ARM64'">
+    <ClCompile>
+      <PreprocessorDefinitions>CDP_LICENSE;CDP_LICENSE_OBFUSCATE;LIC_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <PreprocessorDefinitions>CDP_LICENSE;CDP_LICENSE_OBFUSCATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
+    <ClCompile>
+      <PreprocessorDefinitions>CDP_LICENSE;CDP_LICENSE_OBFUSCATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup>
     <ClCompile>
@@ -107,6 +160,11 @@
     <ClCompile Include="Driver.c" />
     <ClCompile Include="CdpJournal.c" />
 	<ClCompile Include="CdpCredential.c" />
+	<ClCompile Include="CdpLocalSeal.c" />
+	<ClCompile Include="CdpLicenseTrust.c" />
+	<ClCompile Include="CdpLicenseHw.c" />
+	<ClCompile Include="CdpLicenseGate.c" />
+	<ClCompile Include="CdpLicenseProtect.c" />
     <ClCompile Include="CdpIrpDispatchs.c" />
     <ClCompile Include="cdp_dev_store.c" />
     <ClCompile Include="..\CdpCore\src\cdp_core.c" />
@@ -117,11 +175,22 @@
     <ClInclude Include="CdpIrpDispatchs.h" />
     <ClInclude Include="CdpJournal.h" />
 	<ClInclude Include="CdpCredential.h" />
+	<ClInclude Include="CdpLicenseDefs.h" />
+	<ClInclude Include="CdpLocalSeal.h" />
+	<ClInclude Include="CdpLicenseTrust.h" />
+	<ClInclude Include="CdpLicenseHw.h" />
+	<ClInclude Include="CdpLicenseGate.h" />
+	<ClInclude Include="CdpLicenseProtect.h" />
+	<ClInclude Include="CdpLicenseSeg.h" />
+	<ClInclude Include="CdpLicenseSegEnd.h" />
     <ClInclude Include="..\CdpCore\include\cdp_alloc.h" />
     <ClInclude Include="..\CdpCore\include\cdp_core.h" />
     <ClInclude Include="..\CdpCore\include\cdp_dev_store.h" />
     <ClInclude Include="..\CdpCore\include\cdp_portable.h" />
     <ClInclude Include="..\CdpCore\include\cdp_store.h" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="CdpLicensePubKey.inc" />
   </ItemGroup>
   <ItemDefinitionGroup>
     <Link>
