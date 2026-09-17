@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.6.10-test67"
-#define Cdp_DRIVER_BUILD_STRING   "20260914.181-release"
+#define Cdp_DRIVER_VERSION_STRING "1.6.10-test69"
+#define Cdp_DRIVER_BUILD_STRING   "20260917.183-release"
 
 // Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.
 // Cdp_DBG: Debug builds only — verbose I/O and path tracing.
@@ -106,6 +106,9 @@ typedef struct _Cdp_DRIVER_EXTENSION
 	// 按时间点读取的文件预览会话
 	LIST_ENTRY PreviewSessionList;
 	FAST_MUTEX PreviewSessionMutex;
+	// Serializes BEGIN/END replacement so a new BEGIN cannot free a session
+	// while another BEGIN is still constructing and publishing its PreviewTree.
+	KMUTEX PreviewOperationMutex;
 	volatile LONGLONG PreviewSessionNextId;
 
 	volatile LONG AuthFailureCount;

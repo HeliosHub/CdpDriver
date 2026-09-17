@@ -443,12 +443,6 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 		goto cleanup;
 
 	FilterDeviceObject->Flags = DeviceExtension->LowerDeviceObject->Flags | DO_POWER_PAGABLE | DO_DIRECT_IO;
-	if (deviceKind == Cdp_DEVICE_KIND_DISK)
-	{
-		Status = CdpStartCaptureWorker(DeviceExtension);
-		if (!NT_SUCCESS(Status))
-			goto cleanup;
-	}
 	DeviceListNode = cdpalloc(sizeof(Cdp_DEVICE_LIST_NODE));
 	if (!DeviceListNode)
 	{
@@ -557,6 +551,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 	KeInitializeMutex(&DriverExtension->CaptureConfigMutex, 0);
 	InitializeListHead(&DriverExtension->PreviewSessionList);
 	ExInitializeFastMutex(&DriverExtension->PreviewSessionMutex);
+	KeInitializeMutex(&DriverExtension->PreviewOperationMutex, 0);
 	DriverExtension->PreviewSessionNextId = 0;
 	InitializeListHead(&DriverExtension->RestoreSpaceAlertWaitList);
 #ifdef CDP_LICENSE

@@ -13,6 +13,9 @@ static volatile LONG64 g_CdpShutdownHopSequence = 0;
 static volatile LONG64 g_CdpPowerHopSequence = 0;
 static volatile LONG64 g_CdpPreviewBeginSequence = 0;
 
+static VOID CdpCloseAllPreviewSessionsLocked(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt);
+
 static VOID CdpDisableAllCaptureSources(_In_ PCdp_DRIVER_EXTENSION DriverExt);
 static NTSTATUS CdpStartMergeThread(
 	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
@@ -2792,19 +2795,72 @@ static VOID CdpDestroyPreviewSession(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ PCdp_PREVIEW_SESSION Session)
 {
+	LARGE_INTEGER diagnosticTimeout;
+	NTSTATUS waitStatus;
+	NTSTATUS closeStatus = STATUS_SUCCESS;
+	ULONGLONG stageStart100ns;
+
+	Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=session-drain-begin handle=%llu refs=%ld thread=%p\n",
+		Session->HandleId,
+		InterlockedCompareExchange(&Session->ReferenceCount, 0, 0),
+		PsGetCurrentThread());
+	stageStart100ns = KeQueryInterruptTime();
 	CdpReleasePreviewSession(Session); // Drop list ownership.
-	KeWaitForSingleObject(
-		&Session->NoReferences,
-		Executive,
-		KernelMode,
-		FALSE,
-		NULL);
+	diagnosticTimeout.QuadPart = -10LL * 1000LL * 1000LL * 10LL;
+	do
+	{
+		waitStatus = KeWaitForSingleObject(
+			&Session->NoReferences,
+			Executive,
+			KernelMode,
+			FALSE,
+			&diagnosticTimeout);
+		if (waitStatus == STATUS_TIMEOUT)
+		{
+			Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=session-drain-still-blocked handle=%llu refs=%ld elapsedMs=%llu thread=%p\n",
+				Session->HandleId,
+				InterlockedCompareExchange(&Session->ReferenceCount, 0, 0),
+				(KeQueryInterruptTime() - stageStart100ns) / 10000ULL,
+				PsGetCurrentThread());
+		}
+	} while (waitStatus == STATUS_TIMEOUT);
+	Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=session-drain-end handle=%llu status=0x%08X elapsedMs=%llu\n",
+		Session->HandleId,
+		waitStatus,
+		(KeQueryInterruptTime() - stageStart100ns) / 10000ULL);
+
 	if (Session->SourceVolumeHandleId)
-		(void)CdpCloseVolumeHandle(
+	{
+		stageStart100ns = KeQueryInterruptTime();
+		Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=source-handle-close-begin previewHandle=%llu sourceHandle=%llu thread=%p\n",
+			Session->HandleId,
+			Session->SourceVolumeHandleId,
+			PsGetCurrentThread());
+		closeStatus = CdpCloseVolumeHandle(
 			DriverExt,
 			Session->SourceVolumeHandleId);
+		Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=source-handle-close-end previewHandle=%llu sourceHandle=%llu status=0x%08X elapsedMs=%llu\n",
+			Session->HandleId,
+			Session->SourceVolumeHandleId,
+			closeStatus,
+			(KeQueryInterruptTime() - stageStart100ns) / 10000ULL);
+	}
 	if (Session->JournalEntry)
+	{
+		stageStart100ns = KeQueryInterruptTime();
+		Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=journal-reference-release-begin handle=%llu journal=%p refs=%ld\n",
+			Session->HandleId,
+			Session->JournalEntry,
+			InterlockedCompareExchange(
+				&Session->JournalEntry->ReferenceCount, 0, 0));
 		CdpReleaseVolumeHandleEntry(Session->JournalEntry);
+		Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=journal-reference-release-end handle=%llu elapsedMs=%llu\n",
+			Session->HandleId,
+			(KeQueryInterruptTime() - stageStart100ns) / 10000ULL);
+	}
+	Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=session-free handle=%llu session=%p\n",
+		Session->HandleId,
+		Session);
 	cdpfree(Session);
 }
 
@@ -2829,7 +2885,7 @@ static VOID CdpApplyRestorePointTimeLowerBound(
 		*NewestTime = *OldestTime;
 }
 
-static NTSTATUS CdpBeginPreviewSession(
+static NTSTATUS CdpBeginPreviewSessionCore(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const Cdp_PREVIEW_BEGIN_REQUEST* Request,
 	_Out_ PCdp_PREVIEW_BEGIN_REPLY Reply)
@@ -3052,14 +3108,59 @@ cleanup:
 	return status;
 }
 
-static NTSTATUS CdpEndPreviewSession(
+static NTSTATUS CdpBeginPreviewSession(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ const Cdp_PREVIEW_BEGIN_REQUEST* Request,
+	_Out_ PCdp_PREVIEW_BEGIN_REPLY Reply)
+{
+	BOOLEAN replacing;
+	NTSTATUS status;
+	ULONGLONG replaceStart100ns;
+
+	status = KeWaitForSingleObject(
+		&DriverExt->PreviewOperationMutex,
+		Executive,
+		KernelMode,
+		FALSE,
+		NULL);
+	if (!NT_SUCCESS(status))
+		return status;
+
+	replacing = CdpAnyPreviewSessionActive(DriverExt);
+	if (replacing)
+	{
+		replaceStart100ns = KeQueryInterruptTime();
+		Cdp_LOG("[PREVIEW-REPLACE] stage=close-previous-begin requested=%llu thread=%p\n",
+			Request->TargetTime100ns,
+			PsGetCurrentThread());
+		CdpCloseAllPreviewSessionsLocked(DriverExt);
+		Cdp_LOG("[PREVIEW-REPLACE] stage=close-previous-end requested=%llu elapsedMs=%llu\n",
+			Request->TargetTime100ns,
+			(KeQueryInterruptTime() - replaceStart100ns) / 10000ULL);
+	}
+
+	status = CdpBeginPreviewSessionCore(DriverExt, Request, Reply);
+	KeReleaseMutex(&DriverExt->PreviewOperationMutex, FALSE);
+	return status;
+}
+
+static NTSTATUS CdpEndPreviewSessionCore(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ UINT64 HandleId)
 {
 	PCdp_PREVIEW_SESSION session;
 	GUID sourceGuid;
 	BOOLEAN haveGuid = FALSE;
+	ULONGLONG closeStart100ns;
+	ULONGLONG stageStart100ns;
+	NTSTATUS coreStatus = STATUS_SUCCESS;
 
+	closeStart100ns = KeQueryInterruptTime();
+	Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=request-begin handle=%llu thread=%p\n",
+		HandleId,
+		PsGetCurrentThread());
+
+	stageStart100ns = KeQueryInterruptTime();
 	ExAcquireFastMutex(&DriverExt->PreviewSessionMutex);
 	session = CdpLookupPreviewSessionLocked(DriverExt, HandleId);
 	if (session)
@@ -3070,8 +3171,18 @@ static NTSTATUS CdpEndPreviewSession(
 		haveGuid = TRUE;
 	}
 	ExReleaseFastMutex(&DriverExt->PreviewSessionMutex);
+	Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=session-unpublish-end handle=%llu found=%u elapsedMs=%llu\n",
+		HandleId,
+		session ? 1u : 0u,
+		(KeQueryInterruptTime() - stageStart100ns) / 10000ULL);
 	if (!session)
+	{
+		Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=request-end handle=%llu status=0x%08X elapsedMs=%llu\n",
+			HandleId,
+			STATUS_NOT_FOUND,
+			(KeQueryInterruptTime() - closeStart100ns) / 10000ULL);
 		return STATUS_NOT_FOUND;
+	}
 
 	CdpDestroyPreviewSession(DriverExt, session);
 
@@ -3082,20 +3193,68 @@ static NTSTATUS CdpEndPreviewSession(
 		if (sourceExt)
 		{
 			KeEnterCriticalRegion();
+			stageStart100ns = KeQueryInterruptTime();
+			Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=preview-access-wait-begin handle=%llu source=%p thread=%p\n",
+				HandleId,
+				sourceExt,
+				PsGetCurrentThread());
 			ExAcquirePushLockExclusive(&sourceExt->PreviewAccessLock);
+			Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=preview-access-wait-end handle=%llu source=%p elapsedMs=%llu\n",
+				HandleId,
+				sourceExt,
+				(KeQueryInterruptTime() - stageStart100ns) / 10000ULL);
+			stageStart100ns = KeQueryInterruptTime();
+			Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=preview-tree-free-begin handle=%llu core=%p\n",
+				HandleId,
+				sourceExt->Core);
 			if (sourceExt->Core)
-				(void)CdpCorePreviewEnd(sourceExt->Core);
+				coreStatus = CdpCorePreviewEnd(sourceExt->Core);
+			Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=preview-tree-free-end handle=%llu core=%p status=0x%08X elapsedMs=%llu\n",
+				HandleId,
+				sourceExt->Core,
+				coreStatus,
+				(KeQueryInterruptTime() - stageStart100ns) / 10000ULL);
 			InterlockedExchange(&sourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
 			ExReleasePushLockExclusive(&sourceExt->PreviewAccessLock);
 			KeLeaveCriticalRegion();
+			Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=phase-general handle=%llu source=%p\n",
+				HandleId,
+				sourceExt);
+		}
+		else
+		{
+			Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=source-not-found handle=%llu\n",
+				HandleId);
 		}
 	}
 
-	Cdp_DBG("[PREVIEW] end handle=%llu\n", HandleId);
+	Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=request-end handle=%llu status=0x%08X coreStatus=0x%08X elapsedMs=%llu\n",
+		HandleId,
+		STATUS_SUCCESS,
+		coreStatus,
+		(KeQueryInterruptTime() - closeStart100ns) / 10000ULL);
 	return STATUS_SUCCESS;
 }
 
-VOID CdpCloseAllPreviewSessions(_In_ PCdp_DRIVER_EXTENSION DriverExt)
+static NTSTATUS CdpEndPreviewSession(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ UINT64 HandleId)
+{
+	NTSTATUS status = KeWaitForSingleObject(
+		&DriverExt->PreviewOperationMutex,
+		Executive,
+		KernelMode,
+		FALSE,
+		NULL);
+	if (!NT_SUCCESS(status))
+		return status;
+	status = CdpEndPreviewSessionCore(DriverExt, HandleId);
+	KeReleaseMutex(&DriverExt->PreviewOperationMutex, FALSE);
+	return status;
+}
+
+static VOID CdpCloseAllPreviewSessionsLocked(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt)
 {
 	for (;;)
 	{
@@ -3143,6 +3302,22 @@ VOID CdpCloseAllPreviewSessions(_In_ PCdp_DRIVER_EXTENSION DriverExt)
 	}
 }
 
+VOID CdpCloseAllPreviewSessions(_In_ PCdp_DRIVER_EXTENSION DriverExt)
+{
+	NTSTATUS status;
+
+	status = KeWaitForSingleObject(
+		&DriverExt->PreviewOperationMutex,
+		Executive,
+		KernelMode,
+		FALSE,
+		NULL);
+	if (!NT_SUCCESS(status))
+		return;
+	CdpCloseAllPreviewSessionsLocked(DriverExt);
+	KeReleaseMutex(&DriverExt->PreviewOperationMutex, FALSE);
+}
+
 static NTSTATUS CdpReadPreviewSession(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const Cdp_PREVIEW_READ_REQUEST* Request,
@@ -3182,10 +3357,12 @@ static NTSTATUS CdpReadPreviewSession(
 	}
 
 	/* PreviewTree and its payload locations are stable until teardown or merge.
-	 * Use the dedicated shared gate, not HistoryMutex: protected Journal writes
-	 * must remain able to complete while Windows reads the preview LUN. */
+	 * Serialize complete preview reads on the dedicated gate so a request cannot
+	 * overlap another request while either one is combining Journal and source
+	 * data.  Do not use HistoryMutex: protected Journal writes must remain able
+	 * to complete while Windows reads the preview LUN. */
 	KeEnterCriticalRegion();
-	ExAcquirePushLockShared(&sourceExt->PreviewAccessLock);
+	ExAcquirePushLockExclusive(&sourceExt->PreviewAccessLock);
 	previewAccessLocked = TRUE;
 	if (session->StoppedByMerge)
 	{
@@ -3218,7 +3395,7 @@ static NTSTATUS CdpReadPreviewSession(
 cleanup:
 	if (previewAccessLocked && sourceExt)
 	{
-		ExReleasePushLockShared(&sourceExt->PreviewAccessLock);
+		ExReleasePushLockExclusive(&sourceExt->PreviewAccessLock);
 		KeLeaveCriticalRegion();
 	}
 	CdpReleasePreviewSession(session);
@@ -7620,21 +7797,29 @@ NTSTATUS CdpIrpDispatchPnp(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 				if (InterlockedCompareExchange(
 					&DriverExt->AutoDiscoveryDisabled, 0, 0) != 0)
 				{
-					Cdp_LOG("[JOURNAL-DISCOVERY] skip disk=%lu; disabled by preview UI\n",
+					/* Preview iSCSI disks arrive only after the UI disables
+					 * discovery.  They are pass-through devices and must not own
+					 * a capture worker that later participates in PnP removal. */
+					Cdp_LOG("[JOURNAL-DISCOVERY] skip disk=%lu and capture worker; disabled by preview UI\n",
 						DevExt->DiskNumber);
 					discoveryStatus = STATUS_NOT_FOUND;
 				}
 				else
 				{
-					discoveryStatus = KeWaitForSingleObject(
-						&DriverExt->CaptureConfigMutex,
-						Executive, KernelMode, FALSE, NULL);
+					discoveryStatus = DevExt->CaptureThreadHandle ?
+						STATUS_SUCCESS : CdpStartCaptureWorker(DevExt);
 					if (NT_SUCCESS(discoveryStatus))
 					{
-						discoveryStatus = CdpDiscoverJournalForStartedDisk(
-							DriverExt, DevExt);
-						KeReleaseMutex(
-							&DriverExt->CaptureConfigMutex, FALSE);
+						discoveryStatus = KeWaitForSingleObject(
+							&DriverExt->CaptureConfigMutex,
+							Executive, KernelMode, FALSE, NULL);
+						if (NT_SUCCESS(discoveryStatus))
+						{
+							discoveryStatus = CdpDiscoverJournalForStartedDisk(
+								DriverExt, DevExt);
+							KeReleaseMutex(
+								&DriverExt->CaptureConfigMutex, FALSE);
+						}
 					}
 				}
 				if (!NT_SUCCESS(discoveryStatus) &&
