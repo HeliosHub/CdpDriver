@@ -225,6 +225,9 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	 * published. */
 	volatile LONG JournalBackendReady;
 	KEVENT JournalBackendReadyEvent;
+	/* Set by CaptureWorker only after the startup FIFO is empty.  Ordinary
+	 * writes may then redirect in their dispatch path instead of joining it. */
+	volatile LONG DirectRedirectReady;
 	HANDLE CaptureThreadHandle;
 	volatile LONG CaptureStopping;
 	volatile LONG RedirectWritesInFlight;

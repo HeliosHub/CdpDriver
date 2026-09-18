@@ -69,9 +69,6 @@ static NTSTATUS CdpForwardQueuedDiskIrpSynchronously(
 static NTSTATUS CdpDispatchProtectedVolumeIo(
 	_Inout_ PCdp_DEVICE_EXTENSION VolumeExt,
 	_Inout_ PIRP Irp);
-static NTSTATUS CdpDispatchProtectedVolumeFlush(
-	_Inout_ PCdp_DEVICE_EXTENSION VolumeExt,
-	_Inout_ PIRP Irp);
 static PCdp_VOLUME_HANDLE_ENTRY CdpAcquireJournalForSource(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ PCdp_DEVICE_EXTENSION SourceExt);
@@ -1512,6 +1509,7 @@ static NTSTATUS CdpConfigureCaptureInternal(
 	sourceExt->PartitionSize = sourcePartitionSize;
 	sourceExt->JournalHandleId = journalHandleId;
 	InterlockedExchange(&sourceExt->JournalBackendReady, 0);
+	InterlockedExchange(&sourceExt->DirectRedirectReady, 0);
 	KeClearEvent(&sourceExt->JournalBackendReadyEvent);
 
 	{
@@ -1569,9 +1567,11 @@ static NTSTATUS CdpConfigureCaptureInternal(
 	InterlockedExchange(&sourceExt->JournalBackendReady, 1);
 	KeSetEvent(
 		&sourceExt->JournalBackendReadyEvent, IO_NO_INCREMENT, FALSE);
+	KeSetEvent(&sourceExt->CaptureEvent, IO_NO_INCREMENT, FALSE);
 	InterlockedExchange(&sourceExt->VolumeIoAccepting, 1);
 	InterlockedExchange(&sourceExt->ProtectionStateValidated, 1);
 	InterlockedExchange(&sourceExt->CaptureEnabled, 1);
+	KeSetEvent(&sourceExt->CaptureEvent, IO_NO_INCREMENT, FALSE);
 	Cdp_LOG("[PROTECTION-ACTIVE] protection enabled immediately; writes redirect to journal and MetaTree reads are active\n");
 
 	*JournalHandleId = journalHandleId;
@@ -1796,6 +1796,7 @@ static NTSTATUS CdpActivateAutoJournal(
 	sourceExt->VolumeGuidValid = TRUE;
 	sourceExt->SectorSize = sourceSectorSize;
 	InterlockedExchange(&sourceExt->JournalBackendReady, 0);
+	InterlockedExchange(&sourceExt->DirectRedirectReady, 0);
 	KeClearEvent(&sourceExt->JournalBackendReadyEvent);
 	status = CdpDevStoreCreateAbsoluteRange(
 		sourceExt->LowerDeviceObject,
@@ -1894,10 +1895,12 @@ static NTSTATUS CdpActivateAutoJournal(
 			&sourceExt->JournalBackendReadyEvent,
 			IO_NO_INCREMENT,
 			FALSE);
+		KeSetEvent(&sourceExt->CaptureEvent, IO_NO_INCREMENT, FALSE);
 	}
 	InterlockedExchange(&sourceExt->VolumeIoAccepting, 1);
 	InterlockedExchange(&sourceExt->ProtectionStateValidated, 1);
 	InterlockedExchange(&sourceExt->CaptureEnabled, 1);
+	KeSetEvent(&sourceExt->CaptureEvent, IO_NO_INCREMENT, FALSE);
 	Cdp_LOG("[VOLUME-FILTER] auto protection enabled: backendReady=%ld; source I/O uses the ordered Capture FIFO\n",
 		InterlockedCompareExchange(
 			&sourceExt->JournalBackendReady, 0, 0));
@@ -2285,6 +2288,7 @@ static NTSTATUS CdpEnsureOnlineAndBindWaitingJournalBackend(
 	InterlockedExchange(&sourceExt->JournalBackendReady, 1);
 	KeSetEvent(
 		&sourceExt->JournalBackendReadyEvent, IO_NO_INCREMENT, FALSE);
+	KeSetEvent(&sourceExt->CaptureEvent, IO_NO_INCREMENT, FALSE);
 	Cdp_LOG("[AUTO-BACKEND] online switch complete source=%p disk=%lu journalPart=%lu start=%llu size=%llu lower=%p restorePrepared=%u queued=%ld\n",
 		sourceExt,
 		journalEntry->DiskNumber,
@@ -2625,6 +2629,7 @@ static NTSTATUS CdpDiscoverAdjacentJournalForStartedVolume(
 		InterlockedExchange(&SourceExt->JournalBackendReady, 1);
 		KeSetEvent(
 			&SourceExt->JournalBackendReadyEvent, IO_NO_INCREMENT, FALSE);
+		KeSetEvent(&SourceExt->CaptureEvent, IO_NO_INCREMENT, FALSE);
 		Cdp_LOG("[AUTO-BACKEND] switched read-only discovery handle to volume lower=%p disk=%lu part=%lu start=%llu size=%llu restorePrepared=%u\n",
 			metadataLower,
 			journalEntry->DiskNumber,
@@ -5591,6 +5596,17 @@ typedef struct _Cdp_ORIGINAL_IRP_PAYLOAD_CONTEXT
 	BOOLEAN Forwarded;
 } Cdp_ORIGINAL_IRP_PAYLOAD_CONTEXT, *PCdp_ORIGINAL_IRP_PAYLOAD_CONTEXT;
 
+/* A volume-layer source IRP cannot safely be sent to a different volume
+ * lower stack.  This context creates a Journal-targeted IRP while borrowing
+ * the source IRP's MDL chain, so payload bytes are not copied. */
+typedef struct _Cdp_CLONED_IRP_PAYLOAD_CONTEXT
+{
+	PIRP SourceIrp;
+	PDEVICE_OBJECT TargetDevice;
+	UINT64 TargetBaseOffset;
+	BOOLEAN Submitted;
+} Cdp_CLONED_IRP_PAYLOAD_CONTEXT, *PCdp_CLONED_IRP_PAYLOAD_CONTEXT;
+
 static NTSTATUS CdpOriginalIrpPayloadCompletion(
 	_In_ PDEVICE_OBJECT DeviceObject,
 	_In_ PIRP Irp,
@@ -5627,6 +5643,42 @@ static BOOLEAN CdpCanRedirectOriginalWriteIrp(
 		journal->TargetDevice != Item->OriginLowerReference ||
 		journal->TargetBaseOffset != journalEntry->TargetBaseOffset ||
 		journal->SectorSize == 0 || (Length % journal->SectorSize) != 0 ||
+		InterlockedCompareExchange(&journal->RawIoQuiesced, 0, 0) != 0)
+	{
+		return FALSE;
+	}
+	for (mdl = Item->Irp->MdlAddress; mdl; mdl = mdl->Next)
+	{
+		ULONG bytes = MmGetMdlByteCount(mdl);
+		if (mdlBytes > MAXUINT64 - bytes)
+			return FALSE;
+		mdlBytes += bytes;
+	}
+	return mdlBytes >= Length;
+}
+
+static BOOLEAN CdpCanCloneWriteIrpForJournal(
+	_In_ PCdp_DEVICE_EXTENSION SourceExt,
+	_In_ PCdp_CAPTURE_ITEM Item,
+	_In_ ULONG Length)
+{
+	PCdp_VOLUME_HANDLE_ENTRY journalEntry;
+	PCdp_JOURNAL journal;
+	PMDL mdl;
+	UINT64 mdlBytes = 0;
+
+	if (!SourceExt || !Item || !Item->Irp || Length == 0 ||
+		Length > Cdp_JOURNAL_MAX_RECORD_DATA || !Item->Irp->MdlAddress)
+	{
+		return FALSE;
+	}
+	journalEntry = SourceExt->RedirectJournalEntry;
+	if (!journalEntry)
+		return FALSE;
+	journal = &journalEntry->Journal;
+	if (!journal->Mounted || journal->Store || journal->RawDiskHandle ||
+		!journal->TargetDevice || journal->SectorSize == 0 ||
+		(Length % journal->SectorSize) != 0 ||
 		InterlockedCompareExchange(&journal->RawIoQuiesced, 0, 0) != 0)
 	{
 		return FALSE;
@@ -5685,6 +5737,64 @@ static NTSTATUS CdpWriteJournalPayloadWithOriginalIrp(
 	return status;
 }
 
+static NTSTATUS CdpWriteJournalPayloadWithClonedIrp(
+	_In_opt_ PVOID Context,
+	_In_ UINT64 JournalOffset,
+	_In_ ULONG DataLength,
+	_In_ ULONG AlignedLength)
+{
+	PCdp_CLONED_IRP_PAYLOAD_CONTEXT ctx =
+		(PCdp_CLONED_IRP_PAYLOAD_CONTEXT)Context;
+	KEVENT event;
+	LARGE_INTEGER byteOffset;
+	PIRP journalIrp;
+	PIO_STACK_LOCATION nextSp;
+	NTSTATUS status;
+	UINT64 absoluteOffset;
+
+	if (!ctx || !ctx->SourceIrp || !ctx->SourceIrp->MdlAddress ||
+		!ctx->TargetDevice || ctx->Submitted || DataLength == 0 ||
+		DataLength != AlignedLength ||
+		ctx->TargetBaseOffset > MAXUINT64 - JournalOffset)
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+	absoluteOffset = ctx->TargetBaseOffset + JournalOffset;
+	if (absoluteOffset > MAXLONGLONG)
+		return STATUS_INTEGER_OVERFLOW;
+
+	KeInitializeEvent(&event, NotificationEvent, FALSE);
+	byteOffset.QuadPart = (LONGLONG)absoluteOffset;
+	journalIrp = IoAllocateIrp(ctx->TargetDevice->StackSize, FALSE);
+	if (!journalIrp)
+		return STATUS_INSUFFICIENT_RESOURCES;
+	/* The IRP owns no MDL: it temporarily borrows the caller's locked pages,
+	 * which remain valid because the original request is still pending. */
+	journalIrp->MdlAddress = ctx->SourceIrp->MdlAddress;
+	journalIrp->RequestorMode = KernelMode;
+	journalIrp->Tail.Overlay.Thread = PsGetCurrentThread();
+	nextSp = IoGetNextIrpStackLocation(journalIrp);
+	nextSp->MajorFunction = IRP_MJ_WRITE;
+	nextSp->Parameters.Write.ByteOffset = byteOffset;
+	nextSp->Parameters.Write.Length = DataLength;
+	nextSp->Flags |= SL_FORCE_DIRECT_WRITE;
+	IoSetCompletionRoutine(
+		journalIrp,
+		CdpOriginalIrpPayloadCompletion,
+		&event,
+		TRUE,
+		TRUE,
+		TRUE);
+	ctx->Submitted = TRUE;
+	(void)IoCallDriver(ctx->TargetDevice, journalIrp);
+	KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
+	status = journalIrp->IoStatus.Status;
+	if (NT_SUCCESS(status) && journalIrp->IoStatus.Information != DataLength)
+		status = STATUS_UNEXPECTED_IO_ERROR;
+	IoFreeIrp(journalIrp);
+	return status;
+}
+
 static NTSTATUS CdpRedirectJournalWrite(
 	_In_ PCdp_DEVICE_EXTENSION SourceExt,
 	_Inout_ PCdp_CAPTURE_ITEM Item)
@@ -5701,7 +5811,9 @@ static NTSTATUS CdpRedirectJournalWrite(
 	BOOLEAN mergeWaitRetried = FALSE;
 	BOOLEAN ownsMergeSpaceRetryGate = FALSE;
 	BOOLEAN useOriginalIrp = FALSE;
+	BOOLEAN useClonedIrp = FALSE;
 	Cdp_ORIGINAL_IRP_PAYLOAD_CONTEXT originalIrpContext;
+	Cdp_CLONED_IRP_PAYLOAD_CONTEXT clonedIrpContext;
 	NTSTATUS status;
 
 	/* The caller owns HistoryMutex and completes the IRP only after releasing
@@ -5725,6 +5837,7 @@ static NTSTATUS CdpRedirectJournalWrite(
 		return CdpFinishRedirectWrite(SourceExt, STATUS_DEVICE_NOT_READY);
 	CdpWaitForMergeSpaceRetryGateLocked(SourceExt);
 	RtlZeroMemory(&originalIrpContext, sizeof(originalIrpContext));
+	RtlZeroMemory(&clonedIrpContext, sizeof(clonedIrpContext));
 	useOriginalIrp = CdpCanRedirectOriginalWriteIrp(
 		SourceExt, Item, writeLength);
 	if (useOriginalIrp)
@@ -5734,9 +5847,21 @@ static NTSTATUS CdpRedirectJournalWrite(
 			SourceExt->RedirectJournalEntry->Journal.TargetDevice;
 		originalIrpContext.TargetBaseOffset =
 			SourceExt->RedirectJournalEntry->Journal.TargetBaseOffset;
-		Cdp_DBG("[REDIRECT-WRITE-ZEROCOPY] original IRP selected offset=%llu len=%lu irp=%p mdl=%p target=%p\n",
+		Cdp_DBG("[REDIRECT-WRITE-ZEROCOPY-CANDIDATE] mode=original offset=%llu len=%lu irp=%p mdl=%p target=%p\n",
 			writeOffset, writeLength, Irp, Irp->MdlAddress,
 			originalIrpContext.TargetDevice);
+	}
+	else if (CdpCanCloneWriteIrpForJournal(SourceExt, Item, writeLength))
+	{
+		useClonedIrp = TRUE;
+		clonedIrpContext.SourceIrp = Irp;
+		clonedIrpContext.TargetDevice =
+			SourceExt->RedirectJournalEntry->Journal.TargetDevice;
+		clonedIrpContext.TargetBaseOffset =
+			SourceExt->RedirectJournalEntry->Journal.TargetBaseOffset;
+		Cdp_DBG("[REDIRECT-WRITE-ZEROCOPY-CANDIDATE] mode=cloned offset=%llu len=%lu irp=%p mdl=%p target=%p\n",
+			writeOffset, writeLength, Irp, Irp->MdlAddress,
+			clonedIrpContext.TargetDevice);
 	}
 	else
 	{
@@ -5773,6 +5898,16 @@ static NTSTATUS CdpRedirectJournalWrite(
 				&originalIrpContext,
 				&record);
 		}
+		else if (useClonedIrp)
+		{
+			status = CdpCoreAppendAfterImageWithWriter(
+				SourceExt->Core,
+				chunkVolumeOffset,
+				chunkLength,
+				CdpWriteJournalPayloadWithClonedIrp,
+				&clonedIrpContext,
+				&record);
+		}
 		else
 		{
 			status = CdpCoreAppendAfterImage(
@@ -5786,6 +5921,7 @@ static NTSTATUS CdpRedirectJournalWrite(
 		{
 			if (status == STATUS_DISK_FULL && !mergeWaitRetried &&
 				!originalIrpContext.Forwarded &&
+				!clonedIrpContext.Submitted &&
 				InterlockedCompareExchange(
 					&SourceExt->MergeThreadRunning, 0, 0) != 0)
 			{
@@ -5865,6 +6001,36 @@ static NTSTATUS CdpRedirectJournalWrite(
 	}
 	CdpReleaseRedirectWrite(SourceExt);
 	return STATUS_SUCCESS;
+}
+
+/* The bootstrap FIFO is retained until the Journal volume lower backend is
+ * available and the worker has consumed every pre-ready request.  Once that
+ * point is atomically published, ordinary PASSIVE/APC-level writes use the
+ * former disk-layer direct redirect path. */
+static NTSTATUS CdpRedirectVolumeWriteDirectly(
+	_Inout_ PCdp_DEVICE_EXTENSION SourceExt,
+	_In_ PDEVICE_OBJECT OriginLower,
+	_Inout_ PIRP Irp,
+	_In_ UINT64 SourceVolumeOffset)
+{
+	Cdp_CAPTURE_ITEM item;
+	NTSTATUS status;
+
+	if (!SourceExt || !OriginLower || !Irp)
+		return STATUS_INVALID_PARAMETER;
+	if (!CdpTryAcquireRedirectWrite(SourceExt))
+		return STATUS_DEVICE_NOT_READY;
+
+	RtlZeroMemory(&item, sizeof(item));
+	item.Irp = Irp;
+	item.SourceVolumeOffset = SourceVolumeOffset;
+	item.OriginLowerOffset = SourceVolumeOffset;
+	item.OriginLowerReference = OriginLower;
+	KeWaitForSingleObject(
+		&SourceExt->HistoryMutex, Executive, KernelMode, FALSE, NULL);
+	status = CdpRedirectJournalWrite(SourceExt, &item);
+	KeReleaseMutex(&SourceExt->HistoryMutex, FALSE);
+	return status;
 }
 
 static NTSTATUS CdpDispatchProtectedVolumeIo(
@@ -5951,6 +6117,21 @@ static NTSTATUS CdpDispatchProtectedVolumeIo(
 		}
 		return CdpSendToNextDevice(VolumeExt->LowerDeviceObject, Irp);
 	}
+	if (write && KeGetCurrentIrql() <= APC_LEVEL &&
+		InterlockedCompareExchange(&sourceExt->JournalBackendReady, 0, 0) != 0 &&
+		InterlockedCompareExchange(&sourceExt->DirectRedirectReady, 0, 0) != 0)
+	{
+		NTSTATUS writeStatus = CdpRedirectVolumeWriteDirectly(
+			sourceExt,
+			VolumeExt->LowerDeviceObject,
+			Irp,
+			relativeOffset);
+
+		CdpReleaseVolumeIoOutstanding(sourceExt);
+		ObDereferenceObject(sourceReference);
+		return CdpCompleteIrp(
+			Irp, writeStatus, NT_SUCCESS(writeStatus) ? length : 0);
+	}
 	item = (PCdp_CAPTURE_ITEM)cdpalloc(sizeof(*item));
 	if (!item)
 	{
@@ -5973,6 +6154,11 @@ static NTSTATUS CdpDispatchProtectedVolumeIo(
 		InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) != 0)
 	{
 		IoMarkIrpPending(Irp);
+		/* A queued write (normally an elevated-IRQL fallback) closes the direct
+		 * gate again.  CaptureWorker reopens it only after this FIFO work has
+		 * completed, so no later direct write can pass it. */
+		if (write)
+			InterlockedExchange(&sourceExt->DirectRedirectReady, 0);
 		InsertTailList(&sourceExt->CaptureQueue, &item->Entry);
 		InterlockedIncrement(&sourceExt->CaptureQueueDepth);
 		KeSetEvent(&sourceExt->CaptureEvent, IO_NO_INCREMENT, FALSE);
@@ -5996,74 +6182,6 @@ static NTSTATUS CdpDispatchProtectedVolumeIo(
 		return CdpCompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
 	}
 	return CdpSendToNextDevice(VolumeExt->LowerDeviceObject, Irp);
-}
-
-static NTSTATUS CdpDispatchProtectedVolumeFlush(
-	_Inout_ PCdp_DEVICE_EXTENSION VolumeExt,
-	_Inout_ PIRP Irp)
-{
-	PDEVICE_OBJECT sourceReference = NULL;
-	PCdp_DEVICE_EXTENSION sourceExt;
-	PCdp_CAPTURE_ITEM item;
-	KIRQL oldIrql;
-
-	sourceExt = CdpReferenceProtectionForVolumeIo(
-		VolumeExt, &sourceReference);
-	if (!sourceExt)
-	{
-		if (InterlockedCompareExchange(
-				&VolumeExt->CaptureEnabled, 0, 0) != 0)
-		{
-			return CdpCompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
-		}
-		return CdpSendToNextDevice(VolumeExt->LowerDeviceObject, Irp);
-	}
-	if (!CdpAcquireVolumeIoOutstanding(sourceExt))
-	{
-		ObDereferenceObject(sourceReference);
-		return InterlockedCompareExchange(
-			&sourceExt->CaptureEnabled, 0, 0) != 0 ?
-			CdpCompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0) :
-			CdpSendToNextDevice(VolumeExt->LowerDeviceObject, Irp);
-	}
-	if (!sourceExt->RedirectJournalEntry ||
-		!sourceExt->CaptureThreadHandle)
-	{
-		CdpReleaseVolumeIoOutstanding(sourceExt);
-		ObDereferenceObject(sourceReference);
-		return CdpCompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
-	}
-	item = (PCdp_CAPTURE_ITEM)cdpalloc(sizeof(*item));
-	if (!item)
-	{
-		CdpReleaseVolumeIoOutstanding(sourceExt);
-		ObDereferenceObject(sourceReference);
-		return CdpCompleteIrp(Irp, STATUS_INSUFFICIENT_RESOURCES, 0);
-	}
-	RtlZeroMemory(item, sizeof(*item));
-	item->Irp = Irp;
-	item->SourceReference = sourceReference;
-	item->OriginLowerReference = VolumeExt->LowerDeviceObject;
-	ObReferenceObject(item->OriginLowerReference);
-
-	KeAcquireSpinLock(&sourceExt->CaptureQueueLock, &oldIrql);
-	if (InterlockedCompareExchange(&sourceExt->CaptureStopping, 0, 0) == 0 &&
-		InterlockedCompareExchange(&sourceExt->VolumeIoAccepting, 0, 0) != 0 &&
-		InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0) != 0)
-	{
-		IoMarkIrpPending(Irp);
-		InsertTailList(&sourceExt->CaptureQueue, &item->Entry);
-		InterlockedIncrement(&sourceExt->CaptureQueueDepth);
-		KeSetEvent(&sourceExt->CaptureEvent, IO_NO_INCREMENT, FALSE);
-		KeReleaseSpinLock(&sourceExt->CaptureQueueLock, oldIrql);
-		return STATUS_PENDING;
-	}
-	KeReleaseSpinLock(&sourceExt->CaptureQueueLock, oldIrql);
-	CdpReleaseVolumeIoOutstanding(sourceExt);
-	ObDereferenceObject(sourceReference);
-	ObDereferenceObject(item->OriginLowerReference);
-	cdpfree(item);
-	return CdpCompleteIrp(Irp, STATUS_DEVICE_NOT_READY, 0);
 }
 
 static NTSTATUS CdpForwardWriteCompletion(
@@ -6155,6 +6273,19 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 			else
 			{
 				KeClearEvent(&queueExt->CaptureEvent);
+				/* The last bootstrap item has completed. New ordinary writes can
+				 * redirect in dispatch; a queued write closes this gate again. */
+				if (InterlockedCompareExchange(
+						&queueExt->JournalBackendReady, 0, 0) != 0 &&
+					InterlockedCompareExchange(
+						&queueExt->CaptureStopping, 0, 0) == 0 &&
+					InterlockedCompareExchange(
+						&queueExt->CaptureEnabled, 0, 0) != 0 &&
+					InterlockedCompareExchange(&queueExt->Phase, 0, 0) ==
+						(LONG)Cdp_PHASE_GENERAL)
+				{
+					InterlockedExchange(&queueExt->DirectRedirectReady, 1);
+				}
 				entry = NULL;
 			}
 			KeReleaseSpinLock(&queueExt->CaptureQueueLock, oldIrql);
@@ -6757,6 +6888,7 @@ VOID CdpDisableAndDestroyCapture(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 		KeLeaveCriticalRegion();
 	}
 	InterlockedExchange(&DevExt->JournalBackendReady, 0);
+	InterlockedExchange(&DevExt->DirectRedirectReady, 0);
 	KeClearEvent(&DevExt->JournalBackendReadyEvent);
 }
 
@@ -6770,8 +6902,6 @@ NTSTATUS CdpIrpDispatchFlush(
 	if (!deviceExt || !deviceExt->LowerDeviceObject)
 		return CdpCompleteIrp(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);
 
-	if (deviceExt->DeviceKind == Cdp_DEVICE_KIND_VOLUME)
-		return CdpDispatchProtectedVolumeFlush(deviceExt, Irp);
 	return CdpSendToNextDevice(deviceExt->LowerDeviceObject, Irp);
 }
 
