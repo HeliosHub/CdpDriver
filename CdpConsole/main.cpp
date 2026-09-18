@@ -1834,7 +1834,7 @@ static BOOL DoInstallDriver(void)
 
 	if (CdpResolveDriverInfPath(infPath, _countof(infPath)))
 		ConOutFmt(L"Driver package: %s\n", infPath);
-	ConOut(L"Driver and CdpBootConfirm service installed; Volume and DiskDrive UpperFilters registered.\n");
+	ConOut(L"Driver and CdpBootConfirm service installed; Volume UpperFilter registered below volsnap.\n");
 	ConOut(L"Reboot is required before both filter layers attach.\n");
 	return TRUE;
 }

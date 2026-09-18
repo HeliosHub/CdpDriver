@@ -146,9 +146,8 @@ static NTSTATUS CdpDevStoreWrite(
 	if (!ctx || Offset < ctx->LogicalStart || Offset > ctx->Size ||
 		Length > ctx->Size - Offset)
 		return STATUS_INVALID_PARAMETER;
-	/* Source stores are attached below the Disk upper filter.  Core uses this
-	 * writer only to materialize a reclaimed HeaderRegion into the source
-	 * baseline, so the write must be explicitly accepted by the disk stack. */
+	/* Core uses this writer to materialize a reclaimed HeaderRegion into the
+	 * source baseline. Mark it as a direct lower-volume write. */
 	return CdpDevStoreRawIo(
 		ctx->Device,
 		IRP_MJ_WRITE,
@@ -158,17 +157,17 @@ static NTSTATUS CdpDevStoreWrite(
 		(PVOID)Buffer);
 }
 
-NTSTATUS CdpDevStoreWriteDiskAbsoluteForceDirect(
-	_In_ PDEVICE_OBJECT DiskLowerDevice,
-	_In_ UINT64 AbsoluteOffset,
+NTSTATUS CdpDevStoreWriteForceDirect(
+	_In_ PDEVICE_OBJECT LowerDevice,
+	_In_ UINT64 DeviceOffset,
 	_In_ ULONG Length,
 	_In_reads_bytes_(Length) const VOID* Buffer)
 {
 	return CdpDevStoreRawIo(
-		DiskLowerDevice,
+		LowerDevice,
 		IRP_MJ_WRITE,
 		SL_FORCE_DIRECT_WRITE,
-		AbsoluteOffset,
+		DeviceOffset,
 		Length,
 		(PVOID)Buffer);
 }

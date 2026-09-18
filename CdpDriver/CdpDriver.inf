@@ -3,7 +3,7 @@ Signature   = "$WINDOWS NT$"
 Class       = Volume
 ClassGuid   = {71a27cdd-812a-11d0-bec7-08002be2092f}
 Provider    = %ProviderName%
-DriverVer   = 09/17/2026,1.6.10.69
+DriverVer   = 09/18/2026,1.6.10.79
 CatalogFile = CdpDriver.cat
 PnpLockdown = 1
 LegacyUninstall = 1
@@ -21,7 +21,7 @@ CdpDriver_DelFiles.NTamd64 = 12
 
 [DefaultInstall.NTamd64]
 CopyFiles = CdpDriver_CopyFiles.NTamd64
-AddReg    = CdpDriver_AddReg,CdpDriver_DiskUpperFilter_AddReg
+AddReg    = CdpDriver_AddReg
 
 [DefaultInstall.NTamd64.Services]
 AddService = CdpDriver,, CdpDriver_ServiceInstall
@@ -51,9 +51,6 @@ CdpDriver.sys,,,0x00000002
 CdpDriver.sys
 
 [CdpDriver_AddReg]
-
-[CdpDriver_DiskUpperFilter_AddReg]
-HKLM,"SYSTEM\CurrentControlSet\Control\Class\{4d36e967-e325-11ce-bfc1-08002be10318}","UpperFilters",0x00010008,"CdpDriver"
 
 [CdpDriver_DiskUpperFilter_DelReg]
 HKLM,"SYSTEM\CurrentControlSet\Control\Class\{4d36e967-e325-11ce-bfc1-08002be10318}","UpperFilters",0x00018002,"CdpDriver"

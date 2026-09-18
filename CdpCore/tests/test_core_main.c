@@ -3223,6 +3223,42 @@ static int TestAutoDiscoverySkipsRestorePointRecords(void)
 	return g_caseFailed;
 }
 
+static int TestAutoDiscoveryDistinguishesAbsentAndCorruptJournal(void)
+{
+	PCdp_STORE store = NULL;
+	Cdp_JOURNAL journal;
+	Cdp_JOURNAL_SUPERBLOCK superblock;
+	GUID zeroGuid = { 0 };
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, 512, &store)),
+		"create blank adjacent-partition store");
+	if (!store)
+		return g_caseFailed;
+
+	CdpJournalInitializeWithStore(
+		&journal, store, &zeroGuid, NULL, NULL);
+	status = CdpJournalMountForAutoDiscovery(&journal);
+	Expect(status == STATUS_NOT_FOUND,
+		"auto discovery treats missing CDP signature as an unprotected volume");
+	CdpJournalClose(&journal);
+
+	RtlZeroMemory(&superblock, sizeof(superblock));
+	superblock.Magic = Cdp_JOURNAL_MAGIC;
+	Expect(NT_SUCCESS(store->Write(
+		store, 0, sizeof(superblock), &superblock)),
+		"seed a signed but structurally corrupt Journal superblock");
+	CdpJournalInitializeWithStore(
+		&journal, store, &zeroGuid, NULL, NULL);
+	status = CdpJournalMountForAutoDiscovery(&journal);
+	Expect(status == STATUS_DISK_CORRUPT_ERROR,
+		"auto discovery fails closed after recognizing a corrupt Journal");
+	CdpJournalClose(&journal);
+
+	CdpMemStoreDestroy(store);
+	return g_caseFailed;
+}
+
 static int TestGracefulDisableDrainsMetaTree(void)
 {
 	TEST_CTX ctx;
@@ -3283,11 +3319,11 @@ static int TestGracefulDisableDrainsMetaTree(void)
 	Expect(status == STATUS_IO_DEVICE_ERROR && !complete &&
 		writer.Calls == 1 && writer.LastAbsoluteOffset == 512 &&
 		writer.LastLength == sizeof(journalB),
-		"failed disk writer receives exact absolute MetaTree range");
+		"failed source writer receives the exact volume-relative MetaTree range");
 	RtlZeroMemory(output, sizeof(output));
 	Expect(NT_SUCCESS(CdpCoreRead(ctx.Core, 0, sizeof(output), output)) &&
 		memcmp(output, expected, sizeof(output)) == 0,
-		"failed disk backfill does not punch MetaTree coverage");
+		"failed source backfill does not punch MetaTree coverage");
 
 	while (!complete && iterations++ < 16)
 	{
@@ -3644,6 +3680,8 @@ int main(void)
 		TestCheckpointMergeExactReservation);
 	failed += RunCase("Auto discovery skips restore-point records",
 		TestAutoDiscoverySkipsRestorePointRecords);
+	failed += RunCase("Auto discovery distinguishes absent/corrupt Journal",
+		TestAutoDiscoveryDistinguishesAbsentAndCorruptJournal);
 	failed += RunCase("Graceful disable drains MetaTree",
 		TestGracefulDisableDrainsMetaTree);
 	failed += RunCase("Sibling inheritance point retention",

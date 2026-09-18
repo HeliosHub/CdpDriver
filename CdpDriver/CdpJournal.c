@@ -22,6 +22,10 @@
 static ULONG g_CdpCrc32cTable[256];
 static volatile LONG g_CdpCrc32cReady;
 #ifndef Cdp_USERMODE
+NTSYSAPI NTSTATUS NTAPI ZwFlushBuffersFile(
+	_In_ HANDLE FileHandle,
+	_Out_ PIO_STATUS_BLOCK IoStatusBlock);
+
 #endif
 
 static NTSTATUS CdpJournalAppendBranchLocked(
@@ -783,18 +787,23 @@ static NTSTATUS CdpJournalRawIoImpl(
 			Origin, MajorFunction, Offset, Length);
 		return STATUS_DEVICE_NOT_READY;
 	}
-	// Prefer the volume stack below our own filter.  This keeps offsets volume-
-	// relative and avoids blocking on a synchronous \\PhysicalDrive handle.
-	// Retain the physical-disk backend only as a compatibility fallback when no
-	// lower volume device was supplied.
+	// Prefer the volume stack below our own filter once it is available. During
+	// boot auto-discovery the adjacent Journal volume has not started yet, so a
+	// synchronous kernel handle to Partition0 supplies the required FileObject
+	// context while translating Journal-relative offsets to physical offsets.
 	if (Journal->RawDiskHandle && !Journal->TargetDevice)
 	{
 		IO_STATUS_BLOCK iosb;
 		LARGE_INTEGER byteOffset;
 
-		if (MajorFunction != IRP_MJ_READ &&
-			MajorFunction != IRP_MJ_WRITE)
-			return STATUS_NOT_IMPLEMENTED;
+		/* Partition0 exists only to discover and reconstruct the Journal before
+		 * its volume stack starts. Never persist through this handle. */
+		if (MajorFunction != IRP_MJ_READ)
+		{
+			Cdp_LOG("[JOURNAL-PHYSICAL-BLOCKED] origin=%s major=0x%02X partitionOffset=%llu len=%lu reason=discovery-handle-read-only\n",
+				Origin, MajorFunction, Offset, Length);
+			return STATUS_DEVICE_NOT_READY;
+		}
 		if (Journal->TargetBaseOffset >
 			(UINT64)MAXLONGLONG - Offset)
 			return STATUS_INTEGER_OVERFLOW;
@@ -810,20 +819,10 @@ static NTSTATUS CdpJournalRawIoImpl(
 			(UINT64)byteOffset.QuadPart,
 			Length,
 			PsGetCurrentThread());
-		if (MajorFunction == IRP_MJ_READ)
-		{
-			status = ZwReadFile(
-				(HANDLE)Journal->RawDiskHandle,
-				NULL, NULL, NULL, &iosb,
-				Buffer, Length, &byteOffset, NULL);
-		}
-		else
-		{
-			status = ZwWriteFile(
-				(HANDLE)Journal->RawDiskHandle,
-				NULL, NULL, NULL, &iosb,
-				Buffer, Length, &byteOffset, NULL);
-		}
+		status = ZwReadFile(
+			(HANDLE)Journal->RawDiskHandle,
+			NULL, NULL, NULL, &iosb,
+			Buffer, Length, &byteOffset, NULL);
 		if (NT_SUCCESS(status))
 			status = iosb.Status;
 		Cdp_DBG("[JOURNAL-PHYSICAL] io end "
@@ -872,6 +871,13 @@ static NTSTATUS CdpJournalRawIoImpl(
 		&iosb);
 	if (!irp)
 		return STATUS_INSUFFICIENT_RESOURCES;
+	if (MajorFunction == IRP_MJ_WRITE)
+	{
+		/* Journal storage is a dedicated raw volume. Mark kernel writes as
+		 * intentional direct-volume writes so the volume/storage stack does not
+		 * reject superblock, header or payload sectors as protected areas. */
+		IoGetNextIrpStackLocation(irp)->Flags |= SL_FORCE_DIRECT_WRITE;
+	}
 	Cdp_DBG("[JOURNAL-RAW] io begin origin=%s target=%p major=0x%02X "
 		"partitionOffset=%llu diskOffset=%llu len=%lu irp=%p thread=%p\n",
 		Origin, Journal->TargetDevice,
@@ -3931,6 +3937,113 @@ VOID CdpJournalSetMetadataDevice(
 	Journal->MetadataTargetBaseOffset = TargetBaseOffset;
 }
 
+NTSTATUS CdpJournalSwitchToDeviceBackend(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ PVOID TargetDevice,
+	_In_ UINT64 TargetBaseOffset,
+	_In_ PVOID ExpectedRawDiskHandle)
+{
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Journal || !TargetDevice || !ExpectedRawDiskHandle)
+		return STATUS_INVALID_PARAMETER;
+
+	/* The Journal lock waits for boot discovery/restore I/O to finish before
+	 * the caller releases its temporary disk backend. Once this returns,
+	 * subsequent payload and metadata requests are volume-relative. */
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	if (!Journal->Mounted || Journal->Store ||
+		Journal->TargetDevice != NULL ||
+		Journal->RawDiskHandle != ExpectedRawDiskHandle)
+	{
+		status = STATUS_INVALID_DEVICE_STATE;
+	}
+	else
+	{
+		Journal->TargetDevice = TargetDevice;
+		Journal->TargetBaseOffset = TargetBaseOffset;
+		Journal->MetadataTargetDevice = TargetDevice;
+		Journal->MetadataTargetBaseOffset = TargetBaseOffset;
+#ifndef Cdp_USERMODE
+		KeMemoryBarrier();
+#endif
+		Journal->RawDiskHandle = NULL;
+	}
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
+#ifndef Cdp_USERMODE
+static NTSTATUS CdpJournalFlushDevice(_In_ PDEVICE_OBJECT DeviceObject)
+{
+	KEVENT event;
+	IO_STATUS_BLOCK iosb;
+	PIRP irp;
+	NTSTATUS status;
+
+	if (!DeviceObject)
+		return STATUS_SUCCESS;
+	KeInitializeEvent(&event, NotificationEvent, FALSE);
+	RtlZeroMemory(&iosb, sizeof(iosb));
+	irp = IoBuildSynchronousFsdRequest(
+		IRP_MJ_FLUSH_BUFFERS,
+		DeviceObject,
+		NULL,
+		0,
+		NULL,
+		&event,
+		&iosb);
+	if (!irp)
+		return STATUS_INSUFFICIENT_RESOURCES;
+	status = IoCallDriver(DeviceObject, irp);
+	if (status == STATUS_PENDING)
+	{
+		KeWaitForSingleObject(
+			&event, Executive, KernelMode, FALSE, NULL);
+		status = iosb.Status;
+	}
+	else if (NT_SUCCESS(status))
+	{
+		status = iosb.Status;
+	}
+	return status;
+}
+#endif
+
+NTSTATUS CdpJournalFlush(_Inout_ PCdp_JOURNAL Journal)
+{
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!Journal)
+		return STATUS_INVALID_PARAMETER;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+#ifndef Cdp_USERMODE
+	if (Journal->RawDiskHandle && !Journal->TargetDevice)
+	{
+		IO_STATUS_BLOCK iosb;
+		RtlZeroMemory(&iosb, sizeof(iosb));
+		status = ZwFlushBuffersFile(
+			(HANDLE)Journal->RawDiskHandle,
+			&iosb);
+		if (NT_SUCCESS(status))
+			status = iosb.Status;
+	}
+	else if (!Journal->Store)
+	{
+		status = CdpJournalFlushDevice(
+			(PDEVICE_OBJECT)Journal->TargetDevice);
+	}
+	if (NT_SUCCESS(status) && Journal->MetadataTargetDevice &&
+		Journal->MetadataTargetDevice != Journal->TargetDevice)
+	{
+		status = CdpJournalFlushDevice(
+			(PDEVICE_OBJECT)Journal->MetadataTargetDevice);
+	}
+#endif
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return status;
+}
+
 VOID CdpJournalSetPhysicalLayout(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ ULONG DiskPartitionStyle,
@@ -4182,7 +4295,12 @@ static NTSTATUS CdpJournalMountInternal(
 	superblock = (PCdp_JOURNAL_SUPERBLOCK)sector;
 	if (!CdpJournalSuperblockValid(Journal, superblock))
 	{
-		status = STATUS_DISK_CORRUPT_ERROR;
+		/* During boot discovery, a partition with no CDP signature simply is
+		 * not a Journal. Once the signature is present, every structural or
+		 * checksum failure is a damaged protected state and must fail closed. */
+		status = AutoDiscovery &&
+			superblock->Magic != Cdp_JOURNAL_MAGIC ?
+			STATUS_NOT_FOUND : STATUS_DISK_CORRUPT_ERROR;
 		goto cleanup;
 	}
 

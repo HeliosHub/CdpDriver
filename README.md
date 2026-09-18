@@ -1,8 +1,8 @@
 # CdpDriver
 
-CdpDriver 是一个同时工作在 Windows `Volume` 与 `DiskDrive` 类的 Upper Filter 驱动。当前开发版本采用 after-image：受保护分区的应用写在磁盘层持久化到独立 Journal 后直接完成，不再提交到源分区；卷层优先合成读取，磁盘层为旁路读取兜底。
+CdpDriver 是一个位于 `volsnap` 下层的 Windows `Volume` 类 Upper Filter 驱动。当前开发版本采用 after-image：受保护卷的应用写持久化到独立 Journal 后直接完成，不再提交到源卷；卷层合成当前读取视图。
 
-当前版本：**1.6.8-test48**（Build `20260831.135-shutdown-hop-trace`），Journal 磁盘格式：**v15**。
+当前开发 Journal 磁盘格式：**v19**。本阶段不兼容旧格式。
 
 主要功能：
 
@@ -17,7 +17,7 @@ CdpDriver 是一个同时工作在 Windows `Volume` 与 `DiskDrive` 类的 Upper
 
 > ## 数据安全警告
 >
-> 本项目直接工作在卷和物理磁盘设备栈，并会修改源分区与专用 Journal 分区。请先在虚拟机或可重装测试机上验证，并完整备份重要数据。格式化 Journal 会清除其中全部历史。测试签名仅适用于测试环境，生产部署需要符合 Windows 要求的内核驱动签名。
+> 本项目过滤卷设备，并会修改源分区与专用 Journal 分区；自动发现还会直接访问物理相邻的 Journal 分区。请先在虚拟机或可重装测试机上验证，并完整备份重要数据。格式化 Journal 会清除其中全部历史。测试签名仅适用于测试环境，生产部署需要符合 Windows 要求的内核驱动签名。
 
 ## 支持环境
 
@@ -48,7 +48,7 @@ msbuild CdpDriver.sln /m /p:Configuration=Release /p:Platform=x64
 
 1. 测试机开启测试签名并重启：`bcdedit /set testsigning on`。
 2. 以管理员身份运行 `CdpConsole.exe`。
-3. 使用 `i` 安装 INF、注册驱动并配置 Volume/DiskDrive UpperFilters；按提示重启。
+3. 使用 `i` 安装 INF、注册驱动并把 Volume UpperFilter 配置到 `volsnap` 下层；按提示重启。
 4. 准备一块不与源卷混用的专用 Journal 分区。
 5. 使用 `1` 指定源卷 GUID 和 Journal 卷 GUID，选择格式化或挂载并开启保护。
 
@@ -58,7 +58,7 @@ msbuild CdpDriver.sln /m /p:Configuration=Release /p:Platform=x64
 
 | 命令 | 功能 |
 |---|---|
-| `i` | 安装/注册驱动（INF + Volume/DiskDrive UpperFilters） |
+| `i` | 安装/注册驱动（INF + Volume UpperFilter） |
 | `1` | 配置并开启保护：源卷 GUID + 专用 Journal GUID |
 | `2` | 停止指定源卷的保护，并使其 Journal 不再被自动发现 |
 | `6` | 按源卷和时间点开始 Preview |
@@ -104,20 +104,20 @@ Recovery Begin 根据目标时间确定父分支和继承点，追加一个新�
 
 选择“重启恢复”时，`e` 只把恢复标记和目标时间写入 Journal Superblock，不立即构建历史树。下次启动时：
 
-1. 磁盘和卷的 `START_DEVICE` 阶段完成物理布局识别及 Source/Journal 配对。
+1. 源 Volume 的 `START_DEVICE` 阶段查询物理布局，并直接读取相邻下一分区的 Journal Superblock。
 2. 发现 Recovery 标记后读取日志并构建目标 `MetaTree`，启动阶段不创建新分支 Record。
 3. 目标视图发布后保护路径生效；恢复后的第一笔写入先持久化延迟创建的新分支，再追加该笔 payload。
-4. 自动恢复失败时保留标记及原历史用于诊断和重试，不让启动 I/O 永久阻塞。
+4. 已识别 Journal 后若自动恢复失败，会保留标记及原历史，并阻止该卷启动，避免绕过保护。
 
 ## 持久还原点
 
-`o` 会把指定时间的完整视图物化到源分区，并将还原点标记写入 Journal Superblock。物化写入直接从磁盘过滤层下方向对应物理磁盘发送绝对偏移 WRITE，不经过卷栈。目标 Record 及其之前的历史随即回收：完整过期 HeaderRegion（RR）直接删除；与目标边界同处一个 RR 的旧数据 Record 写为 tombstone。该边界 RR 为保留后续数据所需的分支结构 Header 不删除。
+`o` 会把指定时间的完整视图物化到源分区，并将还原点标记写入 Journal Superblock。物化写入从源 Volume 过滤设备的下层按卷相对偏移发送，不重新进入本驱动。目标 Record 及其之前的历史随即回收：完整过期 HeaderRegion（RR）直接删除；与目标边界同处一个 RR 的旧数据 Record 写为 tombstone。该边界 RR 为保留后续数据所需的分支结构 Header 不删除。
 
 设置还原点后的下一次重启会消费一次性还原启动标记：驱动直接使用已经物化的源分区作为基础视图，不扫描旧 Record。第一笔受保护写入前会清空旧历史、创建新的根分支，并持久清除还原点及其一次性启动标记；本次启动产生的文件系统修复和应用写入因此会在后续重启被正常扫描和保留。尚未启动应用时还原点不会自行过期；启动后首次受保护写完成前不支持删除。
 
 ## 停止保护与 Drain
 
-`2` 进入 `DRAINING` 后，把当前 `MetaTree` 覆盖逐段写回源分区。写回 IRP 直接发送给物理磁盘过滤设备的下层对象，使用绝对磁盘偏移，并设置 `SL_FORCE_DIRECT_WRITE`。该路径不使用 volume gate、线程识别或 IRP 私有标记，也不会重新进入本驱动的卷层或磁盘层。只有全部范围成功写回后才关闭保护；失败时保留保护状态。
+`2` 进入 `DRAINING` 后，把当前 `MetaTree` 覆盖逐段写回源分区。写回 IRP 直接发送给源 Volume 的下层对象，使用卷相对偏移并设置 `SL_FORCE_DIRECT_WRITE`；不会重新进入本驱动。只有全部范围成功写回后才关闭保护；失败时保留保护状态。
 
 ## 手动合并
 
@@ -127,10 +127,10 @@ Recovery Begin 根据目标时间确定父分支和继承点，追加一个新�
 
 ## Journal 空间与磁盘格式
 
-当前开发格式为 v15：一个 Superblock，随后是若干 `1 MiB HeaderRegion + PayloadRegion`。单条磁盘 Record Header 为 32 字节，HeaderRegion 末尾 32 字节是 RegionLink。
+当前开发格式为 v19：一个 Superblock，随后是若干 `1 MiB HeaderRegion + PayloadRegion`。单条磁盘 Record Header 为 32 字节，HeaderRegion 末尾 32 字节是 RegionLink。Record 的源偏移和 MetaTree 键均为卷相对偏移。
 
 - 单个 PayloadRegion 的跨度达到 Journal 容量的 `1/10` 时，即使 HeaderRegion 未写满也会切换新区域。
-- 普通模式在 Journal 可用 payload 空间降至 500 MiB 时启动唯一合并线程。删除最旧 HeaderRegion 前，先把其中当前分支仍有效的最新值通过磁盘下层的 `SL_FORCE_DIRECT_WRITE` 写入源卷；仅继承基线已不可重建的分支及其后代会被标记删除。仍有效分支在后续分叉点之后的 tail 也必须保留，供 Preview 或继续创建分支。合并日志会输出模式、RR 偏移和序号范围。
+- 普通模式在 Journal 可用 payload 空间降至 500 MiB 时启动唯一合并线程。删除最旧 HeaderRegion 前，先把其中当前分支仍有效的最新值通过源卷下层的卷相对 `SL_FORCE_DIRECT_WRITE` 写回；仅继承基线已不可重建的分支及其后代会被标记删除。仍有效分支在后续分叉点之后的 tail 也必须保留，供 Preview 或继续创建分支。合并日志会输出模式、RR 偏移和序号范围。
 - 存在持久还原点时不执行源盘回填：有效数据迁移到运行期 checkpoint；命中已有 checkpoint record 的部分直接覆写，未覆盖碎片才作为本次 RR checkpoint 的新 record 占用空间。每个实际分配过新 record 的 RR 合并对应一个运行时 `CheckpointId`，并记录来源 RR 和 Sequence 范围。当前 `MetaTree` 仅更新仍指向被合并 Record 的 payload，Preview 以 checkpoint 作为已回收历史的基础层。checkpoint 元数据不写 Superblock，重启仍由持久还原点源盘基线接管。Console 的 `k`/`n` 可分页查看这些内存元数据，但不返回 payload 内容。
 - 删除还原点时若存在运行期 checkpoint，会先把 checkpoint 基线写入源盘，再清理内存映射和重建最新 `MetaTree`，随后才清除 Superblock 标记。
 - 淘汰空间通过相邻 RegionLink 和最后一条 Record 的 `FileOffset + DataLength` 计算，不扫描整个 1 MiB HeaderRegion。
@@ -143,7 +143,7 @@ Recovery Begin 根据目标时间确定父分支和继承点，追加一个新�
 
 ## 读写分层与 TRIM
 
-卷层 WRITE 始终透传，由磁盘层完成最终保护截获。卷层 READ 对已绑定保护分区优先合成；直接到达磁盘层的读取由磁盘层兜底。每个磁盘使用“最近命中分区 + 有序范围二分查找”定位保护分区，多分区查找复杂度为 `O(log N)`。
+驱动只过滤 Volume 层。受保护卷的 READ、WRITE 与 FLUSH 进入同一个 FIFO：WRITE 重定向到 Journal，READ 由源卷基线和 MetaTree 覆盖合成，FLUSH 先刷新 Journal 再刷新源卷下层。不存在磁盘过滤层兜底；保护已经发布而 Journal/Worker 不可用时请求 fail-closed。
 
 保护开启期间，驱动拦截并抑制 `DeviceDsmAction_Trim`，避免底层回收破坏源卷基础数据。停止保护后 TRIM 和普通写直接下发。
 
@@ -159,11 +159,11 @@ Recovery Begin 根据目标时间确定父分支和继承点，追加一个新�
 
 ## 日志行为
 
-Release 构建保留关键生命周期、失败、读取路径和 drain 诊断日志。高频 I/O 跟踪使用 `Cdp_DBG`，只在 Debug 构建输出。保护期间被抑制的 TRIM 使用 `[COW-TRIM]` 记录；磁盘直写失败使用 `[DRAIN-DISK-WRITE-FAIL]`，同步 I/O 长时间未完成使用 `[DRAIN-DIAG]`。
+Release 构建保留关键生命周期、失败、读取路径和 drain 诊断日志。高频 I/O 跟踪使用 `Cdp_DBG`，只在 Debug 构建输出。保护期间被抑制的 TRIM 使用 `[COW-TRIM]` 记录；同步 I/O 长时间未完成使用 `[DRAIN-DIAG]`。
 
 ## 已知限制
 
-- 当前可挂载 Journal v15 和上一版 v14；更早格式需要重新格式化。
+- 当前只挂载 Journal v19；开发阶段不提供旧格式兼容。
 - 全局同时只允许一个 Preview 会话，Preview 与 Recovery 互斥。
 - 可恢复时间窗口取决于 Journal 容量；淘汰以 HeaderRegion 为粒度。
 - Recovery Begin 扫描期间会排队源卷应用层读写，历史较多时可能产生可感知延迟。

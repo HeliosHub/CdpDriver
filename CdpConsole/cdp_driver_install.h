@@ -16,7 +16,7 @@ BOOL CdpInstallDriverFromInf(_In_ const wchar_t* infPath);
 
 BOOL CdpRegisterVolumeUpperFilter(void);
 
-BOOL CdpRegisterDiskUpperFilter(void);
+BOOL CdpRemoveLegacyDiskUpperFilter(void);
 
 BOOL CdpInstallBootConfirmService(void);
 

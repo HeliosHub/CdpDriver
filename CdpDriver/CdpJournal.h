@@ -13,7 +13,7 @@
 #endif
 
 #define Cdp_JOURNAL_MAGIC            0x4C4E4A51UL /* 'QJNL' */
-#define Cdp_JOURNAL_VERSION          18UL
+#define Cdp_JOURNAL_VERSION          19UL
 #define Cdp_JOURNAL_MAX_RECORD_DATA  (2UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_REGION_SIZE (1UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_LINK_SIZE 32UL
@@ -111,7 +111,7 @@ typedef struct _Cdp_CREDENTIAL_DESCRIPTOR
 	UINT64 AuthEpoch;
 } Cdp_CREDENTIAL_DESCRIPTOR, *PCdp_CREDENTIAL_DESCRIPTOR;
 
-// On-disk layout (v15): VolumeOffset uses the absolute physical-disk address;
+// On-disk layout: VolumeOffset is relative to the protected source volume;
 // FileOffset remains relative to the journal partition's own storage backend.
 // One superblock is followed by alternating header/payload areas.
 //   [Superblock]
@@ -417,8 +417,8 @@ typedef struct _Cdp_JOURNAL
 	UINT64 JournalPartitionSize;
 #ifndef Cdp_USERMODE
 	PDEVICE_OBJECT TargetDevice;
-	// Optional volume-stack backend used only for journal metadata. Payload
-	// remains on TargetDevice with an absolute disk offset.
+	// Optional adjacent-volume backend used only for Journal metadata. Payload
+	// remains on TargetDevice; TargetBaseOffset performs backend translation.
 	PDEVICE_OBJECT MetadataTargetDevice;
 #else
 	PVOID TargetDevice;
@@ -480,6 +480,12 @@ VOID CdpJournalSetMetadataDevice(
 	_In_opt_ PVOID TargetDevice,
 	_In_ UINT64 TargetBaseOffset);
 
+NTSTATUS CdpJournalSwitchToDeviceBackend(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ PVOID TargetDevice,
+	_In_ UINT64 TargetBaseOffset,
+	_In_ PVOID ExpectedRawDiskHandle);
+
 VOID CdpJournalSetPhysicalLayout(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ ULONG DiskPartitionStyle,
@@ -493,6 +499,10 @@ VOID CdpJournalSetPhysicalLayout(
 NTSTATUS CdpJournalFormat(_Inout_ PCdp_JOURNAL Journal);
 
 NTSTATUS CdpJournalMount(_Inout_ PCdp_JOURNAL Journal);
+
+// Persist all completed payload and metadata writes before a protected volume
+// flush is allowed to complete.
+NTSTATUS CdpJournalFlush(_Inout_ PCdp_JOURNAL Journal);
 
 // Transfer the current-view tree produced by the one-pass mount scan.  The
 // caller owns the returned nodes.  This is single-consumer by design.
@@ -603,8 +613,8 @@ NTSTATUS CdpJournalAppendEx(
 	_In_ ULONG RecordFlags,
 	_Out_opt_ PCdp_JOURNAL_RECORD WrittenRecord);
 
-// Append using caller-owned payload transport. This permits the disk filter
-// to retarget an existing write IRP without copying its MDL-backed payload.
+// Append using caller-owned payload transport. This permits the Volume filter
+// to write an existing MDL-backed payload without an extra copy.
 // Header publication and journal cursor advancement remain journal-owned and
 // occur only after PayloadWriter reports a complete successful transfer.
 NTSTATUS CdpJournalAppendWithWriterEx(

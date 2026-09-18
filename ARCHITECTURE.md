@@ -2,106 +2,70 @@
 
 ## 1. 总体结构
 
-CdpDriver 同时注册为 `Volume` 与 `DiskDrive` 类 Upper Filter。卷层负责高效识别已绑定保护分区并优先合成读取；磁盘层负责截获最终物理写入，并为绕过卷层的读取提供兜底。两层共享同一个保护上下文和 after-image Journal 视图。
+CdpDriver 只注册为 Windows `Volume` 类 Upper Filter，并排在 `volsnap` 下层。驱动不附着 `DiskDrive` 栈，也不依靠磁盘层读写兜底。
 
-- `CdpDriver`：PnP、卷/磁盘 IRP、自动发现、保护路由、工作线程、drain 与 IOCTL。
-- `CdpCore`：当前视图、Preview、Recovery、还原点物化和空间回收协调。
-- `CdpJournal`：v15 磁盘格式、Record、分支树、区间树及持久化状态。
+- `CdpDriver`：卷 PnP、自动发现、卷读写 FIFO、drain 与 IOCTL。
+- `CdpCore`：当前视图、Preview、Recovery、还原点和空间回收。
+- `CdpJournal`：v19 Journal、Record、分支树、区间树及持久化状态。
 - `CdpConsole`：安装、保护配置、查询、Preview、Recovery 和还原点管理。
 
-磁盘自动发现可创建不附着设备栈的 `SOURCE` 上下文。已启动卷按磁盘号、分区起始位置和长度绑定到对应保护上下文；若磁盘层已发布该上下文，卷层直接绑定而不重新挂载或扫描同一 Journal。卷 I/O 不需要遍历全部分区。
+每个受保护卷的真实 Volume 过滤设备扩展就是唯一保护上下文。Core、MetaTree 和 Journal Record 的源偏移全部以源卷起点为 0，不再保存物理磁盘绝对偏移。
 
-## 2. 保护路由
+## 2. 自动发现
 
-每个物理磁盘维护按绝对范围排序的保护路由：
+Volume `START_DEVICE` 下发成功后，驱动从卷栈查询磁盘号、当前分区及物理相邻的下一分区。驱动按磁盘号临时引用物理磁盘设备，仅作为 Journal 后端客户端，在下一分区的绝对起点读取 Superblock；它不会创建或附着磁盘过滤设备。
 
-1. 先检查最近命中的分区，连续 I/O 通常一次比较完成定位。
-2. 未命中时对有序路由做二分查找，复杂度为 `O(log N)`。
-3. 只有路由容量异常不足时才启用全局扫描兜底；正常未命中直接下发。
+- 下一分区没有 CDP Magic：返回 `STATUS_NOT_FOUND`，该卷按未保护卷启动。
+- 已识别 CDP Magic，但版本、校验、布局、源卷身份或恢复过程失败：卷 START fail-closed。
+- Superblock 有效：在 START 返回前挂载 Journal、创建卷相对源 Store、启动卷 FIFO Worker 并发布保护状态。
 
-关闭保护时先停止新路由引用，再等待已经取得的磁盘 I/O 引用归零，最后销毁 Core 和 Journal 绑定。
+因此自动发现不依赖注册表中的保护清单。注册表只用于 Windows 类过滤器安装顺序。
 
-## 3. 写入路径
+## 3. 普通读写与 Flush
 
-卷层 WRITE 不接管，直接发往下一层。请求到达磁盘 Upper Filter 后按绝对物理范围匹配保护分区：
+受保护卷的 READ、WRITE 和 FLUSH 排入同一个卷 FIFO：
 
-1. Dispatch 保留原始 IRP 和绝对磁盘偏移，排入该磁盘的 FIFO 工作队列。
-2. Worker 在 `PASSIVE_LEVEL` 获取源保护上下文，并用 `HistoryMutex` 串行化写入顺序。
-3. `CdpCoreAppendAfterImage` 依次持久化 payload 与 Record Header。
-4. Journal 成功后更新当前分支 `MetaTree`，并直接完成应用 IRP；写入不会到达源分区。
-5. Journal 失败时应用写失败，不允许绕过保护写入源分区。
+1. WRITE 把卷相对偏移的 after-image payload 和 Record Header 持久化到 Journal，发布 MetaTree 后完成原 IRP；不会写入源卷。
+2. READ 先查询 MetaTree。未覆盖部分从源卷下层按卷相对偏移读取，覆盖部分由 Journal after-image 合成。
+3. FLUSH 等待此前 FIFO 写完成，先刷新 Journal payload/metadata 后再刷新源卷下层。
+4. Journal 或工作线程不可用但保护仍已发布时，读写和 Flush 一律失败，不允许绕过保护透传。
 
-保护关闭过程进入 `DRAINING` 后，已经到达的普通应用写仍由磁盘 FIFO 串行处理，不使用卷层 gate，也不依靠线程或范围识别内部写回。
+保护期间抑制 `DeviceDsmAction_Trim`，避免源卷基线被回收。未保护卷的请求直接发往下一层。
 
-## 4. 读取路径
+## 4. Drain、合并和还原点回填
 
-- 卷层 READ：已绑定保护卷优先进入合成读取，卷相对偏移只在入口转换一次为绝对磁盘偏移。
-- 磁盘层 READ：处理直接到达磁盘栈、没有经过卷层的读取，作为完整性兜底。
-- 合成规则：命中 `MetaTree`/`PreviewTree` 的区间读取 Journal after-image；未覆盖区间读取源分区基础数据。
+停止保护进入 `DRAINING` 后，Core 逐段返回仍需物化的卷相对范围。驱动向源 Volume 的 `LowerDeviceObject` 发送带 `SL_FORCE_DIRECT_WRITE` 的同步 WRITE，成功后从 MetaTree 移除对应覆盖；全部范围成功后才撤销保护。
 
-保护开启期间抑制 `DeviceDsmAction_Trim`，防止源分区基础数据被底层回收。保护关闭后 READ、WRITE 和 TRIM 均正常下发。
+普通空间合并、设置/删除还原点时的物化和恢复相关回填复用同一个卷相对写回器。它们不经过本过滤设备，因而不会再次进入保护路径。任何写回失败都会保留可重试状态。
 
-## 5. Drain 与磁盘直写
+## 5. Preview、Recovery 与分支
 
-停止保护时，drain 将 `MetaTree` 中当前视图逐段写回源分区：
+- Preview 按目标时间构建独立只读 `PreviewTree`，不会替换当前 MetaTree。
+- Recovery 确定父分支和继承点，构建并原子发布新的当前视图，不回填源卷。
+- 重启 Recovery 先在 Superblock 持久化意图；自动发现挂载时恢复目标视图，第一笔新写之前持久化延迟创建的分支。
+- 持久还原点把目标视图物化到源卷并保留启动锚点。还原点模式下的空间合并使用 Journal 内运行期 checkpoint，不回填源卷。
 
-1. Phase 从 `GENERAL` 原子切换到 `DRAINING`，停止合并并等待正在提交的重定向写完成。
-2. `CdpCoreDrainOneMetaRangeWithWriter` 每次返回一个仍需写回的绝对磁盘范围。
-3. 驱动直接针对物理磁盘过滤设备的 `LowerDeviceObject` 构造同步 WRITE IRP。
-4. IRP 使用绝对磁盘偏移，并在下一层 `IO_STACK_LOCATION::Flags` 设置 `SL_FORCE_DIRECT_WRITE`。
-5. 写入成功后从当前覆盖树移除对应范围；全部范围完成后才清除保护状态。
+## 6. Journal v19
 
-该 IRP 从磁盘过滤层下方发起，不经过卷栈，也不会重新进入本驱动的卷层或磁盘层，因此不需要 IRP 私有标记、线程识别或 volume gate。还原点物化复用同一绝对磁盘写回器。
+Journal 由 Superblock 与循环排列的 `1 MiB HeaderRegion + PayloadRegion` 组成。HeaderRegion 末尾保存 RegionLink，其余为 Record Header。普通 Record 中的源偏移是卷相对偏移；Journal 自身的 payload 偏移仍相对于 Journal 分区起点。
 
-## 6. Journal v15
+自动发现通过物理磁盘设备访问相邻日志分区时，`TargetBaseOffset` 只负责把 Journal 相对地址换算为物理磁盘地址，不参与源卷 MetaTree 的键值计算。
 
-Journal 由一个 Superblock 和循环排列的 `1 MiB HeaderRegion + PayloadRegion` 组成。HeaderRegion 最后 32 字节为 `Cdp_HEADER_REGION_LINK`，其余包含 32767 个 32 字节 Record 槽。
+开发阶段不提供旧 Journal 格式兼容；格式版本不匹配会被视为已识别但不可挂载的保护状态，并阻止卷启动。
 
-普通 Record 保存时间、源偏移、payload 偏移和长度。`Sequence` 低 16 位为区域内索引，最高位 `0x80000000` 表示分支 Record。运行时全局序号为：
-
-```text
-RegionLink.StartSequence + (Header.Sequence & 0xFFFF)
-```
-
-PayloadRegion 达到 Journal 容量的 `1/10` 或 HeaderRegion 写满时切换区域。普通 append 不逐次更新 Superblock；区域切换、Recovery/还原点标记、凭据和格式化等状态变化才更新。
-
-## 7. 分支、Preview 与 Recovery
-
-格式化时创建根分支 1。新分支固定从新 HeaderRegion 的索引 0 开始，全局 Sequence 跨分支持续递增。挂载扫描保留 Record，重建分支树及当前分支 `MetaTree`。
-
-- Preview 按目标时间构建只读 `PreviewTree`，不改变当前分支。
-- Recovery 是分支切换：确定父分支与继承点、追加新分支 Record、构建并原子发布新 `MetaTree`，不写回源分区。
-- 重启 Recovery 先持久化意图；下次启动构建目标视图，恢复后的第一笔受保护写在追加 payload 前持久化延迟创建的分支。
-
-Preview 与 Recovery 互斥。除持久还原点模式外，普通自动合并在 Journal 可用 payload 空间降至 500 MiB 或以下时启动，General 与 Preview 阶段均适用。合并不会预先中止 Preview：已回收且仍对目标视图有效的覆盖会下沉到源盘基线；只有回收触及 Preview 的目标锚点时才停止该 Preview。被中止的 Preview 句柄仍可正常执行结束操作，但其后续读取返回“因合并中止”的忙碌状态，GUI 应明确提示该原因。
-
-## 8. 持久还原点
-
-设置还原点时，驱动把目标时间视图通过磁盘直写器物化到源分区，删除目标 Record 及之前的历史（完整 RR 直接回收、边界 RR 的旧数据 Record tombstone），然后在 Superblock 保存持久锚点和一次性还原启动标记。边界 RR 的分支结构 Header 保留，以确保其中的后续数据在下次挂载仍可恢复所属分支。设置后的下一次重启自动发现看到一次性标记后：
-
-1. 不扫描已经无关的旧 Record 历史。
-2. 直接把已物化源分区作为当前基础视图。
-3. 第一笔受保护写入前重置旧历史、创建新的根分支并持久消费还原点及一次性标记，然后正常追加 after-image；后续重启扫描并保留这些新记录。
-
-尚未启动应用时还原点不会自动过期，也可显式删除；还原启动后的第一笔受保护写会消费它，且在该写入完成前不支持删除。
-
-## 9. 空间合并
-
-除持久还原点模式外，Journal 可用 payload 空间降至 500 MiB 时启动唯一合并线程。Console 的认证命令 `m` 跳过一次最旧 RR 的自动空间判定；同一 Core 回收事务会照常标记并删除由该 RR 导致失效分支的连续 tombstone RR，但手动命令不会再处理下一个普通 RR。普通模式把该区域中当前分支仍有效的最新值通过磁盘下层的 `SL_FORCE_DIRECT_WRITE` 写回源分区，再清理对应覆盖与不可达分支数据。分支是否失效只取决于其继承基线能否由合并后的源盘基线重建；一个仍有效分支在当前分支另行分叉后的 tail 仍是该分支可预览/可继续分支的历史，不能仅因它不在当前祖先路径上而删除。日志会记录合并模式、RR 偏移和序号范围。跨区域删除使用 tombstone，已分配 Sequence 不复用。任一步失败都会停止本轮合并并保留可重试状态。
-
-持久还原点模式改用运行期 checkpoint，绝不回填源盘。每次只取一个最旧完整 RR，在 RR 内得到去重后的有效区间后逐个处理。每个区间按 checkpoint 创建顺序检查重叠：命中部分直接覆写并从剩余集合扣除；剩余为空立即结束；遍历完仍有碎片时才从当前 Journal 空闲游标分配新 checkpoint record。同一次 RR 遍历新分配的所有 record 共用一个 `CheckpointId`，checkpoint 汇总同时保存来源 RR 偏移和 Sequence 范围；若全部数据均被旧 checkpoint record 接收，本次不会创建空 checkpoint。`MetaTree` 仍只保存最新映射，仅把命中原 Record Sequence 的节点（含部分节点拆分）改到 checkpoint payload；PreviewTree 构建时先铺 checkpoint 基线，再按保留 RR 的时间顺序覆盖。checkpoint 列表和 record 归属只在内存保存，不修改 v15 Superblock。若待回收 RR 的物理 payload span 中已有 checkpoint，会先将其搬到当前空闲区并按旧 payload 精确更新 `MetaTree`，之后才回收 RR。删除还原点前先把 checkpoint 基线物化到源盘并重建最新树。诊断 IOCTL 使用 generation 分页快照，Console `k` 输出全部 checkpoint 汇总，`n` 输出指定 checkpoint 的每条 record。
-
-## 10. 主要同步对象
+## 7. 主要同步对象
 
 | 对象 | 保护范围 |
 |---|---|
-| `CaptureConfigMutex` | 保护配置、自动发现和 Source/Journal 对象图变更 |
-| `HistoryMutex` | 单源 Journal append、drain、还原点物化及树发布顺序 |
-| `Journal.Lock` | Journal 游标、区域链和持久元数据 |
-| `TreeLock` | `MetaTree`、`PreviewTree`、Phase 和延迟分支/历史重置状态 |
-| 磁盘 FIFO Worker | 最终物理 I/O 的到达顺序与应用 IRP 完成顺序 |
-| `DiskIoOutstanding` | 路由引用与关闭保护之间的生命周期屏障 |
+| `CaptureConfigMutex` | 保护配置与自动发现对象图变更 |
+| 卷 FIFO Worker | 受保护卷 READ/WRITE/FLUSH 到达和完成顺序 |
+| `HistoryMutex` | Journal append、drain、还原点物化和视图发布顺序 |
+| `Journal.Lock` | Journal 游标、区域链、payload/metadata I/O 与 Flush |
+| `TreeLock` | MetaTree、PreviewTree、Phase 和延迟分支状态 |
+| `VolumeIoOutstanding` | 卷 FIFO 请求与关闭保护的生命周期屏障 |
 
-## 11. 验证边界
+## 8. 验证边界
 
-用户态单元测试覆盖 after-image、挂载重建、区间覆盖、分支继承、Preview、Recovery、持久还原点、drain/物化回调及合并失败重试。PnP 时序、真实 Paging MDL、磁盘过滤栈、`SL_FORCE_DIRECT_WRITE` 和启动盘关闭保护仍需在虚拟机及目标物理机做集成验证。
+用户态测试覆盖 after-image、挂载重建、卷相对区间覆盖、分支继承、Preview、Recovery、持久还原点、checkpoint、drain/物化、合并失败重试，以及自动发现对“无签名”和“已签名但损坏”的区分。
+
+Volume PnP 启动时序、`volsnap` 下层排序、真实 Paging MDL、相邻分区原始 I/O、休眠/关机和启动盘关闭保护仍需在虚拟机及目标物理机做集成验证。

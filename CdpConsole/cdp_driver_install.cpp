@@ -250,15 +250,36 @@ BOOL CdpInstallDriverFromInf(_In_ const wchar_t* infPath)
 	return CdpEnsureDriverService();
 }
 
-static BOOL CdpRegisterClassUpperFilter(_In_ const wchar_t* classKey)
+static BOOL CdpAppendUpperFilterValue(
+	_Out_writes_(capacity) wchar_t* values,
+	_In_ size_t capacity,
+	_Inout_ wchar_t** end,
+	_In_ const wchar_t* value)
 {
-	wchar_t existing[4096];
-	wchar_t* pEnd;
+	size_t length = wcslen(value);
+	if ((size_t)(*end - values) + length + 2 > capacity)
+	{
+		SetLastError(ERROR_BUFFER_OVERFLOW);
+		return FALSE;
+	}
+	wcscpy_s(*end, capacity - (*end - values), value);
+	*end += length + 1;
+	**end = L'\0';
+	return TRUE;
+}
+
+static BOOL CdpRegisterClassUpperFilter(
+	_In_ const wchar_t* classKey,
+	_In_opt_ const wchar_t* insertBefore)
+{
+	wchar_t existing[4096] = {};
+	wchar_t updated[4096] = {};
+	wchar_t* out = updated;
 	DWORD existingSize;
 	DWORD type;
 	LONG result;
 	HKEY hKey;
-	BOOL alreadyExists = FALSE;
+	BOOL inserted = FALSE;
 	const wchar_t* filterName = L"CdpDriver";
 
 	result = RegOpenKeyExW(
@@ -273,9 +294,7 @@ static BOOL CdpRegisterClassUpperFilter(_In_ const wchar_t* classKey)
 		return FALSE;
 	}
 
-	existing[0] = L'\0';
-	existing[1] = L'\0';
-	existingSize = (DWORD)(sizeof(existing) - sizeof(wchar_t));
+	existingSize = sizeof(existing);
 	type = REG_MULTI_SZ;
 	result = RegQueryValueExW(
 		hKey,
@@ -284,59 +303,61 @@ static BOOL CdpRegisterClassUpperFilter(_In_ const wchar_t* classKey)
 		&type,
 		(LPBYTE)existing,
 		&existingSize);
-	if (result == ERROR_SUCCESS && type == REG_MULTI_SZ)
+	if (result == ERROR_FILE_NOT_FOUND)
 	{
-		const wchar_t* p = existing;
-		while (*p)
+		existing[0] = L'\0';
+		existing[1] = L'\0';
+	}
+	else if (result != ERROR_SUCCESS || type != REG_MULTI_SZ)
+	{
+		RegCloseKey(hKey);
+		SetLastError(result == ERROR_SUCCESS ? ERROR_INVALID_DATATYPE : (DWORD)result);
+		return FALSE;
+	}
+	existing[_countof(existing) - 1] = L'\0';
+	existing[_countof(existing) - 2] = L'\0';
+
+	for (const wchar_t* value = existing; *value; value += wcslen(value) + 1)
+	{
+		if (_wcsicmp(value, filterName) == 0)
+			continue;
+		if (!inserted && insertBefore &&
+			_wcsicmp(value, insertBefore) == 0)
 		{
-			if (_wcsicmp(p, filterName) == 0)
+			if (!CdpAppendUpperFilterValue(
+					updated, _countof(updated), &out, filterName))
 			{
-				alreadyExists = TRUE;
-				break;
+				RegCloseKey(hKey);
+				return FALSE;
 			}
-			p += wcslen(p) + 1;
+			inserted = TRUE;
+		}
+		if (!CdpAppendUpperFilterValue(
+				updated, _countof(updated), &out, value))
+		{
+			RegCloseKey(hKey);
+			return FALSE;
 		}
 	}
-
-	if (!alreadyExists)
+	if (!inserted && !CdpAppendUpperFilterValue(
+			updated, _countof(updated), &out, filterName))
 	{
-		pEnd = existing;
-		if (result != ERROR_SUCCESS || type != REG_MULTI_SZ)
-		{
-			existing[0] = L'\0';
-			existing[1] = L'\0';
-			pEnd = existing;
-		}
-		else
-		{
-			while (*pEnd)
-				pEnd += wcslen(pEnd) + 1;
-		}
+		RegCloseKey(hKey);
+		return FALSE;
+	}
 
-		if ((size_t)(pEnd - existing) + wcslen(filterName) + 2 >= _countof(existing))
-		{
-			RegCloseKey(hKey);
-			SetLastError(ERROR_BUFFER_OVERFLOW);
-			return FALSE;
-		}
-
-		wcscpy_s(pEnd, _countof(existing) - (pEnd - existing), filterName);
-		pEnd += wcslen(filterName) + 1;
-		*pEnd = L'\0';
-
-		result = RegSetValueExW(
-			hKey,
-			L"UpperFilters",
-			0,
-			REG_MULTI_SZ,
-			(const BYTE*)existing,
-			(DWORD)((pEnd - existing + 1) * sizeof(wchar_t)));
-		if (result != ERROR_SUCCESS)
-		{
-			RegCloseKey(hKey);
-			SetLastError((DWORD)result);
-			return FALSE;
-		}
+	result = RegSetValueExW(
+		hKey,
+		L"UpperFilters",
+		0,
+		REG_MULTI_SZ,
+		(const BYTE*)updated,
+		(DWORD)((out - updated + 1) * sizeof(wchar_t)));
+	if (result != ERROR_SUCCESS)
+	{
+		RegCloseKey(hKey);
+		SetLastError((DWORD)result);
+		return FALSE;
 	}
 
 	RegCloseKey(hKey);
@@ -345,16 +366,22 @@ static BOOL CdpRegisterClassUpperFilter(_In_ const wchar_t* classKey)
 
 BOOL CdpRegisterVolumeUpperFilter(void)
 {
+	/* UpperFilters are ordered bottom-up.  Keep CdpDriver immediately below
+	 * volsnap so reads that volsnap reissues to its lower device still cross
+	 * the protected-volume view. */
 	return CdpRegisterClassUpperFilter(
 		L"SYSTEM\\CurrentControlSet\\Control\\Class\\"
-		L"{71a27cdd-812a-11d0-bec7-08002be2092f}");
+		L"{71a27cdd-812a-11d0-bec7-08002be2092f}",
+		L"volsnap");
 }
 
-BOOL CdpRegisterDiskUpperFilter(void)
+static BOOL CdpUnregisterClassUpperFilter(_In_ const wchar_t* classKey);
+
+BOOL CdpRemoveLegacyDiskUpperFilter(void)
 {
-	/* Append without replacing the existing REG_MULTI_SZ. In particular,
-	 * PartMgr must remain in the DiskDrive class filter chain. */
-	return CdpRegisterClassUpperFilter(
+	/* Upgrades from the dual-layer development build must detach CdpDriver
+	 * from DiskDrive after reboot while preserving PartMgr and other filters. */
+	return CdpUnregisterClassUpperFilter(
 		L"SYSTEM\\CurrentControlSet\\Control\\Class\\"
 		L"{4d36e967-e325-11ce-bfc1-08002be10318}");
 }
@@ -563,8 +590,8 @@ BOOL CdpInstallDriverPackage(void)
 	g_CdpInstallFailureStage = L"registering Volume UpperFilter";
 	if (!CdpRegisterVolumeUpperFilter())
 		return FALSE;
-	g_CdpInstallFailureStage = L"registering DiskDrive UpperFilter";
-	if (!CdpRegisterDiskUpperFilter())
+	g_CdpInstallFailureStage = L"removing legacy DiskDrive UpperFilter";
+	if (!CdpRemoveLegacyDiskUpperFilter())
 		return FALSE;
 	g_CdpInstallFailureStage = L"installing CdpBootConfirm service";
 	if (!CdpInstallBootConfirmService())

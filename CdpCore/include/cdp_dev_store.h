@@ -16,11 +16,11 @@ NTSTATUS CdpDevStoreCreateAbsoluteRange(
 
 VOID CdpDevStoreDestroy(_Inout_opt_ PCdp_STORE Store);
 
-// Submit a synchronous absolute write below the physical-disk filter and mark
-// the lower write stack with SL_FORCE_DIRECT_WRITE.
-NTSTATUS CdpDevStoreWriteDiskAbsoluteForceDirect(
-	_In_ PDEVICE_OBJECT DiskLowerDevice,
-	_In_ UINT64 AbsoluteOffset,
+// Submit a synchronous write to a caller-supplied lower device and mark the
+// lower stack with SL_FORCE_DIRECT_WRITE. Offset uses that device's namespace.
+NTSTATUS CdpDevStoreWriteForceDirect(
+	_In_ PDEVICE_OBJECT LowerDevice,
+	_In_ UINT64 DeviceOffset,
 	_In_ ULONG Length,
 	_In_reads_bytes_(Length) const VOID* Buffer);
 

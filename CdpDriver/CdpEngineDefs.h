@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.6.10-test69"
-#define Cdp_DRIVER_BUILD_STRING   "20260917.183-release"
+#define Cdp_DRIVER_VERSION_STRING "1.6.10-test79"
+#define Cdp_DRIVER_BUILD_STRING   "20260918.109-release"
 
 // Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.
 // Cdp_DBG: Debug builds only — verbose I/O and path tracing.
@@ -71,6 +71,10 @@ typedef struct _Cdp_VOLUME_HANDLE_ENTRY
 	// Referenced only by the auto-discovered journal. It keeps the volume-lower
 	// object valid while RR/Header/Superblock I/O uses that stack.
 	PDEVICE_OBJECT MetadataLowerDeviceReference;
+	/* Physical identity used only for discovery and adjacency validation. */
+	UINT64 PartitionStart;
+	/* Offset understood by TargetLowerDevice: zero for a volume lower device,
+	 * physical partition start for the raw-disk discovery backend. */
 	UINT64 TargetBaseOffset;
 	ULONG DiskNumber;
 	ULONG PartitionNumber;
@@ -151,50 +155,21 @@ typedef struct _Cdp_PREVIEW_SESSION
 typedef enum _Cdp_DEVICE_KIND
 {
 	Cdp_DEVICE_KIND_UNKNOWN = 0,
-	Cdp_DEVICE_KIND_VOLUME = 1,
-	Cdp_DEVICE_KIND_DISK = 2,
-	/* Unattached per-partition protection context created during disk START.
-	 * A disk can own any number of these contexts. */
-	Cdp_DEVICE_KIND_SOURCE = 3
+	Cdp_DEVICE_KIND_VOLUME = 1
 } Cdp_DEVICE_KIND;
-
-#define Cdp_MAX_DISK_PROTECTION_ROUTES 128
-
-typedef struct _Cdp_DISK_PROTECTION_ROUTE
-{
-	UINT64 Start;
-	UINT64 End;
-	/* The route owns one reference for as long as it is cached. */
-	PDEVICE_OBJECT SourceDevice;
-} Cdp_DISK_PROTECTION_ROUTE, *PCdp_DISK_PROTECTION_ROUTE;
-
-typedef struct _Cdp_DISK_PROTECTION_INDEX
-{
-	KSPIN_LOCK Lock;
-	ULONG Count;
-	LONG RecentIndex;
-	/* Set only if an active route could not be represented in Routes. */
-	volatile LONG FallbackRequired;
-	Cdp_DISK_PROTECTION_ROUTE Routes[Cdp_MAX_DISK_PROTECTION_ROUTES];
-} Cdp_DISK_PROTECTION_INDEX, *PCdp_DISK_PROTECTION_INDEX;
 
 typedef struct _Cdp_DEVICE_EXTENSION
 {
 	Cdp_DEVICE_KIND DeviceKind;
 	volatile LONG CaptureEnabled;
-	// Set only after the complete source/disk/journal/Core object graph has
-	// passed fail-closed activation validation. Disk hot paths require both.
+	// Set only after the complete volume/journal/Core object graph has passed
+	// fail-closed activation validation.
 	volatile LONG ProtectionStateValidated;
-	// Counters retained for optional Disk Upper read-path diagnostics. Regular
-	// [READ-TRACE] output is disabled in this build.
-	volatile LONG64 DiskReadPathEntryCount;
-	volatile LONG64 DiskReadPathNoSourceCount;
-	volatile LONG64 DiskReadPathSourceMatchCount;
-	// The source context accepts Disk Upper FIFO references only while this is
-	// set. Disable clears it before waiting for DiskIoOutstanding to drain.
-	volatile LONG DiskIoAccepting;
-	volatile LONG DiskIoOutstanding;
-	KEVENT DiskIoDrainedEvent;
+	// The protected Volume FIFO accepts new references only while this is set.
+	// Disable clears it before waiting for outstanding requests to drain.
+	volatile LONG VolumeIoAccepting;
+	volatile LONG VolumeIoOutstanding;
+	KEVENT VolumeIoDrainedEvent;
 	/* Normal current-view reads pin immutable Journal payload locations while
 	 * performing slow source/Journal I/O without HistoryMutex. Merge, drain and
 	 * recovery transitions wait for this count to reach zero before changing or
@@ -217,6 +192,9 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	// START_DEVICE publishes this before pre-mount discovery uses the lower
 	// device stack.
 	volatile LONG Started;
+	/* Published only after IOCTL_VOLUME_ONLINE has completed successfully in
+	 * the lower volume stack. Cleared after a successful OFFLINE transition. */
+	volatile LONG VolumeOnline;
 	BOOLEAN VolumeGuidValid;
 	// Physical partition identity captured after START_DEVICE.  The complete
 	// disk layout lets discovery identify the physically adjacent successor.
@@ -236,22 +214,17 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	PDEVICE_OBJECT FilterDeviceObject;
 	PDEVICE_OBJECT LowerDeviceObject;
 	PDEVICE_OBJECT PhysicalDeviceObject;
-	/* DISK objects only: sorted protected-partition routes. The most recently
-	 * matched entry covers sequential I/O (including the one-partition case). */
-	PCdp_DISK_PROTECTION_INDEX DiskProtectionIndex;
-	/* A real volume filter binds directly to the protection owner for its
-	 * partition.  The owner is either this volume object (manual activation)
-	 * or an unattached SOURCE object created by disk pre-start discovery.
-	 * The binding owns an object reference and is protected independently of
-	 * the global device list, so ordinary volume I/O selects its context in
-	 * O(1) without scanning every protected partition. */
-	KSPIN_LOCK ProtectionBindingLock;
-	PDEVICE_OBJECT ProtectionSourceDevice;
 	volatile LONG PagingPathCount;
 	ULONG SectorSize;
 	KSPIN_LOCK CaptureQueueLock;
 	LIST_ENTRY CaptureQueue;
 	KEVENT CaptureEvent;
+	/* Auto discovery can mount the Journal through a physical-disk handle
+	 * before the adjacent Journal volume has received START_DEVICE. Protected
+	 * source I/O remains in CaptureQueue until that volume-lower backend is
+	 * published. */
+	volatile LONG JournalBackendReady;
+	KEVENT JournalBackendReadyEvent;
 	HANDLE CaptureThreadHandle;
 	volatile LONG CaptureStopping;
 	volatile LONG RedirectWritesInFlight;
@@ -302,10 +275,9 @@ typedef struct _Cdp_CAPTURE_ITEM
 {
 	LIST_ENTRY Entry;
 	PIRP Irp;
-	UINT64 OriginalDiskOffset;
-	/* Offset understood by OriginLowerReference.  Disk-originated items use
-	 * the same absolute value as OriginalDiskOffset; volume-originated items
-	 * retain their volume-relative offset here. */
+	/* Source-volume-relative offset used by Core, MetaTree and Journal records. */
+	UINT64 SourceVolumeOffset;
+	/* Offset understood by OriginLowerReference; also volume-relative. */
 	UINT64 OriginLowerOffset;
 	PDEVICE_OBJECT SourceReference;
 	PDEVICE_OBJECT OriginLowerReference;

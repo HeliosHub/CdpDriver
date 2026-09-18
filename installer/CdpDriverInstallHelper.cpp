@@ -81,8 +81,8 @@ int wmain(int argc, wchar_t** argv) {
         return Fail(L"Install driver service");
     if (!CdpRegisterVolumeUpperFilter())
         return Fail(L"Register Volume UpperFilters");
-    if (!CdpRegisterDiskUpperFilter())
-        return Fail(L"Register DiskDrive UpperFilters");
+    if (!CdpRemoveLegacyDiskUpperFilter())
+        return Fail(L"Remove legacy DiskDrive UpperFilters");
     if (!CdpInstallBootConfirmService())
         return Fail(L"Install CdpBootService");
 
