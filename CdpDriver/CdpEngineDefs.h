@@ -259,7 +259,7 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	volatile LONG RestorePointSpaceAlertReason;
 	volatile LONG RestorePointSpaceAlertStatus;
 	volatile LONG64 RestorePointSpaceAlertGeneration;
-	KMUTEX HistoryMutex;
+	EX_PUSH_LOCK HistoryLock;
 	// Preview reads share this gate. Preview teardown/automatic compaction takes
 	// it exclusively, while ordinary protected writes intentionally do not.
 	// This keeps slow history/source reads from blocking Journal appends.
@@ -284,4 +284,5 @@ typedef struct _Cdp_CAPTURE_ITEM
 	UINT64 OriginLowerOffset;
 	PDEVICE_OBJECT SourceReference;
 	PDEVICE_OBJECT OriginLowerReference;
+	/* Captured before queueing so current-view read timing includes FIFO delay. */
 } Cdp_CAPTURE_ITEM, *PCdp_CAPTURE_ITEM;

@@ -8388,7 +8388,7 @@ NTSTATUS CdpJournalApplyPreviewTreeEx(
 	*CoveredCount = 0;
 	RtlZeroMemory(CoveredMask, CdpBitmapByteCount(DataLength));
 
-	Cdp_LOCK_ACQUIRE(TreeLock);
+	Cdp_LOCK_ACQUIRE_SHARED(TreeLock);
 	treeLocked = TRUE;
 	if (!Tree->Root || Tree->NodeCount == 0)
 	{
@@ -8433,7 +8433,7 @@ NTSTATUS CdpJournalApplyPreviewTreeEx(
 	// payload while this read is consuming it.
 	if (!HoldTreeLockAcrossIo)
 	{
-		Cdp_LOCK_RELEASE(TreeLock);
+		Cdp_LOCK_RELEASE_SHARED(TreeLock);
 		treeLocked = FALSE;
 	}
 	Cdp_JOURNAL_DIAG(
@@ -8527,7 +8527,7 @@ NTSTATUS CdpJournalApplyPreviewTreeEx(
 
 cleanup:
 	if (treeLocked)
-		Cdp_LOCK_RELEASE(TreeLock);
+		Cdp_LOCK_RELEASE_SHARED(TreeLock);
 	if (!NT_SUCCESS(status))
 	{
 		Cdp_JOURNAL_DIAG(

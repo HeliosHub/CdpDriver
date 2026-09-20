@@ -1,4 +1,4 @@
-﻿#include "CdpIrpDispatchs.h"
+#include "CdpIrpDispatchs.h"
 #include "..\CdpCore\include\cdp_core.h"
 #include "CdpCredential.h"
 #include "..\CdpCore\include\cdp_dev_store.h"
@@ -13,6 +13,34 @@
 static volatile LONG64 g_CdpShutdownHopSequence = 0;
 static volatile LONG64 g_CdpPowerHopSequence = 0;
 static volatile LONG64 g_CdpPreviewBeginSequence = 0;
+
+static __forceinline VOID CdpAcquireHistoryExclusive(
+	_Inout_ PCdp_DEVICE_EXTENSION DevExt)
+{
+	KeEnterCriticalRegion();
+	ExAcquirePushLockExclusive(&DevExt->HistoryLock);
+}
+
+static __forceinline VOID CdpReleaseHistoryExclusive(
+	_Inout_ PCdp_DEVICE_EXTENSION DevExt)
+{
+	ExReleasePushLockExclusive(&DevExt->HistoryLock);
+	KeLeaveCriticalRegion();
+}
+
+static __forceinline VOID CdpAcquireHistoryShared(
+	_Inout_ PCdp_DEVICE_EXTENSION DevExt)
+{
+	KeEnterCriticalRegion();
+	ExAcquirePushLockShared(&DevExt->HistoryLock);
+}
+
+static __forceinline VOID CdpReleaseHistoryShared(
+	_Inout_ PCdp_DEVICE_EXTENSION DevExt)
+{
+	ExReleasePushLockShared(&DevExt->HistoryLock);
+	KeLeaveCriticalRegion();
+}
 
 static VOID CdpCloseAllPreviewSessionsLocked(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt);
@@ -66,6 +94,15 @@ static NTSTATUS CdpSnapshotWriteMdlChain(
 	_Out_ PUINT64 MdlBytes);
 static NTSTATUS CdpForwardQueuedDiskIrpSynchronously(
 	_Inout_ PCdp_CAPTURE_ITEM Item);
+static NTSTATUS CdpProcessDirectCurrentViewRead(
+	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
+	_Inout_ PCdp_CAPTURE_ITEM Item,
+	_In_ ULONG Length);
+static NTSTATUS CdpStartJournalDirectRead(
+	_In_ PCdp_DEVICE_EXTENSION DevExt,
+	_Inout_ PCdp_CAPTURE_ITEM Item,
+	_In_ UINT64 JournalOffset,
+	_In_ ULONG Length);
 static NTSTATUS CdpDispatchProtectedVolumeIo(
 	_Inout_ PCdp_DEVICE_EXTENSION VolumeExt,
 	_Inout_ PIRP Irp);
@@ -234,13 +271,6 @@ failed:
 
 static volatile LONG g_CdpMdllessSystemBufferReported;
 static volatile LONG g_CdpMdllessUserBufferReported;
-static volatile LONG64 g_CdpVolumeReadPassThroughCount;
-
-static BOOLEAN CdpShouldTraceRead(_In_ LONG64 Sequence)
-{
-	UNREFERENCED_PARAMETER(Sequence);
-	return FALSE;
-}
 
 static NTSTATUS CdpBeginRecovery(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
@@ -1638,8 +1668,7 @@ static NTSTATUS CdpPreparePersistentRestoreBootForSource(
 			Stage);
 		return STATUS_DEVICE_NOT_READY;
 	}
-	KeWaitForSingleObject(
-		&SourceExt->HistoryMutex, Executive, KernelMode, FALSE, NULL);
+	CdpAcquireHistoryExclusive(SourceExt);
 	CdpWaitForCurrentViewReads(SourceExt);
 	status = CdpCorePreparePersistentRestoreBoot(
 		SourceExt->Core,
@@ -1648,7 +1677,7 @@ static NTSTATUS CdpPreparePersistentRestoreBootForSource(
 		&previousBootConfirmed,
 		&materializedRanges,
 		&materializedBytes);
-	KeReleaseMutex(&SourceExt->HistoryMutex, FALSE);
+	CdpReleaseHistoryExclusive(SourceExt);
 	if (NT_SUCCESS(status))
 	{
 		Cdp_LOG("[RESTORE-BOOT] stage=%s previousBootConfirmed=%u action=%s materializedRanges=%lu materializedBytes=%llu target=%llu pendingNow=%u\n",
@@ -3586,19 +3615,14 @@ static NTSTATUS CdpBeginRecovery(
 	if (targetTime < oldestTime)
 		targetTime = oldestTime;
 
-	KeWaitForSingleObject(
-		&sourceExt->HistoryMutex,
-		Executive,
-		KernelMode,
-		FALSE,
-		NULL);
+	CdpAcquireHistoryExclusive(sourceExt);
 	CdpWaitForCurrentViewReads(sourceExt);
 #ifdef CDP_LICENSE
 	status = CdpLicenseGateArmOp(DriverExt, &licenseLocal);
 	if (!NT_SUCCESS(status))
 	{
 		CdpLicenseGateAbortOp();
-		KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
+		CdpReleaseHistoryExclusive(sourceExt);
 		InterlockedExchange(&sourceExt->Phase, previousPhase);
 		return status;
 	}
@@ -3614,7 +3638,7 @@ static NTSTATUS CdpBeginRecovery(
 		if (NT_SUCCESS(status))
 			InterlockedExchange(&sourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
 	}
-	KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
+	CdpReleaseHistoryExclusive(sourceExt);
 	if (!NT_SUCCESS(status))
 	{
 #ifdef CDP_LICENSE
@@ -3661,16 +3685,11 @@ static NTSTATUS CdpCommitRecovery(
 	if (InterlockedCompareExchange(&sourceExt->Phase, 0, 0) !=
 		(LONG)Cdp_PHASE_GENERAL)
 		return STATUS_INVALID_DEVICE_STATE;
-	KeWaitForSingleObject(
-		&sourceExt->HistoryMutex,
-		Executive,
-		KernelMode,
-		FALSE,
-		NULL);
+	CdpAcquireHistoryExclusive(sourceExt);
 	CdpWaitForCurrentViewReads(sourceExt);
 	targetTime = CdpCoreGetTargetTime100ns(sourceExt->Core);
 	status = CdpCoreRecoveryCommitStep(sourceExt->Core, &complete);
-	KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
+	CdpReleaseHistoryExclusive(sourceExt);
 	if (!NT_SUCCESS(status) || !complete)
 		return NT_SUCCESS(status) ? STATUS_UNSUCCESSFUL : status;
 
@@ -3797,8 +3816,7 @@ static NTSTATUS CdpSetRestorePoint(
 	}
 
 	CdpStopMergeThread(sourceExt);
-	KeWaitForSingleObject(
-		&sourceExt->HistoryMutex, Executive, KernelMode, FALSE, NULL);
+	CdpAcquireHistoryExclusive(sourceExt);
 	CdpWaitForCurrentViewReads(sourceExt);
 	journalEntry = CdpAcquireJournalForSource(DriverExt, sourceExt);
 	if (!journalEntry)
@@ -3862,7 +3880,7 @@ static NTSTATUS CdpSetRestorePoint(
 cleanup:
 	if (journalEntry)
 		CdpReleaseVolumeHandleEntry(journalEntry);
-	KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
+	CdpReleaseHistoryExclusive(sourceExt);
 
 phase_cleanup:
 	if (NT_SUCCESS(status))
@@ -3911,8 +3929,7 @@ static NTSTATUS CdpDeleteRestorePoint(
 	if (previousPhase != (LONG)Cdp_PHASE_GENERAL)
 		return STATUS_INVALID_DEVICE_STATE;
 	CdpStopMergeThread(sourceExt);
-	KeWaitForSingleObject(
-		&sourceExt->HistoryMutex, Executive, KernelMode, FALSE, NULL);
+	CdpAcquireHistoryExclusive(sourceExt);
 	CdpWaitForCurrentViewReads(sourceExt);
 	journalEntry = CdpAcquireJournalForSource(DriverExt, sourceExt);
 	if (!journalEntry)
@@ -3928,7 +3945,7 @@ static NTSTATUS CdpDeleteRestorePoint(
 	CdpReleaseVolumeHandleEntry(journalEntry);
 
 cleanup:
-	KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
+	CdpReleaseHistoryExclusive(sourceExt);
 	InterlockedExchange(&sourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
 	CdpStartMergeIfNeeded(sourceExt);
 	if (NT_SUCCESS(status))
@@ -5074,14 +5091,9 @@ static VOID CdpMergeWorker(_In_ PVOID Context)
 		}
 		else
 		{
-			KeWaitForSingleObject(
-				&devExt->HistoryMutex,
-				Executive,
-				KernelMode,
-				FALSE,
-				NULL);
+			CdpAcquireHistoryExclusive(devExt);
 			status = CdpCoreCompactOldestRegion(devExt->Core);
-			KeReleaseMutex(&devExt->HistoryMutex, FALSE);
+			CdpReleaseHistoryExclusive(devExt);
 		}
 		if (CdpCoreConsumePreviewStoppedByMerge(devExt->Core))
 			CdpStopPreviewSessionForSource(driverExt, devExt);
@@ -5564,19 +5576,14 @@ static VOID CdpWaitForMergeSpaceRetryGateLocked(
 	while (InterlockedCompareExchange(
 		&SourceExt->MergeSpaceRetryOwner, 0, 0) != 0)
 	{
-		KeReleaseMutex(&SourceExt->HistoryMutex, FALSE);
+		CdpReleaseHistoryExclusive(SourceExt);
 		(void)KeWaitForSingleObject(
 			&SourceExt->MergeSpaceRetryDoneEvent,
 			Executive,
 			KernelMode,
 			FALSE,
 			NULL);
-		(void)KeWaitForSingleObject(
-			&SourceExt->HistoryMutex,
-			Executive,
-			KernelMode,
-			FALSE,
-			NULL);
+		(void)CdpAcquireHistoryExclusive(SourceExt);
 	}
 }
 
@@ -5936,19 +5943,14 @@ static NTSTATUS CdpRedirectJournalWrite(
 				KeClearEvent(&SourceExt->MergeSpaceRetryDoneEvent);
 				InterlockedExchange(&SourceExt->MergeSpaceRetryOwner, 1);
 				ownsMergeSpaceRetryGate = TRUE;
-				KeReleaseMutex(&SourceExt->HistoryMutex, FALSE);
+				CdpReleaseHistoryExclusive(SourceExt);
 				waitStatus = KeWaitForSingleObject(
 					&SourceExt->MergeThreadDoneEvent,
 					Executive,
 					KernelMode,
 					FALSE,
 					NULL);
-				KeWaitForSingleObject(
-					&SourceExt->HistoryMutex,
-					Executive,
-					KernelMode,
-					FALSE,
-					NULL);
+				CdpAcquireHistoryExclusive(SourceExt);
 				mergeWaitRetried = TRUE;
 				Cdp_LOG("[REDIRECT-WRITE-WAIT] stage=merge-space-wait-end offset=%llu len=%lu waitStatus=0x%08X enabled=%ld stopping=%ld phase=%ld\n",
 					writeOffset,
@@ -6026,10 +6028,9 @@ static NTSTATUS CdpRedirectVolumeWriteDirectly(
 	item.SourceVolumeOffset = SourceVolumeOffset;
 	item.OriginLowerOffset = SourceVolumeOffset;
 	item.OriginLowerReference = OriginLower;
-	KeWaitForSingleObject(
-		&SourceExt->HistoryMutex, Executive, KernelMode, FALSE, NULL);
+	CdpAcquireHistoryExclusive(SourceExt);
 	status = CdpRedirectJournalWrite(SourceExt, &item);
-	KeReleaseMutex(&SourceExt->HistoryMutex, FALSE);
+	CdpReleaseHistoryExclusive(SourceExt);
 	return status;
 }
 
@@ -6046,8 +6047,6 @@ static NTSTATUS CdpDispatchProtectedVolumeIo(
 	BOOLEAN write = irpSp->MajorFunction == IRP_MJ_WRITE;
 	PCdp_CAPTURE_ITEM item;
 	KIRQL oldIrql;
-	LONG64 sequence = write ? 0 : InterlockedIncrement64(
-		&g_CdpVolumeReadPassThroughCount);
 
 	if ((!write && irpSp->MajorFunction != IRP_MJ_READ) ||
 		(write ? irpSp->Parameters.Write.ByteOffset.QuadPart :
@@ -6055,11 +6054,6 @@ static NTSTATUS CdpDispatchProtectedVolumeIo(
 		(write ? irpSp->Parameters.Write.Length :
 			irpSp->Parameters.Read.Length) == 0)
 	{
-		if (!write && CdpShouldTraceRead(sequence))
-			Cdp_LOG("[READ-TRACE] layer=volume stage=fallback reason=invalid-range seq=%lld relativeOffset=%lld len=%lu\n",
-				sequence,
-				irpSp->Parameters.Read.ByteOffset.QuadPart,
-				irpSp->Parameters.Read.Length);
 		return CdpSendToNextDevice(VolumeExt->LowerDeviceObject, Irp);
 	}
 	relativeOffset = (UINT64)(write ?
@@ -6071,26 +6065,16 @@ static NTSTATUS CdpDispatchProtectedVolumeIo(
 		VolumeExt, &sourceReference);
 	if (!sourceExt)
 	{
-		if (!write && CdpShouldTraceRead(sequence))
-			Cdp_LOG("[READ-TRACE] layer=volume stage=fallback reason=no-protection seq=%lld disk=%lu relativeOffset=%llu len=%lu\n",
-				sequence, VolumeExt->DiskNumber, relativeOffset, length);
 		return CdpSendToNextDevice(VolumeExt->LowerDeviceObject, Irp);
 	}
 	if (relativeOffset > sourceExt->PartitionSize ||
 		length > sourceExt->PartitionSize - relativeOffset)
 	{
-		if (!write && CdpShouldTraceRead(sequence))
-			Cdp_LOG("[READ-TRACE] layer=volume stage=fallback reason=outside-source seq=%lld disk=%lu relativeOffset=%llu len=%lu sourceSize=%llu\n",
-				sequence, VolumeExt->DiskNumber, relativeOffset, length,
-				sourceExt->PartitionSize);
 		ObDereferenceObject(sourceReference);
 		return CdpSendToNextDevice(VolumeExt->LowerDeviceObject, Irp);
 	}
 	if (!CdpAcquireVolumeIoOutstanding(sourceExt))
 	{
-		if (!write && CdpShouldTraceRead(sequence))
-			Cdp_LOG("[READ-TRACE] layer=volume stage=fallback reason=admission-closed seq=%lld relativeOffset=%llu len=%lu\n",
-				sequence, relativeOffset, length);
 		ObDereferenceObject(sourceReference);
 		/* While protection is still published, admission closes only for a
 		 * fail-closed transition such as shutdown/disable. Never expose the
@@ -6105,9 +6089,6 @@ static NTSTATUS CdpDispatchProtectedVolumeIo(
 	journalEntry = sourceExt->RedirectJournalEntry;
 	if (!journalEntry || !sourceExt->CaptureThreadHandle)
 	{
-		if (!write && CdpShouldTraceRead(sequence))
-			Cdp_LOG("[READ-TRACE] layer=volume stage=fallback reason=worker-unavailable seq=%lld relativeOffset=%llu len=%lu\n",
-				sequence, relativeOffset, length);
 		CdpReleaseVolumeIoOutstanding(sourceExt);
 		ObDereferenceObject(sourceReference);
 		if (InterlockedCompareExchange(
@@ -6147,6 +6128,29 @@ static NTSTATUS CdpDispatchProtectedVolumeIo(
 	item->SourceReference = sourceReference;
 	item->OriginLowerReference = VolumeExt->LowerDeviceObject;
 	ObReferenceObject(item->OriginLowerReference);
+	/* Once automatic discovery has published the Journal backend and drained
+	 * its startup FIFO, ordinary reads can execute independently.  Writes and
+	 * all non-stable states continue through CaptureQueue. */
+	if (!write && KeGetCurrentIrql() == PASSIVE_LEVEL &&
+		InterlockedCompareExchange(&sourceExt->JournalBackendReady, 0, 0) != 0 &&
+		InterlockedCompareExchange(&sourceExt->DirectRedirectReady, 0, 0) != 0 &&
+		InterlockedCompareExchange(&sourceExt->Phase, 0, 0) ==
+			(LONG)Cdp_PHASE_GENERAL &&
+		InterlockedCompareExchange(&sourceExt->MergeThreadRunning, 0, 0) == 0)
+	{
+		NTSTATUS directReadStatus = CdpProcessDirectCurrentViewRead(
+			sourceExt, item, length);
+		if (directReadStatus == STATUS_PENDING)
+			return STATUS_PENDING;
+		if (directReadStatus != STATUS_RETRY)
+		{
+			CdpReleaseVolumeIoOutstanding(sourceExt);
+			ObDereferenceObject(sourceReference);
+			ObDereferenceObject(item->OriginLowerReference);
+			cdpfree(item);
+			return directReadStatus;
+		}
+	}
 
 	KeAcquireSpinLock(&sourceExt->CaptureQueueLock, &oldIrql);
 	if (InterlockedCompareExchange(&sourceExt->CaptureStopping, 0, 0) == 0 &&
@@ -6163,9 +6167,6 @@ static NTSTATUS CdpDispatchProtectedVolumeIo(
 		InterlockedIncrement(&sourceExt->CaptureQueueDepth);
 		KeSetEvent(&sourceExt->CaptureEvent, IO_NO_INCREMENT, FALSE);
 		KeReleaseSpinLock(&sourceExt->CaptureQueueLock, oldIrql);
-		if (!write && CdpShouldTraceRead(sequence))
-			Cdp_LOG("[READ-TRACE] layer=volume stage=queued seq=%lld disk=%lu relativeOffset=%llu len=%lu source=%p\n",
-				sequence, VolumeExt->DiskNumber, relativeOffset, length, sourceExt);
 		return STATUS_PENDING;
 	}
 	KeReleaseSpinLock(&sourceExt->CaptureQueueLock, oldIrql);
@@ -6173,9 +6174,6 @@ static NTSTATUS CdpDispatchProtectedVolumeIo(
 	ObDereferenceObject(sourceReference);
 	ObDereferenceObject(item->OriginLowerReference);
 	cdpfree(item);
-	if (!write && CdpShouldTraceRead(sequence))
-		Cdp_LOG("[READ-TRACE] layer=volume stage=fallback reason=queue-state-change seq=%lld relativeOffset=%llu len=%lu\n",
-			sequence, relativeOffset, length);
 	if (InterlockedCompareExchange(
 			&sourceExt->CaptureEnabled, 0, 0) != 0)
 	{
@@ -6229,6 +6227,171 @@ static NTSTATUS CdpForwardQueuedDiskIrpSynchronously(
 	(void)IoCallDriver(Item->OriginLowerReference, Item->Irp);
 	KeWaitForSingleObject(&event, Executive, KernelMode, FALSE, NULL);
 	return Item->Irp->IoStatus.Status;
+}
+
+typedef struct _Cdp_DIRECT_JOURNAL_READ_CONTEXT
+{
+	PCdp_DEVICE_EXTENSION SourceExt;
+	PCdp_CAPTURE_ITEM Item;
+	ULONG Length;
+} Cdp_DIRECT_JOURNAL_READ_CONTEXT, *PCdp_DIRECT_JOURNAL_READ_CONTEXT;
+
+/* The private Journal IRP borrows the original MDL chain.  The original IRP
+ * stays pending until this completion routine has released every lifetime pin. */
+static NTSTATUS CdpDirectJournalReadCompletion(
+	_In_ PDEVICE_OBJECT DeviceObject,
+	_In_ PIRP Irp,
+	_In_ PVOID Context)
+{
+	PCdp_DIRECT_JOURNAL_READ_CONTEXT ctx =
+		(PCdp_DIRECT_JOURNAL_READ_CONTEXT)Context;
+	NTSTATUS status = Irp->IoStatus.Status;
+	ULONG_PTR information = Irp->IoStatus.Information;
+	PIRP originalIrp = ctx->Item->Irp;
+
+	UNREFERENCED_PARAMETER(DeviceObject);
+	if (NT_SUCCESS(status) && information != ctx->Length)
+	{
+		status = STATUS_UNEXPECTED_IO_ERROR;
+		information = 0;
+	}
+	IoFreeIrp(Irp);
+	CdpReleaseCurrentViewRead(ctx->SourceExt);
+	CdpReleaseVolumeIoOutstanding(ctx->SourceExt);
+	ObDereferenceObject(ctx->Item->SourceReference);
+	ObDereferenceObject(ctx->Item->OriginLowerReference);
+	cdpfree(ctx->Item);
+	cdpfree(ctx);
+	CdpCompleteIrp(originalIrp, status, NT_SUCCESS(status) ? information : 0);
+	return STATUS_MORE_PROCESSING_REQUIRED;
+}
+
+static NTSTATUS CdpStartJournalDirectRead(
+	_In_ PCdp_DEVICE_EXTENSION DevExt,
+	_Inout_ PCdp_CAPTURE_ITEM Item,
+	_In_ UINT64 JournalOffset,
+	_In_ ULONG Length)
+{
+	PCdp_JOURNAL journal;
+	PCdp_DIRECT_JOURNAL_READ_CONTEXT ctx;
+	PIRP irp;
+	PIO_STACK_LOCATION nextSp;
+	LARGE_INTEGER offset;
+
+	if (!DevExt || !DevExt->RedirectJournalEntry || !Item || !Item->Irp ||
+		!Item->Irp->MdlAddress || Length == 0)
+		return STATUS_NOT_SUPPORTED;
+	journal = &DevExt->RedirectJournalEntry->Journal;
+	if (!journal->Mounted || journal->Store || journal->RawDiskHandle ||
+		!journal->TargetDevice || journal->SectorSize == 0 ||
+		JournalOffset % journal->SectorSize != 0 ||
+		Length % journal->SectorSize != 0 ||
+		journal->TargetBaseOffset > MAXLONGLONG - JournalOffset ||
+		InterlockedCompareExchange(&journal->RawIoQuiesced, 0, 0) != 0)
+		return STATUS_NOT_SUPPORTED;
+	ctx = (PCdp_DIRECT_JOURNAL_READ_CONTEXT)cdpalloc(sizeof(*ctx));
+	if (!ctx)
+		return STATUS_INSUFFICIENT_RESOURCES;
+	irp = IoAllocateIrp(journal->TargetDevice->StackSize, FALSE);
+	if (!irp)
+	{
+		cdpfree(ctx);
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+	ctx->SourceExt = DevExt;
+	ctx->Item = Item;
+	ctx->Length = Length;
+	offset.QuadPart = (LONGLONG)(journal->TargetBaseOffset + JournalOffset);
+	irp->MdlAddress = Item->Irp->MdlAddress;
+	irp->RequestorMode = KernelMode;
+	irp->Tail.Overlay.Thread = PsGetCurrentThread();
+	nextSp = IoGetNextIrpStackLocation(irp);
+	nextSp->MajorFunction = IRP_MJ_READ;
+	nextSp->Parameters.Read.ByteOffset = offset;
+	nextSp->Parameters.Read.Length = Length;
+	IoMarkIrpPending(Item->Irp);
+	IoSetCompletionRoutine(irp, CdpDirectJournalReadCompletion, ctx, TRUE, TRUE, TRUE);
+	(void)IoCallDriver(journal->TargetDevice, irp);
+	return STATUS_PENDING;
+}
+
+/* Stable current-view reads do not need the startup/write FIFO. The direct
+ * Journal-MDL case is submitted asynchronously; the remaining overlay path
+ * still needs PASSIVE_LEVEL. CurrentViewReadsInFlight keeps append-only
+ * payload locations alive after HistoryLock is released. */
+static NTSTATUS CdpProcessDirectCurrentViewRead(
+	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
+	_Inout_ PCdp_CAPTURE_ITEM Item,
+	_In_ ULONG Length)
+{
+	ULONG mdlCount = 0;
+	UINT64 mdlBytes = 0;
+	ULONG copiedBytes = 0;
+	PUCHAR buffer = NULL;
+	Cdp_CORE_READ_COVERAGE coverage = Cdp_CORE_READ_COVERAGE_NONE;
+	UINT64 sourceReadOffset = Item->SourceVolumeOffset;
+	ULONG sourceReadLength = Length;
+	NTSTATUS status;
+	BOOLEAN pinned;
+	Cdp_CORE_DIRECT_PAYLOAD directPayload = { 0 };
+	BOOLEAN directPayloadAvailable = FALSE;
+
+	CdpAcquireHistoryShared(DevExt);
+	pinned = CdpTryPinCurrentViewReadLocked(DevExt);
+	if (!pinned)
+	{
+		CdpReleaseHistoryShared(DevExt);
+		return STATUS_RETRY;
+	}
+	status = DevExt->Core ? CdpCoreQueryCurrentReadCoverage(
+		DevExt->Core, Item->SourceVolumeOffset, Length, &coverage,
+		&sourceReadOffset, &sourceReadLength) : STATUS_DEVICE_NOT_READY;
+	if (NT_SUCCESS(status) && coverage == Cdp_CORE_READ_COVERAGE_FULL)
+		status = CdpCoreQueryDirectPayload(DevExt->Core,
+			Item->SourceVolumeOffset, Length, &directPayload,
+			&directPayloadAvailable);
+	CdpReleaseHistoryShared(DevExt);
+	if (NT_SUCCESS(status) && directPayloadAvailable)
+	{
+		status = CdpStartJournalDirectRead(DevExt, Item,
+			directPayload.JournalFileOffset, Length);
+		if (status == STATUS_PENDING)
+			return STATUS_PENDING;
+		/* The optimization was unavailable before it owned the IRP. Fall back
+		 * to the regular overlay path, which has identical read semantics. */
+		status = STATUS_SUCCESS;
+	}
+
+	if (NT_SUCCESS(status))
+	{
+		buffer = (PUCHAR)cdpalloc(Length);
+		if (!buffer)
+			status = STATUS_INSUFFICIENT_RESOURCES;
+	}
+	if (NT_SUCCESS(status) && sourceReadLength != 0)
+	{
+		status = CdpReadDiskLowerSynchronously(
+			Item->OriginLowerReference,
+			sourceReadOffset,
+			sourceReadLength,
+			buffer + (ULONG)(sourceReadOffset - Item->SourceVolumeOffset));
+	}
+	if (NT_SUCCESS(status))
+	{
+		/* The baseline is ready. Apply only the Journal after-image ranges. */
+		status = CdpCoreOverlayCurrentRead(
+			DevExt->Core, Item->SourceVolumeOffset, Length, buffer);
+	}
+	if (NT_SUCCESS(status))
+	{
+		status = CdpScatterReadMdlChain(
+			Item->Irp, buffer, Length, &mdlCount, &mdlBytes, &copiedBytes);
+	}
+	CdpReleaseCurrentViewRead(DevExt);
+	if (buffer)
+		cdpfree(buffer);
+	return CdpCompleteIrp(Item->Irp, status,
+		NT_SUCCESS(status) ? Length : 0);
 }
 
 static VOID CdpCaptureWorker(_In_ PVOID Context)
@@ -6324,16 +6487,11 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 				{
 					/* Preserve FIFO visibility: the next item cannot start until
 					 * payload/header writes complete and MetaTree is published. */
-					KeWaitForSingleObject(
-						&devExt->HistoryMutex,
-						Executive,
-						KernelMode,
-						FALSE,
-						NULL);
+					CdpAcquireHistoryExclusive(devExt);
 					{
 						NTSTATUS writeStatus =
 							CdpRedirectJournalWrite(devExt, item);
-						KeReleaseMutex(&devExt->HistoryMutex, FALSE);
+						CdpReleaseHistoryExclusive(devExt);
 						CdpCompleteIrp(
 							item->Irp,
 							writeStatus,
@@ -6356,21 +6514,29 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 					NTSTATUS readStatus;
 					BOOLEAN fastReadPinned = FALSE;
 					BOOLEAN historyMutexOwned = FALSE;
+					UINT64 workerStart100ns = KeQueryInterruptTime();
+					UINT64 routeEnd100ns = workerStart100ns;
+					UINT64 allocateEnd100ns = workerStart100ns;
+					UINT64 sourceEnd100ns = workerStart100ns;
+					UINT64 overlayEnd100ns = workerStart100ns;
+					UINT64 copyEnd100ns = workerStart100ns;
+					PCSTR readPath = "overlay";
 					if (readOffset > devExt->PartitionSize ||
 						ioLength > devExt->PartitionSize - readOffset)
 					{
-						Cdp_LOG("[CORE-READ-BYPASS] reason=outside-source-range relativeOffset=%llu len=%lu partitionSize=%llu\n",
-							readOffset,
-							ioLength,
-							devExt->PartitionSize);
-						(void)CdpForwardQueuedDiskIrpSynchronously(item);
+						readPath = "outside-range-pass-through";
+						routeEnd100ns = KeQueryInterruptTime();
+						allocateEnd100ns = routeEnd100ns;
+						readStatus = CdpForwardQueuedDiskIrpSynchronously(item);
+						sourceEnd100ns = KeQueryInterruptTime();
+						overlayEnd100ns = sourceEnd100ns;
+						copyEnd100ns = overlayEnd100ns;
 						IoCompleteRequest(item->Irp, IO_NO_INCREMENT);
 						goto capture_item_done;
 					}
 					/* Determine routing exactly once in the worker. A miss forwards
 					 * the original IRP; only a hit uses a private baseline read. */
-					KeWaitForSingleObject(&devExt->HistoryMutex,
-						Executive, KernelMode, FALSE, NULL);
+					CdpAcquireHistoryExclusive(devExt);
 					historyMutexOwned = TRUE;
 					fastReadPinned = CdpTryPinCurrentViewReadLocked(devExt);
 					readStatus = devExt->Core ?
@@ -6381,11 +6547,17 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 					if (NT_SUCCESS(readStatus) &&
 						coverage == Cdp_CORE_READ_COVERAGE_NONE)
 					{
-						KeReleaseMutex(&devExt->HistoryMutex, FALSE);
+						CdpReleaseHistoryExclusive(devExt);
 						historyMutexOwned = FALSE;
 						if (fastReadPinned)
 							CdpReleaseCurrentViewRead(devExt);
-						(void)CdpForwardQueuedDiskIrpSynchronously(item);
+						readPath = "source-pass-through";
+						routeEnd100ns = KeQueryInterruptTime();
+						allocateEnd100ns = routeEnd100ns;
+						readStatus = CdpForwardQueuedDiskIrpSynchronously(item);
+						sourceEnd100ns = KeQueryInterruptTime();
+						overlayEnd100ns = sourceEnd100ns;
+						copyEnd100ns = overlayEnd100ns;
 						IoCompleteRequest(item->Irp, IO_NO_INCREMENT);
 						goto capture_item_done;
 					}
@@ -6394,13 +6566,15 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 					 * payloads. Exceptional states retain the original mutex path. */
 					if (fastReadPinned)
 					{
-						KeReleaseMutex(&devExt->HistoryMutex, FALSE);
+						CdpReleaseHistoryExclusive(devExt);
 						historyMutexOwned = FALSE;
 					}
+					routeEnd100ns = KeQueryInterruptTime();
 					buffer = NT_SUCCESS(readStatus) ?
 						(PUCHAR)cdpalloc(ioLength) : NULL;
 					if (NT_SUCCESS(readStatus) && !buffer)
 						readStatus = STATUS_INSUFFICIENT_RESOURCES;
+					allocateEnd100ns = KeQueryInterruptTime();
 					if (NT_SUCCESS(readStatus) &&
 						coverage == Cdp_CORE_READ_COVERAGE_PARTIAL &&
 						(sourceReadOffset < readOffset ||
@@ -6418,6 +6592,7 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 							sourceReadLength,
 							buffer + (ULONG)(sourceReadOffset - readOffset));
 					}
+					sourceEnd100ns = KeQueryInterruptTime();
 					if (NT_SUCCESS(readStatus))
 					{
 						readStatus = CdpCoreOverlayCurrentRead(
@@ -6426,8 +6601,9 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 							ioLength,
 							buffer);
 					}
+					overlayEnd100ns = KeQueryInterruptTime();
 					if (historyMutexOwned)
-						KeReleaseMutex(&devExt->HistoryMutex, FALSE);
+						CdpReleaseHistoryExclusive(devExt);
 					if (fastReadPinned)
 						CdpReleaseCurrentViewRead(devExt);
 					if (NT_SUCCESS(readStatus))
@@ -6436,31 +6612,11 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 							item->Irp, buffer, ioLength, &mdlCount,
 							&mdlBytes, &copiedBytes);
 					}
-					if (!NT_SUCCESS(readStatus))
-					{
-						Cdp_LOG("[CORE-READ-FAIL] worker=ordered status=0x%08X sourceOffset=%lld len=%lu partitionSize=%llu originalDiskOffset=%llu mdlCount=%lu mdlBytes=%llu copied=%lu\n",
-							readStatus,
-							(LONGLONG)readOffset,
-							ioLength,
-							devExt->PartitionSize,
-							item->SourceVolumeOffset,
-							mdlCount, mdlBytes, copiedBytes);
-					}
+					copyEnd100ns = KeQueryInterruptTime();
 					if (buffer)
 						cdpfree(buffer);
 					CdpCompleteIrp(item->Irp, readStatus,
 						NT_SUCCESS(readStatus) ? ioLength : 0);
-				}
-				else if (majorFunction == IRP_MJ_FLUSH_BUFFERS && captureActive)
-				{
-					NTSTATUS flushStatus = devExt->RedirectJournalEntry ?
-						CdpJournalFlush(
-							&devExt->RedirectJournalEntry->Journal) :
-						STATUS_DEVICE_NOT_READY;
-					if (NT_SUCCESS(flushStatus))
-						flushStatus =
-							CdpForwardQueuedDiskIrpSynchronously(item);
-					CdpCompleteIrp(item->Irp, flushStatus, 0);
 				}
 				else if (majorFunction == IRP_MJ_WRITE && InterlockedCompareExchange(
 						&devExt->CaptureEnabled, 0, 0) != 0 &&
@@ -6470,12 +6626,7 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 					NTSTATUS writeStatus;
 					NTSTATUS punchStatus = STATUS_SUCCESS;
 
-					KeWaitForSingleObject(
-						&devExt->HistoryMutex,
-						Executive,
-						KernelMode,
-						FALSE,
-						NULL);
+					CdpAcquireHistoryExclusive(devExt);
 					writeStatus =
 						CdpForwardQueuedDiskIrpSynchronously(item);
 					if (NT_SUCCESS(writeStatus) && devExt->Core)
@@ -6496,7 +6647,7 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 								ioLength);
 						}
 					}
-					KeReleaseMutex(&devExt->HistoryMutex, FALSE);
+					CdpReleaseHistoryExclusive(devExt);
 					/* The source write result is the application-visible result. The
 					 * drain failure is reported by CMD2 without falsely retrying an
 					 * already committed application write. */
@@ -6695,8 +6846,8 @@ static NTSTATUS CdpDrainAndDisableCapture(
 	Cdp_LOG("[DRAIN] graceful protection shutdown begin\n");
 	do
 	{
-		waitStatus = KeWaitForSingleObject(&DevExt->HistoryMutex,
-			Executive, KernelMode, FALSE, &diagnosticTimeout);
+		CdpAcquireHistoryExclusive(DevExt);
+		waitStatus = STATUS_SUCCESS;
 		if (waitStatus == STATUS_TIMEOUT)
 			Cdp_LOG("[DRAIN-DIAG] stage=progress-total-wait-still-blocked source=%p\n",
 				DevExt);
@@ -6711,7 +6862,7 @@ static NTSTATUS CdpDrainAndDisableCapture(
 			drainedBytes);
 		drainedBytes = 0;
 	}
-	KeReleaseMutex(&DevExt->HistoryMutex, FALSE);
+	CdpReleaseHistoryExclusive(DevExt);
 	if (!NT_SUCCESS(status))
 	{
 		InterlockedExchange(&DevExt->Phase, (LONG)Cdp_PHASE_GENERAL);
@@ -6733,8 +6884,8 @@ static NTSTATUS CdpDrainAndDisableCapture(
 
 		do
 		{
-			waitStatus = KeWaitForSingleObject(&DevExt->HistoryMutex,
-				Executive, KernelMode, FALSE, &diagnosticTimeout);
+			CdpAcquireHistoryExclusive(DevExt);
+			waitStatus = STATUS_SUCCESS;
 			if (waitStatus == STATUS_TIMEOUT)
 				Cdp_LOG("[DRAIN-DIAG] stage=history-mutex-wait-still-blocked source=%p ranges=%lu bytes=%llu\n",
 					DevExt, drainedRanges, drainedBytes);
@@ -6779,7 +6930,7 @@ static NTSTATUS CdpDrainAndDisableCapture(
 			 * between the final source write and CaptureEnabled=0. */
 			InterlockedExchange(&DevExt->CaptureEnabled, 0);
 		}
-		KeReleaseMutex(&DevExt->HistoryMutex, FALSE);
+		CdpReleaseHistoryExclusive(DevExt);
 		if (drainedRanges == 1 || (drainedRanges % 1024UL) == 0 || complete || !NT_SUCCESS(status))
 			Cdp_LOG("[DRAIN-DIAG] stage=core-drain-call-end source=%p status=0x%08X complete=%lu ranges=%lu bytes=%llu\n",
 				DevExt, status, complete ? 1UL : 0UL,
@@ -6870,11 +7021,10 @@ VOID CdpDisableAndDestroyCapture(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	// The capture worker holds HistoryMutex whenever it can access Core.  Take
 	// ownership under that mutex only after the worker has stopped, then free
 	// Core outside every spin lock and outside the mutex.
-	KeWaitForSingleObject(&DevExt->HistoryMutex,
-		Executive, KernelMode, FALSE, NULL);
+	CdpAcquireHistoryExclusive(DevExt);
 	core = DevExt->Core;
 	DevExt->Core = NULL;
-	KeReleaseMutex(&DevExt->HistoryMutex, FALSE);
+	CdpReleaseHistoryExclusive(DevExt);
 
 	if (core)
 	{
@@ -6990,9 +7140,8 @@ static NTSTATUS CdpPublishTerminalDurableIo(
 	diagnosticTimeout.QuadPart = -10LL * 1000LL * 1000LL * 10LL;
 	do
 	{
-		status = KeWaitForSingleObject(
-			&SourceExt->HistoryMutex,
-			Executive, KernelMode, FALSE, &diagnosticTimeout);
+		CdpAcquireHistoryExclusive(SourceExt);
+		status = STATUS_SUCCESS;
 		if (status == STATUS_TIMEOUT)
 		{
 			Cdp_LOG("[TERMINAL-IO] stage=history-wait hop=%llu source=%p disk=%lu outstanding=%ld redirects=%ld queue=%ld\n",
@@ -7007,7 +7156,7 @@ static NTSTATUS CdpPublishTerminalDurableIo(
 	} while (status == STATUS_TIMEOUT);
 	if (NT_SUCCESS(status))
 	{
-		KeReleaseMutex(&SourceExt->HistoryMutex, FALSE);
+		CdpReleaseHistoryExclusive(SourceExt);
 	}
 	InterlockedExchange(&SourceExt->ShutdownInProgress, 2);
 	Cdp_LOG("[TERMINAL-IO] stage=owner-end hop=%llu source=%p disk=%lu status=0x%08X outstanding=%ld redirects=%ld accepting=%ld\n",

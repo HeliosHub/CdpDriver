@@ -130,47 +130,71 @@ typedef struct _GUID {
 #define cdpalloc(size) malloc(size)
 #define cdpfree(P) free(P)
 
-typedef CRITICAL_SECTION Cdp_LOCK;
+typedef SRWLOCK Cdp_LOCK;
 
 static __forceinline void Cdp_LOCK_INIT(_Out_ Cdp_LOCK* Lock)
 {
-	InitializeCriticalSection(Lock);
+	InitializeSRWLock(Lock);
 }
 
 static __forceinline void Cdp_LOCK_ACQUIRE(_Inout_ Cdp_LOCK* Lock)
 {
-	EnterCriticalSection(Lock);
+	AcquireSRWLockExclusive(Lock);
 }
 
 static __forceinline void Cdp_LOCK_RELEASE(_Inout_ Cdp_LOCK* Lock)
 {
-	LeaveCriticalSection(Lock);
+	ReleaseSRWLockExclusive(Lock);
+}
+
+static __forceinline void Cdp_LOCK_ACQUIRE_SHARED(_Inout_ Cdp_LOCK* Lock)
+{
+	AcquireSRWLockShared(Lock);
+}
+
+static __forceinline void Cdp_LOCK_RELEASE_SHARED(_Inout_ Cdp_LOCK* Lock)
+{
+	ReleaseSRWLockShared(Lock);
 }
 
 static __forceinline void Cdp_LOCK_DELETE(_Inout_ Cdp_LOCK* Lock)
 {
-	DeleteCriticalSection(Lock);
+	UNREFERENCED_PARAMETER(Lock);
 }
 
 #else /* kernel */
 
 #include <ntddk.h>
 
-typedef KMUTEX Cdp_LOCK;
+typedef EX_PUSH_LOCK Cdp_LOCK;
 
 static __forceinline VOID Cdp_LOCK_INIT(_Out_ Cdp_LOCK* Lock)
 {
-	KeInitializeMutex(Lock, 0);
+	ExInitializePushLock(Lock);
 }
 
 static __forceinline VOID Cdp_LOCK_ACQUIRE(_Inout_ Cdp_LOCK* Lock)
 {
-	KeWaitForSingleObject(Lock, Executive, KernelMode, FALSE, NULL);
+	KeEnterCriticalRegion();
+	ExAcquirePushLockExclusive(Lock);
 }
 
 static __forceinline VOID Cdp_LOCK_RELEASE(_Inout_ Cdp_LOCK* Lock)
 {
-	KeReleaseMutex(Lock, FALSE);
+	ExReleasePushLockExclusive(Lock);
+	KeLeaveCriticalRegion();
+}
+
+static __forceinline VOID Cdp_LOCK_ACQUIRE_SHARED(_Inout_ Cdp_LOCK* Lock)
+{
+	KeEnterCriticalRegion();
+	ExAcquirePushLockShared(Lock);
+}
+
+static __forceinline VOID Cdp_LOCK_RELEASE_SHARED(_Inout_ Cdp_LOCK* Lock)
+{
+	ExReleasePushLockShared(Lock);
+	KeLeaveCriticalRegion();
 }
 
 static __forceinline VOID Cdp_LOCK_DELETE(_Inout_ Cdp_LOCK* Lock)

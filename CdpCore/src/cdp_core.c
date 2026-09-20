@@ -1628,7 +1628,7 @@ NTSTATUS CdpCoreQueryCurrentReadCoverage(
 	scan.Cursor = Offset;
 	/* This is the routing query for the live source volume. PreviewTree is
 	 * deliberately excluded; only CdpCorePreviewRead may expose it. */
-	Cdp_LOCK_ACQUIRE(&Core->TreeLock);
+	Cdp_LOCK_ACQUIRE_SHARED(&Core->TreeLock);
 	if (!Core->MetaTreeReady)
 	{
 		status = STATUS_DEVICE_NOT_READY;
@@ -1640,10 +1640,10 @@ NTSTATUS CdpCoreQueryCurrentReadCoverage(
 		tree = &Core->MetaTree;
 		treeLock = &Core->TreeLock;
 	}
-	Cdp_LOCK_RELEASE(&Core->TreeLock);
+	Cdp_LOCK_RELEASE_SHARED(&Core->TreeLock);
 	if (tree)
 	{
-		Cdp_LOCK_ACQUIRE(treeLock);
+		Cdp_LOCK_ACQUIRE_SHARED(treeLock);
 		CdpCoreScanTreeCoverage(tree->Root, &scan);
 		if (scan.Cursor < scan.End)
 			CdpCoreRecordCoverageGap(&scan, scan.Cursor, scan.End);
@@ -1671,9 +1671,39 @@ NTSTATUS CdpCoreQueryCurrentReadCoverage(
 				*SourceLength = Length;
 			}
 		}
-		Cdp_LOCK_RELEASE(treeLock);
+		Cdp_LOCK_RELEASE_SHARED(treeLock);
 	}
 	return status;
+}
+
+NTSTATUS CdpCoreQueryDirectPayload(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_Out_ PCdp_CORE_DIRECT_PAYLOAD Payload,
+	_Out_ PBOOLEAN Direct)
+{
+	PCdp_PREVIEW_TREE_NODE node;
+	if (!Core || !Payload || !Direct || Length == 0 || Offset > MAXUINT64 - Length)
+		return STATUS_INVALID_PARAMETER;
+	*Direct = FALSE;
+	RtlZeroMemory(Payload, sizeof(*Payload));
+	Cdp_LOCK_ACQUIRE_SHARED(&Core->TreeLock);
+	for (node = Core->MetaTree.Root; node; )
+	{
+		if (Offset < node->Start) node = node->Left;
+		else if (Offset >= node->End) node = node->Right;
+		else break;
+	}
+	if (node && !node->Invalid && node->Start == Offset &&
+		node->End == Offset + Length && node->DataLength == Length)
+	{
+		Payload->JournalFileOffset = node->FileOffset;
+		Payload->DataLength = node->DataLength;
+		*Direct = TRUE;
+	}
+	Cdp_LOCK_RELEASE_SHARED(&Core->TreeLock);
+	return STATUS_SUCCESS;
 }
 
 static PCdp_PREVIEW_TREE_NODE CdpCoreFindFirstOverlapNode(

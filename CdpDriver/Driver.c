@@ -164,7 +164,7 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 	InterlockedExchange(&DeviceExtension->RestorePointSpaceAlertStatus, 0);
 	InterlockedExchange64(
 		&DeviceExtension->RestorePointSpaceAlertGeneration, 1);
-	KeInitializeMutex(&DeviceExtension->HistoryMutex, 0);
+	ExInitializePushLock(&DeviceExtension->HistoryLock);
 	ExInitializePushLock(&DeviceExtension->PreviewAccessLock);
 	DeviceExtension->SectorSize = Cdp_SECTOR_SIZE_DEFAULT;
 	InterlockedExchange(&DeviceExtension->Phase, Cdp_PHASE_GENERAL);

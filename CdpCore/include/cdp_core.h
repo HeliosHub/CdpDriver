@@ -205,6 +205,21 @@ typedef enum _Cdp_CORE_READ_COVERAGE
 	Cdp_CORE_READ_COVERAGE_FULL = 2
 } Cdp_CORE_READ_COVERAGE;
 
+typedef struct _Cdp_CORE_DIRECT_PAYLOAD
+{
+	UINT64 JournalFileOffset;
+	ULONG DataLength;
+} Cdp_CORE_DIRECT_PAYLOAD, *PCdp_CORE_DIRECT_PAYLOAD;
+
+/* Return a payload only when one current MetaTree record exactly covers the
+ * request, allowing a caller with a stable read pin to use a direct I/O path. */
+NTSTATUS CdpCoreQueryDirectPayload(
+	_Inout_ PCdp_CORE Core,
+	_In_ UINT64 Offset,
+	_In_ ULONG Length,
+	_Out_ PCdp_CORE_DIRECT_PAYLOAD Payload,
+	_Out_ PBOOLEAN Direct);
+
 // Pure in-memory routing query for the live MetaTree. Preview state never
 // changes this routing. For PARTIAL coverage with one source hole,
 // SourceOffset/Length describes that hole. With multiple separated holes it
