@@ -18,7 +18,7 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.6.10-test79"
+#define Cdp_DRIVER_VERSION_STRING "1.0.0"
 #define Cdp_DRIVER_BUILD_STRING   "20260918.109-release"
 
 // Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.

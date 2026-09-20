@@ -21,11 +21,17 @@ $guiExecutableCandidates = @(
     (Join-Path $guiOutput 'CDPCorePro.exe')
 )
 $guiExecutable = $guiExecutableCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
+if (-not $guiExecutable) {
+    throw "找不到 GUI 发布文件。已检查: $($guiExecutableCandidates -join ', ')"
+}
 $workRoot = Join-Path $installerRoot 'work'
 $payloadRoot = Join-Path $workRoot 'payload'
 $archivePath = Join-Path $workRoot 'payload.zip'
 $runtimeInstaller = Join-Path $installerRoot 'VC_redist.x64.exe'
-$outputPath = Join-Path $OutputDirectory 'RecoverySetup-x64.exe'
+$guiFileVersion = [version](Get-Item -LiteralPath $guiExecutable).VersionInfo.FileVersion
+$guiDisplayVersion = "v$($guiFileVersion.Major).$($guiFileVersion.Minor).$($guiFileVersion.Build)"
+$outputPath = Join-Path $OutputDirectory "RecoverySetup-x64-$($guiFileVersion.Major).$($guiFileVersion.Minor).$($guiFileVersion.Build).exe"
+$unversionedOutputPath = Join-Path $OutputDirectory 'RecoverySetup-x64.exe'
 $localOutputPath = Join-Path $workRoot 'out\RecoverySetup-x64.exe'
 $previousOutputPath = Join-Path $OutputDirectory '源点恢复安装程序-x64.exe'
 $legacyOutputPath = Join-Path $OutputDirectory 'CdpDriverSetup-x64.exe'
@@ -49,9 +55,6 @@ function Copy-ReleaseFile([string]$Source, [string]$Destination) {
     Copy-Item -LiteralPath $Source -Destination $Destination -Force
 }
 
-if (-not $guiExecutable) {
-    throw "找不到 GUI 发布文件。已检查: $($guiExecutableCandidates -join ', ')"
-}
 Require-File $runtimeInstaller
 
 foreach ($file in @(
@@ -102,8 +105,6 @@ Copy-ReleaseFile $guiExecutable (Join-Path $payloadRoot '源点恢复.exe')
 Copy-ReleaseFile (Join-Path $guiOutput 'handle.exe') (Join-Path $payloadRoot 'handle.exe')
 Copy-ReleaseFile (Join-Path $guiOutput 'iscsi_target_dotnet.dll') (Join-Path $payloadRoot 'iscsi_target_dotnet.dll')
 Copy-Item -LiteralPath (Join-Path $guiOutput 'Web') -Destination (Join-Path $payloadRoot 'Web') -Recurse -Force
-$guiFileVersion = [version](Get-Item -LiteralPath $guiExecutable).VersionInfo.FileVersion
-$guiDisplayVersion = "v$($guiFileVersion.Major).$($guiFileVersion.Minor).$($guiFileVersion.Build)"
 $payloadIndexPath = Join-Path $payloadRoot 'Web\index.html'
 # Windows PowerShell 5.1 treats UTF-8 files without a BOM as ANSI when
 # Get-Content has no explicit encoding.  Reading index.html that way corrupts
@@ -155,6 +156,9 @@ do {
 } while ($copyError -and (Get-Date) -lt $copyDeadline)
 if ($copyError) {
     throw "无法替换安装包；请关闭正在运行的旧安装程序后重试。$copyError"
+}
+if ($unversionedOutputPath -ne $outputPath -and (Test-Path -LiteralPath $unversionedOutputPath -PathType Leaf)) {
+    Remove-Item -LiteralPath $unversionedOutputPath -Force
 }
 if (Test-Path -LiteralPath $legacyOutputPath -PathType Leaf) {
     Remove-Item -LiteralPath $legacyOutputPath -Force

@@ -10,7 +10,7 @@ RequestExecutionLevel admin
 !insertmacro VersionCompare
 
 !define PRODUCT_NAME "源点恢复"
-!define PRODUCT_VERSION "1.0.13.0"
+!define PRODUCT_VERSION "1.0.0.0"
 !define PRODUCT_PUBLISHER "源点恢复"
 !define PRODUCT_EXE "源点恢复.exe"
 
