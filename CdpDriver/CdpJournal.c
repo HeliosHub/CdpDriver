@@ -136,6 +136,17 @@ static PVOID CdpAllocateAligned(
 	return (PVOID)address;
 }
 
+static ULONG_PTR CdpJournalBufferAlignmentMask(_In_ PCdp_JOURNAL Journal)
+{
+#ifndef Cdp_USERMODE
+	if (Journal->TargetDevice)
+		return (ULONG_PTR)Journal->TargetDevice->AlignmentRequirement;
+#else
+	UNREFERENCED_PARAMETER(Journal);
+#endif
+	return (ULONG_PTR)sizeof(PVOID) - 1;
+}
+
 static BOOLEAN CdpJournalBufferMeetsIoAlignment(
 	_In_ PCdp_JOURNAL Journal,
 	_In_ const VOID* Buffer)
@@ -8451,6 +8462,7 @@ NTSTATUS CdpJournalApplyPreviewTreeEx(
 		UINT64 overlapEnd;
 		ULONG outputIndex;
 		ULONG copyLength;
+		BOOLEAN readDirectlyToOutput;
 
 		Cdp_JOURNAL_DIAG(
 			"hit begin index=%lu/%lu seq=%llu node=[%llu,%llu) "
@@ -8462,22 +8474,46 @@ NTSTATUS CdpJournalApplyPreviewTreeEx(
 			node->End,
 			node->DataLength,
 			node->FileOffset);
+		overlapStart = node->Start > VolumeOffset ? node->Start : VolumeOffset;
+		overlapEnd = node->End < (VolumeOffset + DataLength) ?
+			node->End : (VolumeOffset + DataLength);
+
+		outputIndex = (ULONG)(overlapStart - VolumeOffset);
+		copyLength = (ULONG)(overlapEnd - overlapStart);
 		alignedSize = CdpAlignUp64(node->DataLength, Journal->SectorSize);
-		payload = (PUCHAR)CdpAllocateAligned(Journal,
-			(SIZE_T)alignedSize,
-			&payloadBase);
-		if (!payload)
+		/* A complete, sector-sized record can be placed in the caller's
+		 * buffer directly.  Keep the bounce buffer for partial records (where
+		 * the aligned read would overrun the output range) or for callers whose
+		 * buffer cannot satisfy the Journal device's alignment requirement. */
+		readDirectlyToOutput =
+			overlapStart == node->Start &&
+			overlapEnd == node->End &&
+			alignedSize == node->DataLength &&
+			(((ULONG_PTR)Buffer + outputIndex) &
+				CdpJournalBufferAlignmentMask(Journal)) == 0;
+		if (readDirectlyToOutput)
 		{
-			status = STATUS_INSUFFICIENT_RESOURCES;
-			goto cleanup;
+			payload = (PUCHAR)Buffer + outputIndex;
+		}
+		else
+		{
+			payload = (PUCHAR)CdpAllocateAligned(Journal,
+				(SIZE_T)alignedSize,
+				&payloadBase);
+			if (!payload)
+			{
+				status = STATUS_INSUFFICIENT_RESOURCES;
+				goto cleanup;
+			}
 		}
 
 		Cdp_JOURNAL_DIAG(
-			"payload read begin index=%lu seq=%llu fileOff=%llu len=%lu\n",
+			"payload read begin index=%lu seq=%llu fileOff=%llu len=%lu direct=%u\n",
 			i,
 			node->Sequence,
 			node->FileOffset,
-			(ULONG)alignedSize);
+			(ULONG)alignedSize,
+			readDirectlyToOutput);
 		status = CdpJournalRawIo(
 			Journal,
 			IRP_MJ_READ,
@@ -8491,23 +8527,21 @@ NTSTATUS CdpJournalApplyPreviewTreeEx(
 			status);
 		if (!NT_SUCCESS(status))
 		{
-			cdpfree(payloadBase);
+			if (payloadBase)
+				cdpfree(payloadBase);
 			goto cleanup;
 		}
-
-		overlapStart = node->Start > VolumeOffset ? node->Start : VolumeOffset;
-		overlapEnd = node->End < (VolumeOffset + DataLength) ?
-			node->End : (VolumeOffset + DataLength);
-
-		outputIndex = (ULONG)(overlapStart - VolumeOffset);
-		copyLength = (ULONG)(overlapEnd - overlapStart);
-		RtlCopyMemory(
-			(PUCHAR)Buffer + outputIndex,
-			payload + (ULONG)(overlapStart - node->Start),
-			copyLength);
+		if (!readDirectlyToOutput)
+		{
+			RtlCopyMemory(
+				(PUCHAR)Buffer + outputIndex,
+				payload + (ULONG)(overlapStart - node->Start),
+				copyLength);
+		}
 		CdpBitmapSetRange(CoveredMask, outputIndex, copyLength);
 		covered += copyLength;
-		cdpfree(payloadBase);
+		if (payloadBase)
+			cdpfree(payloadBase);
 		Cdp_JOURNAL_DIAG(
 			"hit end index=%lu seq=%llu covered=%lu\n",
 			i,

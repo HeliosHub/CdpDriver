@@ -210,6 +210,9 @@ typedef struct _TEST_FAIL_STORE
 	UINT64 TotalReadBytes;
 	UINT64 LastReadOffset;
 	ULONG LastReadLength;
+	UINT64 WatchedReadOffset;
+	PVOID WatchedReadBuffer;
+	ULONG WatchedReadLength;
 	LONG FailNextWrites;
 	LONG FailNextSuperblockWrites;
 	ULONG WriteCallCount;
@@ -232,6 +235,11 @@ static NTSTATUS TestFailStoreRead(
 	NTSTATUS status;
 
 	++fail->ReadCallCount;
+	if (Offset == fail->WatchedReadOffset)
+	{
+		fail->WatchedReadBuffer = Buffer;
+		fail->WatchedReadLength = Length;
+	}
 	if (Length == sizeof(Cdp_JOURNAL_RECORD_HEADER))
 		++fail->ReadLength32Count;
 	if (Length == Cdp_JOURNAL_HEADER_REGION_SIZE)
@@ -319,6 +327,9 @@ static VOID TestFailStoreInstall(_Inout_ PCdp_STORE Store, _Out_ PTEST_FAIL_STOR
 	Fail->TotalReadBytes = 0;
 	Fail->LastReadOffset = 0;
 	Fail->LastReadLength = 0;
+	Fail->WatchedReadOffset = ~(UINT64)0;
+	Fail->WatchedReadBuffer = NULL;
+	Fail->WatchedReadLength = 0;
 	Fail->FailNextWrites = 0;
 	Fail->FailNextSuperblockWrites = 0;
 	Fail->WriteCallCount = 0;
@@ -740,6 +751,61 @@ static int TestAfterImagePayloadZeroCopyAndFallback(void)
 	CdpJournalClose(&journal);
 	_aligned_free(alignedInput);
 	CdpMemStoreDestroy(store);
+	return g_caseFailed;
+}
+
+static int TestAfterImageReadZeroCopyAndFallback(void)
+{
+	TEST_CTX ctx;
+	TEST_FAIL_STORE trace;
+	Cdp_JOURNAL_RECORD record;
+	PUCHAR afterImage = NULL;
+	PUCHAR output = NULL;
+	NTSTATUS status;
+
+	Expect(NT_SUCCESS(TestCtxCreate(
+		&ctx, SRC_SIZE, JNL_SIZE, 92450)),
+		"setup after-image read zero-copy test");
+	afterImage = (PUCHAR)_aligned_malloc(SECTOR, SECTOR);
+	output = (PUCHAR)_aligned_malloc(SECTOR, SECTOR);
+	Expect(afterImage != NULL && output != NULL,
+		"allocate aligned after-image read buffers");
+	if (!afterImage || !output)
+		goto cleanup;
+	FillPattern(afterImage, SECTOR, 0x96);
+	status = CdpCoreAppendAfterImage(
+		ctx.Core, 0, SECTOR, afterImage, &record);
+	Expect(NT_SUCCESS(status), "append aligned after-image for direct read");
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+
+	TestFailStoreInstall(ctx.Journal, &trace);
+	trace.WatchedReadOffset = record.FileOffset;
+	status = CdpCoreRead(ctx.Core, 0, SECTOR, output);
+	Expect(NT_SUCCESS(status) && memcmp(output, afterImage, SECTOR) == 0,
+		"direct Journal read returns the after-image");
+	Expect(trace.WatchedReadBuffer == output &&
+		trace.WatchedReadLength == SECTOR,
+		"complete aligned Journal record reads directly into output");
+
+	trace.WatchedReadBuffer = NULL;
+	trace.WatchedReadLength = 0;
+	status = CdpCoreRead(ctx.Core, 1, SECTOR - 2, output);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(output, afterImage + 1, SECTOR - 2) == 0,
+		"partial Journal read returns the requested slice");
+	Expect(trace.WatchedReadBuffer != NULL &&
+		trace.WatchedReadBuffer != output &&
+		trace.WatchedReadLength == SECTOR,
+		"partial Journal record retains the aligned fallback buffer");
+	TestFailStoreRemove(ctx.Journal, &trace);
+
+cleanup:
+	if (output)
+		_aligned_free(output);
+	if (afterImage)
+		_aligned_free(afterImage);
+	TestCtxDestroy(&ctx);
 	return g_caseFailed;
 }
 
@@ -3632,6 +3698,8 @@ int main(void)
 		TestAfterImageJournalFailureDoesNotBypassSource);
 	failed += RunCase("After-image payload zero-copy and fallback",
 		TestAfterImagePayloadZeroCopyAndFallback);
+	failed += RunCase("After-image read zero-copy and fallback",
+		TestAfterImageReadZeroCopyAndFallback);
 	failed += RunCase("After-image caller-owned payload writer",
 		TestAfterImageCallerPayloadWriter);
 	failed += RunCase("Record-header sector write cache",
