@@ -20,6 +20,7 @@
 #include "CdpLicenseHw.h"
 #include "CdpIrpDispatchs.h"
 #include "CdpLicenseProtect.h"
+#include "CdpLicenseCodec.h"
 #include <ntstrsafe.h>
 #include "CdpLicenseSeg.h" /* 此后本文件代码/常量进入 .licprot / .licpr */
 
@@ -217,12 +218,7 @@ static SIZE_T CdpLicenseStrLen(
 	_In_reads_or_z_(Max) const CHAR* S,
 	_In_ SIZE_T Max)
 {
-	SIZE_T i = 0;
-	if (!S)
-		return 0;
-	while (i < Max && S[i])
-		++i;
-	return i;
+	return CdpLicenseCodecStrLen(S, Max);
 }
 
 /*
@@ -234,60 +230,15 @@ static NTSTATUS CdpLicenseSanitizeApplyQrPrefix(
 	_In_reads_(Cdp_APPLY_QR_PREFIX_MAX) const CHAR* In,
 	_Out_writes_z_(Cdp_APPLY_QR_PREFIX_MAX) CHAR* Out)
 {
-	ULONG i;
-
-	if (!In || !Out)
-	{
-		Cdp_LIC_FAIL("STATUS_INVALID_PARAMETER: QrPrefix null");
-		return STATUS_INVALID_PARAMETER;
-	}
-
-	RtlZeroMemory(Out, Cdp_APPLY_QR_PREFIX_MAX);
-	for (i = 0; i + 1 < Cdp_APPLY_QR_PREFIX_MAX; ++i)
-	{
-		UCHAR c = (UCHAR)In[i];
-		if (c == 0)
-			break;
-		if (c < 0x20 || c > 0x7E)
-		{
-			Cdp_LIC_FAIL("STATUS_INVALID_PARAMETER: QrPrefix char");
-			return STATUS_INVALID_PARAMETER;
-		}
-		Out[i] = (CHAR)c;
-	}
-	if (Out[0] == 0)
-	{
-		Cdp_LIC_FAIL("STATUS_INVALID_PARAMETER: empty QrPrefix");
-		return STATUS_INVALID_PARAMETER;
-	}
-	return STATUS_SUCCESS;
+	return CdpLicenseCodecSanitizePrintablePrefix(
+		In, Out, Cdp_APPLY_QR_PREFIX_MAX);
 }
 
 static BOOLEAN CdpLicenseCStrEq(
 	_In_z_ const CHAR* A,
 	_In_z_ const CHAR* B)
 {
-	if (!A || !B)
-		return FALSE;
-	while (*A && *B)
-	{
-		if (*A != *B)
-			return FALSE;
-		++A;
-		++B;
-	}
-	return *A == *B;
-}
-
-static int CdpLicenseHexNibble(_In_ CHAR C)
-{
-	if (C >= '0' && C <= '9')
-		return C - '0';
-	if (C >= 'a' && C <= 'f')
-		return C - 'a' + 10;
-	if (C >= 'A' && C <= 'F')
-		return C - 'A' + 10;
-	return -1;
+	return CdpLicenseCodecCStrEq(A, B);
 }
 
 static NTSTATUS CdpLicenseHexDecode(
@@ -297,40 +248,7 @@ static NTSTATUS CdpLicenseHexDecode(
 	_In_ ULONG OutCap,
 	_Out_ PULONG OutLen)
 {
-	ULONG i;
-	if ((HexLen & 1) != 0 || HexLen / 2 > OutCap)
-	{
-		Cdp_LIC_FAIL("STATUS_INVALID_PARAMETER: if ((HexLen & 1) != 0 || HexLen / 2 > OutCap)");
-		return STATUS_INVALID_PARAMETER;
-	}
-	for (i = 0; i < HexLen; i += 2)
-	{
-		int hi = CdpLicenseHexNibble(Hex[i]);
-		int lo = CdpLicenseHexNibble(Hex[i + 1]);
-		if (hi < 0 || lo < 0)
-		{
-			Cdp_LIC_FAIL("STATUS_INVALID_PARAMETER: if (hi < 0 || lo < 0)");
-			return STATUS_INVALID_PARAMETER;
-		}
-		Out[i / 2] = (UCHAR)((hi << 4) | lo);
-	}
-	*OutLen = HexLen / 2;
-	return STATUS_SUCCESS;
-}
-
-static const CHAR* CdpLicenseStrChr(
-	_In_z_ const CHAR* S,
-	_In_ CHAR C)
-{
-	if (!S)
-		return NULL;
-	while (*S)
-	{
-		if (*S == C)
-			return S;
-		++S;
-	}
-	return NULL;
+	return CdpLicenseCodecHexDecode(Hex, HexLen, Out, OutCap, OutLen);
 }
 
 static NTSTATUS CdpLicenseBase64Decode(
@@ -340,44 +258,7 @@ static NTSTATUS CdpLicenseBase64Decode(
 	_In_ ULONG OutCap,
 	_Out_ PULONG OutLen)
 {
-	static const CHAR table[] =
-		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-	ULONG i = 0;
-	ULONG o = 0;
-	ULONG val = 0;
-	LONG valb = -8;
-
-	*OutLen = 0;
-	for (i = 0; i < InLen; ++i)
-	{
-		CHAR c = In[i];
-		const CHAR* p;
-		ULONG d;
-
-		if (c == '=' || c == '\r' || c == '\n')
-			continue;
-		p = CdpLicenseStrChr(table, c);
-		if (!p)
-		{
-			Cdp_LIC_FAIL("STATUS_INVALID_PARAMETER: if (!p)");
-			return STATUS_INVALID_PARAMETER;
-		}
-		d = (ULONG)(p - table);
-		val = (val << 6) + d;
-		valb += 6;
-		if (valb >= 0)
-		{
-			if (o >= OutCap)
-			{
-				Cdp_LIC_FAIL("STATUS_BUFFER_TOO_SMALL: if (o >= OutCap)");
-				return STATUS_BUFFER_TOO_SMALL;
-			}
-			Out[o++] = (UCHAR)((val >> valb) & 0xFF);
-			valb -= 8;
-		}
-	}
-	*OutLen = o;
-	return STATUS_SUCCESS;
+	return CdpLicenseCodecBase64Decode(In, InLen, Out, OutCap, OutLen);
 }
 
 static NTSTATUS CdpLicenseBase64Encode(
@@ -387,38 +268,7 @@ static NTSTATUS CdpLicenseBase64Encode(
 	_In_ ULONG OutCap,
 	_Out_ PULONG OutLen)
 {
-	static const CHAR table[] =
-		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-	ULONG i;
-	ULONG o = 0;
-
-	*OutLen = 0;
-	for (i = 0; i < InLen; i += 3)
-	{
-		ULONG n = ((ULONG)In[i]) << 16;
-		ULONG remain = InLen - i;
-		if (remain > 1)
-			n |= ((ULONG)In[i + 1]) << 8;
-		if (remain > 2)
-			n |= (ULONG)In[i + 2];
-		if (o + 4 >= OutCap)
-		{
-			Cdp_LIC_FAIL("STATUS_BUFFER_TOO_SMALL: if (o + 4 >= OutCap)");
-			return STATUS_BUFFER_TOO_SMALL;
-		}
-		Out[o++] = table[(n >> 18) & 63];
-		Out[o++] = table[(n >> 12) & 63];
-		Out[o++] = remain > 1 ? table[(n >> 6) & 63] : '=';
-		Out[o++] = remain > 2 ? table[n & 63] : '=';
-	}
-	if (o >= OutCap)
-	{
-		Cdp_LIC_FAIL("STATUS_BUFFER_TOO_SMALL: if (o >= OutCap)");
-		return STATUS_BUFFER_TOO_SMALL;
-	}
-	Out[o] = 0;
-	*OutLen = o;
-	return STATUS_SUCCESS;
+	return CdpLicenseCodecBase64Encode(In, InLen, Out, OutCap, OutLen);
 }
 
 static BOOLEAN CdpLicenseFindJsonString(
@@ -428,42 +278,7 @@ static BOOLEAN CdpLicenseFindJsonString(
 	_Out_writes_(OutCap) CHAR* Out,
 	_In_ ULONG OutCap)
 {
-	CHAR pattern[96];
-	SIZE_T keyLen;
-	ULONG i;
-
-	RtlZeroMemory(Out, OutCap);
-	keyLen = CdpLicenseStrLen(Key, 64);
-	if (keyLen + 4 >= sizeof(pattern))
-		return FALSE;
-	pattern[0] = '"';
-	RtlCopyMemory(pattern + 1, Key, keyLen);
-	pattern[1 + keyLen] = '"';
-	pattern[2 + keyLen] = ':';
-	pattern[3 + keyLen] = '"';
-	pattern[4 + keyLen] = 0;
-
-	for (i = 0; i + (ULONG)(keyLen + 4) < JsonLen; ++i)
-	{
-		if (RtlCompareMemory(Json + i, pattern, keyLen + 4) == keyLen + 4)
-		{
-			ULONG j = i + (ULONG)keyLen + 4;
-			ULONG o = 0;
-			while (j < JsonLen && Json[j] != '"' && o + 1 < OutCap)
-			{
-				if (Json[j] == '\\' && j + 1 < JsonLen)
-				{
-					Out[o++] = Json[j + 1];
-					j += 2;
-					continue;
-				}
-				Out[o++] = Json[j++];
-			}
-			Out[o] = 0;
-			return TRUE;
-		}
-	}
-	return FALSE;
+	return CdpLicenseCodecFindJsonString(Json, JsonLen, Key, Out, OutCap);
 }
 
 static BOOLEAN CdpLicenseFindJsonNumber(
@@ -472,117 +287,14 @@ static BOOLEAN CdpLicenseFindJsonNumber(
 	_In_z_ const CHAR* Key,
 	_Out_ PLONGLONG Value)
 {
-	CHAR pattern[96];
-	SIZE_T keyLen;
-	ULONG i;
-
-	*Value = 0;
-	keyLen = CdpLicenseStrLen(Key, 64);
-	if (keyLen + 3 >= sizeof(pattern))
-		return FALSE;
-	pattern[0] = '"';
-	RtlCopyMemory(pattern + 1, Key, keyLen);
-	pattern[1 + keyLen] = '"';
-	pattern[2 + keyLen] = ':';
-	pattern[3 + keyLen] = 0;
-
-	for (i = 0; i + (ULONG)(keyLen + 3) < JsonLen; ++i)
-	{
-		if (RtlCompareMemory(Json + i, pattern, keyLen + 3) == keyLen + 3)
-		{
-			ULONG j = i + (ULONG)keyLen + 3;
-			LONGLONG sign = 1;
-			LONGLONG n = 0;
-			while (j < JsonLen && (Json[j] == ' ' || Json[j] == '\t'))
-				++j;
-			if (j < JsonLen && Json[j] == '-')
-			{
-				sign = -1;
-				++j;
-			}
-			if (j >= JsonLen || Json[j] < '0' || Json[j] > '9')
-				return FALSE;
-			while (j < JsonLen && Json[j] >= '0' && Json[j] <= '9')
-			{
-				n = n * 10 + (Json[j] - '0');
-				++j;
-			}
-			*Value = n * sign;
-			return TRUE;
-		}
-	}
-	return FALSE;
+	return CdpLicenseCodecFindJsonNumber(Json, JsonLen, Key, Value);
 }
 
 static NTSTATUS CdpLicenseParseIso8601ToFileTime(
 	_In_z_ const CHAR* Iso,
 	_Out_ PUINT64 Out100ns)
 {
-	TIME_FIELDS tf;
-	LARGE_INTEGER ft;
-	ULONG y = 0, mo = 0, d = 0, h = 0, mi = 0, s = 0;
-	const CHAR* p = Iso;
-
-	*Out100ns = 0;
-	if (!Iso)
-	{
-		Cdp_LIC_FAIL("STATUS_INVALID_PARAMETER: if (!Iso)");
-		return STATUS_INVALID_PARAMETER;
-	}
-	/* YYYY-MM-DDTHH:MM:SSZ */
-	for (y = 0; *p >= '0' && *p <= '9'; ++p)
-		y = y * 10 + (*p - '0');
-	if (*p++ != '-')
-	{
-		Cdp_LIC_FAIL("STATUS_INVALID_PARAMETER: if (*p++ != '-')");
-		return STATUS_INVALID_PARAMETER;
-	}
-	for (mo = 0; *p >= '0' && *p <= '9'; ++p)
-		mo = mo * 10 + (*p - '0');
-	if (*p++ != '-')
-	{
-		Cdp_LIC_FAIL("STATUS_INVALID_PARAMETER: if (*p++ != '-')");
-		return STATUS_INVALID_PARAMETER;
-	}
-	for (d = 0; *p >= '0' && *p <= '9'; ++p)
-		d = d * 10 + (*p - '0');
-	if (*p != 'T' && *p != 't')
-	{
-		Cdp_LIC_FAIL("STATUS_INVALID_PARAMETER: if (*p != 'T' && *p != 't')");
-		return STATUS_INVALID_PARAMETER;
-	}
-	++p;
-	for (h = 0; *p >= '0' && *p <= '9'; ++p)
-		h = h * 10 + (*p - '0');
-	if (*p++ != ':')
-	{
-		Cdp_LIC_FAIL("STATUS_INVALID_PARAMETER: if (*p++ != ':')");
-		return STATUS_INVALID_PARAMETER;
-	}
-	for (mi = 0; *p >= '0' && *p <= '9'; ++p)
-		mi = mi * 10 + (*p - '0');
-	if (*p++ != ':')
-	{
-		Cdp_LIC_FAIL("STATUS_INVALID_PARAMETER: if (*p++ != ':')");
-		return STATUS_INVALID_PARAMETER;
-	}
-	for (s = 0; *p >= '0' && *p <= '9'; ++p)
-		s = s * 10 + (*p - '0');
-
-	RtlZeroMemory(&tf, sizeof(tf));
-	tf.Year = (CSHORT)y;
-	tf.Month = (CSHORT)mo;
-	tf.Day = (CSHORT)d;
-	tf.Hour = (CSHORT)h;
-	tf.Minute = (CSHORT)mi;
-	tf.Second = (CSHORT)s;
-	if (!RtlTimeFieldsToTime(&tf, &ft))
-	{
-		Cdp_LIC_FAIL("STATUS_INVALID_PARAMETER: if (!RtlTimeFieldsToTime(&tf, &ft))");
-		return STATUS_INVALID_PARAMETER;
-	}
-	*Out100ns = (UINT64)ft.QuadPart;
-	return STATUS_SUCCESS;
+	return CdpLicenseCodecParseIso8601ToFileTime(Iso, Out100ns);
 }
 
 /*
@@ -596,124 +308,8 @@ static NTSTATUS CdpLicenseBuildCanonicalWithoutSignature(
 	_In_ ULONG OutCap,
 	_Out_ PULONG OutLen)
 {
-	/* Reconstruct sorted canonical JSON for known license fields. */
-	CHAR licenseId[Cdp_LICENSE_ID_CHARS];
-	CHAR deviceId[Cdp_LICENSE_ID_CHARS];
-	CHAR deviceHash[80];
-	CHAR mbUuid[Cdp_LICENSE_MB_UUID_CHARS];
-	CHAR diskSerial[Cdp_LICENSE_DISK_SERIAL_CHARS];
-	CHAR t0Issue[64];
-	CHAR tExp[64];
-	CHAR issuedAt[64];
-	CHAR signingKeyId[Cdp_LICENSE_ID_CHARS];
-	CHAR applySessionId[Cdp_LICENSE_ID_CHARS];
-	CHAR kind[16];
-	LONGLONG mode = 0;
-	LONGLONG c0 = 0;
-	LONGLONG formatVersion = 0;
-	CHAR body[1600];
-	ULONG bodyLen;
-	NTSTATUS status;
-
-	RtlZeroMemory(kind, sizeof(kind));
-	if (!CdpLicenseFindJsonString(Json, JsonLen, "license_id", licenseId, sizeof(licenseId)) ||
-		!CdpLicenseFindJsonString(Json, JsonLen, "device_id", deviceId, sizeof(deviceId)) ||
-		!CdpLicenseFindJsonString(Json, JsonLen, "device_id_hash", deviceHash, sizeof(deviceHash)) ||
-		!CdpLicenseFindJsonString(Json, JsonLen, "mb_uuid", mbUuid, sizeof(mbUuid)) ||
-		!CdpLicenseFindJsonString(Json, JsonLen, "disk_serial", diskSerial, sizeof(diskSerial)) ||
-		!CdpLicenseFindJsonString(Json, JsonLen, "t0_issue", t0Issue, sizeof(t0Issue)) ||
-		!CdpLicenseFindJsonString(Json, JsonLen, "t_exp", tExp, sizeof(tExp)) ||
-		!CdpLicenseFindJsonString(Json, JsonLen, "issued_at_server", issuedAt, sizeof(issuedAt)) ||
-		!CdpLicenseFindJsonString(Json, JsonLen, "signing_key_id", signingKeyId, sizeof(signingKeyId)) ||
-		!CdpLicenseFindJsonString(Json, JsonLen, "apply_session_id", applySessionId, sizeof(applySessionId)) ||
-		!CdpLicenseFindJsonNumber(Json, JsonLen, "mode", &mode) ||
-		!CdpLicenseFindJsonNumber(Json, JsonLen, "c0_initial", &c0) ||
-		!CdpLicenseFindJsonNumber(Json, JsonLen, "format_version", &formatVersion))
-	{
-		Cdp_LIC_FAIL("STATUS_CDP_LICENSE_INVALID");
-		return STATUS_CDP_LICENSE_INVALID;
-	}
-	if (formatVersion < (LONGLONG)Cdp_LICENSE_FORMAT_VERSION_MIN ||
-		formatVersion > (LONGLONG)Cdp_LICENSE_FORMAT_VERSION_MAX)
-	{
-		Cdp_LIC_FAIL("STATUS_CDP_LICENSE_INVALID: format_version");
-		return STATUS_CDP_LICENSE_INVALID;
-	}
-	if (formatVersion >= 2)
-	{
-		if (!CdpLicenseFindJsonString(Json, JsonLen, "kind", kind, sizeof(kind)) ||
-			(!CdpLicenseCStrEq(kind, "paid") && !CdpLicenseCStrEq(kind, "trial")))
-		{
-			Cdp_LIC_FAIL("STATUS_CDP_LICENSE_INVALID: kind");
-			return STATUS_CDP_LICENSE_INVALID;
-		}
-		status = RtlStringCbPrintfA(
-			body,
-			sizeof(body),
-			"{\"apply_session_id\":\"%s\",\"c0_initial\":%I64d,\"device_id\":\"%s\","
-			"\"device_id_hash\":\"%s\",\"disk_serial\":\"%s\",\"format_version\":%I64d,"
-			"\"issued_at_server\":\"%s\",\"kind\":\"%s\",\"license_id\":\"%s\","
-			"\"mb_uuid\":\"%s\",\"mode\":%I64d,\"signing_key_id\":\"%s\","
-			"\"t0_issue\":\"%s\",\"t_exp\":\"%s\"}",
-			applySessionId,
-			c0,
-			deviceId,
-			deviceHash,
-			diskSerial,
-			formatVersion,
-			issuedAt,
-			kind,
-			licenseId,
-			mbUuid,
-			mode,
-			signingKeyId,
-			t0Issue,
-			tExp);
-	}
-	else
-	{
-		status = RtlStringCbPrintfA(
-			body,
-			sizeof(body),
-			"{\"apply_session_id\":\"%s\",\"c0_initial\":%I64d,\"device_id\":\"%s\","
-			"\"device_id_hash\":\"%s\",\"disk_serial\":\"%s\",\"format_version\":%I64d,"
-			"\"issued_at_server\":\"%s\",\"license_id\":\"%s\",\"mb_uuid\":\"%s\","
-			"\"mode\":%I64d,\"signing_key_id\":\"%s\",\"t0_issue\":\"%s\",\"t_exp\":\"%s\"}",
-			applySessionId,
-			c0,
-			deviceId,
-			deviceHash,
-			diskSerial,
-			formatVersion,
-			issuedAt,
-			licenseId,
-			mbUuid,
-			mode,
-			signingKeyId,
-			t0Issue,
-			tExp);
-	}
-	if (!NT_SUCCESS(status))
-	{
-		Cdp_LIC_FAIL("failed status=0x%08X", status);
-		return status;
-	}
-	// 打印body
-	Cdp_LIC_INFO("body: %s", body);
-
-	bodyLen = (ULONG)CdpLicenseStrLen(body, sizeof(body));
-	if (OutCap < 4 + bodyLen)
-	{
-		Cdp_LIC_FAIL("STATUS_BUFFER_TOO_SMALL: if (OutCap < 4 + bodyLen)");
-		return STATUS_BUFFER_TOO_SMALL;
-	}
-	Out[0] = (UCHAR)((bodyLen >> 24) & 0xFF);
-	Out[1] = (UCHAR)((bodyLen >> 16) & 0xFF);
-	Out[2] = (UCHAR)((bodyLen >> 8) & 0xFF);
-	Out[3] = (UCHAR)(bodyLen & 0xFF);
-	RtlCopyMemory(Out + 4, body, bodyLen);
-	*OutLen = 4 + bodyLen;
-	return STATUS_SUCCESS;
+	return CdpLicenseCodecBuildCanonicalWithoutSignature(
+		Json, JsonLen, Out, OutCap, OutLen);
 }
 
 /* 用当前 g_* 密封为 E0 字节（不落盘） */
@@ -1038,24 +634,9 @@ static NTSTATUS CdpLicenseCheckValidityWithLocal(
 {
 	UINT64 now = CdpLicenseQuerySystemTime100ns();
 
-	if (!g_CdpLicenseState.HasLicense)
-	{
-		Cdp_LIC_FAIL("STATUS_CDP_LICENSE_REQUIRED: if (!g_CdpLicenseState.HasLicense)");
-		return STATUS_CDP_LICENSE_REQUIRED;
-	}
-	if (!(Local->l_T0 < now && now < g_CdpLicenseState.T_EXP_100ns))
-	{
-		Cdp_LIC_FAIL("STATUS_CDP_LICENSE_EXPIRED: if (!(Local->l_T0 < now && now < g_CdpLicenseState.T_EXP_100ns))");
-		return STATUS_CDP_LICENSE_EXPIRED;
-	}
-	if ((g_CdpLicenseState.Mode == Cdp_LICENSE_MODE_COUNTER ||
-		g_CdpLicenseState.Mode == Cdp_LICENSE_MODE_HYBRID) &&
-		Local->l_C0 == 0)
-	{
-		Cdp_LIC_FAIL("STATUS_CDP_LICENSE_EXHAUSTED: if ((g_CdpLicenseState.Mode == Cdp_LICENSE_MODE_COUNTER ||");
-		return STATUS_CDP_LICENSE_EXHAUSTED;
-	}
-	return STATUS_SUCCESS;
+	return CdpLicenseCodecCheckValidity(g_CdpLicenseState.HasLicense,
+		g_CdpLicenseState.Mode, Local->l_T0, Local->l_C0, now,
+		g_CdpLicenseState.T_EXP_100ns);
 }
 
 /* 开机/每小时：T0 := max(T0, now)。调用方须已持有 g_CdpLicenseMutex。 */

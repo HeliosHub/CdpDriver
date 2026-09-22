@@ -1,4 +1,5 @@
 #include "cdp_core.h"
+#include "cdp_view_policy.h"
 #include "cdp_alloc.h"
 #include "CdpJournal.h"
 
@@ -422,21 +423,8 @@ static PCdp_PREVIEW_TREE_NODE CdpCoreFindMetaNodeBySequenceRange(
 	_In_ UINT64 FirstSequence,
 	_In_ UINT64 EndSequence)
 {
-	PCdp_PREVIEW_TREE_NODE found;
-
-	if (!Node)
-		return NULL;
-	found = CdpCoreFindMetaNodeBySequenceRange(
-		Node->Left, FirstSequence, EndSequence);
-	if (found)
-		return found;
-	if (!Node->Invalid && Node->Sequence >= FirstSequence &&
-		Node->Sequence < EndSequence)
-	{
-		return Node;
-	}
-	return CdpCoreFindMetaNodeBySequenceRange(
-		Node->Right, FirstSequence, EndSequence);
+	return CdpViewPolicyFindNodeBySequenceRange(
+		Node, FirstSequence, EndSequence);
 }
 
 static VOID CdpCoreCollectCheckpointMergeRanges(
@@ -445,18 +433,8 @@ static VOID CdpCoreCollectCheckpointMergeRanges(
 	_In_ ULONG Capacity,
 	_Inout_ PULONG Count)
 {
-	if (!Node || *Count >= Capacity)
-		return;
-	CdpCoreCollectCheckpointMergeRanges(
-		Node->Left, Ranges, Capacity, Count);
-	if (!Node->Invalid && *Count < Capacity)
-	{
-		Ranges[*Count].VolumeOffset = Node->Start;
-		Ranges[*Count].DataLength = Node->DataLength;
-		(*Count)++;
-	}
-	CdpCoreCollectCheckpointMergeRanges(
-		Node->Right, Ranges, Capacity, Count);
+	CdpViewPolicyCollectCheckpointMergeRanges(
+		Node, Ranges, Capacity, Count);
 }
 
 static NTSTATUS CdpCoreCheckpointRegionNodes(
@@ -1251,16 +1229,7 @@ NTSTATUS CdpCoreAppendAfterImageWithWriter(
 static PCdp_PREVIEW_TREE_NODE CdpCoreFindFirstValidMetaNode(
 	_In_opt_ PCdp_PREVIEW_TREE_NODE Node)
 {
-	PCdp_PREVIEW_TREE_NODE found;
-
-	if (!Node)
-		return NULL;
-	found = CdpCoreFindFirstValidMetaNode(Node->Left);
-	if (found)
-		return found;
-	if (!Node->Invalid && Node->DataLength != 0)
-		return Node;
-	return CdpCoreFindFirstValidMetaNode(Node->Right);
+	return CdpViewPolicyFindFirstValidNode(Node);
 }
 
 NTSTATUS CdpCoreDrainOneMetaRangeWithWriter(
@@ -1359,24 +1328,7 @@ static NTSTATUS CdpCoreAccumulateMetaCoverage(
 	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
 	_Inout_ PUINT64 CoverageBytes)
 {
-	NTSTATUS status;
-	UINT64 length;
-
-	if (!Node)
-		return STATUS_SUCCESS;
-	status = CdpCoreAccumulateMetaCoverage(Node->Left, CoverageBytes);
-	if (!NT_SUCCESS(status))
-		return status;
-	if (!Node->Invalid)
-	{
-		if (Node->End < Node->Start)
-			return STATUS_DATA_ERROR;
-		length = Node->End - Node->Start;
-		if (*CoverageBytes > MAXUINT64 - length)
-			return STATUS_INTEGER_OVERFLOW;
-		*CoverageBytes += length;
-	}
-	return CdpCoreAccumulateMetaCoverage(Node->Right, CoverageBytes);
+	return CdpViewPolicyAccumulateCoverage(Node, CoverageBytes);
 }
 
 NTSTATUS CdpCoreQueryMetaCoverageBytes(
@@ -1545,60 +1497,19 @@ NTSTATUS CdpCoreOverlayCurrentRead(
 		Core, &Core->MetaTree, Offset, Length, Buffer, FALSE);
 }
 
-typedef struct _Cdp_CORE_COVERAGE_SCAN
-{
-	UINT64 Start;
-	UINT64 End;
-	UINT64 Cursor;
-	UINT64 FirstGap;
-	UINT64 LastGapEnd;
-	ULONG GapCount;
-	BOOLEAN HasGap;
-	BOOLEAN HasCoverage;
-} Cdp_CORE_COVERAGE_SCAN, *PCdp_CORE_COVERAGE_SCAN;
-
 static VOID CdpCoreRecordCoverageGap(
 	_Inout_ PCdp_CORE_COVERAGE_SCAN Scan,
 	_In_ UINT64 Start,
 	_In_ UINT64 End)
 {
-	if (Start >= End)
-		return;
-	if (!Scan->HasGap)
-	{
-		Scan->FirstGap = Start;
-		Scan->HasGap = TRUE;
-	}
-	Scan->LastGapEnd = End;
-	Scan->GapCount += 1;
+	CdpViewPolicyRecordCoverageGap(Scan, Start, End);
 }
 
 static VOID CdpCoreScanTreeCoverage(
 	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
 	_Inout_ PCdp_CORE_COVERAGE_SCAN Scan)
 {
-	UINT64 nodeStart;
-	UINT64 nodeEnd;
-
-	if (!Node || Node->MaxEnd <= Scan->Start || Scan->Cursor >= Scan->End)
-		return;
-	CdpCoreScanTreeCoverage(Node->Left, Scan);
-	if (Scan->Cursor >= Scan->End || Node->Start >= Scan->End)
-		return;
-	if (!Node->Invalid && Node->End > Scan->Start)
-	{
-		nodeStart = Node->Start > Scan->Start ? Node->Start : Scan->Start;
-		nodeEnd = Node->End < Scan->End ? Node->End : Scan->End;
-		if (nodeStart < nodeEnd)
-		{
-			Scan->HasCoverage = TRUE;
-			if (nodeStart > Scan->Cursor)
-				CdpCoreRecordCoverageGap(Scan, Scan->Cursor, nodeStart);
-			if (nodeEnd > Scan->Cursor)
-				Scan->Cursor = nodeEnd;
-		}
-	}
-	CdpCoreScanTreeCoverage(Node->Right, Scan);
+	CdpViewPolicyScanTreeCoverage(Node, Scan);
 }
 
 NTSTATUS CdpCoreQueryCurrentReadCoverage(
@@ -1681,18 +1592,7 @@ static PCdp_PREVIEW_TREE_NODE CdpCoreFindFirstOverlapNode(
 	_In_ UINT64 Start,
 	_In_ UINT64 End)
 {
-	PCdp_PREVIEW_TREE_NODE found;
-
-	if (!Node || Node->MaxEnd <= Start)
-		return NULL;
-	found = CdpCoreFindFirstOverlapNode(Node->Left, Start, End);
-	if (found)
-		return found;
-	if (!Node->Invalid && Node->Start < End && Start < Node->End)
-		return Node;
-	if (Node->Start >= End)
-		return NULL;
-	return CdpCoreFindFirstOverlapNode(Node->Right, Start, End);
+	return CdpViewPolicyFindFirstOverlapNode(Node, Start, End);
 }
 
 NTSTATUS CdpCorePreviewRead(
@@ -2111,20 +2011,7 @@ static NTSTATUS CdpCoreAccumulateMaterializeBytes(
 	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
 	_Inout_ PUINT64 TotalBytes)
 {
-	NTSTATUS status;
-
-	if (!Node)
-		return STATUS_SUCCESS;
-	status = CdpCoreAccumulateMaterializeBytes(Node->Left, TotalBytes);
-	if (!NT_SUCCESS(status))
-		return status;
-	if (!Node->Invalid)
-	{
-		if (*TotalBytes > MAXUINT64 - Node->DataLength)
-			return STATUS_INTEGER_OVERFLOW;
-		*TotalBytes += Node->DataLength;
-	}
-	return CdpCoreAccumulateMaterializeBytes(Node->Right, TotalBytes);
+	return CdpViewPolicyAccumulateMaterializeBytes(Node, TotalBytes);
 }
 
 static NTSTATUS CdpCoreMaterializeTreeWithWriter(

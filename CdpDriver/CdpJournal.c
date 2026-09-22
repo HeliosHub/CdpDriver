@@ -6,6 +6,7 @@
 #include "CdpEngineDefs.h"
 #include "CdpJournal.h"
 #endif
+#include "CdpJournalCodec.h"
 
 #define Cdp_CRC32C_POLY 0x82F63B78UL
 #ifndef Cdp_USERMODE
@@ -61,13 +62,12 @@ static VOID CdpStallBrief(VOID)
 
 static UINT64 CdpAlignDown64(_In_ UINT64 Value, _In_ ULONG Alignment)
 {
-	return Value - (Value % Alignment);
+	return CdpJournalCodecAlignDown64(Value, Alignment);
 }
 
 static UINT64 CdpAlignUp64(_In_ UINT64 Value, _In_ ULONG Alignment)
 {
-	UINT64 remainder = Value % Alignment;
-	return remainder ? Value + (Alignment - remainder) : Value;
+	return CdpJournalCodecAlignUp64(Value, Alignment);
 }
 
 static VOID CdpInitializeCrc32c(VOID)
@@ -210,26 +210,25 @@ static UINT64 CdpJournalQueryRecordTimeSecondsLocked(_In_ PCdp_JOURNAL Journal)
 static BOOLEAN CdpJournalHeaderIsBranch(
 	_In_ const Cdp_JOURNAL_RECORD_HEADER* Header)
 {
-	return (Header->Sequence & Cdp_JOURNAL_RECORD_FLAG_BRANCH) != 0;
+	return CdpJournalCodecHeaderIsBranch(Header);
 }
 
 static BOOLEAN CdpJournalHeaderIsDeleted(
 	_In_ const Cdp_JOURNAL_RECORD_HEADER* Header)
 {
-	return (Header->Sequence & Cdp_JOURNAL_RECORD_FLAG_DELETED) != 0;
+	return CdpJournalCodecHeaderIsDeleted(Header);
 }
 
 static BOOLEAN CdpJournalBranchHeaderIsContinuation(
 	_In_ const Cdp_JOURNAL_BRANCH_RECORD_HEADER* Header)
 {
-	return Header->Reserved == Cdp_JOURNAL_BRANCH_RECORD_FLAG_CONTINUATION;
+	return CdpJournalCodecBranchHeaderIsContinuation(Header);
 }
 
 static BOOLEAN CdpJournalBranchHeaderReservedValid(
 	_In_ const Cdp_JOURNAL_BRANCH_RECORD_HEADER* Header)
 {
-	return Header->Reserved == Cdp_JOURNAL_BRANCH_RECORD_FLAG_FIRST ||
-		CdpJournalBranchHeaderIsContinuation(Header);
+	return CdpJournalCodecBranchHeaderReservedValid(Header);
 }
 
 static VOID CdpBranchTreeFree(_Inout_ PCdp_BRANCH_INFO_TREE Tree)
@@ -253,16 +252,7 @@ static PCdp_BRANCH_INFO_NODE CdpBranchTreeFind(
 	_In_ PCdp_BRANCH_INFO_TREE Tree,
 	_In_ LONG BranchNumber)
 {
-	PCdp_BRANCH_INFO_NODE node;
-
-	if (!Tree || BranchNumber <= 0)
-		return NULL;
-	for (node = Tree->Last; node; node = node->Previous)
-	{
-		if (node->BranchNumber == BranchNumber)
-			return node;
-	}
-	return NULL;
+	return CdpJournalCodecFindBranchByNumber(Tree, BranchNumber);
 }
 
 static BOOLEAN CdpBranchTreeLatestPathLimit(
@@ -270,41 +260,15 @@ static BOOLEAN CdpBranchTreeLatestPathLimit(
 	_In_ PCdp_BRANCH_INFO_NODE Candidate,
 	_Out_opt_ PUINT64 AllowedSequence)
 {
-	PCdp_BRANCH_INFO_NODE branch;
-	UINT64 limit = MAXUINT64;
-
-	if (!Tree || !Tree->Latest || !Candidate)
-		return FALSE;
-	for (branch = Tree->Latest; branch; branch = branch->Parent)
-	{
-		if (branch == Candidate)
-		{
-			if (AllowedSequence)
-				*AllowedSequence = limit;
-			return TRUE;
-		}
-		limit = branch->InheritedRecordSequence;
-	}
-	return FALSE;
+	return CdpJournalCodecLatestPathLimit(Tree, Candidate, AllowedSequence);
 }
 
 static BOOLEAN CdpBranchTreeLatestPathHasInheritancePoint(
 	_In_ PCdp_BRANCH_INFO_TREE Tree,
 	_In_ UINT64 InheritedRecordSequence)
 {
-	PCdp_BRANCH_INFO_NODE branch;
-
-	if (!Tree || !Tree->Latest || InheritedRecordSequence == 0)
-		return FALSE;
-	for (branch = Tree->Latest; branch; branch = branch->Parent)
-	{
-		if (branch->ParentBranchNumber != 0 &&
-			branch->InheritedRecordSequence == InheritedRecordSequence)
-		{
-			return TRUE;
-		}
-	}
-	return FALSE;
+	return CdpJournalCodecLatestPathHasInheritancePoint(
+		Tree, InheritedRecordSequence);
 }
 
 static VOID CdpBranchTreeMarkPruneSubtree(
@@ -387,19 +351,8 @@ static BOOLEAN CdpBranchTreeRegionHasLiveRecords(
 	_In_ UINT64 FirstSequence,
 	_In_ UINT64 EndSequence)
 {
-	PCdp_BRANCH_INFO_NODE branch;
-
-	if (!Tree || FirstSequence >= EndSequence)
-		return FALSE;
-	for (branch = Tree->First; branch; branch = branch->Next)
-	{
-		if (branch->EndRecord.Sequence >= FirstSequence &&
-			branch->StartRecord.Sequence < EndSequence)
-		{
-			return TRUE;
-		}
-	}
-	return FALSE;
+	return CdpJournalCodecRegionHasLiveBranchRecords(
+		Tree, FirstSequence, EndSequence);
 }
 
 static BOOLEAN CdpBranchTreeSequenceDiscardedByCompaction(
@@ -408,17 +361,8 @@ static BOOLEAN CdpBranchTreeSequenceDiscardedByCompaction(
 	_In_ UINT64 FirstSequence,
 	_In_ UINT64 EndSequence)
 {
-	PCdp_BRANCH_INFO_NODE owner;
-	BOOLEAN onLatestPath;
-
-	owner = CdpBranchTreeFindBySequence(Tree, Sequence);
-	if (!owner || owner->PrunePending)
-		return owner != NULL;
-		onLatestPath = CdpBranchTreeLatestPathLimit(
-		Tree, owner, NULL);
-	if (Sequence >= FirstSequence && Sequence < EndSequence)
-		return !onLatestPath;
-	return FALSE;
+	return CdpJournalCodecSequenceDiscardedByCompaction(
+		Tree, Sequence, FirstSequence, EndSequence);
 }
 
 static VOID CdpBranchRecordInfoSet(
@@ -428,10 +372,8 @@ static VOID CdpBranchRecordInfoSet(
 	_In_ UINT64 RegionOffset,
 	_In_ ULONG HeaderIndex)
 {
-	Info->Sequence = Sequence;
-	Info->WallClock100ns = WallClock100ns;
-	Info->HeaderRegionOffset = RegionOffset;
-	Info->HeaderIndex = HeaderIndex;
+	CdpJournalCodecSetBranchRecordInfo(
+		Info, Sequence, WallClock100ns, RegionOffset, HeaderIndex);
 }
 
 static NTSTATUS CdpBranchTreeAttachNode(
@@ -657,42 +599,29 @@ static NTSTATUS CdpJournalRingDistance(
 	_In_ UINT64 End,
 	_Out_ PUINT64 Distance)
 {
-	UINT64 usableStart;
-	UINT64 usableEnd;
-
 	if (!Journal || !Distance)
 		return STATUS_INVALID_PARAMETER;
-	usableStart = CdpJournalUsableStart(Journal);
-	usableEnd = CdpJournalUsableEnd(Journal);
-	if (Start < usableStart || Start > usableEnd ||
-		End < usableStart || End > usableEnd)
-	{
-		return STATUS_DISK_CORRUPT_ERROR;
-	}
-	if (End >= Start)
-		*Distance = End - Start;
-	else
-		*Distance = (usableEnd - Start) + (End - usableStart);
-	return STATUS_SUCCESS;
+	return CdpJournalCodecRingDistance(CdpJournalUsableStart(Journal),
+		CdpJournalUsableEnd(Journal), Start, End, Distance);
 }
 
 static BOOLEAN CdpJournalHeaderRegionOffsetValid(
 	_In_ PCdp_JOURNAL Journal,
 	_In_ UINT64 RegionOff)
 {
-	return RegionOff >= CdpJournalUsableStart(Journal) &&
-		RegionOff <= CdpJournalUsableEnd(Journal) -
-			Cdp_JOURNAL_HEADER_REGION_SIZE &&
-		(RegionOff % Journal->SectorSize) == 0;
+	return CdpJournalCodecHeaderRegionOffsetValid(CdpJournalUsableStart(Journal),
+		CdpJournalUsableEnd(Journal), Journal->SectorSize, RegionOff,
+		Cdp_JOURNAL_HEADER_REGION_SIZE);
 }
 
 static BOOLEAN CdpJournalRegionLinkValid(
 	_In_ PCdp_JOURNAL Journal,
 	_In_ const Cdp_HEADER_REGION_LINK* Link)
 {
-	return Link && Link->Reserved == 0 && Link->StartSequence != 0 &&
-		CdpJournalHeaderRegionOffsetValid(Journal, Link->PrevRegionOff) &&
-		CdpJournalHeaderRegionOffsetValid(Journal, Link->NextRegionOff);
+	return Link && CdpJournalCodecRegionLinkValid(
+		CdpJournalUsableStart(Journal), CdpJournalUsableEnd(Journal),
+		Journal->SectorSize, Cdp_JOURNAL_HEADER_REGION_SIZE, Link->Reserved,
+		Link->StartSequence, Link->PrevRegionOff, Link->NextRegionOff);
 }
 
 static NTSTATUS CdpJournalDecodeRecord(
@@ -700,26 +629,7 @@ static NTSTATUS CdpJournalDecodeRecord(
 	_In_ const Cdp_JOURNAL_RECORD_HEADER* Header,
 	_Out_ PCdp_JOURNAL_RECORD Record)
 {
-	ULONG localSequence;
-	ULONG recordFlags;
-
-	localSequence = Header ?
-		(Header->Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) : 0;
-	recordFlags = Header ?
-		(Header->Sequence & Cdp_JOURNAL_RECORD_FLAGS_MASK) : 0;
-	if (!Link || !Header || !Record || recordFlags != 0 ||
-		Link->StartSequence > MAXUINT64 - localSequence)
-	{
-		return STATUS_INTEGER_OVERFLOW;
-	}
-	RtlZeroMemory(Record, sizeof(*Record));
-	Record->WallClock100ns = Header->WallClock100ns;
-	Record->VolumeOffset = Header->VolumeOffset;
-	Record->FileOffset = Header->FileOffset;
-	Record->Sequence = Link->StartSequence + localSequence;
-	Record->DataLength = Header->DataLength;
-	Record->Flags = recordFlags;
-	return STATUS_SUCCESS;
+	return CdpJournalCodecDecodeRecord(Link, Header, Record);
 }
 
 // Caller holds Journal->Lock. Any write that overlaps the cached header
@@ -1600,22 +1510,9 @@ static NTSTATUS CdpJournalWriteHeaderAt(
 // entering the oldest live header region.
 static UINT64 CdpJournalContiguousFreeLocked(_In_ PCdp_JOURNAL Journal)
 {
-	UINT64 usableEnd = CdpJournalUsableEnd(Journal);
-	UINT64 head = Journal->PayloadRegionOff;
-	UINT64 tail = Journal->OldestHeaderRegionOff;
-
-	if (CdpJournalIsEmptyLocked(Journal))
-		return usableEnd - head;
-
-	// Write cursor caught up with oldest header: no contiguous free in front.
-	if (head == tail)
-		return 0;
-
-	if (head < tail)
-		return tail - head;
-
-	// head > tail: free until partition end; wrap is handled separately.
-	return usableEnd - head;
+	return CdpJournalCodecContiguousFree(CdpJournalUsableEnd(Journal),
+		Journal->PayloadRegionOff, Journal->OldestHeaderRegionOff,
+		CdpJournalIsEmptyLocked(Journal));
 }
 
 static NTSTATUS CdpJournalDropOldestRegionLocked(
@@ -1829,7 +1726,6 @@ static NTSTATUS CdpJournalPayloadRotationNeededLocked(
 	_Out_ PBOOLEAN RotationNeeded)
 {
 	UINT64 payloadSpan;
-	UINT64 threshold;
 	NTSTATUS status;
 
 	if (!Journal || !RotationNeeded || NextPayloadBytes == 0)
@@ -1846,13 +1742,9 @@ static NTSTATUS CdpJournalPayloadRotationNeededLocked(
 	if (!NT_SUCCESS(status))
 		return status;
 
-	threshold = Journal->PartitionSize /
-		Cdp_JOURNAL_PAYLOAD_REGION_CAPACITY_DIVISOR;
-	if (threshold == 0 || payloadSpan >= threshold ||
-		NextPayloadBytes > threshold - payloadSpan)
-	{
-		*RotationNeeded = TRUE;
-	}
+	*RotationNeeded = CdpJournalCodecPayloadRotationNeeded(
+		Journal->CurrentHeaderCount, payloadSpan, Journal->PartitionSize,
+		NextPayloadBytes);
 	return STATUS_SUCCESS;
 }
 
@@ -3038,11 +2930,7 @@ static BOOLEAN CdpJournalOffsetInRingSpan(
 	_In_ UINT64 SpanStart,
 	_In_ UINT64 SpanEnd)
 {
-	if (SpanStart < SpanEnd)
-		return Offset >= SpanStart && Offset < SpanEnd;
-	if (SpanStart > SpanEnd)
-		return Offset >= SpanStart || Offset < SpanEnd;
-	return FALSE;
+	return CdpJournalCodecOffsetInRingSpan(Offset, SpanStart, SpanEnd);
 }
 
 // Measure the union of existing checkpoint coverage without reading any
@@ -6315,28 +6203,13 @@ VOID CdpPreviewTreeFree(_Inout_ PCdp_PREVIEW_TREE Tree)
 static LONG CdpPreviewTreeNodeHeight(
 	_In_opt_ PCdp_PREVIEW_TREE_NODE Node)
 {
-	return Node ? Node->Height : 0;
+	return CdpJournalCodecPreviewNodeHeight(Node);
 }
 
 static VOID CdpPreviewTreeNodeUpdate(
 	_Inout_ PCdp_PREVIEW_TREE_NODE Node)
 {
-	LONG hl = CdpPreviewTreeNodeHeight(Node->Left);
-	LONG hr = CdpPreviewTreeNodeHeight(Node->Right);
-	UINT64 maxEnd = Node->End;
-	UINT64 minValidSequence = Node->Invalid ? MAXUINT64 : Node->Sequence;
-
-	Node->Height = 1 + (hl > hr ? hl : hr);
-	if (Node->Left && Node->Left->MaxEnd > maxEnd)
-		maxEnd = Node->Left->MaxEnd;
-	if (Node->Right && Node->Right->MaxEnd > maxEnd)
-		maxEnd = Node->Right->MaxEnd;
-	Node->MaxEnd = maxEnd;
-	if (Node->Left && Node->Left->MinValidSequence < minValidSequence)
-		minValidSequence = Node->Left->MinValidSequence;
-	if (Node->Right && Node->Right->MinValidSequence < minValidSequence)
-		minValidSequence = Node->Right->MinValidSequence;
-	Node->MinValidSequence = minValidSequence;
+	CdpJournalCodecUpdatePreviewNode(Node);
 }
 
 static PCdp_PREVIEW_TREE_NODE CdpPreviewTreeRotateRight(
@@ -6466,22 +6339,14 @@ static PCdp_PREVIEW_TREE_NODE CdpPreviewTreeAvlRebalance(
 static PCdp_PREVIEW_TREE_NODE CdpPreviewTreeAvlMinimum(
 	_In_ PCdp_PREVIEW_TREE_NODE Root)
 {
-	while (Root->Left)
-		Root = Root->Left;
-	return Root;
+	return CdpJournalCodecPreviewAvlMinimum(Root);
 }
 
 static VOID CdpPreviewTreeCopyNodeData(
 	_Inout_ PCdp_PREVIEW_TREE_NODE Dest,
 	_In_ const PCdp_PREVIEW_TREE_NODE Source)
 {
-	Dest->Start = Source->Start;
-	Dest->End = Source->End;
-	Dest->FileOffset = Source->FileOffset;
-	Dest->WallClock100ns = Source->WallClock100ns;
-	Dest->DataLength = Source->DataLength;
-	Dest->Sequence = Source->Sequence;
-	Dest->Invalid = Source->Invalid;
+	CdpJournalCodecCopyPreviewNodeData(Dest, Source);
 }
 
 static PCdp_PREVIEW_TREE_NODE CdpPreviewTreeAvlDeleteByStart(
@@ -6526,23 +6391,8 @@ static PCdp_PREVIEW_TREE_NODE CdpPreviewTreeFindFirstOverlap(
 	_In_ UINT64 QueryStart,
 	_In_ UINT64 QueryEnd)
 {
-	PCdp_PREVIEW_TREE_NODE hit;
-
-	if (!Node || Node->MaxEnd <= QueryStart)
-		return NULL;
-	if (Node->Left)
-	{
-		hit = CdpPreviewTreeFindFirstOverlap(
-			Node->Left, QueryStart, QueryEnd);
-		if (hit)
-			return hit;
-	}
-	if (!Node->Invalid && Node->Start < QueryEnd && Node->End > QueryStart)
-		return Node;
-	if (Node->Start < QueryEnd && Node->Right)
-		return CdpPreviewTreeFindFirstOverlap(
-			Node->Right, QueryStart, QueryEnd);
-	return NULL;
+	return CdpJournalCodecFindFirstPreviewOverlap(
+		Node, QueryStart, QueryEnd);
 }
 
 // Remove a byte range without rebuilding the tree.  Only overlapping nodes
@@ -6629,7 +6479,7 @@ NTSTATUS CdpPreviewTreeOverlayLatest(
 
 static ULONG CdpBitmapByteCount(_In_ ULONG BitCount)
 {
-	return (BitCount + 7UL) / 8UL;
+	return CdpJournalCodecBitmapByteCount(BitCount);
 }
 
 static VOID CdpBitmapSetRange(
@@ -6637,25 +6487,7 @@ static VOID CdpBitmapSetRange(
 	_In_ ULONG StartBit,
 	_In_ ULONG BitCount)
 {
-	ULONG bit = StartBit;
-	ULONG end = StartBit + BitCount;
-
-	while (bit < end && (bit & 7) != 0)
-	{
-		Bitmap[bit >> 3] |= (UCHAR)(1U << (bit & 7));
-		++bit;
-	}
-	if (bit + 8 <= end)
-	{
-		ULONG bytes = (end - bit) >> 3;
-		RtlFillMemory(Bitmap + (bit >> 3), bytes, 0xFF);
-		bit += bytes << 3;
-	}
-	while (bit < end)
-	{
-		Bitmap[bit >> 3] |= (UCHAR)(1U << (bit & 7));
-		++bit;
-	}
+	CdpJournalCodecBitmapSetRange(Bitmap, StartBit, BitCount);
 }
 
 NTSTATUS CdpPreviewTreeInsert(
@@ -6720,33 +6552,12 @@ NTSTATUS CdpPreviewTreeInsert(
 	return status;
 }
 
-typedef struct _Cdp_PREVIEW_HIT
-{
-	UINT64 Start;
-	UINT64 End;
-	UINT64 FileOffset;
-	ULONG DataLength;
-	UINT64 Sequence;
-} Cdp_PREVIEW_HIT, *PCdp_PREVIEW_HIT;
-
 static ULONG CdpPreviewTreeCountOverlaps(
 	_In_opt_ PCdp_PREVIEW_TREE_NODE Node,
 	_In_ UINT64 QueryStart,
 	_In_ UINT64 QueryEnd)
 {
-	ULONG count = 0;
-
-	if (!Node || Node->MaxEnd <= QueryStart)
-		return 0;
-	if (Node->Left)
-		count += CdpPreviewTreeCountOverlaps(
-			Node->Left, QueryStart, QueryEnd);
-	if (!Node->Invalid && Node->Start < QueryEnd && Node->End > QueryStart)
-		++count;
-	if (Node->Start < QueryEnd && Node->Right)
-		count += CdpPreviewTreeCountOverlaps(
-			Node->Right, QueryStart, QueryEnd);
-	return count;
+	return CdpJournalCodecCountPreviewOverlaps(Node, QueryStart, QueryEnd);
 }
 
 static VOID CdpPreviewTreeCollectOverlaps(
@@ -6757,43 +6568,8 @@ static VOID CdpPreviewTreeCollectOverlaps(
 	_Inout_ PULONG HitCount,
 	_In_ ULONG HitCapacity)
 {
-	if (!Node || *HitCount >= HitCapacity)
-		return;
-	if (Node->MaxEnd <= QueryStart)
-		return;
-
-	if (Node->Left)
-		CdpPreviewTreeCollectOverlaps(
-			Node->Left,
-			QueryStart,
-			QueryEnd,
-			Hits,
-			HitCount,
-			HitCapacity);
-
-	if (!Node->Invalid &&
-		Node->Start < QueryEnd &&
-		Node->End > QueryStart)
-	{
-		if (*HitCount < HitCapacity)
-		{
-			Hits[*HitCount].Start = Node->Start;
-			Hits[*HitCount].End = Node->End;
-			Hits[*HitCount].FileOffset = Node->FileOffset;
-			Hits[*HitCount].DataLength = Node->DataLength;
-			Hits[*HitCount].Sequence = Node->Sequence;
-			(*HitCount)++;
-		}
-	}
-
-	if (Node->Start < QueryEnd && Node->Right)
-		CdpPreviewTreeCollectOverlaps(
-			Node->Right,
-			QueryStart,
-			QueryEnd,
-			Hits,
-			HitCount,
-			HitCapacity);
+	CdpJournalCodecCollectPreviewOverlaps(Node, QueryStart, QueryEnd,
+		Hits, HitCount, HitCapacity);
 }
 
 NTSTATUS CdpPreviewTreePunchRange(
@@ -6821,21 +6597,8 @@ static PCdp_PREVIEW_TREE_NODE CdpPreviewTreeFindSequenceOverlap(
 	_In_ UINT64 QueryStart,
 	_In_ UINT64 QueryEnd)
 {
-	PCdp_PREVIEW_TREE_NODE found;
-
-	if (!Node || Node->MaxEnd <= QueryStart)
-		return NULL;
-	found = CdpPreviewTreeFindSequenceOverlap(
-		Node->Left, ExpectedSequence, QueryStart, QueryEnd);
-	if (found)
-		return found;
-	if (!Node->Invalid && Node->Sequence == ExpectedSequence &&
-		Node->Start < QueryEnd && Node->End > QueryStart)
-		return Node;
-	if (Node->Start < QueryEnd)
-		return CdpPreviewTreeFindSequenceOverlap(
-			Node->Right, ExpectedSequence, QueryStart, QueryEnd);
-	return NULL;
+	return CdpJournalCodecFindPreviewSequenceOverlap(
+		Node, ExpectedSequence, QueryStart, QueryEnd);
 }
 
 NTSTATUS CdpPreviewTreeRemapSequenceRange(
@@ -6929,28 +6692,8 @@ static PCdp_PREVIEW_TREE_NODE CdpPreviewTreeFindPayloadOverlap(
 	_In_ UINT64 ExpectedFileOffset,
 	_In_ UINT64 BaseVolumeOffset)
 {
-	PCdp_PREVIEW_TREE_NODE found;
-	UINT64 overlapStart;
-
-	if (!Node || Node->MaxEnd <= QueryStart)
-		return NULL;
-	found = CdpPreviewTreeFindPayloadOverlap(
-		Node->Left, QueryStart, QueryEnd,
-		ExpectedFileOffset, BaseVolumeOffset);
-	if (found)
-		return found;
-	if (!Node->Invalid && Node->Start < QueryEnd && Node->End > QueryStart)
-	{
-		overlapStart = Node->Start > QueryStart ? Node->Start : QueryStart;
-		if (Node->FileOffset + (overlapStart - Node->Start) ==
-			ExpectedFileOffset + (overlapStart - BaseVolumeOffset))
-			return Node;
-	}
-	if (Node->Start < QueryEnd)
-		return CdpPreviewTreeFindPayloadOverlap(
-			Node->Right, QueryStart, QueryEnd,
-			ExpectedFileOffset, BaseVolumeOffset);
-	return NULL;
+	return CdpJournalCodecFindPreviewPayloadOverlap(Node, QueryStart,
+		QueryEnd, ExpectedFileOffset, BaseVolumeOffset);
 }
 
 NTSTATUS CdpPreviewTreeRemapPayloadRange(
@@ -7420,31 +7163,14 @@ static PCdp_BRANCH_INFO_NODE CdpBranchTreeFindBySequence(
 	_In_ PCdp_BRANCH_INFO_TREE BranchTree,
 	_In_ UINT64 Sequence)
 {
-	PCdp_BRANCH_INFO_NODE branch;
-	for (branch = BranchTree->Last; branch; branch = branch->Previous)
-	{
-		if (Sequence >= branch->StartRecord.Sequence &&
-			Sequence <= branch->EndRecord.Sequence)
-		{
-			return branch;
-		}
-	}
-	return NULL;
+	return CdpJournalCodecFindBranchBySequence(BranchTree, Sequence);
 }
 
 static PCdp_BRANCH_INFO_NODE CdpBranchTreeFindTargetTime(
 	_In_ PCdp_BRANCH_INFO_TREE BranchTree,
 	_In_ UINT64 TargetTime100ns)
 {
-	PCdp_BRANCH_INFO_NODE branch;
-	PCdp_BRANCH_INFO_NODE target = BranchTree->First;
-	for (branch = BranchTree->First; branch; branch = branch->Next)
-	{
-		if (branch->StartRecord.WallClock100ns > TargetTime100ns)
-			break;
-		target = branch;
-	}
-	return target;
+	return CdpJournalCodecFindBranchAtTime(BranchTree, TargetTime100ns);
 }
 
 static LONG CdpBranchPathFind(
@@ -7452,14 +7178,7 @@ static LONG CdpBranchPathFind(
 	_In_ ULONG PathCount,
 	_In_ PCdp_BRANCH_INFO_NODE Branch)
 {
-	ULONG index;
-
-	for (index = 0; index < PathCount; ++index)
-	{
-		if (Path[index] == Branch)
-			return (LONG)index;
-	}
-	return -1;
+	return CdpJournalCodecBranchPathFind(Path, PathCount, Branch);
 }
 
 NTSTATUS CdpJournalResolveSettledPreviewTime(

@@ -61,12 +61,15 @@
     <ClInclude Include="include\cdp_core.h" />
     <ClInclude Include="include\cdp_portable.h" />
     <ClInclude Include="include\cdp_store.h" />
+    <ClInclude Include="include\cdp_view_policy.h" />
     <ClInclude Include="..\CdpDriver\CdpJournal.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\cdp_core.c" />
     <ClCompile Include="src\cdp_mem_store.c" />
+    <ClCompile Include="src\cdp_view_policy.c" />
     <ClCompile Include="..\CdpDriver\CdpJournal.c" />
+    <ClCompile Include="..\CdpDriver\CdpJournalCodec.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

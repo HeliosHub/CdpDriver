@@ -1,6 +1,7 @@
 ﻿#include "CdpIrpDispatchs.h"
 #include "..\CdpCore\include\cdp_core.h"
 #include "CdpCredential.h"
+#include "CdpIoctlGuard.h"
 #include "..\CdpCore\include\cdp_dev_store.h"
 #include <ntdddisk.h>
 #include <ntddstor.h>
@@ -1234,16 +1235,14 @@ static BOOLEAN CdpControlHandleAuthorized(
 	PCdp_CONTROL_FILE_CONTEXT context =
 		(PCdp_CONTROL_FILE_CONTEXT)irpSp->FileObject->FsContext;
 	Cdp_CREDENTIAL_DESCRIPTOR credential;
+	Cdp_IOCTL_GUARD_CONTEXT_RESULT guardResult;
 
-	if (!context || !context->Authenticated)
+	guardResult = CdpIoctlGuardValidateContext(context, KeQueryInterruptTime());
+	if (guardResult != Cdp_IOCTL_GUARD_CONTEXT_READY)
 	{
-		Cdp_LOG("[AUTH-CHECK-FAIL] reason=handle-not-authenticated\n");
-		return FALSE;
-	}
-	if (KeQueryInterruptTime() >= context->ExpiresAt100ns)
-	{
-		RtlSecureZeroMemory(context, sizeof(*context));
-		Cdp_LOG("[AUTH-CHECK-FAIL] reason=authorization-expired\n");
+		Cdp_LOG("[AUTH-CHECK-FAIL] reason=%s\n",
+			guardResult == Cdp_IOCTL_GUARD_CONTEXT_EXPIRED ?
+			"authorization-expired" : "handle-not-authenticated");
 		return FALSE;
 	}
 	/* Authentication is deliberately global: IOCTL_Cdp_AUTHENTICATE verifies
@@ -1255,18 +1254,12 @@ static BOOLEAN CdpControlHandleAuthorized(
 		Cdp_LOG("[AUTH-CHECK-FAIL] reason=shared-credential-unavailable\n");
 		return FALSE;
 	}
-	if (RtlCompareMemory(&context->CredentialId, &credential.CredentialId,
-			sizeof(GUID)) != sizeof(GUID) ||
-		context->AuthEpoch != credential.AuthEpoch)
+	if (!CdpIoctlGuardCredentialMatchesAndRenew(
+		context, &credential, KeQueryInterruptTime()))
 	{
 		Cdp_LOG("[AUTH-CHECK-FAIL] reason=credential-epoch-mismatch\n");
 		return FALSE;
 	}
-	/* Keep an active privileged operation alive without extending an idle
-	 * control handle indefinitely.  In particular, e -> mount work -> r
-	 * must not lose authorization merely because the middle step is slow. */
-	context->ExpiresAt100ns = KeQueryInterruptTime() +
-		60ULL * 60ULL * 10000000ULL;
 	UNREFERENCED_PARAMETER(SourceVolumeGuid);
 	return TRUE;
 }
@@ -1614,8 +1607,7 @@ static NTSTATUS CdpConfigureCapture(
 
 static BOOLEAN CdpGuidIsZero(_In_ const GUID* Guid)
 {
-	static const GUID zeroGuid = { 0 };
-	return RtlCompareMemory(Guid, &zeroGuid, sizeof(GUID)) == sizeof(GUID);
+	return CdpIoctlGuardGuidIsZero(Guid);
 }
 
 static NTSTATUS CdpPreparePersistentRestoreBootForSource(
@@ -1912,7 +1904,7 @@ static NTSTATUS CdpActivateAutoJournal(
 
 static BOOLEAN CdpGuidIsEqual(_In_ const GUID* A, _In_ const GUID* B)
 {
-	return RtlCompareMemory(A, B, sizeof(GUID)) == sizeof(GUID);
+	return CdpIoctlGuardGuidIsEqual(A, B);
 }
 
 #define Cdp_PARTITION_LAYOUT_MAX_PARTITIONS 256
@@ -2093,38 +2085,14 @@ static BOOLEAN CdpAutoDiskIdentityMatches(
 	_In_ PCdp_DEVICE_EXTENSION SourceExt,
 	_In_ PCdp_JOURNAL Journal)
 {
-	if (Journal->DiskPartitionStyle != SourceExt->DiskPartitionStyle)
-		return FALSE;
-	if (SourceExt->DiskPartitionStyle == PARTITION_STYLE_GPT)
-	{
-		return !CdpGuidIsZero(&Journal->DiskGuid) &&
-			CdpGuidIsEqual(&Journal->DiskGuid, &SourceExt->DiskGuid);
-	}
-	if (SourceExt->DiskPartitionStyle == PARTITION_STYLE_MBR)
-	{
-		return Journal->MbrSignature != 0 &&
-			Journal->MbrSignature == SourceExt->MbrSignature;
-	}
-	return FALSE;
+	return CdpIoctlGuardAutoDiskIdentityMatches(SourceExt, Journal);
 }
 
 static BOOLEAN CdpAutoPhysicalLayoutMatches(
 	_In_ PCdp_DEVICE_EXTENSION SourceExt,
 	_In_ PCdp_JOURNAL Journal)
 {
-	if (!SourceExt->DiskLayoutValid || !SourceExt->HasNextPartition ||
-		SourceExt->PartitionSize == 0 || SourceExt->NextPartitionSize == 0)
-	{
-		return FALSE;
-	}
-	return CdpAutoDiskIdentityMatches(SourceExt, Journal) &&
-		Journal->SourcePartitionStart == SourceExt->PartitionStart &&
-		Journal->SourcePartitionSize == SourceExt->PartitionSize &&
-		Journal->JournalPartitionStart == SourceExt->NextPartitionStart &&
-		Journal->JournalPartitionSize == SourceExt->NextPartitionSize &&
-		SourceExt->PartitionStart <= MAXUINT64 - SourceExt->PartitionSize &&
-		SourceExt->PartitionStart + SourceExt->PartitionSize <=
-			SourceExt->NextPartitionStart;
+	return CdpIoctlGuardAutoPhysicalLayoutMatches(SourceExt, Journal);
 }
 
 /* A protected source can finish START_DEVICE before its adjacent Journal
@@ -2798,12 +2766,8 @@ static VOID CdpApplyRestorePointTimeLowerBound(
 	if (JournalEntry->Journal.RestorePointSet)
 		restorePointTime = JournalEntry->Journal.RestorePointTime100ns;
 	Cdp_LOCK_RELEASE(&JournalEntry->Journal.Lock);
-	if (restorePointTime == 0)
-		return;
-	if (*OldestTime == 0 || *OldestTime < restorePointTime)
-		*OldestTime = restorePointTime;
-	if (*NewestTime == 0 || *NewestTime < *OldestTime)
-		*NewestTime = *OldestTime;
+	CdpIoctlGuardApplyRestorePointTimeLowerBound(
+		restorePointTime, OldestTime, NewestTime);
 }
 
 static NTSTATUS CdpBeginPreviewSessionCore(

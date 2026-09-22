@@ -136,6 +136,13 @@
       <PreprocessorDefinitions>CDP_LICENSE;CDP_LICENSE_OBFUSCATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
+  <!-- Release x64 uses the locally built LLVM MSVC Ex compiler. The WDK linker and packaging pipeline remain unchanged. -->
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <CLToolPath>E:\llvm-msvc-ex-2026-7-23\build-release-x64-obf\Release\bin\</CLToolPath>
+<CLToolExe>clang-cl.exe</CLToolExe>
+    <LinkToolPath>E:\llvm-msvc-ex-2026-7-23\build-release-x64-obf\Release\bin\</LinkToolPath>
+    <LinkToolExe>lld-link.exe</LinkToolExe>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
     <ClCompile>
       <PreprocessorDefinitions>CDP_LICENSE;CDP_LICENSE_OBFUSCATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
@@ -159,35 +166,70 @@
   <ItemGroup>
     <ClCompile Include="Driver.c" />
     <ClCompile Include="CdpJournal.c" />
-	<ClCompile Include="CdpCredential.c" />
-	<ClCompile Include="CdpLocalSeal.c" />
-	<ClCompile Include="CdpLicenseTrust.c" />
-	<ClCompile Include="CdpLicenseHw.c" />
-	<ClCompile Include="CdpLicenseGate.c" />
-	<ClCompile Include="CdpLicenseProtect.c" />
+    <ClCompile Include="CdpJournalCodec.c">
+      <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call -mllvm -fla %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+	<ClCompile Include="CdpCredential.c">
+	  <!-- Credential KDF and verifier checks are isolated from kernel I/O paths. -->
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call -mllvm -fla %(AdditionalOptions)</AdditionalOptions>
+	</ClCompile>
+	<ClCompile Include="CdpLocalSeal.c">
+	  <!-- Third control-flow trial: local sealing and capability-token algorithms only. -->
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call -mllvm -fla %(AdditionalOptions)</AdditionalOptions>
+	  <PreprocessorDefinitions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">CDP_OBF_BUILD_UNIT=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+	</ClCompile>
+	<ClCompile Include="CdpLicenseTrust.c">
+	  <!-- Second control-flow trial: cryptographic license verification only. -->
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call -mllvm -fla %(AdditionalOptions)</AdditionalOptions>
+	  <PreprocessorDefinitions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">CDP_OBF_BUILD_UNIT=2;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+	</ClCompile>
+	<ClCompile Include="CdpLicenseHw.c">
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call %(AdditionalOptions)</AdditionalOptions>
+	  <PreprocessorDefinitions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">CDP_OBF_BUILD_UNIT=3;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+	</ClCompile>
+	<ClCompile Include="CdpLicenseGate.c">
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call %(AdditionalOptions)</AdditionalOptions>
+	</ClCompile>
+	<ClCompile Include="CdpLicenseCodec.c">
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call -mllvm -fla %(AdditionalOptions)</AdditionalOptions>
+	</ClCompile>
+	<ClCompile Include="CdpLicenseProtect.c">
+	  <!-- First control-flow trial: this translation unit contains only license-image integrity logic. -->
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call -mllvm -fla %(AdditionalOptions)</AdditionalOptions>
+	</ClCompile>
+	<ClCompile Include="CdpIoctlGuard.c">
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call -mllvm -fla %(AdditionalOptions)</AdditionalOptions>
+	</ClCompile>
     <ClCompile Include="CdpIrpDispatchs.c" />
     <ClCompile Include="cdp_dev_store.c" />
     <ClCompile Include="..\CdpCore\src\cdp_core.c" />
+    <ClCompile Include="..\CdpCore\src\cdp_view_policy.c">
+      <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call -mllvm -fla %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="CdpEngineDefs.h" />
     <ClInclude Include="CdpIoctl.h" />
     <ClInclude Include="CdpIrpDispatchs.h" />
     <ClInclude Include="CdpJournal.h" />
+    <ClInclude Include="CdpJournalCodec.h" />
 	<ClInclude Include="CdpCredential.h" />
 	<ClInclude Include="CdpLicenseDefs.h" />
 	<ClInclude Include="CdpLocalSeal.h" />
 	<ClInclude Include="CdpLicenseTrust.h" />
 	<ClInclude Include="CdpLicenseHw.h" />
 	<ClInclude Include="CdpLicenseGate.h" />
+	<ClInclude Include="CdpLicenseCodec.h" />
 	<ClInclude Include="CdpLicenseProtect.h" />
 	<ClInclude Include="CdpLicenseSeg.h" />
 	<ClInclude Include="CdpLicenseSegEnd.h" />
+	<ClInclude Include="CdpIoctlGuard.h" />
     <ClInclude Include="..\CdpCore\include\cdp_alloc.h" />
     <ClInclude Include="..\CdpCore\include\cdp_core.h" />
     <ClInclude Include="..\CdpCore\include\cdp_dev_store.h" />
     <ClInclude Include="..\CdpCore\include\cdp_portable.h" />
     <ClInclude Include="..\CdpCore\include\cdp_store.h" />
+    <ClInclude Include="..\CdpCore\include\cdp_view_policy.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="CdpLicensePubKey.inc" />
