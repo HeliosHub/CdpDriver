@@ -68,7 +68,7 @@ ErrorControl   = 1 ; SERVICE_ERROR_NORMAL
 LoadOrderGroup = "Storage Volume Filters"
 
 [Strings]
-ProviderName = "CdpDriver"
+ProviderName = "Foshan Yuandian Technology Co., Ltd."
 DiskName     = "CdpDriver Installation Disk"
 ServiceName  = "CdpDriver"
 ServiceDesc  = "Cdp Engine Disk Volume Filter Driver"
