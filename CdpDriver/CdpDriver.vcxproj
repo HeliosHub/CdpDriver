@@ -142,6 +142,32 @@
 <CLToolExe>clang-cl.exe</CLToolExe>
     <LinkToolPath>E:\llvm-msvc-ex-2026-7-23\build-release-x64-obf\Release\bin\</LinkToolPath>
     <LinkToolExe>lld-link.exe</LinkToolExe>
+
+    <!--
+      混淆 pass 集合 + 可复现种子（单一定义，供所有受混淆单元引用）。
+
+      -aesSeed 的作用：工具链的 OLLVM/xVMP pass 共用 CryptoUtils 的 AES-CTR PRNG，
+      它只在传入 -aesSeed 时被确定性播种；否则回落到 CryptGenRandom，导致同一份
+      源码每次编译都产出不同的机器码（-fla 的 case 立即数、-const-obfus 的 x/y 全局、
+      -ind-call 的地址表、-string-obfus 的密钥长度与填充都会变）。这使"源码 → 二进制"
+      不可比对、也无法审计发版产物是否由本仓库构建。
+
+      固定种子后可用两种方式自证可复现：
+        msbuild CdpDriver.vcxproj /p:Configuration=Release /p:Platform=x64 /t:Rebuild
+      连续两次，比较 x64\Release\CdpDriver.sys 的 SHA-256 应一致。
+
+      注意：受保护节的 CRC 是 DriverEntry 时对"已加载映像"做的运行时快照，
+      与构建是否可复现无关，因此固定种子不会影响 O-16 完整性校验。
+
+      另注：现有工具链下 -aesSeed 尚不能做到逐字节可复现——StringObfuscation 自带一个
+      未播种的 CryptoUtils 实例（详见 OBFUSCATION_ANALYSIS.md 第 8.3 节）。此处传种子
+      的价值是"工具链修好后无需再改项目"，并在本项目内强制所有混淆单元使用同一取值。
+
+      轮换方式：直接覆盖该属性（例如 /p:CdpObfSeed=<32位hex>）即可，无需改各单元。
+    -->
+    <CdpObfSeed Condition="'$(CdpObfSeed)'==''">5A17C3E90D4B62F18C7E0A3D5B29F461</CdpObfSeed>
+    <CdpObfPasses>-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call -mllvm -fla -mllvm -aesSeed=$(CdpObfSeed)</CdpObfPasses>
+    <CdpObfPassesNoIndCall>-mllvm -string-obfus -mllvm -const-obfus -mllvm -fla -mllvm -aesSeed=$(CdpObfSeed)</CdpObfPassesNoIndCall>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
     <ClCompile>
@@ -167,44 +193,51 @@
     <ClCompile Include="Driver.c" />
     <ClCompile Include="CdpJournal.c" />
     <ClCompile Include="CdpJournalCodec.c">
-      <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call -mllvm -fla %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfPasses) %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
 	<ClCompile Include="CdpCredential.c">
 	  <!-- Credential KDF and verifier checks are isolated from kernel I/O paths. -->
-	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call -mllvm -fla %(AdditionalOptions)</AdditionalOptions>
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfPasses) %(AdditionalOptions)</AdditionalOptions>
 	</ClCompile>
 	<ClCompile Include="CdpLocalSeal.c">
-	  <!-- Third control-flow trial: local sealing and capability-token algorithms only. -->
-	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call -mllvm -fla %(AdditionalOptions)</AdditionalOptions>
+	  <!-- 本地密封与 capability token 算法；.licprot + .licpr。 -->
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfPasses) %(AdditionalOptions)</AdditionalOptions>
 	  <PreprocessorDefinitions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">CDP_OBF_BUILD_UNIT=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
 	</ClCompile>
 	<ClCompile Include="CdpLicenseTrust.c">
-	  <!-- Second control-flow trial: cryptographic license verification only. -->
-	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call -mllvm -fla %(AdditionalOptions)</AdditionalOptions>
+	  <!-- CNG 验签 / 公钥组装；.licprot + .licpr。 -->
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfPasses) %(AdditionalOptions)</AdditionalOptions>
 	  <PreprocessorDefinitions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">CDP_OBF_BUILD_UNIT=2;%(PreprocessorDefinitions)</PreprocessorDefinitions>
 	</ClCompile>
 	<ClCompile Include="CdpLicenseHw.c">
-	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call %(AdditionalOptions)</AdditionalOptions>
+	  <!-- 指纹采集；补 -fla（此前缺，与 CDP_LICENSE_OBFUSCATE 语义不符）。 -->
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfPasses) %(AdditionalOptions)</AdditionalOptions>
 	  <PreprocessorDefinitions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">CDP_OBF_BUILD_UNIT=3;%(PreprocessorDefinitions)</PreprocessorDefinitions>
 	</ClCompile>
 	<ClCompile Include="CdpLicenseGate.c">
-	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call %(AdditionalOptions)</AdditionalOptions>
+	  <!-- 闸门状态机。补 -fla：与 CDP_LICENSE_OBFUSCATE 的语义一致（须 CFF 的单元）。 -->
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfPasses) %(AdditionalOptions)</AdditionalOptions>
+	</ClCompile>
+	<ClCompile Include="CdpLicenseGateCall.c">
+	  <!-- 受保护闸门调用点：把 BEGIN/COMMIT RECOVERY 的决策点从 I/O 热路径拉回 .licprot。
+	       本单元只做转发，必须与被保护的闸门实现同等级混淆。 -->
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfPassesNoIndCall) %(AdditionalOptions)</AdditionalOptions>
 	</ClCompile>
 	<ClCompile Include="CdpLicenseCodec.c">
-	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call -mllvm -fla %(AdditionalOptions)</AdditionalOptions>
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfPasses) %(AdditionalOptions)</AdditionalOptions>
 	</ClCompile>
 	<ClCompile Include="CdpLicenseProtect.c">
 	  <!-- First control-flow trial: this translation unit contains only license-image integrity logic. -->
-	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call -mllvm -fla %(AdditionalOptions)</AdditionalOptions>
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfPasses) %(AdditionalOptions)</AdditionalOptions>
 	</ClCompile>
 	<ClCompile Include="CdpIoctlGuard.c">
-	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call -mllvm -fla %(AdditionalOptions)</AdditionalOptions>
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfPasses) %(AdditionalOptions)</AdditionalOptions>
 	</ClCompile>
     <ClCompile Include="CdpIrpDispatchs.c" />
     <ClCompile Include="cdp_dev_store.c" />
     <ClCompile Include="..\CdpCore\src\cdp_core.c" />
     <ClCompile Include="..\CdpCore\src\cdp_view_policy.c">
-      <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call -mllvm -fla %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfPasses) %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -219,6 +252,7 @@
 	<ClInclude Include="CdpLicenseTrust.h" />
 	<ClInclude Include="CdpLicenseHw.h" />
 	<ClInclude Include="CdpLicenseGate.h" />
+	<ClInclude Include="CdpLicenseGateCall.h" />
 	<ClInclude Include="CdpLicenseCodec.h" />
 	<ClInclude Include="CdpLicenseProtect.h" />
 	<ClInclude Include="CdpLicenseSeg.h" />

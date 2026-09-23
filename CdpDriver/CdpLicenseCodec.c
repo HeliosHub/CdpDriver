@@ -1,8 +1,25 @@
+/*
+ * 授权编解码（canonical JSON 组装 / 解析 / 有效性判定）。
+ *
+ * 本单元链入 .licprot，并被 O-16 的 .licprot/.licpr CRC32C 完整性校验覆盖。
+ *
+ * 原因：CdpLicenseCodecBuildCanonicalWithoutSignature 定义"被签名保护的到底是
+ * 哪些字节"，CdpLicenseCodecCheckValidity 定义"证件是否有效"，而两者都在
+ * CdpLicenseGate 的验签之前被调用。此前本文件虽带全套混淆 pass，却不进受保护
+ * 节，攻击者可以只改这里的解析/长度判定（例如放宽字段校验或伪造 canonical
+ * 视图）而不触碰任何受完整性保护或被控制流平坦化的代码。
+ *
+ * 注：本文件内只有字符串字面量，没有 const 全局，因此不会向 .licpr 引入新内容
+ *（.licpr 应保持只装 Cdp_PRODUCT_MAGIC / ARX 常量 / 公钥分片）。
+ */
+
 #include "CdpLicenseCodec.h"
 
 #include <ntstrsafe.h>
 
 #ifdef CDP_LICENSE
+
+#include "CdpLicenseSeg.h" /* 此后本文件代码进入 .licprot */
 
 SIZE_T CdpLicenseCodecStrLen(const CHAR* String, SIZE_T Maximum)
 {
@@ -13,6 +30,108 @@ SIZE_T CdpLicenseCodecStrLen(const CHAR* String, SIZE_T Maximum)
     while (index < Maximum && String[index])
         ++index;
     return index;
+}
+
+VOID CdpLicenseCodecNormalizeMbUuid(const CHAR* Input, CHAR* Output)
+{
+    SIZE_T index;
+    SIZE_T outputIndex = 0;
+
+    RtlZeroMemory(Output, Cdp_LICENSE_MB_UUID_CHARS);
+    if (!Input)
+        return;
+    for (index = 0; Input[index] &&
+        outputIndex + 1 < Cdp_LICENSE_MB_UUID_CHARS; ++index)
+    {
+        CHAR character = Input[index];
+        if (character == '{' || character == '}' || character == ' ' ||
+            character == '\t')
+            continue;
+        if (character >= 'A' && character <= 'Z')
+            character = (CHAR)(character - 'A' + 'a');
+        Output[outputIndex++] = character;
+    }
+    Output[outputIndex] = 0;
+}
+
+VOID CdpLicenseCodecNormalizeDiskSerial(const CHAR* Input, CHAR* Output)
+{
+    SIZE_T index;
+    SIZE_T outputIndex = 0;
+    SIZE_T start = 0;
+    SIZE_T end;
+
+    RtlZeroMemory(Output, Cdp_LICENSE_DISK_SERIAL_CHARS);
+    if (!Input)
+        return;
+    end = CdpLicenseCodecStrLen(Input, Cdp_LICENSE_DISK_SERIAL_CHARS - 1);
+    while (start < end && (Input[start] == ' ' || Input[start] == '\t'))
+        ++start;
+    while (end > start && (Input[end - 1] == ' ' || Input[end - 1] == '\t'))
+        --end;
+    for (index = start; index < end &&
+        outputIndex + 1 < Cdp_LICENSE_DISK_SERIAL_CHARS; ++index)
+    {
+        CHAR character = Input[index];
+        if (character >= 'a' && character <= 'z')
+            character = (CHAR)(character - 'a' + 'A');
+        Output[outputIndex++] = character;
+    }
+    Output[outputIndex] = 0;
+}
+
+VOID CdpLicenseCodecUuidBytesToString(const UCHAR* Bytes, CHAR* Output)
+{
+    static const CHAR hex[] = "0123456789abcdef";
+    ULONG index;
+    ULONG outputIndex = 0;
+
+    RtlZeroMemory(Output, Cdp_LICENSE_MB_UUID_CHARS);
+    for (index = 0; index < 16; ++index)
+    {
+        if (index == 4 || index == 6 || index == 8 || index == 10)
+            Output[outputIndex++] = '-';
+        Output[outputIndex++] = hex[(Bytes[index] >> 4) & 0xF];
+        Output[outputIndex++] = hex[Bytes[index] & 0xF];
+    }
+    Output[outputIndex] = 0;
+}
+
+NTSTATUS CdpLicenseCodecBuildHardwareFingerprintMaterial(
+    const CHAR* MbUuidInput, const CHAR* DiskSerialInput,
+    CHAR* NormalizedMbUuid, CHAR* NormalizedDiskSerial,
+    UCHAR* Material, ULONG MaterialCapacity, PULONG MaterialLength)
+{
+    ULONG mbLength;
+    ULONG diskLength;
+    ULONG total = 0;
+
+    if (!NormalizedMbUuid || !NormalizedDiskSerial || !Material ||
+        !MaterialLength)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+    CdpLicenseCodecNormalizeMbUuid(MbUuidInput, NormalizedMbUuid);
+    CdpLicenseCodecNormalizeDiskSerial(DiskSerialInput, NormalizedDiskSerial);
+    mbLength = (ULONG)CdpLicenseCodecStrLen(NormalizedMbUuid,
+        Cdp_LICENSE_MB_UUID_CHARS);
+    diskLength = (ULONG)CdpLicenseCodecStrLen(NormalizedDiskSerial,
+        Cdp_LICENSE_DISK_SERIAL_CHARS);
+    if (mbLength > MaterialCapacity || MaterialCapacity - mbLength < 1 ||
+        diskLength > MaterialCapacity - mbLength - 1 ||
+        MaterialCapacity - mbLength - 1 - diskLength < 2)
+    {
+        return STATUS_BUFFER_TOO_SMALL;
+    }
+    RtlCopyMemory(Material + total, NormalizedMbUuid, mbLength);
+    total += mbLength;
+    Material[total++] = 0;
+    RtlCopyMemory(Material + total, NormalizedDiskSerial, diskLength);
+    total += diskLength;
+    Material[total++] = 0;
+    Material[total++] = 0;
+    *MaterialLength = total;
+    return STATUS_SUCCESS;
 }
 
 BOOLEAN CdpLicenseCodecCStrEq(const CHAR* Left, const CHAR* Right)
@@ -425,5 +544,7 @@ NTSTATUS CdpLicenseCodecCheckValidity(BOOLEAN HasLicense, ULONG Mode,
     }
     return STATUS_SUCCESS;
 }
+
+#include "CdpLicenseSegEnd.h" /* 恢复默认 code/const 节 */
 
 #endif

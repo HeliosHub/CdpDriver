@@ -40,6 +40,17 @@ static volatile LONG g_CdpLicenseRestorePending = 0;
 static ULONG g_CdpLicMirrorA = 0;       /* Gate 侧镜像：crc ^ 0xA55A5AA5 */
 static ULONG g_CdpLicMirrorB = 0;       /* 与 A 异或还原出 crc；与 Protect 分片分开存放 */
 static volatile LONG g_CdpLicMirrorReady = 0;
+/*
+ * Protect 快照是否真的建立成功（0=没有可用快照）。
+ *
+ * 这个标志把"检测到篡改"与"压根没有快照可比"区分开：
+ *   - 闸门路径两者都 fail-closed（保守）；
+ *   - 导入 / 挂载恢复路径只在有快照时才强校验，否则会把
+ *     "DriverEntry 阶段 capture 失败"误判成篡改，导致第一次导入永远失败，
+ *     而这个失败在 Release 下是静默的（Cdp_LIC_FAIL 是空操作）。
+ * Capture 失败本身就意味着闸门会拒绝一切回滚，因此这里放行导入不会削弱保护。
+ */
+static volatile LONG g_CdpLicSnapshotActive = 0;
 
 static UINT64 CdpLicenseQuerySystemTime100ns(VOID);
 static NTSTATUS CdpLicensePersistToAllJournals(
@@ -125,8 +136,15 @@ static NTSTATUS CdpLicenseRequireIntegrity(
 	{
 		return STATUS_SUCCESS;
 	}
-	Cdp_LIC_FAIL("license code integrity failed");
+	Cdp_LOG("[LICENSE] code integrity check FAILED (snapshot=%ld)\n",
+		InterlockedCompareExchange(&g_CdpLicSnapshotActive, 0, 0));
 	return CdpLicenseNoteIntegrityFailure(DriverExt);
+}
+
+/* 是否有可用的 .licprot 快照（DriverEntry 的 Capture+Mirror 是否成功）。 */
+static BOOLEAN CdpLicenseSnapshotAvailable(VOID)
+{
+	return InterlockedCompareExchange(&g_CdpLicSnapshotActive, 0, 0) != 0;
 }
 
 /*
@@ -828,12 +846,26 @@ VOID CdpLicenseInitialize(
 	 * DriverStart 是映射后的映像基址（已重定位）。Capture 失败不让 DriverEntry 失败，
 	 * 否则整机 COW 起不来；之后 GateRequireIntegrity 会 fail-closed 拒绝回滚。
 	 */
+	InterlockedExchange(&g_CdpLicSnapshotActive, 0);
 	if (DriverObject && DriverObject->DriverStart)
 	{
 		if (NT_SUCCESS(CdpLicenseProtectCapture(DriverObject->DriverStart)))
+		{
 			CdpLicenseIntegrityStoreMirror();
+			InterlockedExchange(&g_CdpLicSnapshotActive, 1);
+		}
 		else
-			Cdp_LOG("[LICENSE] protect capture failed; recovery will fail closed\n");
+		{
+			/*
+			 * 这里用 Cdp_LOG 而不是 Cdp_LIC_FAIL：Release 下 LIC_DEBUG 未定义，
+			 * Cdp_LIC_FAIL 会被编译成空操作，"没有快照"就会变成完全静默的故障。
+			 */
+			Cdp_LOG("[LICENSE] protect capture FAILED; recovery will fail closed\n");
+		}
+	}
+	else
+	{
+		Cdp_LOG("[LICENSE] no DriverStart; integrity snapshot unavailable\n");
 	}
 }
 
@@ -841,6 +873,7 @@ VOID CdpLicenseShutdown(_Inout_ PCdp_DRIVER_EXTENSION DriverExt)
 {
 	/* 取消小时定时器、抹 token/SealKey、作废完整性快照。 */
 	UNREFERENCED_PARAMETER(DriverExt);
+	InterlockedExchange(&g_CdpLicSnapshotActive, 0);
 	if (g_CdpLicenseTimerArmed)
 	{
 		KeCancelTimer(&g_CdpLicenseTimer);
@@ -898,6 +931,29 @@ NTSTATUS CdpLicenseSetFromBlob(
 	{
 		Cdp_LIC_FAIL("failed status=0x%08X", status);
 		return status;
+	}
+
+	/*
+	 * O-16 完整性（补）：导入是"授权状态进入本机"的入口之一，此前完全不校验，
+	 * 攻击者可在 DriverEntry 之后 patch .licprot 再导入，把机制建立在被改过的代码上。
+	 *
+	 * 只在"已有证"时强校验：首次导入时若 DriverEntry 的 capture 失败（没有快照），
+	 * 失败会让第一次导入永远失败且 Release 下无任何可观测原因。capture 失败本身
+	 * 已使闸门拒绝一切回滚，因此这里放行导入不削弱保护。
+	 */
+	if (hadLicense)
+	{
+		if (!CdpLicenseSnapshotAvailable())
+			Cdp_LOG("[LICENSE] import: integrity snapshot unavailable; skipping code check\n");
+		else
+		{
+			status = CdpLicenseRequireIntegrity(DriverExt);
+			if (!NT_SUCCESS(status))
+			{
+				Cdp_LOG("[LICENSE] import rejected: code integrity failed\n");
+				return status;
+			}
+		}
 	}
 
 	incomingTrial = g_CdpLicenseState.IsTrial;
@@ -981,6 +1037,25 @@ NTSTATUS CdpLicenseOnJournalMounted(
 	{
 		Cdp_LIC_FAIL("failed status=0x%08X", status);
 		return status;
+	}
+
+	/*
+	 * O-16 完整性（补）：挂载恢复是"授权状态如何从盘上恢复"的主路径，此前不校验。
+	 * 每次驱动启动挂到带证的 Journal 都会走这里，是比闸门更早且更容易下手的点。
+	 * 没有快照时跳过（理由同 CdpLicenseSetFromBlob）。
+	 */
+	if (!CdpLicenseSnapshotAvailable())
+	{
+		Cdp_LOG("[LICENSE] mount: integrity snapshot unavailable; skipping code check\n");
+	}
+	else
+	{
+		status = CdpLicenseRequireIntegrity(DriverExt);
+		if (!NT_SUCCESS(status))
+		{
+			Cdp_LOG("[LICENSE] mount rejected: code integrity failed\n");
+			return status;
+		}
 	}
 
 	CdpLicenseLock();

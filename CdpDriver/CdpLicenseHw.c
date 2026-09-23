@@ -10,6 +10,7 @@
 #ifdef CDP_LICENSE_OBFUSCATE
 
 #include "CdpLicenseHw.h"
+#include "CdpLicenseCodec.h"
 #include "CdpLicenseTrust.h"
 #include "CdpEngineDefs.h"
 #include <ntddstor.h>
@@ -40,82 +41,25 @@ typedef struct _CDP_SYSTEM_FIRMWARE_TABLE_INFORMATION
 
 #define SystemFirmwareTable_Get 1
 
-static SIZE_T CdpHwStrLen(_In_reads_or_z_(Max) const CHAR* S, _In_ SIZE_T Max)
-{
-	SIZE_T i = 0;
-	if (!S)
-		return 0;
-	while (i < Max && S[i])
-		++i;
-	return i;
-}
-
 VOID CdpLicenseNormalizeMbUuid(
 	_In_z_ const CHAR* In,
 	_Out_writes_(Cdp_LICENSE_MB_UUID_CHARS) CHAR* Out)
 {
-	SIZE_T i;
-	SIZE_T o = 0;
-
-	RtlZeroMemory(Out, Cdp_LICENSE_MB_UUID_CHARS);
-	if (!In)
-		return;
-	for (i = 0; In[i] && o + 1 < Cdp_LICENSE_MB_UUID_CHARS; ++i)
-	{
-		CHAR c = In[i];
-		if (c == '{' || c == '}' || c == ' ' || c == '\t')
-			continue;
-		if (c >= 'A' && c <= 'Z')
-			c = (CHAR)(c - 'A' + 'a');
-		Out[o++] = c;
-	}
-	Out[o] = 0;
+	CdpLicenseCodecNormalizeMbUuid(In, Out);
 }
 
 VOID CdpLicenseNormalizeDiskSerial(
 	_In_z_ const CHAR* In,
 	_Out_writes_(Cdp_LICENSE_DISK_SERIAL_CHARS) CHAR* Out)
 {
-	SIZE_T i;
-	SIZE_T o = 0;
-	SIZE_T start = 0;
-	SIZE_T end;
-
-	RtlZeroMemory(Out, Cdp_LICENSE_DISK_SERIAL_CHARS);
-	if (!In)
-		return;
-	end = CdpHwStrLen(In, Cdp_LICENSE_DISK_SERIAL_CHARS - 1);
-	while (start < end && (In[start] == ' ' || In[start] == '\t'))
-		++start;
-	while (end > start && (In[end - 1] == ' ' || In[end - 1] == '\t'))
-		--end;
-	for (i = start; i < end && o + 1 < Cdp_LICENSE_DISK_SERIAL_CHARS; ++i)
-	{
-		CHAR c = In[i];
-		if (c >= 'a' && c <= 'z')
-			c = (CHAR)(c - 'a' + 'A');
-		Out[o++] = c;
-	}
-	Out[o] = 0;
+	CdpLicenseCodecNormalizeDiskSerial(In, Out);
 }
 
 static VOID CdpUuidBytesToString(
 	_In_reads_bytes_(16) const UCHAR* Bytes,
 	_Out_writes_(Cdp_LICENSE_MB_UUID_CHARS) CHAR* Out)
 {
-	static const CHAR hex[] = "0123456789abcdef";
-	ULONG i;
-	ULONG o = 0;
-
-	RtlZeroMemory(Out, Cdp_LICENSE_MB_UUID_CHARS);
-	for (i = 0; i < 16; ++i)
-	{
-		if (i == 4 || i == 6 || i == 8 || i == 10)
-			Out[o++] = '-';
-		Out[o++] = hex[(Bytes[i] >> 4) & 0xF];
-		Out[o++] = hex[Bytes[i] & 0xF];
-	}
-	Out[o] = 0;
+	CdpLicenseCodecUuidBytesToString(Bytes, Out);
 }
 
 static NTSTATUS CdpReadSmbiosUuid(
@@ -330,9 +274,7 @@ NTSTATUS CdpLicenseCollectHardwareId(
 	CHAR diskNorm[Cdp_LICENSE_DISK_SERIAL_CHARS];
 	CHAR mbNorm[Cdp_LICENSE_MB_UUID_CHARS];
 	UCHAR material[Cdp_LICENSE_MB_UUID_CHARS + Cdp_LICENSE_DISK_SERIAL_CHARS + 8];
-	ULONG mLen;
-	ULONG dLen;
-	ULONG total = 0;
+	ULONG materialLength;
 	NTSTATUS status;
 
 	if (!MbUuid || !DiskSerial || !Fingerprint)
@@ -349,24 +291,14 @@ NTSTATUS CdpLicenseCollectHardwareId(
 	if (!NT_SUCCESS(status))
 		RtlStringCbCopyA(DiskSerial, Cdp_LICENSE_DISK_SERIAL_CHARS, "UNKNOWN");
 
-	CdpLicenseNormalizeMbUuid(mbRaw, mbNorm);
-	CdpLicenseNormalizeDiskSerial(DiskSerial, diskNorm);
-	RtlStringCbCopyA(MbUuid, Cdp_LICENSE_MB_UUID_CHARS, mbNorm);
-	RtlStringCbCopyA(DiskSerial, Cdp_LICENSE_DISK_SERIAL_CHARS, diskNorm);
-
-	mLen = (ULONG)CdpHwStrLen(mbNorm, Cdp_LICENSE_MB_UUID_CHARS);
-	dLen = (ULONG)CdpHwStrLen(diskNorm, Cdp_LICENSE_DISK_SERIAL_CHARS);
-	RtlCopyMemory(material + total, mbNorm, mLen);
-	total += mLen;
-	material[total++] = 0;
-	RtlCopyMemory(material + total, diskNorm, dLen);
-	total += dLen;
-	material[total++] = 0;
-	/* tpm_ek_hash empty */
-	material[total++] = 0;
-	/* product_salt empty */
-
-	status = CdpLicenseSha256(material, total, Fingerprint);
+	status = CdpLicenseCodecBuildHardwareFingerprintMaterial(mbRaw, DiskSerial,
+		mbNorm, diskNorm, material, sizeof(material), &materialLength);
+	if (NT_SUCCESS(status))
+	{
+		RtlStringCbCopyA(MbUuid, Cdp_LICENSE_MB_UUID_CHARS, mbNorm);
+		RtlStringCbCopyA(DiskSerial, Cdp_LICENSE_DISK_SERIAL_CHARS, diskNorm);
+		status = CdpLicenseSha256(material, materialLength, Fingerprint);
+	}
 	RtlSecureZeroMemory(material, sizeof(material));
 	return status;
 }

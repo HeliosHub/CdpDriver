@@ -97,18 +97,89 @@ NTSTATUS CdpLicenseRandomBytes(
 	return BCryptGenRandom(NULL, Buffer, Length, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
 }
 
+/*
+ * 组装结果的结构自检常量（O-01/O-02）
+ *
+ * 注意：内核 WDK 的 bcrypt.h 里 BCRYPT_RSAPUBLIC_BLOB 只是宽字符串宏
+ * （L"RSAPUBLICBLOB"，用于 BCryptImportKeyPair 的 blob 类型参数），并没有对应的
+ * 结构体；可解析的头部结构是 BCRYPT_RSAKEY_BLOB（6 个 ULONG，不含指针）。
+ * 因此这里按"头部 + 紧跟的指数 + 紧跟的模数"的紧凑布局自行按偏移解析，
+ * 不能用用户态 SDK winternl.h 里那种带 PublicExponent/Modulus 指针的结构。
+ *
+ * 紧凑布局：
+ *   Magic(4) | BitLength(4) | cbPublicExp(4) | cbModulus(4) | exp[cbExp] | mod[cbMod]
+ *   4+4+4+4 + 3 + 256 = 283 = Cdp_VENDOR_PUB_BLOB_SIZE
+ */
+#define Cdp_VENDOR_KEY_BITS      2048u
+#define Cdp_VENDOR_PUB_EXP       65537UL
+#define Cdp_VENDOR_EXP_BYTES     3u  /* 65537 = 0x010001 */
+#define Cdp_VENDOR_HDR_BYTES     24u /* sizeof(BCRYPT_RSAKEY_BLOB) 在本实现上为 24 */
+#define Cdp_VENDOR_EXP_OFFSET    24u /* 指数紧随头部 */
+#define Cdp_VENDOR_MOD_OFFSET    27u /* 24 + 3 */
+
+C_ASSERT(sizeof(BCRYPT_RSAKEY_BLOB) == Cdp_VENDOR_HDR_BYTES);
+C_ASSERT(FIELD_OFFSET(BCRYPT_RSAKEY_BLOB, Magic) == 0);
+C_ASSERT(FIELD_OFFSET(BCRYPT_RSAKEY_BLOB, BitLength) == 4);
+C_ASSERT(FIELD_OFFSET(BCRYPT_RSAKEY_BLOB, cbPublicExp) == 8);
+C_ASSERT(FIELD_OFFSET(BCRYPT_RSAKEY_BLOB, cbModulus) == 12);
+C_ASSERT(Cdp_VENDOR_MOD_OFFSET + (Cdp_VENDOR_KEY_BITS / 8) ==
+	Cdp_VENDOR_PUB_BLOB_SIZE);
+
+/*
+ * 使用两个全局数组g_CdpVendorPubShardA和g_CdpVendorPubShardB组装Vendor公钥。
+ *
+ * O-01/O-02：
+ *   blob[i] = ShardA[i] ^ ShardB[i]     —— 分片存放，二进制中不出现完整公钥
+ *   再对组装结果做结构自检              —— 见 CdpLicenseCheckVendorBlobStructure
+ *
+ * 历史实现里的"交叉校验"
+ *     check = g_CdpVendorPubShardA[i] ^ g_CdpVendorPubShardB[i];
+ *     if (v != check) return TAMPER;
+ * 是恒真式：v 与 check 由同一对全局变量按同一表达式算出，对任何取值都不成立，
+ * 等于没有校验。分片方案本身保留（能提高静态搜索成本），但校验换成对组装结果
+ * 头部/指数/长度的独立断言：攻击者若要换用自己的公钥，必须伪造出能通过该断言的
+ * blob（含 2048 位、65537 指数与紧凑布局），而不再是改写任意一个分片就自动成立。
+ */
+static NTSTATUS CdpLicenseCheckVendorBlobStructure(
+	_In_reads_bytes_(Cdp_VENDOR_PUB_BLOB_SIZE) const UCHAR* Blob)
+{
+	const BCRYPT_RSAKEY_BLOB* hdr = (const BCRYPT_RSAKEY_BLOB*)Blob;
+	ULONG expValue = 0;
+	ULONG i;
+
+	/* 头部 magic / 位长 / 指数与模数长度 */
+	if (hdr->Magic != BCRYPT_RSAPUBLIC_MAGIC ||
+		hdr->BitLength != Cdp_VENDOR_KEY_BITS ||
+		hdr->cbModulus != (Cdp_VENDOR_KEY_BITS / 8) ||
+		hdr->cbPublicExp != Cdp_VENDOR_EXP_BYTES ||
+		hdr->cbPrime1 != 0 ||
+		hdr->cbPrime2 != 0)
+	{
+		Cdp_LIC_FAIL("vendor blob header invalid");
+		return STATUS_CDP_LICENSE_TAMPER;
+	}
+
+	/* 指数按小端读入并比对 65537（0x010001） */
+	for (i = 0; i < Cdp_VENDOR_EXP_BYTES; ++i)
+		expValue |= ((ULONG)Blob[Cdp_VENDOR_EXP_OFFSET + i]) << (8u * i);
+	if (expValue != Cdp_VENDOR_PUB_EXP)
+	{
+		Cdp_LIC_FAIL("vendor blob exponent != 65537");
+		return STATUS_CDP_LICENSE_TAMPER;
+	}
+
+	return STATUS_SUCCESS;
+}
+
 /* 使用两个全局数组g_CdpVendorPubShardA和g_CdpVendorPubShardB组装Vendor公钥 */
 NTSTATUS CdpLicenseTrustAssemblePublicKey(
 	_Out_writes_bytes_to_(OutCapacity, *OutLength) UCHAR* Out,
 	_In_ ULONG OutCapacity,
 	_Out_ PULONG OutLength)
 {
-	/*
-	 * O-01/O-02：运行时 XOR 组装；并与分片再算一遍交叉校验，
-	 * 防止只 patch 其中一个副本。
-	 */
 	UCHAR copyA[Cdp_VENDOR_PUB_BLOB_SIZE];
 	UCHAR copyB[Cdp_VENDOR_PUB_BLOB_SIZE];
+	NTSTATUS status;
 	ULONG i;
 
 	if (!Out || !OutLength)
@@ -124,21 +195,20 @@ NTSTATUS CdpLicenseTrustAssemblePublicKey(
 	RtlCopyMemory(copyA, g_CdpVendorPubShardA, Cdp_VENDOR_PUB_BLOB_SIZE);
 	RtlCopyMemory(copyB, g_CdpVendorPubShardB, Cdp_VENDOR_PUB_BLOB_SIZE);
 	for (i = 0; i < Cdp_VENDOR_PUB_BLOB_SIZE; ++i)
-	{
-		UCHAR v = (UCHAR)(copyA[i] ^ copyB[i]); // 组装Vendor公钥
-		UCHAR check = (UCHAR)(g_CdpVendorPubShardA[i] ^ g_CdpVendorPubShardB[i]); // 交叉校验
-		if (v != check)
-		{
-			CdpLocalSealSecureZero(copyA, sizeof(copyA));
-			CdpLocalSealSecureZero(copyB, sizeof(copyB));
-			Cdp_LIC_FAIL("STATUS_CDP_LICENSE_TAMPER: if (v != check)");
-			return STATUS_CDP_LICENSE_TAMPER;
-		}
-		Out[i] = v;
-	}
-	*OutLength = Cdp_VENDOR_PUB_BLOB_SIZE;
+		Out[i] = (UCHAR)(copyA[i] ^ copyB[i]); // 组装Vendor公钥
+
 	CdpLocalSealSecureZero(copyA, sizeof(copyA));
 	CdpLocalSealSecureZero(copyB, sizeof(copyB));
+
+	/* 分片本身的一致性由 XOR 组装保证；这里校验组装结果的正确性 */
+	status = CdpLicenseCheckVendorBlobStructure(Out);
+	if (!NT_SUCCESS(status))
+	{
+		CdpLocalSealSecureZero(Out, Cdp_VENDOR_PUB_BLOB_SIZE);
+		return status;
+	}
+
+	*OutLength = Cdp_VENDOR_PUB_BLOB_SIZE;
 	return STATUS_SUCCESS;
 }
 

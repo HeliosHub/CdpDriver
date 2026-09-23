@@ -8,7 +8,6 @@
 #endif
 #include "CdpJournalCodec.h"
 
-#define Cdp_CRC32C_POLY 0x82F63B78UL
 #ifndef Cdp_USERMODE
 #if DBG
 #define Cdp_JOURNAL_DIAG(fmt, ...) \
@@ -20,8 +19,6 @@
 #define Cdp_JOURNAL_DIAG(fmt, ...) ((void)0)
 #endif
 
-static ULONG g_CdpCrc32cTable[256];
-static volatile LONG g_CdpCrc32cReady;
 #ifndef Cdp_USERMODE
 NTSYSAPI NTSTATUS NTAPI ZwFlushBuffersFile(
 	_In_ HANDLE FileHandle,
@@ -51,15 +48,6 @@ static PCdp_BRANCH_INFO_NODE CdpBranchTreeFindBySequence(
 	_In_ PCdp_BRANCH_INFO_TREE BranchTree,
 	_In_ UINT64 Sequence);
 
-static VOID CdpStallBrief(VOID)
-{
-#ifdef Cdp_USERMODE
-	SwitchToThread();
-#else
-	KeStallExecutionProcessor(1);
-#endif
-}
-
 static UINT64 CdpAlignDown64(_In_ UINT64 Value, _In_ ULONG Alignment)
 {
 	return CdpJournalCodecAlignDown64(Value, Alignment);
@@ -70,44 +58,12 @@ static UINT64 CdpAlignUp64(_In_ UINT64 Value, _In_ ULONG Alignment)
 	return CdpJournalCodecAlignUp64(Value, Alignment);
 }
 
-static VOID CdpInitializeCrc32c(VOID)
-{
-	ULONG table[256];
-	ULONG i;
-
-	if (InterlockedCompareExchange(&g_CdpCrc32cReady, 1, 0) != 0)
-	{
-		while (InterlockedCompareExchange(&g_CdpCrc32cReady, 0, 0) != 2)
-			CdpStallBrief();
-		return;
-	}
-
-	for (i = 0; i < RTL_NUMBER_OF(table); ++i)
-	{
-		ULONG crc = i;
-		ULONG bit;
-		for (bit = 0; bit < 8; ++bit)
-			crc = (crc & 1) ? ((crc >> 1) ^ Cdp_CRC32C_POLY) : (crc >> 1);
-		table[i] = crc;
-	}
-	RtlCopyMemory(g_CdpCrc32cTable, table, sizeof(table));
-	InterlockedExchange(&g_CdpCrc32cReady, 2);
-}
-
 static ULONG CdpCrc32c(
 	_In_ ULONG InitialCrc,
 	_In_reads_bytes_(Length) const VOID* Buffer,
 	_In_ SIZE_T Length)
 {
-	const UCHAR* bytes = (const UCHAR*)Buffer;
-	ULONG crc = InitialCrc ^ 0xFFFFFFFFUL;
-
-	if (InterlockedCompareExchange(&g_CdpCrc32cReady, 0, 0) != 2)
-		CdpInitializeCrc32c();
-
-	while (Length--)
-		crc = g_CdpCrc32cTable[(crc ^ *bytes++) & 0xFF] ^ (crc >> 8);
-	return crc ^ 0xFFFFFFFFUL;
+	return CdpJournalCodecCrc32c(InitialCrc, Buffer, Length);
 }
 
 static PVOID CdpAllocateAligned(
@@ -1113,80 +1069,8 @@ static BOOLEAN CdpJournalSuperblockValid(
 	_In_ PCdp_JOURNAL Journal,
 	_In_ const Cdp_JOURNAL_SUPERBLOCK* Superblock)
 {
-	ULONG crc;
-	UINT64 usableStart;
-	UINT64 usableEnd;
-
-	if (Superblock->Magic != Cdp_JOURNAL_MAGIC ||
-		Superblock->Version != Cdp_JOURNAL_VERSION ||
-		Superblock->SectorSize != Journal->SectorSize ||
-		Superblock->PartitionSize != Journal->PartitionSize)
-	{
-		return FALSE;
-	}
-	crc = CdpCrc32c(
-		0,
-		Superblock,
-		FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, Crc32c));
-	if (crc != Superblock->Crc32c)
-		return FALSE;
-	if ((Superblock->Flags & Cdp_JOURNAL_FLAG_RECOVERY_PENDING) != 0 &&
-		(Superblock->RecoveryTargetTime100ns == 0 ||
-		 CdpCrc32c(0, Superblock,
-			FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, RecoveryCrc32c)) !=
-			Superblock->RecoveryCrc32c))
-	{
-		return FALSE;
-	}
-	if (CdpCrc32c(0, Superblock,
-		FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, MetadataCrc32c)) !=
-		Superblock->MetadataCrc32c)
-	{
-		return FALSE;
-	}
-	if (Superblock->Version >= Cdp_JOURNAL_VERSION &&
-		(Superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_POINT_SET) != 0 &&
-		(Superblock->RestorePointTime100ns == 0 ||
-		 CdpCrc32c(0, Superblock,
-			FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, RestorePointCrc32c)) !=
-			Superblock->RestorePointCrc32c))
-	{
-		return FALSE;
-	}
-	if ((Superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_BOOT_PENDING) != 0 &&
-		(Superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_POINT_SET) == 0)
-	{
-		return FALSE;
-	}
-	if ((Superblock->Flags & Cdp_JOURNAL_FLAG_CREDENTIAL_CONFIGURED) != 0 &&
-		(Superblock->Credential.KdfAlgorithm != Cdp_CREDENTIAL_KDF_PBKDF2_SHA256 ||
-		 Superblock->Credential.KdfIterations == 0 ||
-		 Superblock->Credential.AuthEpoch == 0))
-	{
-		return FALSE;
-	}
-#ifdef CDP_LICENSE
-	if ((Superblock->Flags & Cdp_JOURNAL_FLAG_LICENSE_CONFIGURED) != 0 &&
-		(Superblock->LicenseBlobLength == 0 || Superblock->LicenseBlobLength > Cdp_LICENSE_BLOB_MAX ||
-		 Superblock->E0Length == 0 || Superblock->E0Length > Cdp_E0_SEAL_MAX ||
-		 CdpCrc32c(0, Superblock, FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, LicenseCrc32c)) != Superblock->LicenseCrc32c))
-		return FALSE;
-#endif
-	if (Superblock->CurrentBranchNumber <= 0 ||
-		Superblock->HighestBranchNumber < Superblock->CurrentBranchNumber)
-	{
-		return FALSE;
-	}
-
-	usableStart = CdpJournalUsableStart(Journal);
-	usableEnd = Journal->PartitionSize;
-	if (Superblock->LastHeaderRegionOff < usableStart ||
-		Superblock->LastHeaderRegionOff + Cdp_JOURNAL_HEADER_REGION_SIZE > usableEnd ||
-		(Superblock->LastHeaderRegionOff % Journal->SectorSize) != 0)
-	{
-		return FALSE;
-	}
-	return TRUE;
+	return CdpJournalCodecSuperblockValid(Superblock, Journal->SectorSize,
+		Journal->PartitionSize, CdpJournalUsableStart(Journal));
 }
 
 static NTSTATUS CdpJournalReadRegionLink(
@@ -2896,33 +2780,8 @@ static NTSTATUS CdpJournalAppendCheckpointRemap(
 	_In_ UINT64 FileOffset,
 	_In_ ULONG DataLength)
 {
-	PCdp_CHECKPOINT_REMAP grown;
-	ULONG newCapacity;
-
-	if (*Count == *Capacity)
-	{
-		newCapacity = *Capacity == 0 ? 8 : *Capacity * 2;
-		if (newCapacity < *Capacity ||
-			newCapacity > MAXULONG / sizeof(**Remaps))
-			return STATUS_INTEGER_OVERFLOW;
-		grown = (PCdp_CHECKPOINT_REMAP)cdpalloc(
-			newCapacity * sizeof(*grown));
-		if (!grown)
-			return STATUS_INSUFFICIENT_RESOURCES;
-		if (*Remaps)
-		{
-			RtlCopyMemory(grown, *Remaps, *Count * sizeof(*grown));
-			cdpfree(*Remaps);
-		}
-		*Remaps = grown;
-		*Capacity = newCapacity;
-	}
-	(*Remaps)[*Count].VolumeOffset = VolumeOffset;
-	(*Remaps)[*Count].FileOffset = FileOffset;
-	(*Remaps)[*Count].PreviousFileOffset = FileOffset;
-	(*Remaps)[*Count].DataLength = DataLength;
-	(*Count)++;
-	return STATUS_SUCCESS;
+	return CdpJournalCodecAppendCheckpointRemap(Remaps, Count, Capacity,
+		VolumeOffset, FileOffset, DataLength);
 }
 
 static BOOLEAN CdpJournalOffsetInRingSpan(
@@ -2942,81 +2801,9 @@ static NTSTATUS CdpJournalMeasureCheckpointGapsLocked(
 	_In_ ULONG RangeCount,
 	_Out_ PUINT64 NewCheckpointBytes)
 {
-	UINT64 total = 0;
-	ULONG rangeIndex;
-
-	for (rangeIndex = 0; rangeIndex < RangeCount; ++rangeIndex)
-	{
-		UINT64 rangeStart = Ranges[rangeIndex].VolumeOffset;
-		UINT64 rangeEnd;
-		UINT64 cursor;
-
-		if (Ranges[rangeIndex].DataLength == 0 ||
-			rangeStart > MAXUINT64 - Ranges[rangeIndex].DataLength)
-		{
-			return STATUS_INVALID_PARAMETER;
-		}
-		rangeEnd = rangeStart + Ranges[rangeIndex].DataLength;
-		if (rangeIndex != 0)
-		{
-			UINT64 previousEnd = Ranges[rangeIndex - 1].VolumeOffset +
-				Ranges[rangeIndex - 1].DataLength;
-			if (rangeStart < previousEnd)
-				return STATUS_INVALID_PARAMETER;
-		}
-
-		cursor = rangeStart;
-		while (cursor < rangeEnd)
-		{
-			PCdp_RUNTIME_CHECKPOINT checkpoint;
-			UINT64 coveredEnd = cursor;
-			UINT64 nextCoveredStart = rangeEnd;
-
-			for (checkpoint = Journal->CheckpointFirst;
-				checkpoint;
-				checkpoint = checkpoint->Next)
-			{
-				UINT64 checkpointEnd;
-				if (checkpoint->VolumeOffset >
-					MAXUINT64 - checkpoint->DataLength)
-				{
-					return STATUS_DISK_CORRUPT_ERROR;
-				}
-				checkpointEnd = checkpoint->VolumeOffset +
-					checkpoint->DataLength;
-				if (checkpoint->VolumeOffset <= cursor &&
-					checkpointEnd > cursor)
-				{
-					if (checkpointEnd > coveredEnd)
-						coveredEnd = checkpointEnd;
-				}
-				else if (checkpoint->VolumeOffset > cursor &&
-					checkpoint->VolumeOffset < nextCoveredStart)
-				{
-					nextCoveredStart = checkpoint->VolumeOffset;
-				}
-			}
-
-			if (coveredEnd > cursor)
-			{
-				cursor = coveredEnd < rangeEnd ? coveredEnd : rangeEnd;
-			}
-			else
-			{
-				UINT64 gapEnd = nextCoveredStart < rangeEnd ?
-					nextCoveredStart : rangeEnd;
-				UINT64 alignedLength = CdpAlignUp64(
-					gapEnd - cursor, Journal->SectorSize);
-				if (total > MAXUINT64 - alignedLength)
-					return STATUS_INTEGER_OVERFLOW;
-				total += alignedLength;
-				cursor = gapEnd;
-			}
-		}
-	}
-
-	*NewCheckpointBytes = total;
-	return STATUS_SUCCESS;
+	return CdpJournalCodecMeasureCheckpointGaps(
+		Journal->CheckpointFirst, Ranges, RangeCount, Journal->SectorSize,
+		NewCheckpointBytes);
 }
 
 NTSTATUS CdpJournalBeginCheckpointMergeReservation(
@@ -3030,12 +2817,10 @@ NTSTATUS CdpJournalBeginCheckpointMergeReservation(
 	_Out_ PUINT64 ReservedBytes)
 {
 	Cdp_HEADER_REGION_LINK link;
-	PCdp_RUNTIME_CHECKPOINT checkpoint;
 	UINT64 newBytes = 0;
 	UINT64 relocationBytes = 0;
 	UINT64 total;
 	UINT64 wrapPadding = 0;
-	UINT64 usableEnd;
 	NTSTATUS status = STATUS_SUCCESS;
 
 	if (!Journal || (!Ranges && RangeCount != 0) || !NewCheckpointBytes ||
@@ -3070,47 +2855,14 @@ NTSTATUS CdpJournalBeginCheckpointMergeReservation(
 	if (!NT_SUCCESS(status))
 		goto cleanup_locked;
 
-	for (checkpoint = Journal->CheckpointFirst;
-		checkpoint;
-		checkpoint = checkpoint->Next)
-	{
-		UINT64 alignedLength;
-		if (!CdpJournalOffsetInRingSpan(
-				checkpoint->FileOffset,
-				RegionOffset + Cdp_JOURNAL_HEADER_REGION_SIZE,
-				link.NextRegionOff))
-		{
-			continue;
-		}
-		alignedLength = CdpAlignUp64(
-			checkpoint->DataLength, Journal->SectorSize);
-		if (relocationBytes > MAXUINT64 - alignedLength)
-		{
-			status = STATUS_INTEGER_OVERFLOW;
-			goto cleanup_locked;
-		}
-		relocationBytes += alignedLength;
-	}
-	if (newBytes > MAXUINT64 - relocationBytes)
-	{
-		status = STATUS_INTEGER_OVERFLOW;
+	status = CdpJournalCodecCalculateCheckpointMergeReservation(
+		Journal->CheckpointFirst, RegionOffset, link.NextRegionOff,
+		Cdp_JOURNAL_HEADER_REGION_SIZE, Journal->SectorSize, newBytes,
+		CdpJournalUsableStart(Journal), CdpJournalUsableEnd(Journal),
+		Journal->PayloadRegionOff, Journal->PayloadBytesUsed,
+		&relocationBytes, &wrapPadding, &total);
+	if (!NT_SUCCESS(status))
 		goto cleanup_locked;
-	}
-	total = newBytes + relocationBytes;
-	usableEnd = CdpJournalUsableEnd(Journal);
-	if (total != 0 && total > usableEnd - CdpJournalUsableStart(Journal))
-	{
-		status = STATUS_DISK_FULL;
-		goto cleanup_locked;
-	}
-	if (total != 0 && total > usableEnd - Journal->PayloadRegionOff)
-		wrapPadding = usableEnd - Journal->PayloadRegionOff;
-	if (Journal->PayloadBytesUsed > MAXUINT64 - wrapPadding ||
-		Journal->PayloadBytesUsed + wrapPadding > MAXUINT64 - total)
-	{
-		status = STATUS_INTEGER_OVERFLOW;
-		goto cleanup_locked;
-	}
 	if (total != 0)
 	{
 		status = CdpJournalEnsureContiguousLocked(Journal, total);
@@ -6277,32 +6029,7 @@ static NTSTATUS CdpPreviewTreeInsertRaw(
 	_Inout_ PCdp_PREVIEW_TREE Tree,
 	_In_ const Cdp_JOURNAL_RECORD* Record)
 {
-	PCdp_PREVIEW_TREE_NODE node;
-
-	if (!Tree || !Record)
-		return STATUS_INVALID_PARAMETER;
-	if (Record->DataLength == 0)
-		return STATUS_SUCCESS;
-
-	node = (PCdp_PREVIEW_TREE_NODE)cdpalloc(sizeof(*node));
-	if (!node)
-		return STATUS_INSUFFICIENT_RESOURCES;
-
-	RtlZeroMemory(node, sizeof(*node));
-	node->Start = Record->VolumeOffset;
-	node->End = Record->VolumeOffset + Record->DataLength;
-	node->MaxEnd = node->End;
-	node->FileOffset = Record->FileOffset;
-	node->WallClock100ns = Record->WallClock100ns;
-	node->DataLength = Record->DataLength;
-	node->Sequence = Record->Sequence;
-	node->MinValidSequence = Record->Sequence;
-	node->Height = 1;
-	node->Invalid = FALSE;
-
-	Tree->Root = CdpPreviewTreeAvlInsertNode(Tree->Root, node);
-	Tree->NodeCount++;
-	return STATUS_SUCCESS;
+	return CdpJournalCodecPreviewTreeInsertRaw(Tree, Record);
 }
 
 static PCdp_PREVIEW_TREE_NODE CdpPreviewTreeAvlRebalance(
@@ -6403,55 +6130,7 @@ static NTSTATUS CdpPreviewTreeRemoveRangeInPlace(
 	_In_ UINT64 CutStart,
 	_In_ UINT64 CutEnd)
 {
-	NTSTATUS status;
-
-	if (!Tree || CutStart >= CutEnd)
-		return STATUS_INVALID_PARAMETER;
-
-	for (;;)
-	{
-		PCdp_PREVIEW_TREE_NODE overlap = CdpPreviewTreeFindFirstOverlap(
-			Tree->Root, CutStart, CutEnd);
-		Cdp_JOURNAL_RECORD saved;
-		BOOLEAN removed = FALSE;
-
-		if (!overlap)
-			break;
-		RtlZeroMemory(&saved, sizeof(saved));
-		saved.WallClock100ns = overlap->WallClock100ns;
-		saved.VolumeOffset = overlap->Start;
-		saved.FileOffset = overlap->FileOffset;
-		saved.DataLength = overlap->DataLength;
-		saved.Sequence = overlap->Sequence;
-
-		Tree->Root = CdpPreviewTreeAvlDeleteByStart(
-			Tree->Root, overlap->Start, &removed);
-		if (!removed)
-			return STATUS_DISK_CORRUPT_ERROR;
-		Tree->NodeCount--;
-
-		if (saved.VolumeOffset < CutStart)
-		{
-			Cdp_JOURNAL_RECORD left = saved;
-			left.DataLength = (ULONG)(CutStart - saved.VolumeOffset);
-			status = CdpPreviewTreeInsertRaw(Tree, &left);
-			if (!NT_SUCCESS(status))
-				return status;
-		}
-		if (saved.VolumeOffset + saved.DataLength > CutEnd)
-		{
-			Cdp_JOURNAL_RECORD right = saved;
-			right.VolumeOffset = CutEnd;
-			right.FileOffset = saved.FileOffset +
-				(CutEnd - saved.VolumeOffset);
-			right.DataLength = (ULONG)(saved.VolumeOffset +
-				saved.DataLength - CutEnd);
-			status = CdpPreviewTreeInsertRaw(Tree, &right);
-			if (!NT_SUCCESS(status))
-				return status;
-		}
-	}
-	return STATUS_SUCCESS;
+	return CdpJournalCodecPreviewTreeRemoveRange(Tree, CutStart, CutEnd);
 }
 
 // Build and append paths apply records in chronological order. A newly applied
@@ -7757,24 +7436,7 @@ static NTSTATUS CdpPreviewTreeOverlaySnapshot(
 	_Inout_ PCdp_PREVIEW_TREE Tree,
 	_In_opt_ PCdp_PREVIEW_TREE_NODE Node)
 {
-	Cdp_JOURNAL_RECORD record;
-	NTSTATUS status;
-
-	if (!Node)
-		return STATUS_SUCCESS;
-	status = CdpPreviewTreeOverlaySnapshot(Tree, Node->Left);
-	if (!NT_SUCCESS(status))
-		return status;
-	RtlZeroMemory(&record, sizeof(record));
-	record.WallClock100ns = Node->WallClock100ns;
-	record.VolumeOffset = Node->Start;
-	record.FileOffset = Node->FileOffset;
-	record.Sequence = Node->Sequence;
-	record.DataLength = Node->DataLength;
-	status = CdpPreviewTreeOverlayLatest(Tree, &record);
-	if (!NT_SUCCESS(status))
-		return status;
-	return CdpPreviewTreeOverlaySnapshot(Tree, Node->Right);
+	return CdpJournalCodecOverlayPreviewSnapshot(Tree, Node);
 }
 
 NTSTATUS CdpJournalBuildSettledPreviewTree(

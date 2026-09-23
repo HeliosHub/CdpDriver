@@ -8,6 +8,14 @@
  *   blob[i] = ShardA[i] ^ ShardB[i]
  * 与当前调试库 cdpserver/keys 中 active 公钥一致；轮换密钥后需重新生成本文件。
  *
+ * 注意（勿再引入恒真校验）：曾在组装循环里写过
+ *   check = ShardA[i] ^ ShardB[i];  if (v != check) return TAMPER;
+ * 这是恒真式——v 与 check 同源同表达式，永远相等，起不到"防止只 patch 一份"
+ * 的作用。现在的校验在 CdpLicenseTrust.c 的 CdpLicenseCheckVendorBlobStructure：
+ * 对组装结果的 magic('RSA1')、BitLength(2048)、cbPublicExp(3)、指数(65537)、
+ * 模数长度、以及指针必须落在 blob 内部做独立断言。若要换密钥，除更新本文件外
+ * 还要确认这些断言仍然成立（例如改用 3 以外的指数长度会直接失败）。
+ *
  * 切勿在仓库中存放完整未分片公钥的明文副本供生产使用。
  */
 static const UCHAR g_CdpVendorPubShardA[283] = {

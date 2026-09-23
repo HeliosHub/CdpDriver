@@ -1,4 +1,4 @@
-﻿#include "CdpIrpDispatchs.h"
+#include "CdpIrpDispatchs.h"
 #include "..\CdpCore\include\cdp_core.h"
 #include "CdpCredential.h"
 #include "CdpIoctlGuard.h"
@@ -9,6 +9,12 @@
 #include <ntstrsafe.h>
 #ifdef CDP_LICENSE
 #include "CdpLicenseGate.h"
+/*
+ * 闸门调用一律走 CdpLicenseGateCall* 转发（定义在 .licprot 内、含代码混淆）。
+ * 本文件在 I/O 热路径上，不参与混淆与完整性哈希；若在此直接调用闸门函数，
+ * 攻击者改动这一处返回码判断即可让整套授权机制完全不被执行。
+ */
+#include "CdpLicenseGateCall.h"
 #endif
 
 static volatile LONG64 g_CdpShutdownHopSequence = 0;
@@ -3502,7 +3508,7 @@ static NTSTATUS CdpBeginRecovery(
 		return STATUS_INVALID_DEVICE_STATE;
 #ifdef CDP_LICENSE
 	RtlZeroMemory(&licenseLocal, sizeof(licenseLocal));
-	status = CdpLicenseGateBeforeOp(DriverExt, &licenseLocal);
+	status = CdpLicenseGateCallBeforeOp(DriverExt, &licenseLocal);
 	if (!NT_SUCCESS(status))
 	{
 		InterlockedExchange(&sourceExt->Phase, previousPhase);
@@ -3528,7 +3534,7 @@ static NTSTATUS CdpBeginRecovery(
 	{
 #ifdef CDP_LICENSE
 		if (licenseHeld)
-			CdpLicenseGateAbortOp();
+			CdpLicenseGateCallAbortOp();
 #endif
 		InterlockedExchange(&sourceExt->Phase, previousPhase);
 		return status;
@@ -3538,7 +3544,7 @@ static NTSTATUS CdpBeginRecovery(
 	{
 #ifdef CDP_LICENSE
 		if (licenseHeld)
-			CdpLicenseGateAbortOp();
+			CdpLicenseGateCallAbortOp();
 #endif
 		InterlockedExchange(&sourceExt->Phase, previousPhase);
 		return STATUS_DEVICE_NOT_READY;
@@ -3558,10 +3564,10 @@ static NTSTATUS CdpBeginRecovery(
 		NULL);
 	CdpWaitForCurrentViewReads(sourceExt);
 #ifdef CDP_LICENSE
-	status = CdpLicenseGateArmOp(DriverExt, &licenseLocal);
+	status = CdpLicenseGateCallArmOp(DriverExt, &licenseLocal);
 	if (!NT_SUCCESS(status))
 	{
-		CdpLicenseGateAbortOp();
+		CdpLicenseGateCallAbortOp();
 		KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
 		InterlockedExchange(&sourceExt->Phase, previousPhase);
 		return status;
@@ -3583,13 +3589,13 @@ static NTSTATUS CdpBeginRecovery(
 	{
 #ifdef CDP_LICENSE
 		if (licenseHeld)
-			CdpLicenseGateAbortOp();
+			CdpLicenseGateCallAbortOp();
 #endif
 		InterlockedExchange(&sourceExt->Phase, previousPhase);
 		return status;
 	}
 #ifdef CDP_LICENSE
-	status = CdpLicenseGateAfterOpSuccess(DriverExt, &licenseLocal);
+	status = CdpLicenseGateCallAfterOpSuccess(DriverExt, &licenseLocal);
 	if (!NT_SUCCESS(status))
 		return status;
 #endif

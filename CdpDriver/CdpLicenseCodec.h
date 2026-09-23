@@ -5,6 +5,13 @@
 #ifdef CDP_LICENSE
 
 SIZE_T CdpLicenseCodecStrLen(const CHAR* String, SIZE_T Maximum);
+VOID CdpLicenseCodecNormalizeMbUuid(const CHAR* Input, CHAR* Output);
+VOID CdpLicenseCodecNormalizeDiskSerial(const CHAR* Input, CHAR* Output);
+VOID CdpLicenseCodecUuidBytesToString(const UCHAR* Bytes, CHAR* Output);
+NTSTATUS CdpLicenseCodecBuildHardwareFingerprintMaterial(
+    const CHAR* MbUuidInput, const CHAR* DiskSerialInput,
+    CHAR* NormalizedMbUuid, CHAR* NormalizedDiskSerial,
+    UCHAR* Material, ULONG MaterialCapacity, PULONG MaterialLength);
 BOOLEAN CdpLicenseCodecCStrEq(const CHAR* Left, const CHAR* Right);
 NTSTATUS CdpLicenseCodecHexDecode(const CHAR* Hex, ULONG HexLen,
     UCHAR* Output, ULONG OutputCapacity, PULONG OutputLength);

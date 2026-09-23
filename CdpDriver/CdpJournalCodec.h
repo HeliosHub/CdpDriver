@@ -10,6 +10,11 @@ typedef struct _Cdp_PREVIEW_HIT
     UINT64 Sequence;
 } Cdp_PREVIEW_HIT, *PCdp_PREVIEW_HIT;
 
+ULONG CdpJournalCodecCrc32c(ULONG InitialCrc, const VOID* Buffer,
+    SIZE_T Length);
+BOOLEAN CdpJournalCodecSuperblockValid(
+    const Cdp_JOURNAL_SUPERBLOCK* Superblock, ULONG SectorSize,
+    UINT64 PartitionSize, UINT64 UsableStart);
 UINT64 CdpJournalCodecAlignDown64(UINT64 Value, ULONG Alignment);
 UINT64 CdpJournalCodecAlignUp64(UINT64 Value, ULONG Alignment);
 NTSTATUS CdpJournalCodecRingDistance(UINT64 UsableStart, UINT64 UsableEnd,
@@ -80,4 +85,24 @@ VOID CdpJournalCodecCollectPreviewOverlaps(PCdp_PREVIEW_TREE_NODE Node,
 VOID CdpJournalCodecUpdatePreviewNode(PCdp_PREVIEW_TREE_NODE Node);
 VOID CdpJournalCodecCopyPreviewNodeData(PCdp_PREVIEW_TREE_NODE Destination,
     const PCdp_PREVIEW_TREE_NODE Source);
+NTSTATUS CdpJournalCodecPreviewTreeInsertRaw(PCdp_PREVIEW_TREE Tree,
+    const Cdp_JOURNAL_RECORD* Record);
+NTSTATUS CdpJournalCodecPreviewTreeRemoveRange(PCdp_PREVIEW_TREE Tree,
+    UINT64 CutStart, UINT64 CutEnd);
+NTSTATUS CdpJournalCodecOverlayPreviewSnapshot(PCdp_PREVIEW_TREE Tree,
+    PCdp_PREVIEW_TREE_NODE Node);
+NTSTATUS CdpJournalCodecMeasureCheckpointGaps(
+    PCdp_RUNTIME_CHECKPOINT FirstCheckpoint,
+    const Cdp_CHECKPOINT_MERGE_RANGE* Ranges, ULONG RangeCount,
+    ULONG SectorSize, PUINT64 NewCheckpointBytes);
+NTSTATUS CdpJournalCodecCalculateCheckpointMergeReservation(
+    PCdp_RUNTIME_CHECKPOINT FirstCheckpoint, UINT64 RegionOffset,
+    UINT64 NextRegionOffset, ULONG HeaderRegionSize, ULONG SectorSize,
+    UINT64 NewCheckpointBytes, UINT64 UsableStart, UINT64 UsableEnd,
+    UINT64 PayloadRegionOffset, UINT64 PayloadBytesUsed,
+    PUINT64 RelocationBytes, PUINT64 WrapPaddingBytes,
+    PUINT64 ReservedBytes);
+NTSTATUS CdpJournalCodecAppendCheckpointRemap(
+    PCdp_CHECKPOINT_REMAP* Remaps, PULONG Count, PULONG Capacity,
+    UINT64 VolumeOffset, UINT64 FileOffset, ULONG DataLength);
 
