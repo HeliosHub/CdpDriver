@@ -115,6 +115,10 @@
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
+    <Link>
+      <!-- Do not publish CodeView/PDB pointers in the production driver. -->
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+    </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug-Lic|x64'">
     <DriverSign>
@@ -131,9 +135,15 @@
       <PreprocessorDefinitions>CDP_LICENSE;CDP_LICENSE_OBFUSCATE;LIC_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+	<!-- Production Release images compile out Cdp_LOG.  Enable it only for a
+	     diagnostic rebuild with /p:CdpReleaseLogging=true. -->
+	<CdpReleaseLogging Condition="'$(CdpReleaseLogging)'==''">false</CdpReleaseLogging>
+	<CdpReleaseLoggingDefinition Condition="'$(CdpReleaseLogging)'=='true'">CDP_ENABLE_RELEASE_LOGGING;</CdpReleaseLoggingDefinition>
+  </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
-      <PreprocessorDefinitions>CDP_LICENSE;CDP_LICENSE_OBFUSCATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>CDP_LICENSE;CDP_LICENSE_OBFUSCATE;CDP_RELEASE_MINIMAL_TEXT;$(CdpReleaseLoggingDefinition)%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <!-- Release x64 uses the locally built LLVM MSVC Ex compiler. The WDK linker and packaging pipeline remain unchanged. -->
@@ -142,7 +152,6 @@
 <CLToolExe>clang-cl.exe</CLToolExe>
     <LinkToolPath>E:\llvm-msvc-ex-2026-7-23\build-release-x64-obf\Release\bin\</LinkToolPath>
     <LinkToolExe>lld-link.exe</LinkToolExe>
-
     <!--
       混淆 pass 集合 + 可复现种子（单一定义，供所有受混淆单元引用）。
 
@@ -193,7 +202,7 @@
     <ClCompile Include="Driver.c" />
     <ClCompile Include="CdpJournal.c" />
     <ClCompile Include="CdpJournalCodec.c">
-      <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfPasses) %(AdditionalOptions)</AdditionalOptions>
+    <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfPasses) %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
 	<ClCompile Include="CdpCredential.c">
 	  <!-- Credential KDF and verifier checks are isolated from kernel I/O paths. -->
@@ -215,8 +224,11 @@
 	  <PreprocessorDefinitions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">CDP_OBF_BUILD_UNIT=3;%(PreprocessorDefinitions)</PreprocessorDefinitions>
 	</ClCompile>
 	<ClCompile Include="CdpLicenseGate.c">
-	  <!-- 闸门状态机。补 -fla：与 CDP_LICENSE_OBFUSCATE 的语义一致（须 CFF 的单元）。 -->
+    <!-- 闸门状态机。补 -fla：与 CDP_LICENSE_OBFUSCATE 的语义一致（须 CFF 的单元）。 -->
 	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfPasses) %(AdditionalOptions)</AdditionalOptions>
+	</ClCompile>
+	<ClCompile Include="CdpLicenseVmRecomputeCap.c">
+	  <!-- Normal object is replaced by xollvm only when build_obfuscated.ps1 receives -EnableKernelVm. -->
 	</ClCompile>
 	<ClCompile Include="CdpLicenseGateCall.c">
 	  <!-- 受保护闸门调用点：把 BEGIN/COMMIT RECOVERY 的决策点从 I/O 热路径拉回 .licprot。

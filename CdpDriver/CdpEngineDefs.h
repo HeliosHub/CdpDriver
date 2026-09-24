@@ -18,14 +18,40 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
+// Release images expose the numeric journal ABI through IOCTL_Cdp_QUERY_VERSION,
+// but do not embed product/build identifiers or user-facing command semantics.
+// This is compile-time only: debug builds retain the detailed diagnostics.
+#if defined(CDP_RELEASE_MINIMAL_TEXT)
+#define Cdp_DRIVER_VERSION_STRING ""
+#define Cdp_DRIVER_BUILD_STRING   ""
+#define Cdp_COMMAND_REPLY_TEXT(debugText) L""
+#else
 #define Cdp_DRIVER_VERSION_STRING "1.0.0"
 #define Cdp_DRIVER_BUILD_STRING   "20260918.109-release"
+#define Cdp_COMMAND_REPLY_TEXT(debugText) (debugText)
+#endif
 
-// Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.
-// Cdp_DBG: Debug builds only — verbose I/O and path tracing.
+// Production Release images compile out every Cdp_LOG call and its format
+// string.  Logging is a compile-time-only diagnostic opt-in: define
+// CDP_ENABLE_RELEASE_LOGGING through /p:CdpReleaseLogging=true when building.
+// There is deliberately no registry, IOCTL, or other runtime enable path.
+#if DBG || defined(CDP_ENABLE_RELEASE_LOGGING)
 #define Cdp_LOG(fmt, ...) \
 	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
 		"CdpDriver: " fmt, ##__VA_ARGS__)
+#else
+// Keep diagnostic-only arguments syntactically referenced so a production
+// build stays warning-clean. The compiler removes this constant-false branch,
+// including the call and format string, before code generation.
+#define Cdp_LOG(fmt, ...) do { \
+	if (0) { \
+		DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
+			"CdpDriver: " fmt, ##__VA_ARGS__); \
+	} \
+} while (0)
+#endif
+
+// Cdp_DBG remains Debug-only.
 #if DBG
 #define Cdp_DBG(fmt, ...) Cdp_LOG(fmt, ##__VA_ARGS__)
 #else

@@ -5,12 +5,24 @@ rem Usage:
 rem   build.bat
 rem   build.bat Release x64
 rem   build.bat Debug x64
+rem   build.bat Release x64 logs  (diagnostic Release image only)
 
 set "CONFIGURATION=%~1"
 if not defined CONFIGURATION set "CONFIGURATION=Release"
 
 set "PLATFORM=%~2"
 if not defined PLATFORM set "PLATFORM=x64"
+
+set "RELEASE_LOGGING=%~3"
+set "LOG_PROPERTY="
+if defined RELEASE_LOGGING (
+    if /I "%RELEASE_LOGGING%"=="logs" (
+        set "LOG_PROPERTY=/p:CdpReleaseLogging=true"
+    ) else (
+        echo [ERROR] Third argument must be "logs" when enabling Release diagnostics.
+        exit /b 1
+    )
+)
 
 set "ROOT_DIR=%~dp0"
 set "SOLUTION=%ROOT_DIR%CdpDriver.sln"
@@ -47,11 +59,12 @@ if not defined MSBUILD_EXE (
 echo [BUILD] Solution      : "%SOLUTION%"
 echo [BUILD] Configuration : %CONFIGURATION%
 echo [BUILD] Platform      : %PLATFORM%
+if defined LOG_PROPERTY echo [BUILD] Release logging: enabled (diagnostic image only)
 echo [BUILD] MSBuild       : "%MSBUILD_EXE%"
 echo.
 
 pushd "%ROOT_DIR%" >nul
-"%MSBUILD_EXE%" "%SOLUTION%" /nologo /m /t:Build /p:Configuration="%CONFIGURATION%" /p:Platform="%PLATFORM%" /v:minimal
+"%MSBUILD_EXE%" "%SOLUTION%" /nologo /m /t:Build /p:Configuration="%CONFIGURATION%" /p:Platform="%PLATFORM%" %LOG_PROPERTY% /v:minimal
 set "BUILD_RESULT=%ERRORLEVEL%"
 popd >nul
 

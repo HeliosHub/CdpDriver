@@ -32,6 +32,41 @@ extern KMUTEX g_CdpLicenseMutex;
 #define CdpLicenseUnlock() \
 	KeReleaseMutex(&g_CdpLicenseMutex, FALSE)
 
+/*
+ * Isolated capability-token recomputation core.  The gate snapshots mutable
+ * global state and passes it here so Release|x64 can replace this one object
+ * with the xollvm kernel-profile VM object after normal compilation.
+ */
+NTSTATUS CdpLicenseVmRecomputeCap(
+	_In_ ULONG SealKeyValid,
+	_In_ ULONG PendingCapValid,
+	_In_reads_bytes_(32) const UCHAR* SealKey,
+	_In_ UINT64 T0,
+	_In_ ULONG C0,
+	_In_ ULONG OpsT,
+	_In_ ULONG OpsS,
+	_In_ ULONG AMod,
+	_In_ ULONG Nonce,
+	_In_ UINT64 Issued100ns,
+	_Out_writes_bytes_(Cdp_CAP_TOKEN_BYTES) UCHAR* TokenOut);
+
+BOOLEAN CdpLicenseVmArmEvidenceValid(
+	_In_ ULONG PendingCapValid,
+	_In_ ULONG LocalCapValid,
+	_In_ ULONG LocalNonce,
+	_In_ ULONG PendingNonce,
+	_In_ UINT64 LocalIssued100ns,
+	_In_ UINT64 PendingIssued100ns,
+	_In_reads_bytes_(Cdp_CAP_TOKEN_BYTES) const UCHAR* LocalToken,
+	_In_reads_bytes_(Cdp_CAP_TOKEN_BYTES) const UCHAR* PendingToken,
+	_In_reads_bytes_(Cdp_CAP_TOKEN_BYTES) const UCHAR* RecomputedToken);
+
+BOOLEAN CdpLicenseVmCommitEvidenceValid(
+	_In_ ULONG PendingCapValid,
+	_In_ ULONG PendingCapArmed,
+	_In_reads_bytes_(Cdp_CAP_TOKEN_BYTES) const UCHAR* RecomputedToken,
+	_In_reads_bytes_(Cdp_CAP_TOKEN_BYTES) const UCHAR* PendingToken);
+
 /* 清全局状态、捕获 .licprot CRC 快照（O-16）、启动每小时推进 T0 的定时器 */
 VOID CdpLicenseInitialize(
 	_In_ PDRIVER_OBJECT DriverObject,

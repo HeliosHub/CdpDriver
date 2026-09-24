@@ -54,8 +54,7 @@ static NTSTATUS CdpVolumeBackfillWriteRelative(
 	_In_reads_bytes_(Length) const VOID* Buffer);
 static NTSTATUS CdpPreparePersistentRestoreBootForSource(
 	_Inout_ PCdp_DEVICE_EXTENSION SourceExt,
-	_Inout_ PCdp_JOURNAL Journal,
-	_In_ PCSTR Stage);
+	_Inout_ PCdp_JOURNAL Journal);
 static VOID CdpQueueOnlineJournalBind(
 	_In_ PDEVICE_OBJECT VolumeFilterDevice);
 static NTSTATUS CdpScatterReadMdlChain(
@@ -1618,22 +1617,20 @@ static BOOLEAN CdpGuidIsZero(_In_ const GUID* Guid)
 
 static NTSTATUS CdpPreparePersistentRestoreBootForSource(
 	_Inout_ PCdp_DEVICE_EXTENSION SourceExt,
-	_Inout_ PCdp_JOURNAL Journal,
-	_In_ PCSTR Stage)
+	_Inout_ PCdp_JOURNAL Journal)
 {
 	BOOLEAN previousBootConfirmed = FALSE;
 	ULONG materializedRanges = 0;
 	UINT64 materializedBytes = 0;
 	NTSTATUS status;
 
-	if (!SourceExt || !SourceExt->Core || !Journal || !Stage)
+	if (!SourceExt || !SourceExt->Core || !Journal)
 		return STATUS_INVALID_PARAMETER;
 	/* Persistent restore is allowed only after the Journal volume backend is
 	 * online. Partition0 is a read-only discovery backend. */
 	if (!Journal->TargetDevice || Journal->RawDiskHandle != NULL)
 	{
-		Cdp_LOG("[RESTORE-POINT-FAIL] stage=%s reason=journal-volume-backend-not-ready\n",
-			Stage);
+		Cdp_LOG("[RESTORE-POINT-FAIL] reason=journal-volume-backend-not-ready\n");
 		return STATUS_DEVICE_NOT_READY;
 	}
 	KeWaitForSingleObject(
@@ -1649,8 +1646,7 @@ static NTSTATUS CdpPreparePersistentRestoreBootForSource(
 	KeReleaseMutex(&SourceExt->HistoryMutex, FALSE);
 	if (NT_SUCCESS(status))
 	{
-		Cdp_LOG("[RESTORE-BOOT] stage=%s previousBootConfirmed=%u action=%s materializedRanges=%lu materializedBytes=%llu target=%llu pendingNow=%u\n",
-			Stage,
+		Cdp_LOG("[RESTORE-BOOT] previousBootConfirmed=%u action=%s materializedRanges=%lu materializedBytes=%llu target=%llu pendingNow=%u\n",
 			previousBootConfirmed ? 1u : 0u,
 			previousBootConfirmed ? "normal-restore" :
 				"materialize-current-then-restore",
@@ -1661,8 +1657,7 @@ static NTSTATUS CdpPreparePersistentRestoreBootForSource(
 	}
 	else
 	{
-		Cdp_LOG("[RESTORE-POINT-FAIL] stage=%s status=0x%08X target=%llu pending=%u\n",
-			Stage,
+		Cdp_LOG("[RESTORE-POINT-FAIL] status=0x%08X target=%llu pending=%u\n",
 			status,
 			Journal->RestorePointTime100ns,
 			Journal->RestoreBootPending ? 1u : 0u);
@@ -1862,8 +1857,7 @@ static NTSTATUS CdpActivateAutoJournal(
 		JournalEntry->Journal.RawDiskHandle == NULL)
 	{
 		status = CdpPreparePersistentRestoreBootForSource(
-			sourceExt, &JournalEntry->Journal,
-			"auto-prepare");
+			sourceExt, &JournalEntry->Journal);
 		if (!NT_SUCCESS(status))
 		{
 			Cdp_LOG("[RESTORE-POINT-FAIL] stage=auto-prepare-ready-backend status=0x%08X; protection activation blocked\n",
@@ -2249,8 +2243,7 @@ static NTSTATUS CdpEnsureOnlineAndBindWaitingJournalBackend(
 		!journalEntry->Journal.RecoveryPending)
 	{
 		status = CdpPreparePersistentRestoreBootForSource(
-			sourceExt, &journalEntry->Journal,
-			"post-journal-online");
+			sourceExt, &journalEntry->Journal);
 		if (!NT_SUCCESS(status))
 		{
 			Cdp_LOG("[RESTORE-POINT-FAIL] stage=post-journal-online status=0x%08X; source FIFO remains closed\n",
@@ -2590,8 +2583,7 @@ static NTSTATUS CdpDiscoverAdjacentJournalForStartedVolume(
 			!journalEntry->Journal.RecoveryPending)
 		{
 			status = CdpPreparePersistentRestoreBootForSource(
-				SourceExt, &journalEntry->Journal,
-				"auto-journal-already-started");
+				SourceExt, &journalEntry->Journal);
 			if (!NT_SUCCESS(status))
 			{
 				Cdp_LOG("[RESTORE-POINT-FAIL] stage=auto-journal-already-started status=0x%08X; source FIFO remains closed\n",
@@ -7797,11 +7789,11 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 				{
 					Cdp_LOG("CMD1 configure failed status=0x%08X\n", Status);
 					CdpFillReply(reply, Cdp_CMD_1, (ULONG)Status, 0,
-						L"ERROR: capture configuration failed");
+						Cdp_COMMAND_REPLY_TEXT(L"ERROR: capture configuration failed"));
 					return CdpCompleteIrp(Irp, Status, sizeof(Cdp_COMMAND_REPLY));
 				}
 				CdpFillReply(reply, Cdp_CMD_1, 0, handleId,
-					L"OK: capture configured");
+					Cdp_COMMAND_REPLY_TEXT(L"OK: capture configured"));
 				return CdpCompleteIrp(Irp, STATUS_SUCCESS, sizeof(Cdp_COMMAND_REPLY));
 			}
 
@@ -7821,7 +7813,7 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 					Irp, DriverExt, &local.SourceVolumeGuid))
 				{
 					CdpFillReply(reply, Cdp_CMD_2, (ULONG)STATUS_ACCESS_DENIED, 0,
-						L"ERROR: password authentication required");
+						Cdp_COMMAND_REPLY_TEXT(L"ERROR: password authentication required"));
 					return CdpCompleteIrp(Irp, STATUS_ACCESS_DENIED,
 						sizeof(Cdp_COMMAND_REPLY));
 				}
@@ -7837,7 +7829,7 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 				if (!NT_SUCCESS(Status))
 				{
 					CdpFillReply(reply, Cdp_CMD_2, (ULONG)Status, 0,
-						L"ERROR: stop capture failed");
+						Cdp_COMMAND_REPLY_TEXT(L"ERROR: stop capture failed"));
 					return CdpCompleteIrp(Irp, Status, sizeof(Cdp_COMMAND_REPLY));
 				}
 				sourceExt = CdpFindSourceExtensionByGuid(
@@ -7859,7 +7851,7 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 				{
 					KeReleaseMutex(&DriverExt->CaptureConfigMutex, FALSE);
 					CdpFillReply(reply, Cdp_CMD_2, (ULONG)STATUS_NOT_FOUND, 0,
-						L"ERROR: capture is not configured for source");
+						Cdp_COMMAND_REPLY_TEXT(L"ERROR: capture is not configured for source"));
 					return CdpCompleteIrp(Irp, STATUS_NOT_FOUND, sizeof(Cdp_COMMAND_REPLY));
 				}
 				Status = CdpCloseVolumeHandle(DriverExt, handleId);
@@ -7868,18 +7860,20 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 				{
 					Cdp_LOG("CMD2 stop capture failed status=0x%08X\n", Status);
 					CdpFillReply(reply, Cdp_CMD_2, (ULONG)Status, 0,
-						L"ERROR: stop capture failed");
+						Cdp_COMMAND_REPLY_TEXT(L"ERROR: stop capture failed"));
 					return CdpCompleteIrp(Irp, Status, sizeof(Cdp_COMMAND_REPLY));
 				}
 				Cdp_LOG("capture stopped for source\n");
-				CdpFillReply(reply, Cdp_CMD_2, 0, 0, L"OK: capture stopped");
+				CdpFillReply(reply, Cdp_CMD_2, 0, 0,
+					Cdp_COMMAND_REPLY_TEXT(L"OK: capture stopped"));
 				return CdpCompleteIrp(Irp, STATUS_SUCCESS, sizeof(Cdp_COMMAND_REPLY));
 			}
 
 			default:
 				reply = (PCdp_COMMAND_REPLY)Irp->AssociatedIrp.SystemBuffer;
 				Cdp_LOG("unknown command code %lu on SEND_COMMAND\n", *pCode);
-				CdpFillReply(reply, *pCode, (ULONG)STATUS_INVALID_PARAMETER, 0, L"ERROR: unknown command");
+				CdpFillReply(reply, *pCode, (ULONG)STATUS_INVALID_PARAMETER, 0,
+					Cdp_COMMAND_REPLY_TEXT(L"ERROR: unknown command"));
 				return CdpCompleteIrp(Irp, STATUS_INVALID_PARAMETER, sizeof(Cdp_COMMAND_REPLY));
 			}
 		}

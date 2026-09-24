@@ -24,8 +24,9 @@
 
       - every translation unit received exactly the pass set it should have
         (read from CdpDriver.tlog\clang-cl.command.1.tlog, i.e. what actually ran)
-      - .licprot / .licpr are present, not writable, .licpr not executable,
-        and their sizes are sane
+      - .licprot / .licpr are present, nonpageable, not writable, .licpr not
+        executable, and their sizes are sane
+      - the production image has no PE debug directory / CodeView PDB pointer
       - string obfuscation really took effect (license strings must NOT be
         recoverable as plaintext from the .sys)
       - the protected sections exist in the final image (a missing .licprot makes
@@ -39,7 +40,7 @@
 
 .PARAMETER ProjectDir
     CdpDriver project directory (the one containing CdpDriver.vcxproj).
-    Defaults to the parent of this script's directory.
+    Defaults to the repository's CdpDriver subdirectory.
 
 .PARAMETER Configuration
     Build configuration to inspect. Default: Release.
@@ -63,7 +64,8 @@ param(
     [string]$ProjectDir,
     [string]$Configuration = 'Release',
     [string]$Platform = 'x64',
-    [string]$SysPath
+    [string]$SysPath,
+    [switch]$AllowReleaseLogging
 )
 
 $ErrorActionPreference = 'Stop'
@@ -127,6 +129,34 @@ $ForbiddenPlaintext = @(
     'device_id_hash',
     'signing_key_id',
     'issued_at_server'
+)
+
+# A production Release image removes operational DbgPrint templates at compile
+# time. This is intentionally separate from string obfuscation: it proves no
+# runtime switch merely leaves the messages dormant in the final image.
+$ForbiddenReleaseLogPlaintext = @(
+    'CdpDriver: [CHECKPOINT-MERGE-RESERVE]',
+    'CdpDriver: [RECOVERY-BRANCH-FAIL]',
+    'CdpDriver: [DRAIN-DIAG]',
+    'CdpDriver: [AUTO-LAYOUT]'
+)
+
+# Release command replies and build identity must not provide a reverse-
+# engineering map through UTF-16 literals. Debug builds keep these strings.
+$ForbiddenReleaseUnicodePlaintext = @(
+    'ERROR: capture configuration failed',
+    'OK: capture configured',
+    'ERROR: password authentication required',
+    'ERROR: stop capture failed',
+    'ERROR: capture is not configured for source',
+    'OK: capture stopped',
+    'ERROR: unknown command'
+)
+$ForbiddenReleaseIdentityPlaintext = @('20260918.109-release', '1.0.0')
+$ForbiddenReleaseStatusPlaintext = @(
+    'auto-prepare',
+    'post-journal-online',
+    'auto-journal-already-started'
 )
 
 # Sections whose file-backed bytes get scanned for forbidden plaintext. PE
@@ -217,7 +247,20 @@ function Get-PeSections {
 
     $numSections = [int]($bytes[$peOffset+6] -bor ($bytes[$peOffset+7] -shl 8))
     $optHdrSize  = [int]($bytes[$peOffset+20] -bor ($bytes[$peOffset+21] -shl 8))
-    $secTableOff = $peOffset + 24 + $optHdrSize
+    $optHdrOff   = $peOffset + 24
+    $secTableOff = $optHdrOff + $optHdrSize
+    if (($optHdrOff + 2) -gt $bytes.Length) { throw 'Optional header is truncated' }
+    $optMagic = [int](([uint32]$bytes[$optHdrOff]) -bor (([uint32]$bytes[$optHdrOff+1]) -shl 8))
+    if ($optMagic -eq 0x20B) {
+        $dataDirOff = $optHdrOff + 112
+    } elseif ($optMagic -eq 0x10B) {
+        $dataDirOff = $optHdrOff + 96
+    } else {
+        throw ("Unsupported PE optional-header magic: 0x{0:X}" -f $optMagic)
+    }
+    # Data-directory index 6 is IMAGE_DIRECTORY_ENTRY_DEBUG.
+    $debugDirOff = $dataDirOff + (6 * 8)
+    if (($debugDirOff + 8) -gt ($optHdrOff + $optHdrSize)) { throw 'PE data-directory table is truncated' }
 
     $sections = @()
     for ($i = 0; $i -lt $numSections; $i++) {
@@ -234,7 +277,12 @@ function Get-PeSections {
             Characteristics   = Read-UInt32 -Bytes $bytes -Offset ($off + 36)
         }
     }
-    return [pscustomobject]@{ Bytes = $bytes; Sections = $sections }
+    return [pscustomobject]@{
+        Bytes = $bytes
+        Sections = $sections
+        DebugDirectoryRva = Read-UInt32 -Bytes $bytes -Offset $debugDirOff
+        DebugDirectorySize = Read-UInt32 -Bytes $bytes -Offset ($debugDirOff + 4)
+    }
 }
 
 function Get-CoffSections {
@@ -495,6 +543,13 @@ function Invoke-MainStepCheckImage {
     $pe = Get-PeSections -Path $Path
     Write-Host "  Image : $Path"
     Write-Host ("  Size  : {0:N0} bytes" -f $pe.Bytes.Length)
+    if ($pe.DebugDirectoryRva -ne 0 -or $pe.DebugDirectorySize -ne 0) {
+        Add-Failure ("PE debug directory is present (RVA=0x{0:X8}, Size={1}) -- production images must not publish CodeView/PDB metadata" -f `
+            $pe.DebugDirectoryRva, $pe.DebugDirectorySize)
+        Write-Host '  FAIL PE debug directory is present' -ForegroundColor Red
+    } else {
+        Write-Host '  OK   no PE debug directory / CodeView PDB pointer' -ForegroundColor Green
+    }
 
     # Materialise the two section objects as scalars up front. Empty arrays are
     # handled by an explicit null check rather than .Count.
@@ -531,7 +586,10 @@ function Invoke-MainStepCheckImage {
             Add-Failure '.licpr is executable -- a read-only constant section must not be executable'
         }
         if (-not $notPaged) {
-            Add-Warning "$($sec.Name) lacks IMAGE_SCN_MEM_NOT_PAGED (lld-link does not add it, unlike link.exe /DRIVER). Checks currently run at PASSIVE_LEVEL so this is latent, but a DPC/ISR path reaching the gate would page fault."
+            Add-Failure "$($sec.Name) lacks IMAGE_SCN_MEM_NOT_PAGED -- protected code/data must be safe above PASSIVE_LEVEL"
+            Write-Host "  FAIL $($sec.Name) is pageable" -ForegroundColor Red
+        } else {
+            Write-Host "  OK   $($sec.Name) is nonpageable" -ForegroundColor Green
         }
     }
 
@@ -548,7 +606,7 @@ function Invoke-MainStepCheckImage {
         }
     }
 
-    Write-Head '3. String obfuscation effectiveness (license strings must not be plaintext)'
+    Write-Head '3. String checks (protected strings and production log removal)'
     # Build a buffer from the file-backed bytes of the loaded sections only, so
     # that section NAMES in the PE header table are not mistaken for leaked
     # string literals.
@@ -565,7 +623,8 @@ function Invoke-MainStepCheckImage {
     }
     Write-Host ("  Scanning {0:N0} bytes from: {1}" -f $scanned.Count, ($scannedNames -join ' '))
 
-    $text  = [System.Text.Encoding]::ASCII.GetString($scanned.ToArray())
+    $scanBytes = $scanned.ToArray()
+    $text  = [System.Text.Encoding]::ASCII.GetString($scanBytes)
     $upper = $text.ToUpperInvariant()
     foreach ($needle in $ForbiddenPlaintext) {
         if ($upper.Contains($needle.ToUpperInvariant())) {
@@ -575,11 +634,50 @@ function Invoke-MainStepCheckImage {
             Write-Host "  OK   hidden: '$needle'" -ForegroundColor Green
         }
     }
+    if ($AllowReleaseLogging) {
+        Write-Host '  SKIP Release-log check: diagnostic logging was explicitly requested.' -ForegroundColor Yellow
+    } else {
+        foreach ($needle in $ForbiddenReleaseLogPlaintext) {
+            if ($upper.Contains($needle.ToUpperInvariant())) {
+                Add-Failure "Release log plaintext still present: '$needle' -- build without /p:CdpReleaseLogging=true"
+                Write-Host "  FAIL removed: '$needle'" -ForegroundColor Red
+            } else {
+                Write-Host "  OK   removed: '$needle'" -ForegroundColor Green
+            }
+        }
+    }
+    foreach ($needle in $ForbiddenReleaseIdentityPlaintext) {
+        if ($upper.Contains($needle.ToUpperInvariant())) {
+            Add-Failure "Release identity plaintext still present: '$needle'"
+            Write-Host "  FAIL removed: '$needle'" -ForegroundColor Red
+        } else {
+            Write-Host "  OK   removed: '$needle'" -ForegroundColor Green
+        }
+    }
+    foreach ($needle in $ForbiddenReleaseStatusPlaintext) {
+        if ($upper.Contains($needle.ToUpperInvariant())) {
+            Add-Failure "Release diagnostic plaintext still present: '$needle'"
+            Write-Host "  FAIL removed: '$needle'" -ForegroundColor Red
+        } else {
+            Write-Host "  OK   removed: '$needle'" -ForegroundColor Green
+        }
+    }
+    # PE section raw sizes are file-aligned, therefore concatenating the scanned
+    # sections preserves UTF-16LE code-unit alignment.
+    $wideText = [System.Text.Encoding]::Unicode.GetString($scanBytes)
+    foreach ($needle in $ForbiddenReleaseUnicodePlaintext) {
+        if ($wideText.Contains($needle)) {
+            Add-Failure "Release UTF-16 reply plaintext still present: '$needle'"
+            Write-Host "  FAIL removed: '$needle'" -ForegroundColor Red
+        } else {
+            Write-Host "  OK   removed: '$needle'" -ForegroundColor Green
+        }
+    }
 }
 
 # ---------------------------------------------------------------- main
 if (-not $ProjectDir) {
-    $ProjectDir = Split-Path -Parent $PSScriptRoot
+    $ProjectDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'CdpDriver'
 }
 if (-not (Test-Path -LiteralPath $ProjectDir)) {
     Write-Host "Project directory not found: $ProjectDir" -ForegroundColor Red
@@ -601,8 +699,9 @@ Invoke-MainStepCheckFlags -TlogPath (Join-Path $ProjectDir "x64\$Configuration\C
 Write-Head '2. Locating final image'
 if (-not $SysPath) {
     $candidates = @(
-        (Join-Path $ProjectDir "x64\$Configuration\CdpDriver.sys"),
+        (Join-Path $ProjectDir "..\x64\$Configuration\CdpDriver.sys"),
         (Join-Path $ProjectDir "..\x64\$Configuration\driver\CdpDriver.sys"),
+        (Join-Path $ProjectDir "x64\$Configuration\CdpDriver.sys"),
         (Join-Path $ProjectDir "x64\$Configuration\CdpDriver\CdpDriver.sys")
     )
     $SysPath = @($candidates | Where-Object { Test-Path -LiteralPath $_ })[0]
@@ -642,6 +741,8 @@ if ($script:Failures.Count -gt 0) {
     exit 1
 }
 
+$checkCount = $ForbiddenPlaintext.Count + $ForbiddenReleaseIdentityPlaintext.Count + $ForbiddenReleaseStatusPlaintext.Count + $ForbiddenReleaseUnicodePlaintext.Count
+if (-not $AllowReleaseLogging) { $checkCount += $ForbiddenReleaseLogPlaintext.Count }
 Write-Host ("Obfuscated-build verification PASSED ({0} units, {1} plaintext checks)." -f `
-    $ExpectedUnits.Count, $ForbiddenPlaintext.Count) -ForegroundColor Green
+    $ExpectedUnits.Count, $checkCount) -ForegroundColor Green
 exit 0

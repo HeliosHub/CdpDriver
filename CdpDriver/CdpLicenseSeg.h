@@ -10,18 +10,9 @@
  *   .licprot  代码，ER = 可执行 + 只读（禁止 W，避免 HVCI 反感的 RWX）
  *   .licpr    只读常量（公钥分片、PRODUCT_MAGIC 等）
  *
- * 【分页约束，勿忽略】官方 link.exe 的 /DRIVER 会给所有节加 MEM_NOT_PAGED，
- * 但本工程 Release|x64 用的是 lld-link，它不加；而：
- *   - lld-link 的 /SECTION 修饰符没有"清除 paged"的语法；
- *   - clang 的 #pragma section(..., nopage) 被映射为 PSF_Invalid
- *     （clang/lib/Parse/ParsePragma.cpp 中 .Case("nopage", ...PSF_Invalid)），
- *     只会报 warning 并丢弃。
- * 所以 .licprot / .licpr 在混淆构建下是**可分页**的。
- * → 结论：**.licprot 内的代码只能在 PASSIVE_LEVEL 调用**（当前所有校验点
- *   确实都在 PASSIVE_LEVEL：闸门、导入、挂载恢复、小时定时器工作项）。
- *   若将来需要从 DPC/ISR 触达闸门，必须先解决分页问题（换回 link.exe 或
- *   显式给节打属性），否则会 page fault。
- *   script/verify_obfuscation.ps1 会持续把这条作为警告输出，避免被遗忘。
+ * P requests IMAGE_SCN_MEM_NOT_PAGED from the linker. The verifier treats a
+ * missing bit as a Release-build failure, so protected code/data remains safe
+ * if a future call path reaches it above PASSIVE_LEVEL.
  *
  * #pragma comment(linker, "/SECTION:...") 保证链接器按上述属性创建节，
  * 即使某个翻译单元暂时没有输入也不会默认为可写。
@@ -58,6 +49,6 @@
 #if defined(CDP_LICENSE) && defined(CDP_LICENSE_OBFUSCATE)
 #pragma code_seg(".licprot")
 #pragma const_seg(".licpr")
-#pragma comment(linker, "/SECTION:.licprot,ER")
-#pragma comment(linker, "/SECTION:.licpr,R")
+#pragma comment(linker, "/SECTION:.licprot,ERP")
+#pragma comment(linker, "/SECTION:.licpr,RP")
 #endif

@@ -211,9 +211,9 @@ static NTSTATUS CdpLicenseRecomputeCap(
 	_In_ ULONG AMod,
 	_Out_writes_bytes_(Cdp_CAP_TOKEN_BYTES) UCHAR* TokenOut)
 {
-	if (!g_CdpLicenseState.SealKeyValid || !g_CdpLicenseState.PendingCapValid)
-		return STATUS_CDP_LICENSE_TAMPER;
-	return CdpLocalSealMakeCapToken(
+	return CdpLicenseVmRecomputeCap(
+		(ULONG)g_CdpLicenseState.SealKeyValid,
+		(ULONG)g_CdpLicenseState.PendingCapValid,
 		g_CdpLicenseState.SealKey,
 		T0,
 		C0,
@@ -1217,10 +1217,16 @@ NTSTATUS CdpLicenseGateArmOp(
 	}
 
 	CdpLicenseLock();
-	if (!g_CdpLicenseState.PendingCapValid ||
-		Local->CapNonce != g_CdpLicenseState.PendingCapNonce ||
-		Local->CapIssued100ns != g_CdpLicenseState.PendingCapIssued100ns ||
-		!CdpLocalSealCapTokenEqual(Local->CapToken, g_CdpLicenseState.PendingCapToken))
+	if (!CdpLicenseVmArmEvidenceValid(
+		(ULONG)g_CdpLicenseState.PendingCapValid,
+		(ULONG)Local->CapTokenValid,
+		Local->CapNonce,
+		g_CdpLicenseState.PendingCapNonce,
+		Local->CapIssued100ns,
+		g_CdpLicenseState.PendingCapIssued100ns,
+		Local->CapToken,
+		g_CdpLicenseState.PendingCapToken,
+		Local->CapToken))
 	{
 		CdpLicenseUnlock();
 		Cdp_LIC_FAIL("arm: token mismatch vs pending");
@@ -1235,7 +1241,16 @@ NTSTATUS CdpLicenseGateArmOp(
 		Local->l_A_MOD,
 		expect);
 	if (!NT_SUCCESS(status) ||
-		!CdpLocalSealCapTokenEqual(expect, g_CdpLicenseState.PendingCapToken))
+		!CdpLicenseVmArmEvidenceValid(
+			(ULONG)g_CdpLicenseState.PendingCapValid,
+			(ULONG)Local->CapTokenValid,
+			Local->CapNonce,
+			g_CdpLicenseState.PendingCapNonce,
+			Local->CapIssued100ns,
+			g_CdpLicenseState.PendingCapIssued100ns,
+			Local->CapToken,
+			g_CdpLicenseState.PendingCapToken,
+			expect))
 	{
 		CdpLocalSealSecureZero(expect, sizeof(expect));
 		CdpLicenseUnlock();
@@ -1295,7 +1310,11 @@ NTSTATUS CdpLicenseGateAfterOpSuccess(
 		g_CdpLicenseState.g_A_MOD,
 		expect);
 	if (!NT_SUCCESS(status) ||
-		!CdpLocalSealCapTokenEqual(expect, g_CdpLicenseState.PendingCapToken))
+		!CdpLicenseVmCommitEvidenceValid(
+			(ULONG)g_CdpLicenseState.PendingCapValid,
+			(ULONG)g_CdpLicenseState.PendingCapArmed,
+			expect,
+			g_CdpLicenseState.PendingCapToken))
 	{
 		Cdp_LIC_FAIL("after: cap recompute mismatch");
 		g_CdpLicenseState.g_A_MOD += 1;
