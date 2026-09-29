@@ -13,6 +13,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CdpConsole", "CdpConsole\Cd
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CdpConsole_Param", "CdpConsoleParam\CdpConsoleParam.vcxproj", "{E4281A15-640A-4F59-9B58-2C56FCF2BF0B}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CdpLicenseApply", "CdpLicenseApply\CdpLicenseApply.vcxproj", "{BC7FB2DF-89D0-4ED4-AF66-0983586F7472}"
+EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CdpBootService", "CdpBootService\CdpBootService.vcxproj", "{D6F70F72-775D-4A41-8E46-66C9B1D27E55}"
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "CdpCore", "CdpCore\CdpCore.vcxproj", "{A11CE001-C0DE-4000-8001-535952455443}"
@@ -60,6 +62,10 @@ Global
 		{E4281A15-640A-4F59-9B58-2C56FCF2BF0B}.Debug|x64.Build.0 = Debug|x64
 		{E4281A15-640A-4F59-9B58-2C56FCF2BF0B}.Release|x64.ActiveCfg = Release|x64
 		{E4281A15-640A-4F59-9B58-2C56FCF2BF0B}.Release|x64.Build.0 = Release|x64
+		{BC7FB2DF-89D0-4ED4-AF66-0983586F7472}.Debug|x64.ActiveCfg = Debug|x64
+		{BC7FB2DF-89D0-4ED4-AF66-0983586F7472}.Debug|x64.Build.0 = Debug|x64
+		{BC7FB2DF-89D0-4ED4-AF66-0983586F7472}.Release|x64.ActiveCfg = Release|x64
+		{BC7FB2DF-89D0-4ED4-AF66-0983586F7472}.Release|x64.Build.0 = Release|x64
 		{A11CE001-C0DE-4000-8001-535952455443}.Debug|x64.ActiveCfg = Debug|x64
 		{A11CE001-C0DE-4000-8001-535952455443}.Debug|x64.Build.0 = Debug|x64
 		{A11CE001-C0DE-4000-8001-535952455443}.Release|x64.ActiveCfg = Release|x64

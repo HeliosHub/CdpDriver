@@ -557,8 +557,10 @@ BOOL CdpInstallBootConfirmService(void)
 	ZeroMemory(&startupInfo, sizeof(startupInfo));
 	ZeroMemory(&processInfo, sizeof(processInfo));
 	startupInfo.cb = sizeof(startupInfo);
+	startupInfo.dwFlags = STARTF_USESHOWWINDOW;
+	startupInfo.wShowWindow = SW_HIDE;
 	if (!CreateProcessW(
-		NULL, commandLine, NULL, NULL, FALSE, 0, NULL, exeDir,
+		NULL, commandLine, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, exeDir,
 		&startupInfo, &processInfo))
 	{
 		return FALSE;

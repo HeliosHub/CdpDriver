@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.0.0"
-#define Cdp_DRIVER_BUILD_STRING   "20260918.109-release"
+#define Cdp_DRIVER_VERSION_STRING "1.0.2"
+#define Cdp_DRIVER_BUILD_STRING   "20260929.102-release"
 
 // Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.
 // Cdp_DBG: Debug builds only — verbose I/O and path tracing.

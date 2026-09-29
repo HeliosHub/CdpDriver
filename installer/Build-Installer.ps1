@@ -14,6 +14,27 @@ if ([string]::IsNullOrWhiteSpace($GuiRoot)) {
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = $installerRoot
 }
+$guiBuildScript = Join-Path $GuiRoot 'build-release.bat'
+$driverBuildScript = Join-Path $driverRoot 'build.bat'
+$buildScripts = @($guiBuildScript, $driverBuildScript)
+foreach ($script in $buildScripts) {
+    if (-not (Test-Path -LiteralPath $script -PathType Leaf)) {
+        throw "找不到构建脚本: $script"
+    }
+}
+
+Write-Host "正在重新生成 GUI Release 版本..."
+& $guiBuildScript
+if ($LASTEXITCODE -ne 0) {
+    throw "生成 GUI Release 版本失败 (exit code $LASTEXITCODE)。"
+}
+
+Write-Host "正在重新生成驱动 Release 版本..."
+& $driverBuildScript 'Release' 'x64' '--no-pause'
+if ($LASTEXITCODE -ne 0) {
+    throw "生成驱动 Release 版本失败 (exit code $LASTEXITCODE)。"
+}
+
 $driverOutput = Join-Path $driverRoot 'x64\Release'
 $guiOutput = Join-Path $GuiRoot 'bin\x64\Release'
 $guiExecutableCandidates = @(
@@ -55,6 +76,16 @@ function Copy-ReleaseFile([string]$Source, [string]$Destination) {
     Copy-Item -LiteralPath $Source -Destination $Destination -Force
 }
 
+function Remove-ReleaseSymbols([string[]]$Directories) {
+    foreach ($directory in $Directories) {
+        if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+            continue
+        }
+        Get-ChildItem -LiteralPath $directory -Filter '*.pdb' -File -Recurse |
+            Remove-Item -Force
+    }
+}
+
 Require-File $runtimeInstaller
 
 foreach ($file in @(
@@ -92,6 +123,10 @@ if ($helperBuildExitCode -ne 0) {
 }
 Require-File (Join-Path $driverOutput 'CdpBootService.exe')
 Require-File (Join-Path $driverOutput 'CdpDriverInstallHelper.exe')
+
+# The installer is a release-only artifact. Keep symbol files out of the
+# release output directories before copying the approved payload files.
+Remove-ReleaseSymbols @($guiOutput, $driverOutput)
 
 if (-not (Test-Path -LiteralPath (Join-Path $guiOutput 'Web') -PathType Container)) {
     throw "找不到 GUI Web 资源目录: $(Join-Path $guiOutput 'Web')"
@@ -174,6 +209,10 @@ $zip.Dispose()
 $presentExcluded = $archiveEntries | Where-Object { $_ -in $excluded }
 if ($presentExcluded) {
     throw "安装包包含不应发布的文件: $($presentExcluded -join ', ')"
+}
+$pdbEntries = $archiveEntries | Where-Object { $_ -match '(?i)(^|/)[^/]+\.pdb$' }
+if ($pdbEntries) {
+    throw "安装包包含 PDB 调试符号: $($pdbEntries -join ', ')"
 }
 
 Write-Host "安装包已生成: $outputPath"

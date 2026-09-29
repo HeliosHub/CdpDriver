@@ -5,12 +5,15 @@ rem Usage:
 rem   build.bat
 rem   build.bat Release x64
 rem   build.bat Debug x64
+rem   build.bat Release x64 --no-pause
 
 set "CONFIGURATION=%~1"
 if not defined CONFIGURATION set "CONFIGURATION=Release"
 
 set "PLATFORM=%~2"
 if not defined PLATFORM set "PLATFORM=x64"
+
+set "NO_PAUSE=%~3"
 
 set "ROOT_DIR=%~dp0"
 set "SOLUTION=%ROOT_DIR%CdpDriver.sln"
@@ -64,4 +67,4 @@ if not "%BUILD_RESULT%"=="0" (
 echo.
 echo [OK] Build completed successfully.
 echo [OK] Output directory: "%ROOT_DIR%%PLATFORM%\%CONFIGURATION%"
-pause
+if /i not "%NO_PAUSE%"=="--no-pause" pause
