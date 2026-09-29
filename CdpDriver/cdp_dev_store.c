@@ -2,6 +2,14 @@
 #include "..\CdpCore\include\cdp_alloc.h"
 #include "..\CdpCore\include\cdp_dev_store.h"
 
+/* Keep the physical-store adaptation below the Core from exposing a clean
+ * source-to-journal I/O map in the release image. */
+#if defined(__clang__)
+#define Cdp_DEVSTORE_OBF_LIGHT __attribute__((annotate("const-obfus,ind-call")))
+#else
+#define Cdp_DEVSTORE_OBF_LIGHT
+#endif
+
 typedef struct _Cdp_DEV_STORE_CTX
 {
 	PDEVICE_OBJECT Device;
@@ -11,7 +19,7 @@ typedef struct _Cdp_DEV_STORE_CTX
 	ULONG SectorSize;
 } Cdp_DEV_STORE_CTX, *PCdp_DEV_STORE_CTX;
 
-static NTSTATUS CdpDevStoreRawIo(
+Cdp_DEVSTORE_OBF_LIGHT static NTSTATUS CdpDevStoreRawIo(
 	_In_ PDEVICE_OBJECT Device,
 	_In_ UCHAR MajorFunction,
 	_In_ UCHAR StackFlags,
@@ -117,7 +125,7 @@ static NTSTATUS CdpDevStoreRawIo(
 	return status;
 }
 
-static NTSTATUS CdpDevStoreRead(
+Cdp_DEVSTORE_OBF_LIGHT static NTSTATUS CdpDevStoreRead(
 	_In_ PCdp_STORE Store,
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
@@ -136,7 +144,7 @@ static NTSTATUS CdpDevStoreRead(
 		Buffer);
 }
 
-static NTSTATUS CdpDevStoreWrite(
+Cdp_DEVSTORE_OBF_LIGHT static NTSTATUS CdpDevStoreWrite(
 	_In_ PCdp_STORE Store,
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
@@ -157,7 +165,7 @@ static NTSTATUS CdpDevStoreWrite(
 		(PVOID)Buffer);
 }
 
-NTSTATUS CdpDevStoreWriteForceDirect(
+Cdp_DEVSTORE_OBF_LIGHT NTSTATUS CdpDevStoreWriteForceDirect(
 	_In_ PDEVICE_OBJECT LowerDevice,
 	_In_ UINT64 DeviceOffset,
 	_In_ ULONG Length,
@@ -172,7 +180,7 @@ NTSTATUS CdpDevStoreWriteForceDirect(
 		(PVOID)Buffer);
 }
 
-NTSTATUS CdpDevStoreCreateAbsoluteRange(
+Cdp_DEVSTORE_OBF_LIGHT NTSTATUS CdpDevStoreCreateAbsoluteRange(
 	_In_ PDEVICE_OBJECT Device,
 	_In_ UINT64 AbsoluteStart,
 	_In_ UINT64 Size,

@@ -55,6 +55,27 @@ function Copy-ReleaseFile([string]$Source, [string]$Destination) {
     Copy-Item -LiteralPath $Source -Destination $Destination -Force
 }
 
+function Assert-NoSymbolOrBuildMetadata([string]$Root, [string]$Label) {
+    # Symbols and linker maps make a protected binary dramatically easier to
+    # navigate.  Keep this check at the packaging boundary so a future broad
+    # copy (or a new dependency) cannot silently ship them.
+    $forbiddenExtensions = @('.pdb', '.map', '.tlog', '.obj', '.lib', '.exp', '.ilk')
+    $forbiddenNames = @('compile_commands.json', 'compile_commands.txt')
+    $leaks = @(
+        Get-ChildItem -LiteralPath $Root -Recurse -Force -File |
+        Where-Object {
+            $forbiddenExtensions -contains $_.Extension.ToLowerInvariant() -or
+            $forbiddenNames -contains $_.Name.ToLowerInvariant()
+        }
+    )
+    if ($leaks.Count -ne 0) {
+        $relativeLeaks = $leaks | ForEach-Object {
+            $_.FullName.Substring($Root.Length).TrimStart('\\')
+        }
+        throw "$Label contains symbols or build metadata that must never be shipped: $($relativeLeaks -join ', ')"
+    }
+}
+
 Require-File $runtimeInstaller
 
 foreach ($file in @(
@@ -130,6 +151,8 @@ Copy-ReleaseFile (Join-Path $driverOutput 'driver\CdpDriver.inf') (Join-Path $pa
 Copy-ReleaseFile (Join-Path $driverOutput 'driver\CdpDriver.sys') (Join-Path $payloadRoot 'driver\CdpDriver.sys')
 Copy-ReleaseFile (Join-Path $driverOutput 'driver\cdpdriver.cat') (Join-Path $payloadRoot 'driver\CdpDriver.cat')
 
+Assert-NoSymbolOrBuildMetadata $payloadRoot 'Installer payload'
+
 $payloadItems = Get-ChildItem -LiteralPath $payloadRoot
 Compress-Archive -Path $payloadItems.FullName -DestinationPath $archivePath -CompressionLevel Optimal
 Copy-Item -LiteralPath (Join-Path $GuiRoot 'CDPCorePro\res\app.ico') -Destination (Join-Path $workRoot 'app.ico') -Force
@@ -174,6 +197,13 @@ $zip.Dispose()
 $presentExcluded = $archiveEntries | Where-Object { $_ -in $excluded }
 if ($presentExcluded) {
     throw "安装包包含不应发布的文件: $($presentExcluded -join ', ')"
+}
+$forbiddenArchiveEntry = $archiveEntries | Where-Object {
+    $_ -match '(?i)(^|/)(compile_commands\.(json|txt))$' -or
+    $_ -match '(?i)\.(pdb|map|tlog|obj|lib|exp|ilk)$'
+}
+if ($forbiddenArchiveEntry) {
+    throw "安装包包含符号或构建元数据: $($forbiddenArchiveEntry -join ', ')"
 }
 
 Write-Host "安装包已生成: $outputPath"

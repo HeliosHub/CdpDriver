@@ -3,6 +3,16 @@
 #include "cdp_alloc.h"
 #include "CdpJournal.h"
 
+/* Protect the state-transition algorithms without flattening every capture
+ * read/write.  The compiler recognizes these annotations in the driver build. */
+#if defined(__clang__) && !defined(Cdp_USERMODE)
+#define Cdp_CORE_OBF_WORKFLOW __attribute__((annotate("fla,const-obfus,string-obfus,ind-call")))
+#define Cdp_CORE_OBF_LIGHT __attribute__((annotate("const-obfus,ind-call")))
+#else
+#define Cdp_CORE_OBF_WORKFLOW
+#define Cdp_CORE_OBF_LIGHT
+#endif
+
 #ifndef Cdp_USERMODE
 #include "cdp_dev_store.h"
 #define Cdp_RECOVERY_TRACE(fmt, ...) \
@@ -1021,7 +1031,7 @@ BOOLEAN CdpCoreHasPendingRecoveryBranch(_In_ PCdp_CORE Core)
  * superblock. In that case CurrentBranchNumber already identifies the planned
  * branch, so retry only the recovery-intent completion instead of creating a
  * duplicate branch. */
-static NTSTATUS CdpCoreMaterializePendingRecoveryBranchLocked(
+Cdp_CORE_OBF_WORKFLOW static NTSTATUS CdpCoreMaterializePendingRecoveryBranchLocked(
 	_Inout_ PCdp_CORE Core)
 {
 	NTSTATUS status;
@@ -1082,7 +1092,7 @@ static NTSTATUS CdpCoreMaterializePendingRecoveryBranchLocked(
 	return STATUS_SUCCESS;
 }
 
-static NTSTATUS CdpCoreMaterializePendingRestoreResetLocked(
+Cdp_CORE_OBF_WORKFLOW static NTSTATUS CdpCoreMaterializePendingRestoreResetLocked(
 	_Inout_ PCdp_CORE Core)
 {
 	NTSTATUS status;
@@ -1109,7 +1119,7 @@ static NTSTATUS CdpCoreMaterializePendingRestoreResetLocked(
 	return STATUS_SUCCESS;
 }
 
-static NTSTATUS CdpCoreAppendAfterImageCommon(
+Cdp_CORE_OBF_LIGHT static NTSTATUS CdpCoreAppendAfterImageCommon(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
@@ -1202,7 +1212,7 @@ static NTSTATUS CdpCoreAppendAfterImageCommon(
 	return status;
 }
 
-NTSTATUS CdpCoreAppendAfterImage(
+Cdp_CORE_OBF_LIGHT NTSTATUS CdpCoreAppendAfterImage(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
@@ -1213,7 +1223,7 @@ NTSTATUS CdpCoreAppendAfterImage(
 		Core, Offset, Length, AfterImage, NULL, NULL, WrittenRecord);
 }
 
-NTSTATUS CdpCoreAppendAfterImageWithWriter(
+Cdp_CORE_OBF_LIGHT NTSTATUS CdpCoreAppendAfterImageWithWriter(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
@@ -1232,7 +1242,7 @@ static PCdp_PREVIEW_TREE_NODE CdpCoreFindFirstValidMetaNode(
 	return CdpViewPolicyFindFirstValidNode(Node);
 }
 
-NTSTATUS CdpCoreDrainOneMetaRangeWithWriter(
+Cdp_CORE_OBF_WORKFLOW NTSTATUS CdpCoreDrainOneMetaRangeWithWriter(
 	_Inout_ PCdp_CORE Core,
 	_In_ Cdp_CORE_DRAIN_WRITE_ROUTINE WriteRoutine,
 	_In_opt_ PVOID WriteContext,
@@ -1350,7 +1360,7 @@ NTSTATUS CdpCoreQueryMetaCoverageBytes(
 	return status;
 }
 
-static NTSTATUS CdpCoreSynthesizeRead(
+Cdp_CORE_OBF_LIGHT static NTSTATUS CdpCoreSynthesizeRead(
 	_Inout_ PCdp_CORE Core,
 	_In_ PCdp_PREVIEW_TREE Tree,
 	_In_ UINT64 Offset,
@@ -1461,7 +1471,7 @@ done:
 
 /* MetaTree and PreviewTree store after-image payload locations. Missing ranges
  * are read from the source baseline. */
-NTSTATUS CdpCoreRead(
+Cdp_CORE_OBF_LIGHT NTSTATUS CdpCoreRead(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
@@ -1480,7 +1490,7 @@ NTSTATUS CdpCoreRead(
 		Core, &Core->MetaTree, Offset, Length, Buffer, TRUE);
 }
 
-NTSTATUS CdpCoreOverlayCurrentRead(
+Cdp_CORE_OBF_LIGHT NTSTATUS CdpCoreOverlayCurrentRead(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
@@ -1512,7 +1522,7 @@ static VOID CdpCoreScanTreeCoverage(
 	CdpViewPolicyScanTreeCoverage(Node, Scan);
 }
 
-NTSTATUS CdpCoreQueryCurrentReadCoverage(
+Cdp_CORE_OBF_LIGHT NTSTATUS CdpCoreQueryCurrentReadCoverage(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
@@ -1595,7 +1605,7 @@ static PCdp_PREVIEW_TREE_NODE CdpCoreFindFirstOverlapNode(
 	return CdpViewPolicyFindFirstOverlapNode(Node, Start, End);
 }
 
-NTSTATUS CdpCorePreviewRead(
+Cdp_CORE_OBF_LIGHT NTSTATUS CdpCorePreviewRead(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 Offset,
 	_In_ ULONG Length,
@@ -1609,7 +1619,7 @@ NTSTATUS CdpCorePreviewRead(
 		Core, &Core->PreviewTree, Offset, Length, Buffer, TRUE);
 }
 
-static NTSTATUS CdpCoreResolveTargetTime(
+Cdp_CORE_OBF_WORKFLOW static NTSTATUS CdpCoreResolveTargetTime(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 RequestedTime100ns,
 	_Out_ PUINT64 EffectiveTime100ns)
@@ -1634,7 +1644,7 @@ static NTSTATUS CdpCoreResolveTargetTime(
 	return STATUS_SUCCESS;
 }
 
-NTSTATUS CdpCorePreviewBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns)
+Cdp_CORE_OBF_WORKFLOW NTSTATUS CdpCorePreviewBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns)
 {
 	NTSTATUS status;
 	UINT64 effectiveTargetTime100ns;
@@ -1708,7 +1718,7 @@ NTSTATUS CdpCorePreviewBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns
 	return STATUS_SUCCESS;
 }
 
-NTSTATUS CdpCorePreviewEnd(_Inout_ PCdp_CORE Core)
+Cdp_CORE_OBF_WORKFLOW NTSTATUS CdpCorePreviewEnd(_Inout_ PCdp_CORE Core)
 {
 	if (!Core)
 		return STATUS_INVALID_PARAMETER;
@@ -1728,7 +1738,7 @@ NTSTATUS CdpCorePreviewEnd(_Inout_ PCdp_CORE Core)
 	return STATUS_SUCCESS;
 }
 
-NTSTATUS CdpCoreRecoveryCommitStep(
+Cdp_CORE_OBF_WORKFLOW NTSTATUS CdpCoreRecoveryCommitStep(
 	_Inout_ PCdp_CORE Core,
 	_Out_ PBOOLEAN Complete)
 {
@@ -1743,7 +1753,7 @@ NTSTATUS CdpCoreRecoveryCommitStep(
 	return STATUS_SUCCESS;
 }
 
-NTSTATUS CdpCorePrepareRebootRecovery(
+Cdp_CORE_OBF_WORKFLOW NTSTATUS CdpCorePrepareRebootRecovery(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 TargetTime100ns)
 {
@@ -1864,7 +1874,7 @@ failure:
 	return status;
 }
 
-NTSTATUS CdpCorePreparePersistentRestoreBoot(
+Cdp_CORE_OBF_WORKFLOW NTSTATUS CdpCorePreparePersistentRestoreBoot(
 	_Inout_ PCdp_CORE Core,
 	_In_ Cdp_CORE_DRAIN_WRITE_ROUTINE WriteRoutine,
 	_In_opt_ PVOID WriteContext,
@@ -1953,7 +1963,7 @@ NTSTATUS CdpCorePreparePersistentRestoreBoot(
 	return STATUS_SUCCESS;
 }
 
-NTSTATUS CdpCoreCancelPersistentRestoreBoot(_Inout_ PCdp_CORE Core)
+Cdp_CORE_OBF_WORKFLOW NTSTATUS CdpCoreCancelPersistentRestoreBoot(_Inout_ PCdp_CORE Core)
 {
 	BOOLEAN pending;
 
@@ -1970,7 +1980,7 @@ NTSTATUS CdpCoreCancelPersistentRestoreBoot(_Inout_ PCdp_CORE Core)
 	return STATUS_INVALID_DEVICE_STATE;
 }
 
-NTSTATUS CdpCoreSetRestorePointMarker(
+Cdp_CORE_OBF_WORKFLOW NTSTATUS CdpCoreSetRestorePointMarker(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 TargetTime100ns)
 {
@@ -1979,14 +1989,14 @@ NTSTATUS CdpCoreSetRestorePointMarker(
 	return CdpJournalSetRestorePoint(Core->Journal, TargetTime100ns);
 }
 
-NTSTATUS CdpCoreConfirmPersistentRestoreBoot(_Inout_ PCdp_CORE Core)
+Cdp_CORE_OBF_WORKFLOW NTSTATUS CdpCoreConfirmPersistentRestoreBoot(_Inout_ PCdp_CORE Core)
 {
 	if (!Core || !Core->Journal)
 		return STATUS_INVALID_PARAMETER;
 	return CdpJournalConfirmRestoreBoot(Core->Journal);
 }
 
-NTSTATUS CdpCoreClearRestorePointMarker(_Inout_ PCdp_CORE Core)
+Cdp_CORE_OBF_WORKFLOW NTSTATUS CdpCoreClearRestorePointMarker(_Inout_ PCdp_CORE Core)
 {
 	NTSTATUS status;
 	if (!Core)
@@ -2000,7 +2010,7 @@ NTSTATUS CdpCoreClearRestorePointMarker(_Inout_ PCdp_CORE Core)
 	return CdpJournalClearRestorePoint(Core->Journal);
 }
 
-NTSTATUS CdpCoreRebuildCurrentView(_Inout_ PCdp_CORE Core)
+Cdp_CORE_OBF_WORKFLOW NTSTATUS CdpCoreRebuildCurrentView(_Inout_ PCdp_CORE Core)
 {
 	if (!Core)
 		return STATUS_INVALID_PARAMETER;
@@ -2060,7 +2070,7 @@ static NTSTATUS CdpCoreMaterializeTreeWithWriter(
 		WrittenRanges, WrittenBytes);
 }
 
-NTSTATUS CdpCoreMaterializeTimeWithWriterProgress(
+Cdp_CORE_OBF_WORKFLOW NTSTATUS CdpCoreMaterializeTimeWithWriterProgress(
 	_Inout_ PCdp_CORE Core,
 	_In_ UINT64 TargetTime100ns,
 	_In_ Cdp_CORE_DRAIN_WRITE_ROUTINE WriteRoutine,
@@ -2114,7 +2124,7 @@ done:
 	return status;
 }
 
-NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns)
+Cdp_CORE_OBF_WORKFLOW NTSTATUS CdpCoreRecoveryBegin(_Inout_ PCdp_CORE Core, _In_ UINT64 TargetTime100ns)
 {
 	Cdp_PREVIEW_TREE newTree;
 	Cdp_PREVIEW_TREE oldTree;
@@ -2287,7 +2297,7 @@ failure:
 	return status;
 }
 
-NTSTATUS CdpCoreRecoveryCommit(_Inout_ PCdp_CORE Core)
+Cdp_CORE_OBF_WORKFLOW NTSTATUS CdpCoreRecoveryCommit(_Inout_ PCdp_CORE Core)
 {
 	BOOLEAN complete;
 	return CdpCoreRecoveryCommitStep(Core, &complete);

@@ -8,6 +8,18 @@
 #endif
 #include "CdpJournalCodec.h"
 
+/* The journal encodes the durable history graph: branch ancestry, recovery
+ * intent, restore-point handoff and preview reconstruction.  Keep its public
+ * I/O surface lean, but make the state-machine and graph-building routines
+ * materially harder to recover as equivalent source from the release image. */
+#if defined(__clang__) && !defined(Cdp_USERMODE)
+#define Cdp_JOURNAL_OBF_WORKFLOW __attribute__((annotate("fla,const-obfus,string-obfus,ind-call")))
+#define Cdp_JOURNAL_OBF_LIGHT __attribute__((annotate("const-obfus,ind-call")))
+#else
+#define Cdp_JOURNAL_OBF_WORKFLOW
+#define Cdp_JOURNAL_OBF_LIGHT
+#endif
+
 #ifndef Cdp_USERMODE
 #if DBG
 #define Cdp_JOURNAL_DIAG(fmt, ...) \
@@ -610,7 +622,7 @@ static VOID CdpJournalInvalidateHeaderWriteCacheRangeLocked(
 /* Keep the immediate high-level Journal caller in every raw-I/O trace.  A
  * boot-time hang cannot be classified from IRP_MJ_READ alone: the same raw
  * transport is used for mount metadata, payload reads and checkpoint work. */
-static NTSTATUS CdpJournalRawIoImpl(
+Cdp_JOURNAL_OBF_LIGHT static NTSTATUS CdpJournalRawIoImpl(
 	_In_ PCdp_JOURNAL Journal,
 	_In_ UCHAR MajorFunction,
 	_In_ UINT64 Offset,
@@ -2304,7 +2316,7 @@ static VOID CdpJournalFreeRuntimeCheckpointsLocked(
 		Journal->CheckpointGeneration++;
 }
 
-static NTSTATUS CdpJournalWritePayloadRangeLocked(
+Cdp_JOURNAL_OBF_LIGHT static NTSTATUS CdpJournalWritePayloadRangeLocked(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 FileOffset,
 	_In_ ULONG DataLength,
@@ -3806,7 +3818,7 @@ cleanup:
 	return status;
 }
 
-NTSTATUS CdpJournalResetHistoryPreserveRestorePoint(
+Cdp_JOURNAL_OBF_WORKFLOW NTSTATUS CdpJournalResetHistoryPreserveRestorePoint(
 	_Inout_ PCdp_JOURNAL Journal)
 {
 	UINT64 usableStart;
@@ -3886,7 +3898,7 @@ cleanup:
 	return status;
 }
 
-static NTSTATUS CdpJournalMountInternal(
+Cdp_JOURNAL_OBF_WORKFLOW static NTSTATUS CdpJournalMountInternal(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ BOOLEAN AutoDiscovery)
 {
@@ -4088,7 +4100,7 @@ cleanup:
 	return status;
 }
 
-static NTSTATUS CdpJournalAppendBranchLocked(
+Cdp_JOURNAL_OBF_WORKFLOW static NTSTATUS CdpJournalAppendBranchLocked(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ LONG BranchNumber,
 	_In_ LONG ParentBranchNumber,
@@ -4245,7 +4257,7 @@ static NTSTATUS CdpJournalAppendBranchLocked(
 // Every header region begins with the identity of the currently active branch.
 // Unlike a branch-creation marker, this continuation does not create a tree
 // node or alter ancestry; Reserved makes the two forms unambiguous on disk.
-static NTSTATUS CdpJournalAppendBranchContinuationLocked(
+Cdp_JOURNAL_OBF_WORKFLOW static NTSTATUS CdpJournalAppendBranchContinuationLocked(
 	_Inout_ PCdp_JOURNAL Journal)
 {
 	PCdp_BRANCH_INFO_NODE branchNode;
@@ -4324,7 +4336,7 @@ NTSTATUS CdpJournalAppendBranch(
 	return status;
 }
 
-NTSTATUS CdpJournalRollbackLatestBranch(
+Cdp_JOURNAL_OBF_WORKFLOW NTSTATUS CdpJournalRollbackLatestBranch(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ LONG BranchNumber)
 {
@@ -4421,7 +4433,7 @@ cleanup:
 	return status;
 }
 
-NTSTATUS CdpJournalSetRecoveryIntent(
+Cdp_JOURNAL_OBF_WORKFLOW NTSTATUS CdpJournalSetRecoveryIntent(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 TargetTime100ns)
 {
@@ -4445,7 +4457,7 @@ done:
 	return status;
 }
 
-NTSTATUS CdpJournalClearRecoveryIntent(_Inout_ PCdp_JOURNAL Journal)
+Cdp_JOURNAL_OBF_WORKFLOW NTSTATUS CdpJournalClearRecoveryIntent(_Inout_ PCdp_JOURNAL Journal)
 {
 	NTSTATUS status;
 
@@ -4467,7 +4479,7 @@ done:
 	return status;
 }
 
-NTSTATUS CdpJournalCompleteRecoveryIntent(_Inout_ PCdp_JOURNAL Journal)
+Cdp_JOURNAL_OBF_WORKFLOW NTSTATUS CdpJournalCompleteRecoveryIntent(_Inout_ PCdp_JOURNAL Journal)
 {
 	NTSTATUS status;
 
@@ -4524,7 +4536,7 @@ NTSTATUS CdpJournalMountForAutoDiscovery(_Inout_ PCdp_JOURNAL Journal)
 	return CdpJournalMountInternal(Journal, TRUE);
 }
 
-NTSTATUS CdpJournalSetRestorePoint(
+Cdp_JOURNAL_OBF_WORKFLOW NTSTATUS CdpJournalSetRestorePoint(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 TargetTime100ns)
 {
@@ -4561,7 +4573,7 @@ done:
 	return status;
 }
 
-NTSTATUS CdpJournalBeginRestoreBoot(
+Cdp_JOURNAL_OBF_WORKFLOW NTSTATUS CdpJournalBeginRestoreBoot(
 	_Inout_ PCdp_JOURNAL Journal,
 	_Out_ PBOOLEAN PreviousBootConfirmed)
 {
@@ -4601,7 +4613,7 @@ done:
 	return status;
 }
 
-NTSTATUS CdpJournalConfirmRestoreBoot(_Inout_ PCdp_JOURNAL Journal)
+Cdp_JOURNAL_OBF_WORKFLOW NTSTATUS CdpJournalConfirmRestoreBoot(_Inout_ PCdp_JOURNAL Journal)
 {
 	NTSTATUS status = STATUS_SUCCESS;
 
@@ -4634,7 +4646,7 @@ done:
 	return status;
 }
 
-NTSTATUS CdpJournalClearRestorePoint(_Inout_ PCdp_JOURNAL Journal)
+Cdp_JOURNAL_OBF_WORKFLOW NTSTATUS CdpJournalClearRestorePoint(_Inout_ PCdp_JOURNAL Journal)
 {
 	NTSTATUS status;
 	BOOLEAN oldSet;
@@ -4813,7 +4825,7 @@ NTSTATUS CdpJournalAppend(
 		WrittenRecord);
 }
 
-static NTSTATUS CdpJournalAppendCommonEx(
+Cdp_JOURNAL_OBF_LIGHT static NTSTATUS CdpJournalAppendCommonEx(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 VolumeOffset,
 	_In_ ULONG DataLength,
@@ -5303,7 +5315,7 @@ NTSTATUS CdpJournalAppendWithWriterEx(
 		PayloadWriter, PayloadContext, WrittenRecord);
 }
 
-NTSTATUS CdpJournalDeleteRecordsThroughSequence(
+Cdp_JOURNAL_OBF_WORKFLOW NTSTATUS CdpJournalDeleteRecordsThroughSequence(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 SequenceInclusive,
 	_Out_ PULONG DeletedRegionCount,
@@ -5439,7 +5451,7 @@ cleanup:
 // Tombstone exactly one branch's contiguous creation-order range. BranchTree
 // supplies both endpoints, so unrelated RRs are never scanned for ownership.
 // Caller holds Journal->Lock.
-static NTSTATUS CdpJournalTombstoneBranchRangeLocked(
+Cdp_JOURNAL_OBF_WORKFLOW static NTSTATUS CdpJournalTombstoneBranchRangeLocked(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ PCdp_BRANCH_INFO_NODE Branch,
 	_In_ UINT64 PreviewTargetSequence,
@@ -5517,7 +5529,7 @@ static NTSTATUS CdpJournalTombstoneBranchRangeLocked(
 	}
 }
 
-NTSTATUS CdpJournalPruneUnreachableForCompaction(
+Cdp_JOURNAL_OBF_WORKFLOW NTSTATUS CdpJournalPruneUnreachableForCompaction(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 FirstSequence,
 	_In_ UINT64 EndSequence,
@@ -6458,7 +6470,7 @@ NTSTATUS CdpPreviewTreeRemapPayloadRange(
 	return STATUS_SUCCESS;
 }
 
-static NTSTATUS CdpJournalBuildCurrentBranchTreeInternal(
+Cdp_JOURNAL_OBF_WORKFLOW static NTSTATUS CdpJournalBuildCurrentBranchTreeInternal(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ BOOLEAN RestrictSequenceRange,
 	_In_ UINT64 FirstSequence,
@@ -6860,7 +6872,7 @@ static LONG CdpBranchPathFind(
 	return CdpJournalCodecBranchPathFind(Path, PathCount, Branch);
 }
 
-NTSTATUS CdpJournalResolveSettledPreviewTime(
+Cdp_JOURNAL_OBF_WORKFLOW NTSTATUS CdpJournalResolveSettledPreviewTime(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 RequestedTime100ns,
 	_In_ ULONG MaxLookaheadSeconds,
@@ -7074,7 +7086,7 @@ cleanup:
 	return status;
 }
 
-NTSTATUS CdpJournalResolveTargetBranch(
+Cdp_JOURNAL_OBF_WORKFLOW NTSTATUS CdpJournalResolveTargetBranch(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 TargetTime100ns,
 	_Out_ PLONG BranchNumber,
@@ -7183,7 +7195,7 @@ cleanup:
 	return status;
 }
 
-NTSTATUS CdpJournalBuildPreviewTreeEx(
+Cdp_JOURNAL_OBF_WORKFLOW NTSTATUS CdpJournalBuildPreviewTreeEx(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 TargetTime100ns,
 	_In_ UINT64 MaxSequence,
@@ -7439,7 +7451,7 @@ static NTSTATUS CdpPreviewTreeOverlaySnapshot(
 	return CdpJournalCodecOverlayPreviewSnapshot(Tree, Node);
 }
 
-NTSTATUS CdpJournalBuildSettledPreviewTree(
+Cdp_JOURNAL_OBF_WORKFLOW NTSTATUS CdpJournalBuildSettledPreviewTree(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 RequestedTime100ns,
 	_In_ UINT64 MaxSequence,
@@ -7751,7 +7763,7 @@ NTSTATUS CdpJournalBuildPreviewTree(
 		NULL);
 }
 
-NTSTATUS CdpJournalApplyPreviewTreeEx(
+Cdp_JOURNAL_OBF_LIGHT NTSTATUS CdpJournalApplyPreviewTreeEx(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ PCdp_PREVIEW_TREE Tree,
 	_Inout_ Cdp_LOCK* TreeLock,
@@ -7959,7 +7971,7 @@ cleanup:
 	return status;
 }
 
-NTSTATUS CdpJournalReadPayload(
+Cdp_JOURNAL_OBF_LIGHT NTSTATUS CdpJournalReadPayload(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 FileOffset,
 	_In_ ULONG DataLength,

@@ -19,9 +19,9 @@
  * 改为只调用这里的转发函数，因此"决策点"重新回到受保护 + 被控制流平坦化
  * 的范围内，而分发文件的代码与性能特征保持不变。
  *
- * 只允许存放"转发"逻辑：任何判定、常量或数据结构一旦写在这里，都会同时
- * 进入 CRC 覆盖范围与 .licprot 尺寸统计，反而增加维护成本。真正的判定
- * 仍留在 CdpLicenseGate.c。
+ * 这里仅承接恢复闸门转发与许可证 IOCTL 的最小路由/长度校验；授权判定
+ * 仍留在 CdpLicenseGate.c。这样既收紧静态边界，又不会把 I/O 热路径搬进
+ * .licprot。
  */
 
 #include "CdpLicenseGate.h"
@@ -52,6 +52,81 @@ NTSTATUS CdpLicenseGateCallAfterOpSuccess(
 VOID CdpLicenseGateCallAbortOp(VOID)
 {
 	CdpLicenseGateAbortOp();
+}
+
+BOOLEAN CdpLicenseGateCallTryDispatchIoctl(
+	_In_opt_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ ULONG IoControlCode,
+	_Inout_opt_ PVOID SystemBuffer,
+	_In_ ULONG InputLength,
+	_In_ ULONG OutputLength,
+	_Out_ PNTSTATUS Status,
+	_Out_ PULONG Information)
+{
+	if (!Status || !Information)
+		return FALSE;
+
+	*Information = 0;
+	switch (IoControlCode)
+	{
+	case IOCTL_Cdp_SET_LICENSE:
+	{
+		PCdp_SET_LICENSE_REQUEST request;
+		if (!DriverExt || !SystemBuffer ||
+			InputLength < sizeof(*request))
+		{
+			*Status = STATUS_BUFFER_TOO_SMALL;
+			return TRUE;
+		}
+		request = (PCdp_SET_LICENSE_REQUEST)SystemBuffer;
+		if (request->LicenseLength == 0 ||
+			request->LicenseLength > Cdp_LICENSE_BLOB_MAX)
+		{
+			*Status = STATUS_INVALID_PARAMETER;
+			return TRUE;
+		}
+		*Status = CdpLicenseSetFromBlob(
+			DriverExt, request->LicenseBlob, request->LicenseLength);
+		return TRUE;
+	}
+
+	case IOCTL_Cdp_QUERY_LICENSE:
+		if (!SystemBuffer)
+		{
+			*Status = STATUS_BUFFER_TOO_SMALL;
+			return TRUE;
+		}
+		*Status = CdpLicenseQueryStatus(SystemBuffer, OutputLength, Information);
+		return TRUE;
+
+	case IOCTL_Cdp_EXPORT_RECEIPT:
+		if (!SystemBuffer)
+		{
+			*Status = STATUS_BUFFER_TOO_SMALL;
+			return TRUE;
+		}
+		*Status = CdpLicenseExportReceipt(SystemBuffer, OutputLength, Information);
+		return TRUE;
+
+	case IOCTL_Cdp_BUILD_APPLY_QR:
+	{
+		Cdp_BUILD_APPLY_QR_REQUEST request;
+		if (!SystemBuffer || InputLength < sizeof(request) ||
+			OutputLength < sizeof(Cdp_LICENSE_APPLY_QR_REPLY))
+		{
+			*Status = STATUS_BUFFER_TOO_SMALL;
+			return TRUE;
+		}
+		request = *(PCdp_BUILD_APPLY_QR_REQUEST)SystemBuffer;
+		*Status = CdpLicenseBuildApplyQrPayload(request.DesiredDurationSec,
+			request.DesiredCredits, request.Mode, request.Kind, request.QrPrefix,
+			SystemBuffer, OutputLength, Information);
+		return TRUE;
+	}
+
+	default:
+		return FALSE;
+	}
 }
 
 #include "CdpLicenseSegEnd.h" /* 恢复默认 code/const 节 */

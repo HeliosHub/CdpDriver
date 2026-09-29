@@ -1,5 +1,8 @@
+#include "CdpEngineDefs.h"
 #include "CdpCredential.h"
 #include <bcrypt.h>
+
+#include "CdpLicenseSeg.h"
 
 static BOOLEAN CdpConstantTimeEqual(
 	_In_reads_bytes_(Length) const UCHAR* Left,
@@ -94,3 +97,48 @@ BOOLEAN CdpCredentialVerify(
 	RtlSecureZeroMemory(verifier, sizeof(verifier));
 	return equal;
 }
+
+NTSTATUS CdpCredentialGetShared(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_Out_ PCdp_CREDENTIAL_DESCRIPTOR Credential,
+	_Out_opt_ PULONG JournalCount)
+{
+	PLIST_ENTRY entry;
+	BOOLEAN found = FALSE;
+	ULONG count = 0;
+	NTSTATUS status = STATUS_NOT_FOUND;
+
+	RtlZeroMemory(Credential, sizeof(*Credential));
+	ExAcquireFastMutex(&DriverExt->VolumeHandleMutex);
+	for (entry = DriverExt->VolumeHandleList.Flink;
+		entry != &DriverExt->VolumeHandleList; entry = entry->Flink)
+	{
+		PCdp_VOLUME_HANDLE_ENTRY item =
+			CONTAINING_RECORD(entry, Cdp_VOLUME_HANDLE_ENTRY, Entry);
+		Cdp_CREDENTIAL_DESCRIPTOR current;
+		if (item->Closing || !item->Journal.Mounted ||
+			!CdpJournalGetCredential(&item->Journal, &current))
+		{
+			continue;
+		}
+		if (!found)
+		{
+			*Credential = current;
+			found = TRUE;
+			status = STATUS_SUCCESS;
+		}
+		else if (RtlCompareMemory(Credential, &current, sizeof(current)) !=
+			sizeof(current))
+		{
+			status = STATUS_OBJECT_TYPE_MISMATCH;
+			break;
+		}
+		++count;
+	}
+	ExReleaseFastMutex(&DriverExt->VolumeHandleMutex);
+	if (JournalCount)
+		*JournalCount = count;
+	return status;
+}
+
+#include "CdpLicenseSegEnd.h"

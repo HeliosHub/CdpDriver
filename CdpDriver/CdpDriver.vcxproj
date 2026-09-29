@@ -115,6 +115,12 @@
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
+    <Link>
+      <!-- Keep release navigation data out of the distributable build.  If
+           crash symbols are needed, create and retain them separately. -->
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <GenerateMapFile>false</GenerateMapFile>
+    </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug-Lic|x64'">
     <DriverSign>
@@ -168,6 +174,9 @@
     <CdpObfSeed Condition="'$(CdpObfSeed)'==''">5A17C3E90D4B62F18C7E0A3D5B29F461</CdpObfSeed>
     <CdpObfPasses>-mllvm -string-obfus -mllvm -const-obfus -mllvm -ind-call -mllvm -fla -mllvm -aesSeed=$(CdpObfSeed)</CdpObfPasses>
     <CdpObfPassesNoIndCall>-mllvm -string-obfus -mllvm -const-obfus -mllvm -fla -mllvm -aesSeed=$(CdpObfSeed)</CdpObfPassesNoIndCall>
+    <!-- Annotation-selected workflow functions need the shared PRNG seed but
+         deliberately receive no file-wide pass flag. -->
+    <CdpObfAnnotationSeed>-mllvm -aesSeed=$(CdpObfSeed)</CdpObfAnnotationSeed>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
     <ClCompile>
@@ -191,12 +200,17 @@
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="Driver.c" />
-    <ClCompile Include="CdpJournal.c" />
+	<ClCompile Include="CdpJournal.c">
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfAnnotationSeed) %(AdditionalOptions)</AdditionalOptions>
+	</ClCompile>
     <ClCompile Include="CdpJournalCodec.c">
       <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfPasses) %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
 	<ClCompile Include="CdpCredential.c">
 	  <!-- Credential KDF and verifier checks are isolated from kernel I/O paths. -->
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfPasses) %(AdditionalOptions)</AdditionalOptions>
+	</ClCompile>
+	<ClCompile Include="CdpCredentialRoute.c">
 	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfPasses) %(AdditionalOptions)</AdditionalOptions>
 	</ClCompile>
 	<ClCompile Include="CdpLocalSeal.c">
@@ -233,9 +247,15 @@
 	<ClCompile Include="CdpIoctlGuard.c">
 	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfPasses) %(AdditionalOptions)</AdditionalOptions>
 	</ClCompile>
-    <ClCompile Include="CdpIrpDispatchs.c" />
-    <ClCompile Include="cdp_dev_store.c" />
-    <ClCompile Include="..\CdpCore\src\cdp_core.c" />
+	<ClCompile Include="CdpIrpDispatchs.c">
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfAnnotationSeed) %(AdditionalOptions)</AdditionalOptions>
+	</ClCompile>
+	<ClCompile Include="cdp_dev_store.c">
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfAnnotationSeed) %(AdditionalOptions)</AdditionalOptions>
+	</ClCompile>
+	<ClCompile Include="..\CdpCore\src\cdp_core.c">
+	  <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfAnnotationSeed) %(AdditionalOptions)</AdditionalOptions>
+	</ClCompile>
     <ClCompile Include="..\CdpCore\src\cdp_view_policy.c">
       <AdditionalOptions Condition="'$(Configuration)|$(Platform)'=='Release|x64'">$(CdpObfPasses) %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
@@ -247,6 +267,7 @@
     <ClInclude Include="CdpJournal.h" />
     <ClInclude Include="CdpJournalCodec.h" />
 	<ClInclude Include="CdpCredential.h" />
+	<ClInclude Include="CdpCredentialRoute.h" />
 	<ClInclude Include="CdpLicenseDefs.h" />
 	<ClInclude Include="CdpLocalSeal.h" />
 	<ClInclude Include="CdpLicenseTrust.h" />
@@ -274,6 +295,14 @@
     </Link>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <Target Name="RemoveReleaseNavigationArtifacts" AfterTargets="Link"
+          Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <!-- The WDK packaging targets can still request a linker map even when
+         GenerateMapFile is false.  These are generated release by-products,
+         never distributable assets. -->
+    <Delete Files="$(TargetDir)$(TargetName).map;$(TargetDir)$(TargetName).pdb"
+            TreatErrorsAsWarnings="false" />
+  </Target>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
   <Target Name="CopyDriverToConsoleDeploy" AfterTargets="Build">

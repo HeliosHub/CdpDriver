@@ -21,14 +21,17 @@
 #define Cdp_DRIVER_VERSION_STRING "1.0.0"
 #define Cdp_DRIVER_BUILD_STRING   "20260918.109-release"
 
-// Cdp_LOG: always (Release+Debug) — version / errors / rare lifecycle.
-// Cdp_DBG: Debug builds only — verbose I/O and path tracing.
+/* Diagnostic text is an architecture oracle: messages name the COW redirect,
+ * journal layout, preview tree and recovery state transitions.  Keep it in
+ * DBG builds for supportability, but never compile the format strings into a
+ * shippable release driver. */
+#if DBG
 #define Cdp_LOG(fmt, ...) \
 	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
 		"CdpDriver: " fmt, ##__VA_ARGS__)
-#if DBG
 #define Cdp_DBG(fmt, ...) Cdp_LOG(fmt, ##__VA_ARGS__)
 #else
+#define Cdp_LOG(fmt, ...) ((void)0)
 #define Cdp_DBG(fmt, ...) ((void)0)
 #endif
 

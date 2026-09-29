@@ -97,17 +97,20 @@ $ExpectedUnits = [ordered]@{
     'CdpLicenseGateCall.c' = @{ Passes = @('-string-obfus','-const-obfus','-fla');            Section = $true }
     'CdpLicenseHw.c'       = @{ Passes = @('-string-obfus','-const-obfus','-ind-call','-fla'); Section = $true }
     'CdpLicenseCodec.c'    = @{ Passes = @('-string-obfus','-const-obfus','-ind-call','-fla'); Section = $true }
-    # Obfuscated, but intentionally NOT in .licprot: not on a license decision point.
-    'CdpCredential.c'      = @{ Passes = @('-string-obfus','-const-obfus','-ind-call','-fla'); Section = $false }
+    # Credential material and its IOCTL router participate in authorization;
+    # they must therefore share the protected section with the license gate.
+    'CdpCredential.c'      = @{ Passes = @('-string-obfus','-const-obfus','-ind-call','-fla'); Section = $true }
+    'CdpCredentialRoute.c' = @{ Passes = @('-string-obfus','-const-obfus','-ind-call','-fla'); Section = $true }
     'CdpIoctlGuard.c'      = @{ Passes = @('-string-obfus','-const-obfus','-ind-call','-fla'); Section = $false }
     'CdpJournalCodec.c'    = @{ Passes = @('-string-obfus','-const-obfus','-ind-call','-fla'); Section = $false }
     'cdp_view_policy.c'    = @{ Passes = @('-string-obfus','-const-obfus','-ind-call','-fla'); Section = $false }
-    # Intentionally unobfuscated: I/O hot paths (see CdpLicenseSeg.h:16-17).
+    # I/O hot paths remain unobfuscated.  Sensitive license IOCTL routing is
+    # moved into CdpLicenseGateCall.c, which is a protected unit above.
     'Driver.c'             = @{ Passes = @(); Section = $false }
-    'CdpIrpDispatchs.c'    = @{ Passes = @(); Section = $false }
-    'CdpJournal.c'         = @{ Passes = @(); Section = $false }
-    'cdp_core.c'           = @{ Passes = @(); Section = $false }
-    'cdp_dev_store.c'      = @{ Passes = @(); Section = $false }
+    'CdpIrpDispatchs.c'    = @{ Passes = @(); Annotations = @('Cdp_OBF_WORKFLOW','Cdp_OBF_WORKFLOW_LIGHT'); Section = $false }
+    'CdpJournal.c'         = @{ Passes = @(); Annotations = @('Cdp_JOURNAL_OBF_WORKFLOW','Cdp_JOURNAL_OBF_LIGHT'); Section = $false }
+    'cdp_core.c'           = @{ Passes = @(); Annotations = @('Cdp_CORE_OBF_WORKFLOW','Cdp_CORE_OBF_LIGHT'); Section = $false }
+    'cdp_dev_store.c'      = @{ Passes = @(); Annotations = @('Cdp_DEVSTORE_OBF_LIGHT'); Section = $false }
 }
 
 # License-path strings that must NOT survive as plaintext in the loaded code/data
@@ -126,7 +129,14 @@ $ForbiddenPlaintext = @(
     'vendor blob header invalid',
     'device_id_hash',
     'signing_key_id',
-    'issued_at_server'
+    'issued_at_server',
+    # Release diagnostics must not reveal the protected storage architecture.
+    '[REDIRECT-WRITE-',
+    '[COW-',
+    '[ORDERED-IO]',
+    '[RECOVERY]',
+    '[RESTORE-POINT]',
+    '[CHECKPOINT-MERGE]'
 )
 
 # Sections whose file-backed bytes get scanned for forbidden plaintext. PE
@@ -443,7 +453,8 @@ function Invoke-MainStepCheckFlags {
 
         # Seed: required only for obfuscated units, and must match across all of
         # them (a shared value is what makes obfuscation output stable).
-        if ($exp.Passes.Count -gt 0) {
+        $hasAnnotations = $null -ne $exp.Annotations -and @($exp.Annotations).Count -gt 0
+        if ($exp.Passes.Count -gt 0 -or $hasAnnotations) {
             $seedMatch = [regex]::Match($bySource[$key], $SeedPattern)
             if (-not $seedMatch.Success) {
                 Add-Failure "$src has no -mllvm -aesSeed -- this unit's obfuscation output is NOT reproducible"
@@ -458,7 +469,13 @@ function Invoke-MainStepCheckFlags {
         }
 
         if ($nMissing -eq 0 -and $nExtra -eq 0) {
-            $shown = if ($actual.Count -gt 0) { $actual -join ' ' } else { '(none)' }
+            $shown = if ($actual.Count -gt 0) {
+                $actual -join ' '
+            } elseif ($hasAnnotations) {
+                '(annotation-selected)'
+            } else {
+                '(none)'
+            }
             Write-Host ("  OK   {0,-22} {1}" -f $src, $shown) -ForegroundColor Green
         } else {
             $parts = @()
@@ -485,6 +502,193 @@ function Invoke-MainStepCheckFlags {
         Write-Host '       (note: the shipped toolchain still produces byte-different output per'
         Write-Host '        build because StringObfuscation owns an unseeded CryptoUtils; see'
         Write-Host '        OBFUSCATION_ANALYSIS.md section on reproducibility)'
+    }
+}
+
+function Invoke-MainStepCheckWorkflowAnnotations {
+    param([string]$ProjectPath)
+
+    Write-Head '1d. Core workflow annotation boundary'
+    $specs = @(
+        @{
+            Path = 'CdpIrpDispatchs.c'
+            Macro = 'Cdp_OBF_WORKFLOW'
+            Functions = @(
+                'CdpBeginPreviewSessionCore', 'CdpEndPreviewSessionCore',
+                'CdpBeginRecovery', 'CdpCommitRecovery', 'CdpCancelRecovery',
+                'CdpSetRestorePoint', 'CdpDeleteRestorePoint', 'CdpQueryRestorePoint',
+                'CdpRedirectJournalWrite', 'CdpRedirectVolumeWriteDirectly',
+                'CdpCaptureWorker', 'CdpDrainAndDisableCapture'
+            )
+        },
+        @{
+            Path = 'CdpIrpDispatchs.c'
+            Macro = 'Cdp_OBF_WORKFLOW_LIGHT'
+            Functions = @(
+                'CdpCoreReadAlignedView', 'CdpSnapshotWriteMdlChain',
+                'CdpScatterReadMdlChain', 'CdpCanRedirectOriginalWriteIrp',
+                'CdpCanCloneWriteIrpForJournal',
+                'CdpWriteJournalPayloadWithOriginalIrp',
+                'CdpWriteJournalPayloadWithClonedIrp',
+                'CdpDispatchProtectedVolumeIo', 'CdpIrpDispatchRead',
+                'CdpIrpDispatchWrite'
+            )
+        },
+        @{
+            Path = '..\CdpCore\src\cdp_core.c'
+            Macro = 'Cdp_CORE_OBF_WORKFLOW'
+            Functions = @(
+                'CdpCorePreviewBegin', 'CdpCorePreviewEnd',
+                'CdpCoreRecoveryCommitStep', 'CdpCorePrepareRebootRecovery',
+                'CdpCorePreparePersistentRestoreBoot', 'CdpCoreCancelPersistentRestoreBoot',
+                'CdpCoreSetRestorePointMarker', 'CdpCoreConfirmPersistentRestoreBoot',
+                'CdpCoreClearRestorePointMarker', 'CdpCoreRebuildCurrentView',
+                'CdpCoreMaterializeTimeWithWriterProgress', 'CdpCoreRecoveryBegin',
+                'CdpCoreRecoveryCommit',
+                'CdpCoreMaterializePendingRecoveryBranchLocked',
+                'CdpCoreMaterializePendingRestoreResetLocked',
+                'CdpCoreDrainOneMetaRangeWithWriter', 'CdpCoreResolveTargetTime'
+            )
+        },
+        @{
+            Path = '..\CdpCore\src\cdp_core.c'
+            Macro = 'Cdp_CORE_OBF_LIGHT'
+            Functions = @(
+                'CdpCoreAppendAfterImage', 'CdpCoreAppendAfterImageCommon',
+                'CdpCoreAppendAfterImageWithWriter', 'CdpCoreRead',
+                'CdpCoreSynthesizeRead', 'CdpCoreOverlayCurrentRead',
+                'CdpCoreQueryCurrentReadCoverage', 'CdpCorePreviewRead'
+            )
+        },
+        @{
+            Path = 'CdpJournal.c'
+            Macro = 'Cdp_JOURNAL_OBF_WORKFLOW'
+            Functions = @(
+                'CdpJournalMountInternal', 'CdpJournalAppendBranchLocked',
+                'CdpJournalAppendBranchContinuationLocked', 'CdpJournalRollbackLatestBranch',
+                'CdpJournalSetRecoveryIntent', 'CdpJournalClearRecoveryIntent',
+                'CdpJournalCompleteRecoveryIntent', 'CdpJournalSetRestorePoint',
+                'CdpJournalBeginRestoreBoot', 'CdpJournalConfirmRestoreBoot',
+                'CdpJournalClearRestorePoint', 'CdpJournalResetHistoryPreserveRestorePoint',
+                'CdpJournalDeleteRecordsThroughSequence',
+                'CdpJournalTombstoneBranchRangeLocked', 'CdpJournalPruneUnreachableForCompaction',
+                'CdpJournalBuildCurrentBranchTreeInternal', 'CdpJournalResolveSettledPreviewTime',
+                'CdpJournalResolveTargetBranch', 'CdpJournalBuildPreviewTreeEx',
+                'CdpJournalBuildSettledPreviewTree'
+            )
+        },
+        @{
+            Path = 'CdpJournal.c'
+            Macro = 'Cdp_JOURNAL_OBF_LIGHT'
+            Functions = @(
+                'CdpJournalRawIoImpl', 'CdpJournalWritePayloadRangeLocked',
+                'CdpJournalAppendCommonEx', 'CdpJournalApplyPreviewTreeEx',
+                'CdpJournalReadPayload'
+            )
+        },
+        @{
+            Path = 'cdp_dev_store.c'
+            Macro = 'Cdp_DEVSTORE_OBF_LIGHT'
+            Functions = @(
+                'CdpDevStoreRawIo', 'CdpDevStoreRead', 'CdpDevStoreWrite',
+                'CdpDevStoreWriteForceDirect', 'CdpDevStoreCreateAbsoluteRange'
+            )
+        }
+    )
+
+    foreach ($spec in $specs) {
+        $path = Join-Path $ProjectPath $spec.Path
+        if (-not (Test-Path -LiteralPath $path)) {
+            Add-Failure "Workflow source missing: $path"
+            continue
+        }
+        $source = Read-TextFileAuto -Path $path
+        $missing = @()
+        foreach ($name in $spec.Functions) {
+            $pattern = [regex]::Escape($spec.Macro) + '\s+(?:static\s+)?[A-Za-z_][A-Za-z0-9_\s\*]*\b' +
+                [regex]::Escape($name) + '\s*\('
+            if (-not [regex]::IsMatch($source, $pattern)) {
+                $missing += $name
+            }
+        }
+        if ($missing.Count -ne 0) {
+            Add-Failure "$($spec.Macro) is missing from: $($missing -join ', ')"
+            Write-Host "  FAIL $($spec.Macro): $($missing -join ', ')" -ForegroundColor Red
+        } else {
+            Write-Host ("  OK   {0}: {1} functions" -f $spec.Macro, $spec.Functions.Count) -ForegroundColor Green
+        }
+    }
+}
+
+function Invoke-MainStepCheckLicenseRouting {
+    param([string]$ProjectPath)
+
+    Write-Head '1b. License IOCTL routing boundary'
+    $dispatchPath = Join-Path $ProjectPath 'CdpIrpDispatchs.c'
+    $protectedPath = Join-Path $ProjectPath 'CdpLicenseGateCall.c'
+    if (-not (Test-Path -LiteralPath $dispatchPath) -or
+        -not (Test-Path -LiteralPath $protectedPath)) {
+        Add-Failure 'License routing sources are missing; cannot verify the protected IOCTL boundary'
+        return
+    }
+
+    $dispatch = Read-TextFileAuto -Path $dispatchPath
+    $protected = Read-TextFileAuto -Path $protectedPath
+    $anchors = @(
+        'IOCTL_Cdp_SET_LICENSE',
+        'IOCTL_Cdp_QUERY_LICENSE',
+        'IOCTL_Cdp_EXPORT_RECEIPT',
+        'IOCTL_Cdp_BUILD_APPLY_QR'
+    )
+    $leaked = @($anchors | Where-Object { $dispatch.Contains($_) })
+    if ($leaked.Count -ne 0) {
+        Add-Failure "License IOCTL identifiers remain in CdpIrpDispatchs.c: $($leaked -join ', ')"
+        Write-Host "  FAIL unprotected dispatch still names: $($leaked -join ', ')" -ForegroundColor Red
+    } else {
+        Write-Host '  OK   license IOCTL identifiers are absent from CdpIrpDispatchs.c' -ForegroundColor Green
+    }
+
+    $missing = @($anchors | Where-Object { -not $protected.Contains($_) })
+    if ($missing.Count -ne 0 -or -not $protected.Contains('CdpLicenseGateCallTryDispatchIoctl')) {
+        Add-Failure 'CdpLicenseGateCall.c does not contain the complete protected license router'
+        Write-Host '  FAIL protected license router is incomplete' -ForegroundColor Red
+    } else {
+        Write-Host '  OK   protected license router owns all license IOCTL identifiers' -ForegroundColor Green
+    }
+}
+
+function Invoke-MainStepCheckCredentialRouting {
+    param([string]$ProjectPath)
+
+    Write-Head '1c. Credential IOCTL routing boundary'
+    $dispatchPath = Join-Path $ProjectPath 'CdpIrpDispatchs.c'
+    $routePath = Join-Path $ProjectPath 'CdpCredentialRoute.c'
+    $credentialPath = Join-Path $ProjectPath 'CdpCredential.c'
+    if (-not (Test-Path -LiteralPath $dispatchPath) -or
+        -not (Test-Path -LiteralPath $routePath) -or
+        -not (Test-Path -LiteralPath $credentialPath)) {
+        Add-Failure 'Credential routing sources are missing; cannot verify the protected IOCTL boundary'
+        return
+    }
+
+    $dispatch = Read-TextFileAuto -Path $dispatchPath
+    $route = Read-TextFileAuto -Path $routePath
+    $credential = Read-TextFileAuto -Path $credentialPath
+    $anchors = @('IOCTL_Cdp_QUERY_CREDENTIAL', 'IOCTL_Cdp_AUTHENTICATE')
+    $leaked = @($anchors | Where-Object { $dispatch.Contains($_) })
+    if ($leaked.Count -ne 0) {
+        Add-Failure "Credential IOCTL identifiers remain in CdpIrpDispatchs.c: $($leaked -join ', ')"
+        Write-Host "  FAIL unprotected dispatch still names: $($leaked -join ', ')" -ForegroundColor Red
+    } else {
+        Write-Host '  OK   credential IOCTL identifiers are absent from CdpIrpDispatchs.c' -ForegroundColor Green
+    }
+    $missing = @($anchors | Where-Object { -not $route.Contains($_) })
+    if ($missing.Count -ne 0 -or -not $route.Contains('CdpCredentialRouteTryDispatchIoctl') -or
+        -not $credential.Contains('CdpCredentialGetShared')) {
+        Add-Failure 'Protected credential router or shared-credential reader is incomplete'
+        Write-Host '  FAIL protected credential router is incomplete' -ForegroundColor Red
+    } else {
+        Write-Host '  OK   protected credential router owns authentication and credential-query identifiers' -ForegroundColor Green
     }
 }
 
@@ -579,7 +783,7 @@ function Invoke-MainStepCheckImage {
 
 # ---------------------------------------------------------------- main
 if (-not $ProjectDir) {
-    $ProjectDir = Split-Path -Parent $PSScriptRoot
+    $ProjectDir = Join-Path (Split-Path -Parent $PSScriptRoot) 'CdpDriver'
 }
 if (-not (Test-Path -LiteralPath $ProjectDir)) {
     Write-Host "Project directory not found: $ProjectDir" -ForegroundColor Red
@@ -597,6 +801,9 @@ if (-not (Test-Path -LiteralPath $vcxproj)) {
 }
 
 Invoke-MainStepCheckFlags -TlogPath (Join-Path $ProjectDir "x64\$Configuration\CdpDriver.tlog\clang-cl.command.1.tlog")
+Invoke-MainStepCheckLicenseRouting -ProjectPath $ProjectDir
+Invoke-MainStepCheckCredentialRouting -ProjectPath $ProjectDir
+Invoke-MainStepCheckWorkflowAnnotations -ProjectPath $ProjectDir
 
 Write-Head '2. Locating final image'
 if (-not $SysPath) {

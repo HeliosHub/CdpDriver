@@ -1,17 +1,28 @@
 #include "CdpIrpDispatchs.h"
 #include "..\CdpCore\include\cdp_core.h"
 #include "CdpCredential.h"
+#include "CdpCredentialRoute.h"
 #include "CdpIoctlGuard.h"
 #include "..\CdpCore\include\cdp_dev_store.h"
 #include <ntdddisk.h>
 #include <ntddstor.h>
 #include <ntddvol.h>
 #include <ntstrsafe.h>
+
+/* The workflow state machines below are rare control operations.  Keep the
+ * per-I/O fast path clean, but make their static control flow non-obvious. */
+#if defined(__clang__)
+#define Cdp_OBF_WORKFLOW __attribute__((annotate("fla,const-obfus,string-obfus,ind-call")))
+#define Cdp_OBF_WORKFLOW_LIGHT __attribute__((annotate("const-obfus,ind-call")))
+#else
+#define Cdp_OBF_WORKFLOW
+#define Cdp_OBF_WORKFLOW_LIGHT
+#endif
 #ifdef CDP_LICENSE
 #include "CdpLicenseGate.h"
 /*
  * 闸门调用一律走 CdpLicenseGateCall* 转发（定义在 .licprot 内、含代码混淆）。
- * 本文件在 I/O 热路径上，不参与混淆与完整性哈希；若在此直接调用闸门函数，
+ * 本文件在 I/O 热路径上，不参与控制流混淆或完整性哈希；若在此直接调用闸门函数，
  * 攻击者改动这一处返回码判断即可让整套授权机制完全不被执行。
  */
 #include "CdpLicenseGateCall.h"
@@ -65,7 +76,7 @@ static NTSTATUS CdpScatterReadMdlChain(
 	_Out_ PULONG MdlCount,
 	_Out_ PUINT64 MdlBytes,
 	_Out_ PULONG CopiedBytes);
-static NTSTATUS CdpSnapshotWriteMdlChain(
+Cdp_OBF_WORKFLOW_LIGHT static NTSTATUS CdpSnapshotWriteMdlChain(
 	_In_ PIRP Irp,
 	_In_ ULONG RequiredLength,
 	_Outptr_result_bytebuffer_(RequiredLength) PUCHAR* Snapshot,
@@ -468,49 +479,6 @@ static PCdp_VOLUME_HANDLE_ENTRY CdpLookupVolumeHandleLocked(
 		entry = entry->Flink;
 	}
 	return NULL;
-}
-
-static NTSTATUS CdpGetSharedCredential(
-	_In_ PCdp_DRIVER_EXTENSION DriverExt,
-	_Out_ PCdp_CREDENTIAL_DESCRIPTOR Credential,
-	_Out_opt_ PULONG JournalCount)
-{
-	PLIST_ENTRY entry;
-	BOOLEAN found = FALSE;
-	ULONG count = 0;
-	NTSTATUS status = STATUS_NOT_FOUND;
-
-	RtlZeroMemory(Credential, sizeof(*Credential));
-	ExAcquireFastMutex(&DriverExt->VolumeHandleMutex);
-	for (entry = DriverExt->VolumeHandleList.Flink;
-		entry != &DriverExt->VolumeHandleList; entry = entry->Flink)
-	{
-		PCdp_VOLUME_HANDLE_ENTRY item =
-			CONTAINING_RECORD(entry, Cdp_VOLUME_HANDLE_ENTRY, Entry);
-		Cdp_CREDENTIAL_DESCRIPTOR current;
-		if (item->Closing || !item->Journal.Mounted ||
-			!CdpJournalGetCredential(&item->Journal, &current))
-		{
-			continue;
-		}
-		if (!found)
-		{
-			*Credential = current;
-			found = TRUE;
-			status = STATUS_SUCCESS;
-		}
-		else if (RtlCompareMemory(Credential, &current, sizeof(current)) !=
-			sizeof(current))
-		{
-			status = STATUS_OBJECT_TYPE_MISMATCH;
-			break;
-		}
-		++count;
-	}
-	ExReleaseFastMutex(&DriverExt->VolumeHandleMutex);
-	if (JournalCount)
-		*JournalCount = count;
-	return status;
 }
 
 // Find our filter's LowerDeviceObject for a volume PDO / stack member.
@@ -1251,11 +1219,11 @@ static BOOLEAN CdpControlHandleAuthorized(
 			"authorization-expired" : "handle-not-authenticated");
 		return FALSE;
 	}
-	/* Authentication is deliberately global: IOCTL_Cdp_AUTHENTICATE verifies
+	/* Authentication is deliberately global: the authentication request verifies
 	 * the shared protection credential, and all journals carry that credential.
 	 * Do not conflate authentication with whether auto discovery happened to
 	 * bind this particular source during the current boot. */
-	if (!NT_SUCCESS(CdpGetSharedCredential(DriverExt, &credential, NULL)))
+	if (!NT_SUCCESS(CdpCredentialGetShared(DriverExt, &credential, NULL)))
 	{
 		Cdp_LOG("[AUTH-CHECK-FAIL] reason=shared-credential-unavailable\n");
 		return FALSE;
@@ -2776,7 +2744,7 @@ static VOID CdpApplyRestorePointTimeLowerBound(
 		restorePointTime, OldestTime, NewestTime);
 }
 
-static NTSTATUS CdpBeginPreviewSessionCore(
+Cdp_OBF_WORKFLOW static NTSTATUS CdpBeginPreviewSessionCore(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const Cdp_PREVIEW_BEGIN_REQUEST* Request,
 	_Out_ PCdp_PREVIEW_BEGIN_REPLY Reply)
@@ -3052,7 +3020,7 @@ static NTSTATUS CdpBeginPreviewSession(
 	return status;
 }
 
-static NTSTATUS CdpEndPreviewSessionCore(
+Cdp_OBF_WORKFLOW static NTSTATUS CdpEndPreviewSessionCore(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ UINT64 HandleId)
 {
@@ -3435,7 +3403,7 @@ NTSTATUS CdpIrpDispatchCreateClose(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIR
 	return CdpIrpDispatchDefault(DeviceObject, Irp);
 }
 
-static NTSTATUS CdpBeginRecovery(
+Cdp_OBF_WORKFLOW static NTSTATUS CdpBeginRecovery(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const Cdp_RECOVERY_BEGIN_REQUEST* Request,
 	_Out_ PCdp_RECOVERY_BEGIN_REPLY Reply)
@@ -3610,7 +3578,7 @@ static NTSTATUS CdpBeginRecovery(
 	return STATUS_SUCCESS;
 }
 
-static NTSTATUS CdpCommitRecovery(
+Cdp_OBF_WORKFLOW static NTSTATUS CdpCommitRecovery(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const Cdp_RECOVERY_CONTROL_REQUEST* Request,
 	_Out_ PCdp_RECOVERY_COMMIT_REPLY Reply)
@@ -3653,7 +3621,7 @@ static NTSTATUS CdpCommitRecovery(
 	return STATUS_SUCCESS;
 }
 
-static NTSTATUS CdpCancelRecovery(
+Cdp_OBF_WORKFLOW static NTSTATUS CdpCancelRecovery(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const Cdp_RECOVERY_CONTROL_REQUEST* Request)
 {
@@ -3707,7 +3675,7 @@ static VOID CdpRestorePointMaterializeProgress(
 	InterlockedExchange64(&sourceExt->DrainProgressCompletedBytes, (LONG64)CompletedBytes);
 }
 
-static NTSTATUS CdpSetRestorePoint(
+Cdp_OBF_WORKFLOW static NTSTATUS CdpSetRestorePoint(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const Cdp_RESTORE_POINT_SET_REQUEST* Request,
 	_Out_ PCdp_RESTORE_POINT_SET_REPLY Reply)
@@ -3855,7 +3823,7 @@ phase_cleanup:
 	return status;
 }
 
-static NTSTATUS CdpDeleteRestorePoint(
+Cdp_OBF_WORKFLOW static NTSTATUS CdpDeleteRestorePoint(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const Cdp_RESTORE_POINT_DELETE_REQUEST* Request)
 {
@@ -3911,7 +3879,7 @@ cleanup:
 	return status;
 }
 
-static NTSTATUS CdpQueryRestorePoint(
+Cdp_OBF_WORKFLOW static NTSTATUS CdpQueryRestorePoint(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt,
 	_In_ const Cdp_RESTORE_POINT_QUERY_REQUEST* Request,
 	_Out_ PCdp_RESTORE_POINT_QUERY_REPLY Reply)
@@ -4474,7 +4442,7 @@ static NTSTATUS CdpQueryPhase(
 /* CdpCore operates on sector-aligned ranges, while preview/recovery clients
  * may request an arbitrary byte subrange.  The caller owns the appropriate
  * Core lifetime gate (PreviewAccessLock for preview, HistoryMutex otherwise). */
-static NTSTATUS CdpCoreReadAlignedView(
+Cdp_OBF_WORKFLOW_LIGHT static NTSTATUS CdpCoreReadAlignedView(
 	_In_ PCdp_DEVICE_EXTENSION DevExt,
 	_In_ BOOLEAN Preview,
 	_In_ UINT64 Offset,
@@ -4766,7 +4734,7 @@ static NTSTATUS CdpReadDiskLowerSynchronously(
 	return status;
 }
 
-NTSTATUS CdpIrpDispatchRead(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
+Cdp_OBF_WORKFLOW_LIGHT NTSTATUS CdpIrpDispatchRead(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 {
 	PCdp_DEVICE_EXTENSION deviceExt =
 		(PCdp_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
@@ -5438,7 +5406,7 @@ static NTSTATUS CdpQueryMdlChain(
 	return STATUS_SUCCESS;
 }
 
-static NTSTATUS CdpScatterReadMdlChain(
+Cdp_OBF_WORKFLOW_LIGHT static NTSTATUS CdpScatterReadMdlChain(
 	_In_ PIRP Irp,
 	_In_reads_bytes_(Length) const UCHAR* Source,
 	_In_ ULONG Length,
@@ -5588,7 +5556,7 @@ static NTSTATUS CdpOriginalIrpPayloadCompletion(
 	return STATUS_MORE_PROCESSING_REQUIRED;
 }
 
-static BOOLEAN CdpCanRedirectOriginalWriteIrp(
+Cdp_OBF_WORKFLOW_LIGHT static BOOLEAN CdpCanRedirectOriginalWriteIrp(
 	_In_ PCdp_DEVICE_EXTENSION SourceExt,
 	_In_ PCdp_CAPTURE_ITEM Item,
 	_In_ ULONG Length)
@@ -5627,7 +5595,7 @@ static BOOLEAN CdpCanRedirectOriginalWriteIrp(
 	return mdlBytes >= Length;
 }
 
-static BOOLEAN CdpCanCloneWriteIrpForJournal(
+Cdp_OBF_WORKFLOW_LIGHT static BOOLEAN CdpCanCloneWriteIrpForJournal(
 	_In_ PCdp_DEVICE_EXTENSION SourceExt,
 	_In_ PCdp_CAPTURE_ITEM Item,
 	_In_ ULONG Length)
@@ -5663,7 +5631,7 @@ static BOOLEAN CdpCanCloneWriteIrpForJournal(
 	return mdlBytes >= Length;
 }
 
-static NTSTATUS CdpWriteJournalPayloadWithOriginalIrp(
+Cdp_OBF_WORKFLOW_LIGHT static NTSTATUS CdpWriteJournalPayloadWithOriginalIrp(
 	_In_opt_ PVOID Context,
 	_In_ UINT64 JournalOffset,
 	_In_ ULONG DataLength,
@@ -5707,7 +5675,7 @@ static NTSTATUS CdpWriteJournalPayloadWithOriginalIrp(
 	return status;
 }
 
-static NTSTATUS CdpWriteJournalPayloadWithClonedIrp(
+Cdp_OBF_WORKFLOW_LIGHT static NTSTATUS CdpWriteJournalPayloadWithClonedIrp(
 	_In_opt_ PVOID Context,
 	_In_ UINT64 JournalOffset,
 	_In_ ULONG DataLength,
@@ -5765,7 +5733,7 @@ static NTSTATUS CdpWriteJournalPayloadWithClonedIrp(
 	return status;
 }
 
-static NTSTATUS CdpRedirectJournalWrite(
+Cdp_OBF_WORKFLOW static NTSTATUS CdpRedirectJournalWrite(
 	_In_ PCdp_DEVICE_EXTENSION SourceExt,
 	_Inout_ PCdp_CAPTURE_ITEM Item)
 {
@@ -5977,7 +5945,7 @@ static NTSTATUS CdpRedirectJournalWrite(
  * available and the worker has consumed every pre-ready request.  Once that
  * point is atomically published, ordinary PASSIVE/APC-level writes use the
  * former disk-layer direct redirect path. */
-static NTSTATUS CdpRedirectVolumeWriteDirectly(
+Cdp_OBF_WORKFLOW static NTSTATUS CdpRedirectVolumeWriteDirectly(
 	_Inout_ PCdp_DEVICE_EXTENSION SourceExt,
 	_In_ PDEVICE_OBJECT OriginLower,
 	_Inout_ PIRP Irp,
@@ -6003,7 +5971,7 @@ static NTSTATUS CdpRedirectVolumeWriteDirectly(
 	return status;
 }
 
-static NTSTATUS CdpDispatchProtectedVolumeIo(
+Cdp_OBF_WORKFLOW_LIGHT static NTSTATUS CdpDispatchProtectedVolumeIo(
 	_Inout_ PCdp_DEVICE_EXTENSION VolumeExt,
 	_Inout_ PIRP Irp)
 {
@@ -6201,7 +6169,7 @@ static NTSTATUS CdpForwardQueuedDiskIrpSynchronously(
 	return Item->Irp->IoStatus.Status;
 }
 
-static VOID CdpCaptureWorker(_In_ PVOID Context)
+Cdp_OBF_WORKFLOW static VOID CdpCaptureWorker(_In_ PVOID Context)
 {
 	PCdp_DEVICE_EXTENSION queueExt = (PCdp_DEVICE_EXTENSION)Context;
 
@@ -6613,7 +6581,7 @@ static NTSTATUS CdpVolumeBackfillWriteRelative(
 	return status;
 }
 
-static NTSTATUS CdpDrainAndDisableCapture(
+Cdp_OBF_WORKFLOW static NTSTATUS CdpDrainAndDisableCapture(
 	_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 {
 	NTSTATUS status = STATUS_SUCCESS;
@@ -7095,7 +7063,7 @@ NTSTATUS CdpIrpDispatchShutdown(
 		deviceExt, DeviceObject, Irp, hopId);
 }
 
-NTSTATUS CdpIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
+Cdp_OBF_WORKFLOW_LIGHT NTSTATUS CdpIrpDispatchWrite(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 {
 	PCdp_DEVICE_EXTENSION deviceExt = (PCdp_DEVICE_EXTENSION)DeviceObject->DeviceExtension;
 
@@ -7485,6 +7453,37 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 	// ?????��?????????????????????? IOCTL
 	if (isControlDevice)
 	{
+		NTSTATUS credentialStatus;
+		ULONG credentialInformation;
+		if (CdpCredentialRouteTryDispatchIoctl(
+			DriverExt,
+			IrpSp->Parameters.DeviceIoControl.IoControlCode,
+			Irp->AssociatedIrp.SystemBuffer,
+			IrpSp->Parameters.DeviceIoControl.InputBufferLength,
+			IrpSp->Parameters.DeviceIoControl.OutputBufferLength,
+			IrpSp->FileObject,
+			&credentialStatus,
+			&credentialInformation))
+		{
+			return CdpCompleteIrp(Irp, credentialStatus, credentialInformation);
+		}
+
+	#ifdef CDP_LICENSE
+		NTSTATUS licenseStatus;
+		ULONG licenseInformation;
+		if (CdpLicenseGateCallTryDispatchIoctl(
+			DriverExt,
+			IrpSp->Parameters.DeviceIoControl.IoControlCode,
+			Irp->AssociatedIrp.SystemBuffer,
+			IrpSp->Parameters.DeviceIoControl.InputBufferLength,
+			IrpSp->Parameters.DeviceIoControl.OutputBufferLength,
+			&licenseStatus,
+			&licenseInformation))
+		{
+			return CdpCompleteIrp(Irp, licenseStatus, licenseInformation);
+		}
+	#endif
+
 		switch (IrpSp->Parameters.DeviceIoControl.IoControlCode)
 		{
 		case IOCTL_Cdp_QUERY_PROTECT_STATUS:
@@ -7517,87 +7516,6 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 			return CdpCompleteIrp(Irp, STATUS_SUCCESS, sizeof(BOOLEAN));
 		}
 
-		case IOCTL_Cdp_QUERY_CREDENTIAL:
-		{
-			PCdp_CREDENTIAL_STATUS_REPLY reply;
-			Cdp_CREDENTIAL_DESCRIPTOR credential;
-			ULONG count = 0;
-			NTSTATUS status;
-			if (!Irp->AssociatedIrp.SystemBuffer ||
-				IrpSp->Parameters.DeviceIoControl.OutputBufferLength < sizeof(*reply))
-			{
-				return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
-			}
-			reply = (PCdp_CREDENTIAL_STATUS_REPLY)Irp->AssociatedIrp.SystemBuffer;
-			RtlZeroMemory(reply, sizeof(*reply));
-			status = CdpGetSharedCredential(DriverExt, &credential, &count);
-			if (status == STATUS_NOT_FOUND)
-				return CdpCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*reply));
-			if (!NT_SUCCESS(status))
-				return CdpCompleteIrp(Irp, status, 0);
-			reply->Configured = 1;
-			reply->JournalCount = count;
-			reply->CredentialId = credential.CredentialId;
-			reply->AuthEpoch = credential.AuthEpoch;
-			return CdpCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*reply));
-		}
-
-		case IOCTL_Cdp_AUTHENTICATE:
-		{
-			Cdp_AUTH_REQUEST request;
-			Cdp_CREDENTIAL_DESCRIPTOR credential;
-			PCdp_CONTROL_FILE_CONTEXT context =
-				(PCdp_CONTROL_FILE_CONTEXT)IrpSp->FileObject->FsContext;
-			NTSTATUS status;
-			UINT64 now = KeQueryInterruptTime();
-			if (!context || !Irp->AssociatedIrp.SystemBuffer ||
-				IrpSp->Parameters.DeviceIoControl.InputBufferLength < sizeof(request))
-			{
-				return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
-			}
-			request = *(PCdp_AUTH_REQUEST)Irp->AssociatedIrp.SystemBuffer;
-			RtlSecureZeroMemory(Irp->AssociatedIrp.SystemBuffer, sizeof(request));
-			if (request.PasswordLength == 0 ||
-				request.PasswordLength > Cdp_PASSWORD_MAX_UTF8_BYTES)
-			{
-				RtlSecureZeroMemory(&request, sizeof(request));
-				return CdpCompleteIrp(Irp, STATUS_INVALID_PARAMETER, 0);
-			}
-			if ((UINT64)InterlockedCompareExchange64(
-				&DriverExt->AuthBlockedUntil100ns, 0, 0) > now)
-			{
-				RtlSecureZeroMemory(&request, sizeof(request));
-				return CdpCompleteIrp(Irp, STATUS_ACCOUNT_LOCKED_OUT, 0);
-			}
-			status = CdpGetSharedCredential(DriverExt, &credential, NULL);
-			if (NT_SUCCESS(status) &&
-				!CdpCredentialVerify(request.Password, request.PasswordLength, &credential))
-			{
-				status = STATUS_ACCESS_DENIED;
-			}
-			RtlSecureZeroMemory(&request, sizeof(request));
-			if (!NT_SUCCESS(status))
-			{
-				if (status == STATUS_ACCESS_DENIED &&
-					InterlockedIncrement(&DriverExt->AuthFailureCount) >= 5)
-				{
-					InterlockedExchange(&DriverExt->AuthFailureCount, 0);
-					InterlockedExchange64(&DriverExt->AuthBlockedUntil100ns,
-						(LONGLONG)(now + 60ULL * 60ULL * 10000000ULL));
-					status = STATUS_ACCOUNT_LOCKED_OUT;
-				}
-				RtlSecureZeroMemory(context, sizeof(*context));
-				return CdpCompleteIrp(Irp, status, 0);
-			}
-			context->Authenticated = TRUE;
-			InterlockedExchange(&DriverExt->AuthFailureCount, 0);
-			InterlockedExchange64(&DriverExt->AuthBlockedUntil100ns, 0);
-			context->CredentialId = credential.CredentialId;
-			context->AuthEpoch = credential.AuthEpoch;
-			context->ExpiresAt100ns = KeQueryInterruptTime() + 60ULL * 60ULL * 10000000ULL;
-			return CdpCompleteIrp(Irp, STATUS_SUCCESS, 0);
-		}
-
 		case IOCTL_Cdp_CHANGE_PASSWORD:
 		{
 			Cdp_CHANGE_PASSWORD_REQUEST request;
@@ -7627,7 +7545,7 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 				RtlSecureZeroMemory(&request, sizeof(request));
 				return CdpCompleteIrp(Irp, STATUS_INVALID_PARAMETER, 0);
 			}
-			status = CdpGetSharedCredential(DriverExt, &oldCredential, NULL);
+			status = CdpCredentialGetShared(DriverExt, &oldCredential, NULL);
 			if (!NT_SUCCESS(status) ||
 				RtlCompareMemory(&context->CredentialId, &oldCredential.CredentialId,
 					sizeof(GUID)) != sizeof(GUID) ||
@@ -7756,7 +7674,7 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 				RtlZeroMemory(&credential, sizeof(credential));
 				if (local.FormatJournal != 0)
 				{
-					Status = CdpGetSharedCredential(DriverExt, &credential, NULL);
+					Status = CdpCredentialGetShared(DriverExt, &credential, NULL);
 					if (Status == STATUS_NOT_FOUND)
 					{
 						if (inLen < sizeof(Cdp_CMD1_REQUEST_V2) ||
@@ -8577,66 +8495,6 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 				Cdp_DRIVER_BUILD_STRING);
 			return CdpCompleteIrp(Irp, STATUS_SUCCESS, sizeof(*reply));
 		}
-
-#ifdef CDP_LICENSE
-		case IOCTL_Cdp_SET_LICENSE:
-		{
-			PCdp_SET_LICENSE_REQUEST request;
-			ULONG inLen = IrpSp->Parameters.DeviceIoControl.InputBufferLength;
-			NTSTATUS status;
-
-			if (!DriverExt || !Irp->AssociatedIrp.SystemBuffer ||
-				inLen < sizeof(*request))
-				return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
-			request = (PCdp_SET_LICENSE_REQUEST)Irp->AssociatedIrp.SystemBuffer;
-			if (request->LicenseLength == 0 ||
-				request->LicenseLength > Cdp_LICENSE_BLOB_MAX)
-				return CdpCompleteIrp(Irp, STATUS_INVALID_PARAMETER, 0);
-			status = CdpLicenseSetFromBlob(
-				DriverExt, request->LicenseBlob, request->LicenseLength);
-			return CdpCompleteIrp(Irp, status, 0);
-		}
-
-		case IOCTL_Cdp_QUERY_LICENSE:
-		{
-			ULONG written = 0;
-			NTSTATUS status;
-			if (!Irp->AssociatedIrp.SystemBuffer)
-				return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
-			status = CdpLicenseQueryStatus(Irp->AssociatedIrp.SystemBuffer,
-				IrpSp->Parameters.DeviceIoControl.OutputBufferLength, &written);
-			return CdpCompleteIrp(Irp, status, written);
-		}
-
-		case IOCTL_Cdp_EXPORT_RECEIPT:
-		{
-			ULONG written = 0;
-			NTSTATUS status;
-			if (!Irp->AssociatedIrp.SystemBuffer)
-				return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
-			status = CdpLicenseExportReceipt(Irp->AssociatedIrp.SystemBuffer,
-				IrpSp->Parameters.DeviceIoControl.OutputBufferLength, &written);
-			return CdpCompleteIrp(Irp, status, written);
-		}
-
-		case IOCTL_Cdp_BUILD_APPLY_QR:
-		{
-			Cdp_BUILD_APPLY_QR_REQUEST request;
-			ULONG inLen = IrpSp->Parameters.DeviceIoControl.InputBufferLength;
-			ULONG outLen = IrpSp->Parameters.DeviceIoControl.OutputBufferLength;
-			ULONG written = 0;
-			NTSTATUS status;
-
-			if (!Irp->AssociatedIrp.SystemBuffer || inLen < sizeof(request) ||
-				outLen < sizeof(Cdp_LICENSE_APPLY_QR_REPLY))
-				return CdpCompleteIrp(Irp, STATUS_BUFFER_TOO_SMALL, 0);
-			request = *(PCdp_BUILD_APPLY_QR_REQUEST)Irp->AssociatedIrp.SystemBuffer;
-			status = CdpLicenseBuildApplyQrPayload(request.DesiredDurationSec,
-				request.DesiredCredits, request.Mode, request.Kind, request.QrPrefix,
-				Irp->AssociatedIrp.SystemBuffer, outLen, &written);
-			return CdpCompleteIrp(Irp, status, written);
-		}
-#endif
 
 		default:
 			Cdp_LOG("unknown IOCTL 0x%08X on control device\n",
