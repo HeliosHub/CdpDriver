@@ -18,8 +18,8 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.0.0"
-#define Cdp_DRIVER_BUILD_STRING   "20260918.109-release"
+#define Cdp_DRIVER_VERSION_STRING "1.0.2"
+#define Cdp_DRIVER_BUILD_STRING   "20260929.102-release"
 
 /* Diagnostic text is an architecture oracle: messages name the COW redirect,
  * journal layout, preview tree and recovery state transitions.  Keep it in

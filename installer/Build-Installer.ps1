@@ -14,6 +14,27 @@ if ([string]::IsNullOrWhiteSpace($GuiRoot)) {
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = $installerRoot
 }
+$guiBuildScript = Join-Path $GuiRoot 'build-release.bat'
+$driverBuildScript = Join-Path $driverRoot 'build.bat'
+$buildScripts = @($guiBuildScript, $driverBuildScript)
+foreach ($script in $buildScripts) {
+    if (-not (Test-Path -LiteralPath $script -PathType Leaf)) {
+        throw "找不到构建脚本: $script"
+    }
+}
+
+Write-Host "正在重新生成 GUI Release 版本..."
+& $guiBuildScript
+if ($LASTEXITCODE -ne 0) {
+    throw "生成 GUI Release 版本失败 (exit code $LASTEXITCODE)。"
+}
+
+Write-Host "正在重新生成驱动 Release 版本..."
+& $driverBuildScript 'Release' 'x64' '--no-pause'
+if ($LASTEXITCODE -ne 0) {
+    throw "生成驱动 Release 版本失败 (exit code $LASTEXITCODE)。"
+}
+
 $driverOutput = Join-Path $driverRoot 'x64\Release'
 $guiOutput = Join-Path $GuiRoot 'bin\x64\Release'
 $guiExecutableCandidates = @(
@@ -198,6 +219,7 @@ $presentExcluded = $archiveEntries | Where-Object { $_ -in $excluded }
 if ($presentExcluded) {
     throw "安装包包含不应发布的文件: $($presentExcluded -join ', ')"
 }
+
 $forbiddenArchiveEntry = $archiveEntries | Where-Object {
     $_ -match '(?i)(^|/)(compile_commands\.(json|txt))$' -or
     $_ -match '(?i)\.(pdb|map|tlog|obj|lib|exp|ilk)$'

@@ -3,10 +3,9 @@ Signature   = "$WINDOWS NT$"
 Class       = Volume
 ClassGuid   = {71a27cdd-812a-11d0-bec7-08002be2092f}
 Provider    = %ProviderName%
-DriverVer   = 09/20/2026,1.0.0.0
+DriverVer   = 09/29/2026,1.0.2.0
 CatalogFile = CdpDriver.cat
 PnpLockdown = 1
-LegacyUninstall = 1
 
 [SourceDisksNames]
 1 = %DiskName%,,,
@@ -30,6 +29,7 @@ AddService = CdpDriver,, CdpDriver_ServiceInstall
 AddFilter = CdpDriver,, CdpDriver_FilterInstall
 
 [DefaultUninstall.NTamd64]
+LegacyUninstall = 1
 DelFiles = CdpDriver_DelFiles.NTamd64
 DelReg = CdpDriver_DelReg,CdpDriver_DiskUpperFilter_DelReg
 

@@ -10,7 +10,7 @@ RequestExecutionLevel admin
 !insertmacro VersionCompare
 
 !define PRODUCT_NAME "源点恢复"
-!define PRODUCT_VERSION "1.0.0.0"
+!define PRODUCT_VERSION "1.0.2.0"
 !define PRODUCT_PUBLISHER "源点恢复"
 !define PRODUCT_EXE "源点恢复.exe"
 
@@ -78,9 +78,70 @@ cancel_uninstall:
     Abort
 FunctionEnd
 
+Function EnsureSystemProtectionDisabled
+system_protection_check:
+    nsExec::ExecToLog '"$PLUGINSDIR\CdpDriverInstallHelper.exe" --check-system-protection'
+    Pop $0
+    ${If} $0 == 0
+        Return
+    ${EndIf}
+    ${If} $0 == 10
+        MessageBox MB_YESNO|MB_ICONEXCLAMATION "检测到系统盘仍受源点恢复保护。必须先关闭系统盘保护，才能继续安装。$\r$\n$\r$\n点击“是”立即关闭系统盘保护（随后需要输入保护密码）；点击“否”取消安装。" IDYES system_protection_stop IDNO system_protection_cancel
+    ${EndIf}
+    MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "暂时无法检测系统盘保护状态。请关闭正在运行的源点恢复后重试。" IDRETRY system_protection_check IDCANCEL system_protection_cancel
+
+system_protection_stop:
+    DetailPrint "正在关闭系统盘保护..."
+    ; The helper shows its own password window. nsExec runs child processes
+    ; hidden, which would make that prompt invisible and leave setup waiting.
+    ExecWait '"$PLUGINSDIR\CdpDriverInstallHelper.exe" --stop-system-protection' $0
+    ${If} $0 == 0
+        DetailPrint "系统盘保护已关闭。"
+        Goto system_protection_check
+    ${EndIf}
+    ${If} $0 == 12
+        MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "已取消输入保护密码。必须关闭系统盘保护才能继续安装。" IDRETRY system_protection_stop IDCANCEL system_protection_cancel
+    ${EndIf}
+    MessageBox MB_RETRYCANCEL|MB_ICONSTOP "关闭系统盘保护失败。请确认保护密码正确且没有恢复或预览任务正在执行，然后重试。" IDRETRY system_protection_stop IDCANCEL system_protection_cancel
+
+system_protection_cancel:
+    Abort
+FunctionEnd
+
+Function CloseRunningGui
+close_gui_current:
+    DetailPrint "正在关闭已运行的源点恢复..."
+    nsExec::ExecToLog '"$WINDIR\Sysnative\taskkill.exe" /F /T /IM "源点恢复.exe"'
+    Pop $0
+    ${If} $0 != 0
+    ${AndIf} $0 != 128
+        MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "无法关闭正在运行的源点恢复（错误码：$0）。请手动关闭后重试。" IDRETRY close_gui_current IDCANCEL close_gui_cancel
+    ${EndIf}
+
+close_gui_legacy:
+    nsExec::ExecToLog '"$WINDIR\Sysnative\taskkill.exe" /F /T /IM "CDPCorePro.exe"'
+    Pop $0
+    ${If} $0 != 0
+    ${AndIf} $0 != 128
+        MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "无法关闭正在运行的源点恢复（错误码：$0）。请手动关闭后重试。" IDRETRY close_gui_legacy IDCANCEL close_gui_cancel
+    ${EndIf}
+    Return
+
+close_gui_cancel:
+    Abort
+FunctionEnd
+
 Section "安装源点恢复" SEC_MAIN
     SectionIn RO
     SetShellVarContext all
+
+    ; Extract only the helper needed for the pre-install protection check;
+    ; the final payload is not copied to the selected install directory yet.
+    InitPluginsDir
+    SetOutPath "$PLUGINSDIR"
+    File /oname=CdpDriverInstallHelper.exe "work\payload\CdpDriverInstallHelper.exe"
+    Call CloseRunningGui
+    Call EnsureSystemProtectionDisabled
 
     DetailPrint "正在检查 Microsoft Visual C++ x64 运行库..."
     StrCpy $2 1
@@ -119,6 +180,18 @@ Section "安装源点恢复" SEC_MAIN
     DetailPrint "正在复制图形管理工具..."
     SetOutPath "$INSTDIR"
     File /r "work\payload\*.*"
+
+    DetailPrint "正在启用 Windows 测试模式..."
+    ; NSIS is a 32-bit process. Sysnative bypasses WOW64 redirection so this
+    ; launches the 64-bit bcdedit.exe; SysWOW64 does not include bcdedit.exe.
+    nsExec::ExecToLog '"$WINDIR\Sysnative\bcdedit.exe" /set testsigning on'
+    Pop $0
+    ${If} $0 != 0
+        MessageBox MB_OK|MB_ICONSTOP "无法启用 Windows 测试模式，错误码：$0。请确认以管理员身份运行安装程序；若已启用安全启动，请先关闭安全启动后再试。"
+        Abort
+    ${EndIf}
+    DetailPrint "Windows 测试模式将在重启后生效。"
+    SetRebootFlag true
 
     DetailPrint "正在安装 CdpDriver 测试签名证书..."
     nsExec::ExecToLog '"$SYSDIR\certutil.exe" -addstore -f Root "$INSTDIR\driver\CdpDriver.cer"'
