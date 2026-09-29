@@ -14,27 +14,9 @@ if ([string]::IsNullOrWhiteSpace($GuiRoot)) {
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = $installerRoot
 }
-$guiBuildScript = Join-Path $GuiRoot 'build-release.bat'
-$driverBuildScript = Join-Path $driverRoot 'build.bat'
-$buildScripts = @($guiBuildScript, $driverBuildScript)
-foreach ($script in $buildScripts) {
-    if (-not (Test-Path -LiteralPath $script -PathType Leaf)) {
-        throw "找不到构建脚本: $script"
-    }
-}
-
-Write-Host "正在重新生成 GUI Release 版本..."
-& $guiBuildScript
-if ($LASTEXITCODE -ne 0) {
-    throw "生成 GUI Release 版本失败 (exit code $LASTEXITCODE)。"
-}
-
-Write-Host "正在重新生成驱动 Release 版本..."
-& $driverBuildScript 'Release' 'x64' '--no-pause'
-if ($LASTEXITCODE -ne 0) {
-    throw "生成驱动 Release 版本失败 (exit code $LASTEXITCODE)。"
-}
-
+# Packaging intentionally consumes the already-built GUI and driver release
+# artifacts below.  This keeps packaging fast and avoids rebuilding either
+# component when producing a setup executable.
 $driverOutput = Join-Path $driverRoot 'x64\Release'
 $guiOutput = Join-Path $GuiRoot 'bin\x64\Release'
 $guiExecutableCandidates = @(

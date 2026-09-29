@@ -116,9 +116,9 @@
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
     <Link>
-      <!-- Keep release navigation data out of the distributable build.  If
-           crash symbols are needed, create and retain them separately. -->
-      <GenerateDebugInformation>false</GenerateDebugInformation>
+      <!-- Produce a separate PDB for crash analysis.  The package contains
+           only the SYS; retain symbols alongside the release build output. -->
+      <GenerateDebugInformation>true</GenerateDebugInformation>
       <GenerateMapFile>false</GenerateMapFile>
     </Link>
   </ItemDefinitionGroup>
@@ -261,6 +261,10 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
+    <!-- Embed the version resource so Windows exposes the SYS file metadata. -->
+    <ResourceCompile Include="CdpDriver.rc" />
+  </ItemGroup>
+  <ItemGroup>
     <ClInclude Include="CdpEngineDefs.h" />
     <ClInclude Include="CdpIoctl.h" />
     <ClInclude Include="CdpIrpDispatchs.h" />
@@ -295,14 +299,6 @@
     </Link>
   </ItemDefinitionGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
-  <Target Name="RemoveReleaseNavigationArtifacts" AfterTargets="Link"
-          Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
-    <!-- The WDK packaging targets can still request a linker map even when
-         GenerateMapFile is false.  These are generated release by-products,
-         never distributable assets. -->
-    <Delete Files="$(TargetDir)$(TargetName).map;$(TargetDir)$(TargetName).pdb"
-            TreatErrorsAsWarnings="false" />
-  </Target>
   <ImportGroup Label="ExtensionTargets">
   </ImportGroup>
   <Target Name="CopyDriverToConsoleDeploy" AfterTargets="Build">
