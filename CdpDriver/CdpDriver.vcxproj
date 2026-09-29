@@ -154,6 +154,9 @@
     </Inf>
   </ItemGroup>
   <ItemGroup>
+    <ResourceCompile Include="CdpDriver.rc" />
+  </ItemGroup>
+  <ItemGroup>
     <FilesToPackage Include="$(TargetPath)" />
   </ItemGroup>
   <ItemGroup>
