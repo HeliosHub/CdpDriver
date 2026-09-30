@@ -14,27 +14,6 @@ if ([string]::IsNullOrWhiteSpace($GuiRoot)) {
 if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = $installerRoot
 }
-$guiBuildScript = Join-Path $GuiRoot 'build-release.bat'
-$driverBuildScript = Join-Path $driverRoot 'build.bat'
-$buildScripts = @($guiBuildScript, $driverBuildScript)
-foreach ($script in $buildScripts) {
-    if (-not (Test-Path -LiteralPath $script -PathType Leaf)) {
-        throw "找不到构建脚本: $script"
-    }
-}
-
-Write-Host "正在重新生成 GUI Release 版本..."
-& $guiBuildScript
-if ($LASTEXITCODE -ne 0) {
-    throw "生成 GUI Release 版本失败 (exit code $LASTEXITCODE)。"
-}
-
-Write-Host "正在重新生成驱动 Release 版本..."
-& $driverBuildScript 'Release' 'x64' '--no-pause'
-if ($LASTEXITCODE -ne 0) {
-    throw "生成驱动 Release 版本失败 (exit code $LASTEXITCODE)。"
-}
-
 $driverOutput = Join-Path $driverRoot 'x64\Release'
 $guiOutput = Join-Path $GuiRoot 'bin\x64\Release'
 $guiExecutableCandidates = @(
@@ -92,6 +71,8 @@ foreach ($file in @(
     $guiExecutable,
     (Join-Path $guiOutput 'handle.exe'),
     (Join-Path $guiOutput 'iscsi_target_dotnet.dll'),
+    (Join-Path $guiOutput 'libbfio.dll'),
+    (Join-Path $guiOutput 'libfsntfs.dll'),
     (Join-Path $driverOutput 'CdpDriver.cer'),
     (Join-Path $driverOutput 'driver\CdpDriver.inf'),
     (Join-Path $driverOutput 'driver\CdpDriver.sys'),
@@ -139,6 +120,8 @@ New-Item -ItemType Directory -Force -Path (Join-Path $workRoot 'out') | Out-Null
 Copy-ReleaseFile $guiExecutable (Join-Path $payloadRoot '源点恢复.exe')
 Copy-ReleaseFile (Join-Path $guiOutput 'handle.exe') (Join-Path $payloadRoot 'handle.exe')
 Copy-ReleaseFile (Join-Path $guiOutput 'iscsi_target_dotnet.dll') (Join-Path $payloadRoot 'iscsi_target_dotnet.dll')
+Copy-ReleaseFile (Join-Path $guiOutput 'libbfio.dll') (Join-Path $payloadRoot 'libbfio.dll')
+Copy-ReleaseFile (Join-Path $guiOutput 'libfsntfs.dll') (Join-Path $payloadRoot 'libfsntfs.dll')
 Copy-Item -LiteralPath (Join-Path $guiOutput 'Web') -Destination (Join-Path $payloadRoot 'Web') -Recurse -Force
 $payloadIndexPath = Join-Path $payloadRoot 'Web\index.html'
 # Windows PowerShell 5.1 treats UTF-8 files without a BOM as ANSI when

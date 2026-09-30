@@ -142,7 +142,6 @@ typedef struct _Cdp_PREVIEW_SESSION
 	LIST_ENTRY Entry;
 	UINT64 HandleId;
 	UINT64 TargetTime100ns;
-	UINT64 SourceVolumeHandleId;
 	PCdp_VOLUME_HANDLE_ENTRY JournalEntry;
 	GUID SourceVolumeGuid;
 	volatile LONG ReferenceCount;
@@ -189,6 +188,10 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	volatile LONG64 PowerIrpEntryCount;
 	volatile LONG64 PowerIrpCompletionCount;
 	volatile LONG Phase;
+	/* Once an online recovery publishes a historical MetaTree, current-volume
+	 * reads use the same Core synthesis path as Preview. This avoids a semantic
+	 * split between Preview baseline reads and pass-through cache/mount reads. */
+	volatile LONG RecoverySynthesizeReads;
 	// START_DEVICE publishes this before pre-mount discovery uses the lower
 	// device stack.
 	volatile LONG Started;
@@ -282,6 +285,8 @@ typedef struct _Cdp_CAPTURE_ITEM
 	UINT64 SourceVolumeOffset;
 	/* Offset understood by OriginLowerReference; also volume-relative. */
 	UINT64 OriginLowerOffset;
+	/* Monotonic protected-read id used only by bounded recovery diagnostics. */
+	LONG64 ReadTraceSequence;
 	PDEVICE_OBJECT SourceReference;
 	PDEVICE_OBJECT OriginLowerReference;
 } Cdp_CAPTURE_ITEM, *PCdp_CAPTURE_ITEM;

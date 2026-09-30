@@ -235,11 +235,16 @@ failed:
 static volatile LONG g_CdpMdllessSystemBufferReported;
 static volatile LONG g_CdpMdllessUserBufferReported;
 static volatile LONG64 g_CdpVolumeReadPassThroughCount;
+static volatile LONG64 g_CdpRecoveryReadTraceStart;
+static volatile LONG64 g_CdpRecoveryReadTraceEnd;
 
 static BOOLEAN CdpShouldTraceRead(_In_ LONG64 Sequence)
 {
-	UNREFERENCED_PARAMETER(Sequence);
-	return FALSE;
+	LONG64 start = InterlockedCompareExchange64(
+		&g_CdpRecoveryReadTraceStart, 0, 0);
+	LONG64 end = InterlockedCompareExchange64(
+		&g_CdpRecoveryReadTraceEnd, 0, 0);
+	return Sequence > start && Sequence <= end;
 }
 
 static NTSTATUS CdpBeginRecovery(
@@ -1510,6 +1515,7 @@ static NTSTATUS CdpConfigureCaptureInternal(
 	sourceExt->JournalHandleId = journalHandleId;
 	InterlockedExchange(&sourceExt->JournalBackendReady, 0);
 	InterlockedExchange(&sourceExt->DirectRedirectReady, 0);
+	InterlockedExchange(&sourceExt->RecoverySynthesizeReads, 0);
 	KeClearEvent(&sourceExt->JournalBackendReadyEvent);
 
 	{
@@ -1797,6 +1803,7 @@ static NTSTATUS CdpActivateAutoJournal(
 	sourceExt->SectorSize = sourceSectorSize;
 	InterlockedExchange(&sourceExt->JournalBackendReady, 0);
 	InterlockedExchange(&sourceExt->DirectRedirectReady, 0);
+	InterlockedExchange(&sourceExt->RecoverySynthesizeReads, 0);
 	KeClearEvent(&sourceExt->JournalBackendReadyEvent);
 	status = CdpDevStoreCreateAbsoluteRange(
 		sourceExt->LowerDeviceObject,
@@ -2718,8 +2725,8 @@ static VOID CdpDestroyPreviewSession(
 {
 	LARGE_INTEGER diagnosticTimeout;
 	NTSTATUS waitStatus;
-	NTSTATUS closeStatus = STATUS_SUCCESS;
 	ULONGLONG stageStart100ns;
+	UNREFERENCED_PARAMETER(DriverExt);
 
 	Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=session-drain-begin handle=%llu refs=%ld thread=%p\n",
 		Session->HandleId,
@@ -2750,22 +2757,6 @@ static VOID CdpDestroyPreviewSession(
 		waitStatus,
 		(KeQueryInterruptTime() - stageStart100ns) / 10000ULL);
 
-	if (Session->SourceVolumeHandleId)
-	{
-		stageStart100ns = KeQueryInterruptTime();
-		Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=source-handle-close-begin previewHandle=%llu sourceHandle=%llu thread=%p\n",
-			Session->HandleId,
-			Session->SourceVolumeHandleId,
-			PsGetCurrentThread());
-		closeStatus = CdpCloseVolumeHandle(
-			DriverExt,
-			Session->SourceVolumeHandleId);
-		Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=source-handle-close-end previewHandle=%llu sourceHandle=%llu status=0x%08X elapsedMs=%llu\n",
-			Session->HandleId,
-			Session->SourceVolumeHandleId,
-			closeStatus,
-			(KeQueryInterruptTime() - stageStart100ns) / 10000ULL);
-	}
 	if (Session->JournalEntry)
 	{
 		stageStart100ns = KeQueryInterruptTime();
@@ -2814,7 +2805,6 @@ static NTSTATUS CdpBeginPreviewSessionCore(
 	PCdp_VOLUME_HANDLE_ENTRY journalEntry = NULL;
 	PCdp_PREVIEW_SESSION session = NULL;
 	PCdp_DEVICE_EXTENSION sourceExt = NULL;
-	UINT64 sourceHandleId = 0;
 	UINT64 oldestTime = 0;
 	UINT64 newestTime = 0;
 	UINT64 targetTime = Request->TargetTime100ns;
@@ -2903,13 +2893,6 @@ static NTSTATUS CdpBeginPreviewSessionCore(
 	if (targetTime < oldestTime)
 		targetTime = oldestTime;
 
-	status = CdpOpenVolumeHandle(
-		DriverExt,
-		&Request->SourceVolumeGuid,
-		&sourceHandleId);
-	if (!NT_SUCCESS(status))
-		goto cleanup;
-
 	if (InterlockedCompareExchange(
 			&sourceExt->Phase,
 			(LONG)Cdp_PHASE_PREVIEW,
@@ -2939,7 +2922,6 @@ static NTSTATUS CdpBeginPreviewSessionCore(
 	session->HandleId =
 		(UINT64)InterlockedIncrement64(&DriverExt->PreviewSessionNextId);
 	session->TargetTime100ns = targetTime;
-	session->SourceVolumeHandleId = sourceHandleId;
 	session->JournalEntry = journalEntry;
 	session->SourceVolumeGuid = Request->SourceVolumeGuid;
 	session->ReferenceCount = 1;
@@ -3018,16 +3000,12 @@ cleanup:
 	if (session)
 	{
 		/* The session was never published successfully (or was removed again
-		 * before arriving here), so no read reference can exist. Release the two
-		 * resources whose ownership was transferred into it before freeing it. */
-		if (session->SourceVolumeHandleId)
-			(void)CdpCloseVolumeHandle(
-				DriverExt, session->SourceVolumeHandleId);
+		 * before arriving here), so no read reference can exist. Release the
+		 * Journal reference whose ownership was transferred into it. */
 		if (session->JournalEntry)
 			CdpReleaseVolumeHandleEntry(session->JournalEntry);
 		cdpfree(session);
 		journalEntry = NULL;
-		sourceHandleId = 0;
 	}
 	if (phaseTransitioned && sourceExt)
 	{
@@ -3039,8 +3017,6 @@ cleanup:
 		ExReleasePushLockExclusive(&sourceExt->PreviewAccessLock);
 		KeLeaveCriticalRegion();
 	}
-	if (sourceHandleId)
-		(void)CdpCloseVolumeHandle(DriverExt, sourceHandleId);
 	if (journalEntry)
 		CdpReleaseVolumeHandleEntry(journalEntry);
 	return status;
@@ -3612,7 +3588,10 @@ static NTSTATUS CdpBeginRecovery(
 		if (journalEntry)
 			CdpReleaseVolumeHandleEntry(journalEntry);
 		if (NT_SUCCESS(status))
+		{
+			InterlockedExchange(&sourceExt->RecoverySynthesizeReads, 1);
 			InterlockedExchange(&sourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
+		}
 	}
 	KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
 	if (!NT_SUCCESS(status))
@@ -3635,6 +3614,30 @@ static NTSTATUS CdpBeginRecovery(
 	Reply->TargetTime100ns = targetTime;
 	Reply->OldestRecoverable100ns = oldestTime;
 	Reply->NewestRecoverable100ns = newestTime;
+	{
+		LONG64 traceStart = InterlockedCompareExchange64(
+			&g_CdpVolumeReadPassThroughCount, 0, 0);
+		UINT64 metaCoverageBytes = 0;
+		NTSTATUS coverageStatus = CdpCoreQueryMetaCoverageBytes(
+			sourceExt->Core, &metaCoverageBytes);
+		InterlockedExchange64(&g_CdpRecoveryReadTraceStart, traceStart);
+		InterlockedExchange64(&g_CdpRecoveryReadTraceEnd, traceStart + 256);
+		Cdp_LOG("[RECOVERY-READ-ARM] source=%p disk=%lu part=%lu target=%llu reads=%lld..%lld metaCoverageStatus=0x%08X metaCoverageBytes=%llu enabled=%ld accepting=%ld validated=%ld backendReady=%ld directReady=%ld phase=%ld\n",
+			sourceExt,
+			sourceExt->DiskNumber,
+			sourceExt->PartitionNumber,
+			targetTime,
+			traceStart + 1,
+			traceStart + 256,
+			coverageStatus,
+			metaCoverageBytes,
+			InterlockedCompareExchange(&sourceExt->CaptureEnabled, 0, 0),
+			InterlockedCompareExchange(&sourceExt->VolumeIoAccepting, 0, 0),
+			InterlockedCompareExchange(&sourceExt->ProtectionStateValidated, 0, 0),
+			InterlockedCompareExchange(&sourceExt->JournalBackendReady, 0, 0),
+			InterlockedCompareExchange(&sourceExt->DirectRedirectReady, 0, 0),
+			InterlockedCompareExchange(&sourceExt->Phase, 0, 0));
+	}
 	Cdp_LOG("[PHASE] recovery branch switch complete target=%llu -> normal\n",
 		targetTime);
 	return STATUS_SUCCESS;
@@ -6144,6 +6147,7 @@ static NTSTATUS CdpDispatchProtectedVolumeIo(
 	/* Core, MetaTree and Journal records use source-volume-relative offsets. */
 	item->SourceVolumeOffset = relativeOffset;
 	item->OriginLowerOffset = relativeOffset;
+	item->ReadTraceSequence = sequence;
 	item->SourceReference = sourceReference;
 	item->OriginLowerReference = VolumeExt->LowerDeviceObject;
 	ObReferenceObject(item->OriginLowerReference);
@@ -6356,6 +6360,7 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 					NTSTATUS readStatus;
 					BOOLEAN fastReadPinned = FALSE;
 					BOOLEAN historyMutexOwned = FALSE;
+					LONG64 readTraceSequence = item->ReadTraceSequence;
 					if (readOffset > devExt->PartitionSize ||
 						ioLength > devExt->PartitionSize - readOffset)
 					{
@@ -6378,16 +6383,35 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 							devExt->Core, readOffset, ioLength, &coverage,
 							&sourceReadOffset, &sourceReadLength) :
 						STATUS_DEVICE_NOT_READY;
+					if (CdpShouldTraceRead(readTraceSequence))
+					{
+						Cdp_LOG("[RECOVERY-READ] stage=route seq=%lld status=0x%08X coverage=%lu requestOffset=%llu requestLength=%lu baselineOffset=%llu baselineLength=%lu source=%p core=%p phase=%ld pinned=%u\n",
+							readTraceSequence,
+							readStatus,
+							(ULONG)coverage,
+							readOffset,
+							ioLength,
+							sourceReadOffset,
+							sourceReadLength,
+							devExt,
+							devExt->Core,
+							phase,
+							fastReadPinned ? 1u : 0u);
+					}
 					if (NT_SUCCESS(readStatus) &&
 						coverage == Cdp_CORE_READ_COVERAGE_NONE)
 					{
-						KeReleaseMutex(&devExt->HistoryMutex, FALSE);
-						historyMutexOwned = FALSE;
-						if (fastReadPinned)
-							CdpReleaseCurrentViewRead(devExt);
-						(void)CdpForwardQueuedDiskIrpSynchronously(item);
-						IoCompleteRequest(item->Irp, IO_NO_INCREMENT);
-						goto capture_item_done;
+						if (InterlockedCompareExchange(
+								&devExt->RecoverySynthesizeReads, 0, 0) == 0)
+						{
+							KeReleaseMutex(&devExt->HistoryMutex, FALSE);
+							historyMutexOwned = FALSE;
+							if (fastReadPinned)
+								CdpReleaseCurrentViewRead(devExt);
+							(void)CdpForwardQueuedDiskIrpSynchronously(item);
+							IoCompleteRequest(item->Irp, IO_NO_INCREMENT);
+							goto capture_item_done;
+						}
 					}
 					/* In the append-only GENERAL state, the pin keeps copied Journal
 					 * locations alive while writes continue publishing new immutable
@@ -6410,7 +6434,23 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 					{
 						readStatus = STATUS_INVALID_PARAMETER;
 					}
-					if (NT_SUCCESS(readStatus) && sourceReadLength != 0)
+					if (NT_SUCCESS(readStatus) &&
+						InterlockedCompareExchange(
+							&devExt->RecoverySynthesizeReads, 0, 0) != 0)
+					{
+						readStatus = CdpCoreRead(
+							devExt->Core, readOffset, ioLength, buffer);
+						if (CdpShouldTraceRead(readTraceSequence))
+						{
+							Cdp_LOG("[RECOVERY-READ] stage=core-synthesize seq=%lld status=0x%08X coverage=%lu requestOffset=%llu requestLength=%lu\n",
+								readTraceSequence,
+								readStatus,
+								(ULONG)coverage,
+								readOffset,
+								ioLength);
+						}
+					}
+					else if (NT_SUCCESS(readStatus) && sourceReadLength != 0)
 					{
 						readStatus = CdpReadDiskLowerSynchronously(
 							item->OriginLowerReference,
@@ -6418,13 +6458,25 @@ static VOID CdpCaptureWorker(_In_ PVOID Context)
 							sourceReadLength,
 							buffer + (ULONG)(sourceReadOffset - readOffset));
 					}
-					if (NT_SUCCESS(readStatus))
+					if (NT_SUCCESS(readStatus) &&
+						InterlockedCompareExchange(
+							&devExt->RecoverySynthesizeReads, 0, 0) == 0)
 					{
 						readStatus = CdpCoreOverlayCurrentRead(
 							devExt->Core,
 							readOffset,
 							ioLength,
 							buffer);
+						if (CdpShouldTraceRead(readTraceSequence))
+						{
+							Cdp_LOG("[RECOVERY-READ] stage=overlay seq=%lld status=0x%08X coverage=%lu requestOffset=%llu requestLength=%lu baselineLength=%lu\n",
+								readTraceSequence,
+								readStatus,
+								(ULONG)coverage,
+								readOffset,
+								ioLength,
+								sourceReadLength);
+						}
 					}
 					if (historyMutexOwned)
 						KeReleaseMutex(&devExt->HistoryMutex, FALSE);
