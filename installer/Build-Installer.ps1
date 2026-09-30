@@ -84,7 +84,8 @@ Require-File $runtimeInstaller
 foreach ($file in @(
     $guiExecutable,
     (Join-Path $guiOutput 'handle.exe'),
-    (Join-Path $guiOutput 'iscsi_target_dotnet.dll'),
+    (Join-Path $guiOutput 'libfsntfs.dll'),
+    (Join-Path $guiOutput 'libbfio.dll'),
     (Join-Path $driverOutput 'CdpDriver.cer'),
     (Join-Path $driverOutput 'driver\CdpDriver.inf'),
     (Join-Path $driverOutput 'driver\CdpDriver.sys'),
@@ -127,7 +128,8 @@ New-Item -ItemType Directory -Force -Path (Join-Path $workRoot 'out') | Out-Null
 
 Copy-ReleaseFile $guiExecutable (Join-Path $payloadRoot '源点恢复.exe')
 Copy-ReleaseFile (Join-Path $guiOutput 'handle.exe') (Join-Path $payloadRoot 'handle.exe')
-Copy-ReleaseFile (Join-Path $guiOutput 'iscsi_target_dotnet.dll') (Join-Path $payloadRoot 'iscsi_target_dotnet.dll')
+Copy-ReleaseFile (Join-Path $guiOutput 'libfsntfs.dll') (Join-Path $payloadRoot 'libfsntfs.dll')
+Copy-ReleaseFile (Join-Path $guiOutput 'libbfio.dll') (Join-Path $payloadRoot 'libbfio.dll')
 Copy-Item -LiteralPath (Join-Path $guiOutput 'Web') -Destination (Join-Path $payloadRoot 'Web') -Recurse -Force
 $payloadIndexPath = Join-Path $payloadRoot 'Web\index.html'
 # Windows PowerShell 5.1 treats UTF-8 files without a BOM as ANSI when

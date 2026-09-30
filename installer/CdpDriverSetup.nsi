@@ -249,6 +249,8 @@ Section "Uninstall"
 
     Delete "$DESKTOP\源点恢复.lnk"
     RMDir /r "$SMPROGRAMS\源点恢复"
+    ; 许可证仅用于本产品的本机恢复；卸载时必须一并移除，避免下一次安装继承旧授权。
+    DeleteRegKey HKLM "Software\CDPCorePro\License"
     DeleteRegKey HKLM "Software\Microsoft\Windows\CurrentVersion\Uninstall\源点恢复"
     DeleteRegKey HKLM "Software\源点恢复"
     RMDir /r "$INSTDIR"

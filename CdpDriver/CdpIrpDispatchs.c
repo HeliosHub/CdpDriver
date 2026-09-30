@@ -2660,8 +2660,9 @@ static VOID CdpDestroyPreviewSession(
 {
 	LARGE_INTEGER diagnosticTimeout;
 	NTSTATUS waitStatus;
-	NTSTATUS closeStatus = STATUS_SUCCESS;
 	ULONGLONG stageStart100ns;
+
+	UNREFERENCED_PARAMETER(DriverExt);
 
 	Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=session-drain-begin handle=%llu refs=%ld thread=%p\n",
 		Session->HandleId,
@@ -2692,22 +2693,6 @@ static VOID CdpDestroyPreviewSession(
 		waitStatus,
 		(KeQueryInterruptTime() - stageStart100ns) / 10000ULL);
 
-	if (Session->SourceVolumeHandleId)
-	{
-		stageStart100ns = KeQueryInterruptTime();
-		Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=source-handle-close-begin previewHandle=%llu sourceHandle=%llu thread=%p\n",
-			Session->HandleId,
-			Session->SourceVolumeHandleId,
-			PsGetCurrentThread());
-		closeStatus = CdpCloseVolumeHandle(
-			DriverExt,
-			Session->SourceVolumeHandleId);
-		Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=source-handle-close-end previewHandle=%llu sourceHandle=%llu status=0x%08X elapsedMs=%llu\n",
-			Session->HandleId,
-			Session->SourceVolumeHandleId,
-			closeStatus,
-			(KeQueryInterruptTime() - stageStart100ns) / 10000ULL);
-	}
 	if (Session->JournalEntry)
 	{
 		stageStart100ns = KeQueryInterruptTime();
@@ -2752,7 +2737,6 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpBeginPreviewSessionCore(
 	PCdp_VOLUME_HANDLE_ENTRY journalEntry = NULL;
 	PCdp_PREVIEW_SESSION session = NULL;
 	PCdp_DEVICE_EXTENSION sourceExt = NULL;
-	UINT64 sourceHandleId = 0;
 	UINT64 oldestTime = 0;
 	UINT64 newestTime = 0;
 	UINT64 targetTime = Request->TargetTime100ns;
@@ -2841,13 +2825,6 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpBeginPreviewSessionCore(
 	if (targetTime < oldestTime)
 		targetTime = oldestTime;
 
-	status = CdpOpenVolumeHandle(
-		DriverExt,
-		&Request->SourceVolumeGuid,
-		&sourceHandleId);
-	if (!NT_SUCCESS(status))
-		goto cleanup;
-
 	if (InterlockedCompareExchange(
 			&sourceExt->Phase,
 			(LONG)Cdp_PHASE_PREVIEW,
@@ -2877,7 +2854,6 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpBeginPreviewSessionCore(
 	session->HandleId =
 		(UINT64)InterlockedIncrement64(&DriverExt->PreviewSessionNextId);
 	session->TargetTime100ns = targetTime;
-	session->SourceVolumeHandleId = sourceHandleId;
 	session->JournalEntry = journalEntry;
 	session->SourceVolumeGuid = Request->SourceVolumeGuid;
 	session->ReferenceCount = 1;
@@ -2956,16 +2932,12 @@ cleanup:
 	if (session)
 	{
 		/* The session was never published successfully (or was removed again
-		 * before arriving here), so no read reference can exist. Release the two
-		 * resources whose ownership was transferred into it before freeing it. */
-		if (session->SourceVolumeHandleId)
-			(void)CdpCloseVolumeHandle(
-				DriverExt, session->SourceVolumeHandleId);
+		 * before arriving here), so no read reference can exist. Release the
+		 * Journal reference whose ownership was transferred into it. */
 		if (session->JournalEntry)
 			CdpReleaseVolumeHandleEntry(session->JournalEntry);
 		cdpfree(session);
 		journalEntry = NULL;
-		sourceHandleId = 0;
 	}
 	if (phaseTransitioned && sourceExt)
 	{
@@ -2977,8 +2949,6 @@ cleanup:
 		ExReleasePushLockExclusive(&sourceExt->PreviewAccessLock);
 		KeLeaveCriticalRegion();
 	}
-	if (sourceHandleId)
-		(void)CdpCloseVolumeHandle(DriverExt, sourceHandleId);
 	if (journalEntry)
 		CdpReleaseVolumeHandleEntry(journalEntry);
 	return status;

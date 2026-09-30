@@ -145,7 +145,6 @@ typedef struct _Cdp_PREVIEW_SESSION
 	LIST_ENTRY Entry;
 	UINT64 HandleId;
 	UINT64 TargetTime100ns;
-	UINT64 SourceVolumeHandleId;
 	PCdp_VOLUME_HANDLE_ENTRY JournalEntry;
 	GUID SourceVolumeGuid;
 	volatile LONG ReferenceCount;
