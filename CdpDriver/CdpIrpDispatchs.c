@@ -6257,6 +6257,7 @@ Cdp_OBF_WORKFLOW static VOID CdpCaptureWorker(_In_ PVOID Context)
 					ULONG mdlCount = 0;
 					UINT64 mdlBytes = 0;
 					ULONG copiedBytes = 0;
+					ULONG synthesisLength = ioLength;
 					Cdp_CORE_READ_COVERAGE coverage =
 						Cdp_CORE_READ_COVERAGE_NONE;
 					UINT64 sourceReadOffset = readOffset;
@@ -6264,6 +6265,7 @@ Cdp_OBF_WORKFLOW static VOID CdpCaptureWorker(_In_ PVOID Context)
 					NTSTATUS readStatus;
 					BOOLEAN fastReadPinned = FALSE;
 					BOOLEAN historyMutexOwned = FALSE;
+
 					if (readOffset > devExt->PartitionSize ||
 						ioLength > devExt->PartitionSize - readOffset)
 					{
@@ -6275,6 +6277,9 @@ Cdp_OBF_WORKFLOW static VOID CdpCaptureWorker(_In_ PVOID Context)
 						IoCompleteRequest(item->Irp, IO_NO_INCREMENT);
 						goto capture_item_done;
 					}
+					if (item->Irp->MdlAddress)
+						(void)CdpQueryMdlChain(item->Irp->MdlAddress,
+							&mdlCount, &mdlBytes);
 					/* Determine routing exactly once in the worker. A miss forwards
 					 * the original IRP; only a hit uses a private baseline read. */
 					KeWaitForSingleObject(&devExt->HistoryMutex,
@@ -6297,6 +6302,22 @@ Cdp_OBF_WORKFLOW static VOID CdpCaptureWorker(_In_ PVOID Context)
 						IoCompleteRequest(item->Irp, IO_NO_INCREMENT);
 						goto capture_item_done;
 					}
+					/* A Journal hit only needs the sectors that fit the MDL chain.
+					 * Keep the full-length query above so a complete miss still
+					 * forwards the original IRP unchanged. */
+					if (NT_SUCCESS(readStatus) && mdlCount != 0 &&
+						mdlBytes < ioLength &&
+						devExt->SectorSize != 0 &&
+						mdlBytes >= devExt->SectorSize &&
+						(readOffset % devExt->SectorSize) == 0 &&
+						(ioLength % devExt->SectorSize) == 0)
+					{
+						synthesisLength = (ULONG)(mdlBytes -
+							(mdlBytes % devExt->SectorSize));
+						readStatus = CdpCoreQueryCurrentReadCoverage(
+							devExt->Core, readOffset, synthesisLength,
+							&coverage, &sourceReadOffset, &sourceReadLength);
+					}
 					/* In the append-only GENERAL state, the pin keeps copied Journal
 					 * locations alive while writes continue publishing new immutable
 					 * payloads. Exceptional states retain the original mutex path. */
@@ -6306,14 +6327,14 @@ Cdp_OBF_WORKFLOW static VOID CdpCaptureWorker(_In_ PVOID Context)
 						historyMutexOwned = FALSE;
 					}
 					buffer = NT_SUCCESS(readStatus) ?
-						(PUCHAR)cdpalloc(ioLength) : NULL;
+						(PUCHAR)cdpalloc(synthesisLength) : NULL;
 					if (NT_SUCCESS(readStatus) && !buffer)
 						readStatus = STATUS_INSUFFICIENT_RESOURCES;
 					if (NT_SUCCESS(readStatus) &&
 						coverage == Cdp_CORE_READ_COVERAGE_PARTIAL &&
 						(sourceReadOffset < readOffset ||
-						sourceReadOffset - readOffset > ioLength ||
-						sourceReadLength > ioLength -
+						sourceReadOffset - readOffset > synthesisLength ||
+						sourceReadLength > synthesisLength -
 							(ULONG)(sourceReadOffset - readOffset)))
 					{
 						readStatus = STATUS_INVALID_PARAMETER;
@@ -6331,7 +6352,7 @@ Cdp_OBF_WORKFLOW static VOID CdpCaptureWorker(_In_ PVOID Context)
 						readStatus = CdpCoreOverlayCurrentRead(
 							devExt->Core,
 							readOffset,
-							ioLength,
+							synthesisLength,
 							buffer);
 					}
 					if (historyMutexOwned)
@@ -6341,7 +6362,7 @@ Cdp_OBF_WORKFLOW static VOID CdpCaptureWorker(_In_ PVOID Context)
 					if (NT_SUCCESS(readStatus))
 					{
 						readStatus = CdpScatterReadMdlChain(
-							item->Irp, buffer, ioLength, &mdlCount,
+							item->Irp, buffer, synthesisLength, &mdlCount,
 							&mdlBytes, &copiedBytes);
 					}
 					if (!NT_SUCCESS(readStatus))
@@ -6357,7 +6378,7 @@ Cdp_OBF_WORKFLOW static VOID CdpCaptureWorker(_In_ PVOID Context)
 					if (buffer)
 						cdpfree(buffer);
 					CdpCompleteIrp(item->Irp, readStatus,
-						NT_SUCCESS(readStatus) ? ioLength : 0);
+						NT_SUCCESS(readStatus) ? copiedBytes : 0);
 				}
 				else if (majorFunction == IRP_MJ_FLUSH_BUFFERS && captureActive)
 				{

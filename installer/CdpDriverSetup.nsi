@@ -10,7 +10,7 @@ RequestExecutionLevel admin
 !insertmacro VersionCompare
 
 !define PRODUCT_NAME "源点恢复"
-!define PRODUCT_VERSION "1.0.2.0"
+!define PRODUCT_VERSION "1.0.16.0"
 !define PRODUCT_PUBLISHER "源点恢复"
 !define PRODUCT_EXE "源点恢复.exe"
 
@@ -87,6 +87,9 @@ system_protection_check:
     ${EndIf}
     ${If} $0 == 10
         MessageBox MB_YESNO|MB_ICONEXCLAMATION "检测到系统盘仍受源点恢复保护。必须先关闭系统盘保护，才能继续安装。$\r$\n$\r$\n点击“是”立即关闭系统盘保护（随后需要输入保护密码）；点击“否”取消安装。" IDYES system_protection_stop IDNO system_protection_cancel
+    ${EndIf}
+    ${If} $0 == 13
+        MessageBox MB_YESNO|MB_ICONEXCLAMATION "检测到系统盘仍受源点恢复保护，且已设置还原点。必须先关闭系统盘保护，才能继续安装。$\r$\n$\r$\n建议先重启系统，再关闭系统盘保护。$\r$\n$\r$\n点击“是”立即关闭系统盘保护（随后需要输入保护密码）；点击“否”取消安装。" IDYES system_protection_stop IDNO system_protection_cancel
     ${EndIf}
     MessageBox MB_RETRYCANCEL|MB_ICONEXCLAMATION "暂时无法检测系统盘保护状态。请关闭正在运行的源点恢复后重试。" IDRETRY system_protection_check IDCANCEL system_protection_cancel
 

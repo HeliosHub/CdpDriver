@@ -3,7 +3,7 @@ Signature   = "$WINDOWS NT$"
 Class       = Volume
 ClassGuid   = {71a27cdd-812a-11d0-bec7-08002be2092f}
 Provider    = %ProviderName%
-DriverVer   = 09/29/2026,1.0.2.0
+DriverVer   = 10/09/2026,1.0.16.0
 CatalogFile = CdpDriver.cat
 PnpLockdown = 1
 

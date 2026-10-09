@@ -450,6 +450,63 @@ static int TestUnixSecondTimeRangeDoesNotAdvance(void)
 	return g_caseFailed;
 }
 
+static int TestClockRollbackStillAppends(void)
+{
+	PCdp_STORE store = NULL;
+	Cdp_JOURNAL journal;
+	GUID sourceGuid = { 0 };
+	UCHAR first[512];
+	UCHAR second[512];
+	UINT64 now = 1791590400ULL; /* 2026-10-10T00:00:00Z */
+	UINT64 oldest = 0;
+	UINT64 newest = 0;
+	UINT64 partitionBytes = 0;
+	UINT64 metadataBytes = 0;
+	UINT64 payloadBytesUsed = 0;
+	UINT64 payloadBytesFree = 0;
+	UINT64 records = 0;
+	UINT64 generation = 0;
+	ULONG returned = 0;
+	Cdp_JOURNAL_RECORD headers[3];
+
+	RtlFillMemory(first, sizeof(first), 0xA5);
+	RtlFillMemory(second, sizeof(second), 0x5A);
+	Expect(NT_SUCCESS(CdpMemStoreCreate(JNL_SIZE, SECTOR, &store)),
+		"create journal for clock-rollback append test");
+	if (!store)
+		return g_caseFailed;
+
+	CdpJournalInitializeWithStore(
+		&journal, store, &sourceGuid, TestMutableTime100ns, &now);
+	Expect(NT_SUCCESS(CdpJournalFormat(&journal)),
+		"format journal before clock rollback");
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, 0, sizeof(first), first, NULL)),
+		"append record before clock rollback");
+
+	now = 1791417600ULL; /* 2026-10-08T00:00:00Z */
+	Expect(NT_SUCCESS(CdpJournalAppend(
+		&journal, sizeof(first), sizeof(second), second, NULL)),
+		"append record after clock rollback");
+	Expect(NT_SUCCESS(CdpJournalQueryTimeRange(&journal, &oldest, &newest)) &&
+		NT_SUCCESS(CdpJournalQueryUsage(
+			&journal, &partitionBytes, &metadataBytes, &payloadBytesUsed,
+			&payloadBytesFree, &records)) &&
+		NT_SUCCESS(CdpJournalQueryRecordHeaders(
+			&journal, 0, 0, headers, ARRAYSIZE(headers), &records,
+			&generation, &returned)) &&
+		records == 3 && /* Root branch marker plus both application records. */
+		returned == ARRAYSIZE(headers) &&
+		headers[1].WallClock100ns == 1791590400ULL &&
+		headers[2].WallClock100ns == 1791417600ULL &&
+		oldest == 1791417600ULL && newest == 1791590400ULL,
+		"clock rollback continues to append with the actual wall-clock time");
+
+	CdpJournalClose(&journal);
+	CdpMemStoreDestroy(store);
+	return g_caseFailed;
+}
+
 static int TestSettledPreviewTargetTime(void)
 {
 	PCdp_STORE store = NULL;
@@ -803,6 +860,60 @@ static int TestAfterImageReadZeroCopyAndFallback(void)
 cleanup:
 	if (output)
 		_aligned_free(output);
+	if (afterImage)
+		_aligned_free(afterImage);
+	TestCtxDestroy(&ctx);
+	return g_caseFailed;
+}
+
+static int TestAfterImageSmallReadFromLargeRecord(void)
+{
+	TEST_CTX ctx;
+	TEST_FAIL_STORE trace;
+	Cdp_JOURNAL_RECORD record;
+	PUCHAR afterImage = NULL;
+	UCHAR output[2048];
+	NTSTATUS status;
+	const ULONG recordLength = 1024 * 1024;
+
+	RtlZeroMemory(&ctx, sizeof(ctx));
+	status = TestCtxCreate(&ctx, 2 * recordLength, JNL_SIZE, 92475);
+	Expect(NT_SUCCESS(status), "setup large after-image record test");
+	if (!NT_SUCCESS(status))
+		return g_caseFailed;
+	afterImage = (PUCHAR)_aligned_malloc(recordLength, SECTOR);
+	Expect(afterImage != NULL, "allocate large after-image payload");
+	if (!afterImage)
+		goto cleanup;
+	FillPattern(afterImage, recordLength, 0xA7);
+	status = CdpCoreAppendAfterImage(ctx.Core, 0, recordLength,
+		afterImage, &record);
+	Expect(NT_SUCCESS(status), "append 1 MiB after-image record");
+	if (!NT_SUCCESS(status))
+		goto cleanup;
+
+	TestFailStoreInstall(ctx.Journal, &trace);
+	status = CdpCoreRead(ctx.Core, 0, sizeof(output), output);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(output, afterImage, sizeof(output)) == 0,
+		"small read returns the beginning of the large record");
+	Expect(trace.ReadCallCount == 1 &&
+		trace.LastReadOffset == record.FileOffset &&
+		trace.LastReadLength == sizeof(output),
+		"2 KiB request reads only 2 KiB from Journal");
+
+	trace.ReadCallCount = 0;
+	status = CdpCoreRead(ctx.Core, 123, SECTOR, output);
+	Expect(NT_SUCCESS(status) &&
+		memcmp(output, afterImage + 123, SECTOR) == 0,
+		"unaligned overlap returns the requested bytes");
+	Expect(trace.ReadCallCount == 1 &&
+		trace.LastReadOffset == record.FileOffset &&
+		trace.LastReadLength == 2 * SECTOR,
+		"unaligned overlap reads only its two covering sectors");
+	TestFailStoreRemove(ctx.Journal, &trace);
+
+cleanup:
 	if (afterImage)
 		_aligned_free(afterImage);
 	TestCtxDestroy(&ctx);
@@ -3688,6 +3799,8 @@ int main(void)
 		TestAfterImageInitialBranchRecord);
 	failed += RunCase("UTC Unix-second range does not advance",
 		TestUnixSecondTimeRangeDoesNotAdvance);
+	failed += RunCase("Clock rollback still appends",
+		TestClockRollbackStillAppends);
 	failed += RunCase("Settled Preview target time",
 		TestSettledPreviewTargetTime);
 	failed += RunCase("Journal physical-layout persistence",
@@ -3700,6 +3813,8 @@ int main(void)
 		TestAfterImagePayloadZeroCopyAndFallback);
 	failed += RunCase("After-image read zero-copy and fallback",
 		TestAfterImageReadZeroCopyAndFallback);
+	failed += RunCase("After-image small read from large record",
+		TestAfterImageSmallReadFromLargeRecord);
 	failed += RunCase("After-image caller-owned payload writer",
 		TestAfterImageCallerPayloadWriter);
 	failed += RunCase("Record-header sector write cache",

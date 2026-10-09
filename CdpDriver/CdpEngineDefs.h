@@ -18,13 +18,10 @@
 #include "CdpIoctl.h"
 #include "CdpJournal.h"
 
-#define Cdp_DRIVER_VERSION_STRING "1.0.2"
-#define Cdp_DRIVER_BUILD_STRING   "20260929.102-release"
+#define Cdp_DRIVER_VERSION_STRING "1.0.16"
+#define Cdp_DRIVER_BUILD_STRING   "20261009.116-release-quiet"
 
-/* Diagnostic text is an architecture oracle: messages name the COW redirect,
- * journal layout, preview tree and recovery state transitions.  Keep it in
- * DBG builds for supportability, but never compile the format strings into a
- * shippable release driver. */
+/* Keep diagnostic text out of the Release driver. */
 #if DBG
 #define Cdp_LOG(fmt, ...) \
 	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \

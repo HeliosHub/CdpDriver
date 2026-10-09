@@ -759,8 +759,8 @@ NTSTATUS CdpJournalPruneUnreachableForCompaction(
 	_In_ UINT64 PreviewTargetSequence,
 	_Out_opt_ PBOOLEAN PreviewTargetDeleted);
 
-// Read retained records in chronological order. Records contain only
-// record metadata; callers never receive journal payload data.  The caller
+// Read retained records in append-sequence order. Records contain only
+// record metadata; callers never receive journal payload data. The caller
 // can page with StartIndex and must echo Generation after the first page to
 // detect concurrent capture/eviction.
 NTSTATUS CdpJournalQueryRecordHeaders(

@@ -14,6 +14,7 @@ enum ProtectionCheckExitCode {
     ProtectionCheckActive = 10,
     ProtectionCheckUnavailable = 11,
     ProtectionCheckCancelled = 12,
+    ProtectionCheckActiveWithRestorePoint = 13,
 };
 
 static HANDLE OpenControlDevice() {
@@ -89,6 +90,8 @@ static int CheckSystemProtectionStatus() {
     GUID sourceVolumeGuid = {};
     Cdp_PHASE_QUERY_REQUEST request = {};
     Cdp_PHASE_QUERY_REPLY reply = {};
+    Cdp_RESTORE_POINT_QUERY_REQUEST restorePointRequest = {};
+    Cdp_RESTORE_POINT_QUERY_REPLY restorePointReply = {};
     DWORD bytesReturned = 0;
     HANDLE device;
 
@@ -117,13 +120,34 @@ static int CheckSystemProtectionStatus() {
         &bytesReturned,
         nullptr);
     const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
-    CloseHandle(device);
 
     if (!ok || bytesReturned < sizeof(reply)) {
+        CloseHandle(device);
         fwprintf(stderr, L"Query protection status failed (Win32=%lu).\n", error);
         return ProtectionCheckUnavailable;
     }
-    return reply.Status >= 0 ? ProtectionCheckActive : ProtectionCheckNone;
+    if (reply.Status < 0) {
+        CloseHandle(device);
+        return ProtectionCheckNone;
+    }
+
+    restorePointRequest.SourceVolumeGuid = sourceVolumeGuid;
+    const BOOL restorePointOk = DeviceIoControl(
+        device,
+        IOCTL_Cdp_QUERY_RESTORE_POINT,
+        &restorePointRequest,
+        sizeof(restorePointRequest),
+        &restorePointReply,
+        sizeof(restorePointReply),
+        &bytesReturned,
+        nullptr);
+    const DWORD restorePointError = restorePointOk ? ERROR_SUCCESS : GetLastError();
+    CloseHandle(device);
+    if (!restorePointOk || bytesReturned < sizeof(restorePointReply)) {
+        fwprintf(stderr, L"Query system restore point failed (Win32=%lu).\n", restorePointError);
+        return ProtectionCheckActive;
+    }
+    return restorePointReply.IsSet ? ProtectionCheckActiveWithRestorePoint : ProtectionCheckActive;
 }
 
 struct PasswordPromptState {
@@ -405,7 +429,7 @@ static int StopSystemProtection() {
     wchar_t systemMountPoint[MAX_PATH] = {};
     const int state = CheckSystemProtectionStatus();
 
-    if (state != ProtectionCheckActive)
+    if (state != ProtectionCheckActive && state != ProtectionCheckActiveWithRestorePoint)
         return state;
     if (!GetSystemVolumeGuid(&sourceVolumeGuid))
         return ProtectionCheckUnavailable;

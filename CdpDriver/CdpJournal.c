@@ -155,24 +155,26 @@ static UINT64 CdpJournalQueryWallClock100ns(_In_ PCdp_JOURNAL Journal)
 #endif
 }
 
-/* The caller holds Journal->Lock.  UTC Unix seconds are intentionally allowed
- * to repeat.  A backwards wall-clock adjustment must not make the retained
- * time range or branch ordering run backwards, so clamp only to the current
- * newest second; never advance it artificially. */
+/* The caller holds Journal->Lock. UTC Unix seconds are intentionally allowed
+ * to repeat and to move backward when the system clock is adjusted. Preserve
+ * the observed wall-clock time in every record; append sequence, rather than
+ * timestamp, remains the durable write-order key. */
 static UINT64 CdpJournalQueryRecordTimeSecondsLocked(_In_ PCdp_JOURNAL Journal)
 {
-	UINT64 wallClockSeconds = CdpJournalQueryWallClock100ns(Journal);
+	return CdpJournalQueryWallClock100ns(Journal);
+}
 
-	if (Journal->Newest100ns != 0 &&
-		wallClockSeconds < Journal->Newest100ns)
-	{
-#ifndef Cdp_USERMODE
-		Cdp_LOG("[JOURNAL-TIME] UTC clock moved backward raw=%llu clamped=%llu\n",
-			wallClockSeconds, Journal->Newest100ns);
-#endif
-		return Journal->Newest100ns;
-	}
-	return wallClockSeconds;
+/* Maintain the displayed retained-time bounds independently from append
+ * order: manual clock changes can make a newer sequence have an older UTC
+ * timestamp. */
+static VOID CdpJournalObserveRecordTimeLocked(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 WallClockSeconds)
+{
+	if (Journal->Oldest100ns == 0 || WallClockSeconds < Journal->Oldest100ns)
+		Journal->Oldest100ns = WallClockSeconds;
+	if (WallClockSeconds > Journal->Newest100ns)
+		Journal->Newest100ns = WallClockSeconds;
 }
 
 static BOOLEAN CdpJournalHeaderIsBranch(
@@ -4228,12 +4230,11 @@ Cdp_JOURNAL_OBF_WORKFLOW static NTSTATUS CdpJournalAppendBranchLocked(
 	Journal->HighestBranchNumber = BranchNumber;
 	Journal->SuperblockDirty = TRUE;
 	CdpJournalAdvanceRecordGenerationLocked(Journal);
-	Journal->Newest100ns = writeTime;
+	CdpJournalObserveRecordTimeLocked(Journal, writeTime);
 	if (Journal->TotalRecords == 1)
 	{
 		Journal->OldestHeaderRegionOff = Journal->LastHeaderRegionOff;
 		Journal->OldestHeaderIndex = Journal->CurrentHeaderCount - 1;
-		Journal->Oldest100ns = writeTime;
 	}
 
 	if (Journal->SuperblockDirty)
@@ -4312,7 +4313,7 @@ Cdp_JOURNAL_OBF_WORKFLOW static NTSTATUS CdpJournalAppendBranchContinuationLocke
 	Journal->CurrentHeaderCount = 1;
 	Journal->NextSequence = writeSequence + 1;
 	Journal->TotalRecords++;
-	Journal->Newest100ns = writeTime;
+	CdpJournalObserveRecordTimeLocked(Journal, writeTime);
 	CdpJournalAdvanceRecordGenerationLocked(Journal);
 	return STATUS_SUCCESS;
 }
@@ -5002,12 +5003,11 @@ Cdp_JOURNAL_OBF_LIGHT static NTSTATUS CdpJournalAppendCommonEx(
 	Journal->TotalRecords++;
 	Journal->PayloadBytesUsed += alignedSize;
 	CdpJournalAdvanceRecordGenerationLocked(Journal);
-	Journal->Newest100ns = writeTime;
+	CdpJournalObserveRecordTimeLocked(Journal, writeTime);
 	if (Journal->TotalRecords == 1)
 	{
 		Journal->OldestHeaderRegionOff = Journal->LastHeaderRegionOff;
 		Journal->OldestHeaderIndex = Journal->CurrentHeaderCount - 1;
-		Journal->Oldest100ns = writeTime;
 	}
 
 	if (WrittenRecord)
@@ -6872,6 +6872,83 @@ static LONG CdpBranchPathFind(
 	return CdpJournalCodecBranchPathFind(Path, PathCount, Branch);
 }
 
+/* Resolve a wall-clock request only once.  Scan newest-to-oldest so a clock
+ * rollback selects the most recently appended record whose displayed time is
+ * not later than the request.  All subsequent view construction is bounded
+ * by the resulting Sequence, never by wall-clock ordering.  Caller holds
+ * Journal->Lock. */
+static NTSTATUS CdpJournalFindTargetLocationLocked(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ UINT64 TargetTime100ns,
+	_In_ UINT64 MaxSequence,
+	_In_ BOOLEAN IncludeTargetTime,
+	_Out_ PCdp_JOURNAL_RECORD_LOCATION Location)
+{
+	PUCHAR region = NULL;
+	UINT64 regionOff;
+	ULONG guard = 0;
+	NTSTATUS status;
+
+	if (!Journal || !Location || MaxSequence == 0)
+		return STATUS_INVALID_PARAMETER;
+	RtlZeroMemory(Location, sizeof(*Location));
+	status = CdpJournalGetHeaderScanBufferLocked(Journal, &region);
+	if (!NT_SUCCESS(status))
+		return status;
+	regionOff = Journal->LastHeaderRegionOff;
+	for (;;)
+	{
+		Cdp_HEADER_REGION_LINK link;
+		ULONG limit;
+		ULONG startIndex;
+		ULONG index;
+
+		if (++guard > 100000UL)
+			return STATUS_DISK_CORRUPT_ERROR;
+		status = CdpJournalReadHeaderRegion(Journal, regionOff, region);
+		if (!NT_SUCCESS(status))
+			return status;
+		RtlCopyMemory(&link, region + Cdp_JOURNAL_HEADER_REGION_SIZE -
+			Cdp_JOURNAL_HEADER_LINK_SIZE, sizeof(link));
+		if (!CdpJournalRegionLinkValid(Journal, &link))
+			return STATUS_DISK_CORRUPT_ERROR;
+		status = CdpJournalGetRegionHeaderLimitLocked(
+			Journal, regionOff, &link, &limit, NULL);
+		if (!NT_SUCCESS(status))
+			return status;
+		startIndex = regionOff == Journal->OldestHeaderRegionOff ?
+			Journal->OldestHeaderIndex : 0;
+		for (index = limit; index > startIndex; )
+		{
+			Cdp_JOURNAL_RECORD_HEADER header;
+			UINT64 sequence;
+			--index;
+			RtlCopyMemory(&header, region + index * sizeof(header), sizeof(header));
+			if ((header.Sequence & Cdp_JOURNAL_RECORD_INDEX_MASK) != index)
+				return STATUS_DISK_CORRUPT_ERROR;
+			if (CdpJournalHeaderIsDeleted(&header) ||
+				link.StartSequence > MAXUINT64 - index)
+				continue;
+			sequence = link.StartSequence + index;
+			if (sequence >= MaxSequence ||
+				(IncludeTargetTime ? header.WallClock100ns > TargetTime100ns :
+					header.WallClock100ns >= TargetTime100ns))
+				continue;
+			Location->Sequence = sequence;
+			Location->WallClock100ns = header.WallClock100ns;
+			Location->HeaderRegionOffset = regionOff;
+			Location->HeaderIndex = index;
+			return STATUS_SUCCESS;
+		}
+		if (regionOff == Journal->OldestHeaderRegionOff)
+			break;
+		if (link.PrevRegionOff == regionOff)
+			return STATUS_DISK_CORRUPT_ERROR;
+		regionOff = link.PrevRegionOff;
+	}
+	return STATUS_NOT_FOUND;
+}
+
 Cdp_JOURNAL_OBF_WORKFLOW NTSTATUS CdpJournalResolveSettledPreviewTime(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 RequestedTime100ns,
@@ -7850,6 +7927,10 @@ Cdp_JOURNAL_OBF_LIGHT NTSTATUS CdpJournalApplyPreviewTreeEx(
 		PCdp_PREVIEW_HIT node = &hits[i];
 		PVOID payloadBase = NULL;
 		PUCHAR payload;
+		UINT64 payloadOffset;
+		UINT64 payloadEnd;
+		UINT64 alignedOffset;
+		UINT64 alignedEnd;
 		UINT64 alignedSize;
 		UINT64 overlapStart;
 		UINT64 overlapEnd;
@@ -7873,15 +7954,39 @@ Cdp_JOURNAL_OBF_LIGHT NTSTATUS CdpJournalApplyPreviewTreeEx(
 
 		outputIndex = (ULONG)(overlapStart - VolumeOffset);
 		copyLength = (ULONG)(overlapEnd - overlapStart);
-		alignedSize = CdpAlignUp64(node->DataLength, Journal->SectorSize);
-		/* A complete, sector-sized record can be placed in the caller's
-		 * buffer directly.  Keep the bounce buffer for partial records (where
-		 * the aligned read would overrun the output range) or for callers whose
-		 * buffer cannot satisfy the Journal device's alignment requirement. */
+		if (Journal->SectorSize == 0 || copyLength == 0 ||
+			overlapStart - node->Start > node->DataLength ||
+			copyLength > node->DataLength -
+				(ULONG)(overlapStart - node->Start) ||
+			node->FileOffset > MAXUINT64 - (overlapStart - node->Start))
+		{
+			status = STATUS_DISK_CORRUPT_ERROR;
+			goto cleanup;
+		}
+		payloadOffset = node->FileOffset + (overlapStart - node->Start);
+		if (payloadOffset > MAXUINT64 - copyLength ||
+			payloadOffset + copyLength > MAXUINT64 -
+				(Journal->SectorSize - 1))
+		{
+			status = STATUS_INTEGER_OVERFLOW;
+			goto cleanup;
+		}
+		payloadEnd = payloadOffset + copyLength;
+		/* Fragments may start in the middle of a Journal sector. Align the
+		 * absolute payload offsets, not offsets relative to the tree node. */
+		alignedOffset = CdpAlignDown64(payloadOffset, Journal->SectorSize);
+		alignedEnd = CdpAlignUp64(payloadEnd, Journal->SectorSize);
+		alignedSize = alignedEnd - alignedOffset;
+		if (alignedSize > MAXULONG)
+		{
+			status = STATUS_INTEGER_OVERFLOW;
+			goto cleanup;
+		}
+		/* Read only the sectors covering this overlap. A precisely aligned
+		 * overlap can be placed directly in the caller's buffer. */
 		readDirectlyToOutput =
-			overlapStart == node->Start &&
-			overlapEnd == node->End &&
-			alignedSize == node->DataLength &&
+			alignedOffset == payloadOffset &&
+			alignedSize == copyLength &&
 			(((ULONG_PTR)Buffer + outputIndex) &
 				CdpJournalBufferAlignmentMask(Journal)) == 0;
 		if (readDirectlyToOutput)
@@ -7904,13 +8009,13 @@ Cdp_JOURNAL_OBF_LIGHT NTSTATUS CdpJournalApplyPreviewTreeEx(
 			"payload read begin index=%lu seq=%llu fileOff=%llu len=%lu direct=%u\n",
 			i,
 			node->Sequence,
-			node->FileOffset,
+			alignedOffset,
 			(ULONG)alignedSize,
 			readDirectlyToOutput);
 		status = CdpJournalRawIo(
 			Journal,
 			IRP_MJ_READ,
-			node->FileOffset,
+			alignedOffset,
 			(ULONG)alignedSize,
 			payload);
 		Cdp_JOURNAL_DIAG(
@@ -7928,7 +8033,7 @@ Cdp_JOURNAL_OBF_LIGHT NTSTATUS CdpJournalApplyPreviewTreeEx(
 		{
 			RtlCopyMemory(
 				(PUCHAR)Buffer + outputIndex,
-				payload + (ULONG)(overlapStart - node->Start),
+				payload + (ULONG)(payloadOffset - alignedOffset),
 				copyLength);
 		}
 		CdpBitmapSetRange(CoveredMask, outputIndex, copyLength);

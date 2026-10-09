@@ -250,7 +250,6 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 	PCdp_DRIVER_EXTENSION DriverExtension = NULL;
 
 	UNREFERENCED_PARAMETER(RegistryPath);
-
 	Cdp_LOG(
 		"loaded version=%s journal=v%lu build=%s\n",
 		Cdp_DRIVER_VERSION_STRING,
