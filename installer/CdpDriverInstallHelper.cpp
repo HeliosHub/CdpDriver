@@ -1,7 +1,10 @@
 #include "../CdpConsole/cdp_driver_install.h"
 #include "../CdpDriver/CdpIoctl.h"
 
+#include <commctrl.h>
 #include <stdio.h>
+
+#pragma comment(lib, "comctl32.lib")
 
 static int Fail(const wchar_t* stage) {
     DWORD error = GetLastError();
@@ -335,6 +338,236 @@ cleanup:
     return ok;
 }
 
+/* The graceful-stop IOCTL does the writeback synchronously.  Keep it on a
+ * worker thread so the installer can query the driver's published drain
+ * counters while it is running. */
+struct StopProgressState {
+    HANDLE CommandDevice;
+    HANDLE QueryDevice;
+    GUID SourceVolumeGuid;
+    HWND Window;
+    HWND Detail;
+    HWND Bar;
+    HWND Percent;
+    HANDLE Worker;
+    DWORD Result;
+    HFONT BodyFont;
+};
+
+static const UINT CdpStopProgressTimer = 1;
+static const UINT CdpStopProgressCloseTimer = 2;
+static const UINT CdpStopProgressCompleteMessage = WM_APP + 42;
+
+static void LayoutStopProgress(HWND window, StopProgressState* state) {
+    RECT client = {};
+    const int contentHeight = 78;
+    int top;
+    int width;
+
+    if (!state || !state->Detail || !state->Bar || !state->Percent)
+        return;
+    GetClientRect(window, &client);
+    top = (client.bottom - client.top - contentHeight) / 2;
+    if (top < 12)
+        top = 12;
+    width = client.right - client.left - 44;
+    SetWindowPos(state->Detail, nullptr, 22, top, width, 22,
+        SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(state->Bar, nullptr, 22, top + 30, width, 14,
+        SWP_NOZORDER | SWP_NOACTIVATE);
+    SetWindowPos(state->Percent, nullptr, 22, top + 56, width, 22,
+        SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+static void UpdateStopProgress(StopProgressState* state) {
+    Cdp_DRAIN_PROGRESS_QUERY_REQUEST request = {};
+    Cdp_DRAIN_PROGRESS_QUERY_REPLY reply = {};
+    DWORD bytesReturned = 0;
+    wchar_t text[192] = {};
+
+    if (!state || !state->Detail)
+        return;
+    request.SourceVolumeGuid = state->SourceVolumeGuid;
+    if (state->QueryDevice == INVALID_HANDLE_VALUE || !DeviceIoControl(
+            state->QueryDevice, IOCTL_Cdp_QUERY_DRAIN_PROGRESS,
+            &request, sizeof(request), &reply, sizeof(reply),
+            &bytesReturned, nullptr) || bytesReturned < sizeof(reply)) {
+        SetWindowTextW(state->Detail, L"正在准备回填数据，请稍候…");
+        SetWindowTextW(state->Percent, L"准备中");
+        return;
+    }
+
+    if (reply.TotalBytes != 0) {
+        const UINT64 completed = reply.CompletedBytes > reply.TotalBytes ?
+            reply.TotalBytes : reply.CompletedBytes;
+        const ULONG percent = static_cast<ULONG>(
+            (completed * 100ULL) / reply.TotalBytes);
+        _snwprintf_s(text, _countof(text), _TRUNCATE,
+            L"%lu%%  ·  %llu / %llu MiB",
+            percent,
+            completed / (1024ULL * 1024ULL),
+            reply.TotalBytes / (1024ULL * 1024ULL));
+        SetWindowTextW(state->Percent, text);
+        SendMessageW(state->Bar, PBM_SETPOS, percent, 0);
+    } else if (reply.State == Cdp_DRAIN_PROGRESS_COMPLETED) {
+        SetWindowTextW(state->Detail, L"回填完成，正在继续安装…");
+        SetWindowTextW(state->Percent, L"100%");
+        SendMessageW(state->Bar, PBM_SETPOS, 100, 0);
+    } else {
+        SetWindowTextW(state->Detail, L"正在准备回填数据，请稍候…");
+        SetWindowTextW(state->Percent, L"准备中");
+    }
+}
+
+static DWORD WINAPI StopProtectionWorker(void* context) {
+    StopProgressState* state = static_cast<StopProgressState*>(context);
+    Cdp_CMD2_REQUEST request = {};
+    Cdp_COMMAND_REPLY reply = {};
+    DWORD bytesReturned = 0;
+
+    request.Code = Cdp_CMD_2;
+    request.SourceVolumeGuid = state->SourceVolumeGuid;
+    if (!DeviceIoControl(state->CommandDevice, IOCTL_Cdp_SEND_COMMAND,
+            &request, sizeof(request), &reply, sizeof(reply),
+            &bytesReturned, nullptr) || bytesReturned < sizeof(reply) ||
+        reply.Result != 0) {
+        const DWORD error = GetLastError();
+        state->Result = error ? error : ERROR_GEN_FAILURE;
+    } else {
+        state->Result = ERROR_SUCCESS;
+    }
+    SecureZeroMemory(&request, sizeof(request));
+    PostMessageW(state->Window, CdpStopProgressCompleteMessage,
+        0, reinterpret_cast<LPARAM>(state));
+    return 0;
+}
+
+static LRESULT CALLBACK StopProgressWindowProc(
+    HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    StopProgressState* state = reinterpret_cast<StopProgressState*>(
+        GetWindowLongPtrW(window, GWLP_USERDATA));
+
+    if (message == WM_NCCREATE) {
+        const CREATESTRUCTW* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
+        state = static_cast<StopProgressState*>(create->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+        return TRUE;
+    }
+    switch (message) {
+    case WM_CREATE:
+    {
+        state->Window = window;
+        state->BodyFont = CreateFontW(-15, 0, 0, 0, FW_NORMAL,
+            FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+            L"Segoe UI");
+        state->Detail = CreateWindowW(L"STATIC", L"正在回填系统盘数据…",
+            WS_CHILD | WS_VISIBLE, 22, 20, 360, 22, window, nullptr, nullptr, nullptr);
+        state->Bar = CreateWindowExW(0, PROGRESS_CLASSW, L"",
+            WS_CHILD | WS_VISIBLE | PBS_SMOOTH, 22, 50, 376, 14,
+            window, nullptr, nullptr, nullptr);
+        state->Percent = CreateWindowW(L"STATIC", L"准备中",
+            WS_CHILD | WS_VISIBLE, 22, 76, 376, 22, window, nullptr, nullptr, nullptr);
+        SendMessageW(state->Detail, WM_SETFONT, reinterpret_cast<WPARAM>(state->BodyFont), TRUE);
+        SendMessageW(state->Percent, WM_SETFONT, reinterpret_cast<WPARAM>(state->BodyFont), TRUE);
+        SendMessageW(state->Bar, PBM_SETRANGE32, 0, 100);
+        LayoutStopProgress(window, state);
+        return 0;
+    }
+
+    case WM_SIZE:
+        LayoutStopProgress(window, state);
+        return 0;
+
+    case WM_CTLCOLORSTATIC:
+        SetBkMode(reinterpret_cast<HDC>(wParam), TRANSPARENT);
+        SetTextColor(reinterpret_cast<HDC>(wParam), RGB(70, 70, 70));
+        return reinterpret_cast<LRESULT>(GetStockObject(WHITE_BRUSH));
+
+    case WM_TIMER:
+        if (wParam == CdpStopProgressTimer) {
+            UpdateStopProgress(state);
+            return 0;
+        }
+        if (wParam == CdpStopProgressCloseTimer) {
+            DestroyWindow(window);
+            return 0;
+        }
+        break;
+
+    case CdpStopProgressCompleteMessage:
+        if (reinterpret_cast<StopProgressState*>(lParam) == state) {
+            KillTimer(window, CdpStopProgressTimer);
+            UpdateStopProgress(state);
+            SetTimer(window, CdpStopProgressCloseTimer, 350, nullptr);
+            return 0;
+        }
+        break;
+
+    case WM_CLOSE:
+        /* The driver cannot safely cancel a writeback part way through. */
+        return 0;
+
+    case WM_DESTROY:
+        KillTimer(window, CdpStopProgressTimer);
+        KillTimer(window, CdpStopProgressCloseTimer);
+        if (state->BodyFont) DeleteObject(state->BodyFont);
+        return 0;
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+static BOOL StopProtectionWithProgress(HANDLE device, const GUID& sourceVolumeGuid) {
+    static const wchar_t className[] = L"CdpDriverStopProgress";
+    static ATOM windowClass = 0;
+    WNDCLASSW windowClassInfo = {};
+    StopProgressState state = { device, INVALID_HANDLE_VALUE, sourceVolumeGuid,
+        nullptr, nullptr, nullptr, nullptr, nullptr, ERROR_GEN_FAILURE, nullptr };
+    HWND window;
+    MSG message;
+
+    if (!windowClass) {
+        windowClassInfo.lpfnWndProc = StopProgressWindowProc;
+        windowClassInfo.hInstance = GetModuleHandleW(nullptr);
+        windowClassInfo.hCursor = LoadCursorW(nullptr, IDC_WAIT);
+        windowClassInfo.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+        windowClassInfo.lpszClassName = className;
+        windowClass = RegisterClassW(&windowClassInfo);
+        if (!windowClass && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+            return FALSE;
+    }
+    InitCommonControls();
+    state.QueryDevice = OpenControlDevice();
+    window = CreateWindowExW(WS_EX_DLGMODALFRAME, className, L"正在关闭系统盘保护",
+        WS_CAPTION | WS_POPUP | WS_VISIBLE,
+        (GetSystemMetrics(SM_CXSCREEN) - 420) / 2,
+        (GetSystemMetrics(SM_CYSCREEN) - 135) / 2,
+        420, 135, nullptr, nullptr, GetModuleHandleW(nullptr), &state);
+    if (!window) {
+        if (state.QueryDevice != INVALID_HANDLE_VALUE) CloseHandle(state.QueryDevice);
+        return FALSE;
+    }
+    state.Worker = CreateThread(nullptr, 0, StopProtectionWorker, &state, 0, nullptr);
+    if (!state.Worker) {
+        DestroyWindow(window);
+        if (state.QueryDevice != INVALID_HANDLE_VALUE) CloseHandle(state.QueryDevice);
+        return FALSE;
+    }
+    SetTimer(window, CdpStopProgressTimer, 200, nullptr);
+    while (IsWindow(window) && GetMessageW(&message, nullptr, 0, 0) > 0) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+    WaitForSingleObject(state.Worker, INFINITE);
+    CloseHandle(state.Worker);
+    if (state.QueryDevice != INVALID_HANDLE_VALUE) CloseHandle(state.QueryDevice);
+    if (state.Result != ERROR_SUCCESS) {
+        SetLastError(state.Result);
+        return FALSE;
+    }
+    return TRUE;
+}
+
 static BOOL ReclaimSystemJournal(const Cdp_PHASE_QUERY_REPLY& phase, wchar_t systemDrive) {
     wchar_t volumePath[] = L"\\\\.\\C:";
     VOLUME_DISK_EXTENTS extents = {};
@@ -419,8 +652,6 @@ static BOOL ReclaimSystemJournal(const Cdp_PHASE_QUERY_REPLY& phase, wchar_t sys
 
 static int StopSystemProtection() {
     GUID sourceVolumeGuid = {};
-    Cdp_CMD2_REQUEST request = {};
-    Cdp_COMMAND_REPLY reply = {};
     DWORD bytesReturned = 0;
     HANDLE device;
     Cdp_PHASE_QUERY_REQUEST phaseRequest = {};
@@ -449,14 +680,10 @@ static int StopSystemProtection() {
         return error == ERROR_CANCELLED ? ProtectionCheckCancelled : ProtectionCheckUnavailable;
     }
 
-    request.Code = Cdp_CMD_2;
-    request.SourceVolumeGuid = sourceVolumeGuid;
-    const BOOL ok = DeviceIoControl(device, IOCTL_Cdp_SEND_COMMAND,
-        &request, sizeof(request), &reply, sizeof(reply), &bytesReturned, nullptr);
+    const BOOL ok = StopProtectionWithProgress(device, sourceVolumeGuid);
     const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
-    SecureZeroMemory(&request, sizeof(request));
     CloseHandle(device);
-    if (!ok || bytesReturned < sizeof(reply) || reply.Result != 0) {
+    if (!ok) {
         SetLastError(error ? error : ERROR_GEN_FAILURE);
         return ProtectionCheckUnavailable;
     }
