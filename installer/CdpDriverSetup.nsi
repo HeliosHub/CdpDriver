@@ -17,7 +17,6 @@ RequestExecutionLevel admin
 Name "${PRODUCT_NAME}"
 OutFile "work\out\RecoverySetup-x64.exe"
 InstallDir "$PROGRAMFILES64\源点恢复"
-InstallDirRegKey HKLM "Software\源点恢复" "InstallDir"
 BrandingText "源点恢复安装向导"
 Icon "work\app.ico"
 UninstallIcon "work\app.ico"
@@ -36,13 +35,11 @@ VIAddVersionKey /LANG=2052 "ProductVersion" "${PRODUCT_VERSION}"
 !define MUI_UNICON "work\app.ico"
 !define MUI_WELCOMEPAGE_TITLE "欢迎安装源点恢复"
 !define MUI_WELCOMEPAGE_TEXT "安装向导将安装源点恢复、卷筛选驱动和启动服务。$\r$\n$\r$\n继续前请关闭正在运行的源点恢复程序。"
-!define MUI_DIRECTORYPAGE_TEXT_TOP "请选择源点恢复的安装位置。"
 !define MUI_FINISHPAGE_TITLE "源点恢复安装完成"
 !define MUI_FINISHPAGE_TEXT "源点恢复已成功安装。必须重启 Windows 才能加载卷筛选驱动。"
 !define MUI_FINISHPAGE_REBOOTLATER_DEFAULT
 
 !insertmacro MUI_PAGE_WELCOME
-!insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
 
@@ -58,6 +55,9 @@ Function .onInit
         Abort
     ${EndIf}
     SetRegView 64
+    ; Keep the product in its fixed default location, including upgrades from
+    ; older installers that may have remembered a custom directory.
+    StrCpy $INSTDIR "$PROGRAMFILES64\源点恢复"
 FunctionEnd
 
 Function un.onInit
