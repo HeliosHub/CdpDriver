@@ -34,12 +34,47 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 
 VOID CdpDeleteFilterDevice(_In_ PDEVICE_OBJECT FilterDeviceObject);
 
+NTSTATUS CdpCreateInternalSourceDevice(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ PCdp_DEVICE_EXTENSION DiskExt,
+	_Out_ PDEVICE_OBJECT* SourceDeviceObject,
+	_Out_ PCdp_DEVICE_EXTENSION* SourceExt);
+
+VOID CdpDeleteInternalSourceDevice(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ PDEVICE_OBJECT SourceDeviceObject);
+
+VOID CdpDeleteInternalSourceDevicesForDisk(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ ULONG DiskNumber);
+NTSTATUS CdpBindVolumeProtectionContext(
+	_Inout_ PCdp_DEVICE_EXTENSION VolumeExt,
+	_In_ PDEVICE_OBJECT SourceDeviceObject);
+VOID CdpUnbindVolumeProtectionContext(
+	_Inout_ PCdp_DEVICE_EXTENSION VolumeExt);
+VOID CdpUnbindVolumesFromSource(
+	_In_ PCdp_DRIVER_EXTENSION DriverExt,
+	_In_ PDEVICE_OBJECT SourceDeviceObject);
+
 VOID CdpCloseAllVolumeHandles(_In_ PCdp_DRIVER_EXTENSION DriverExt);
 
 VOID CdpCloseAllPreviewSessions(_In_ PCdp_DRIVER_EXTENSION DriverExt);
 
 VOID CdpCancelAllRestoreSpaceAlertWaits(
 	_In_ PCdp_DRIVER_EXTENSION DriverExt);
+
+VOID CdpInitializeUnloadGate(
+	_In_ PDRIVER_OBJECT DriverObject,
+	_Inout_ PCdp_DRIVER_EXTENSION DriverExt);
+
+NTSTATUS CdpArmDriverUnload(
+	_In_ PDRIVER_OBJECT DriverObject,
+	_Inout_ PCdp_DRIVER_EXTENSION DriverExt);
+
+VOID CdpMarkProtectedUnloadStarted(
+	_Inout_ PCdp_DRIVER_EXTENSION DriverExt);
+
+VOID CdpDriverUnload(_In_ PDRIVER_OBJECT DriverObject);
 
 NTSTATUS CdpStartCaptureWorker(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
 

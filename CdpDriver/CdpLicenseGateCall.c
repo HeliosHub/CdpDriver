@@ -120,7 +120,7 @@ BOOLEAN CdpLicenseGateCallTryDispatchIoctl(
 		request = *(PCdp_BUILD_APPLY_QR_REQUEST)SystemBuffer;
 		*Status = CdpLicenseBuildApplyQrPayload(request.DesiredDurationSec,
 			request.DesiredCredits, request.Mode, request.Kind, request.QrPrefix,
-			SystemBuffer, OutputLength, Information);
+			request.Email, SystemBuffer, OutputLength, Information);
 		return TRUE;
 	}
 

@@ -14,6 +14,8 @@ RequestExecutionLevel admin
 !define PRODUCT_PUBLISHER "源点恢复"
 !define PRODUCT_EXE "源点恢复.exe"
 
+Var MaintenanceAuthorized
+
 Name "${PRODUCT_NAME}"
 OutFile "work\out\RecoverySetup-x64.exe"
 InstallDir "$PROGRAMFILES64\源点恢复"
@@ -34,7 +36,7 @@ VIAddVersionKey /LANG=2052 "ProductVersion" "${PRODUCT_VERSION}"
 !define MUI_ICON "work\app.ico"
 !define MUI_UNICON "work\app.ico"
 !define MUI_WELCOMEPAGE_TITLE "欢迎安装源点恢复"
-!define MUI_WELCOMEPAGE_TEXT "安装向导将安装源点恢复、卷筛选驱动和启动服务。$\r$\n$\r$\n继续前请关闭正在运行的源点恢复程序。"
+!define MUI_WELCOMEPAGE_TEXT "安装向导将把源点恢复安装到固定目录，并安装卷筛选驱动、自保护驱动和启动服务。$\r$\n$\r$\n安装位置不能修改。继续前请关闭正在运行的源点恢复程序。"
 !define MUI_FINISHPAGE_TITLE "源点恢复安装完成"
 !define MUI_FINISHPAGE_TEXT "源点恢复已成功安装。必须重启 Windows 才能加载卷筛选驱动。"
 !define MUI_FINISHPAGE_REBOOTLATER_DEFAULT
@@ -97,7 +99,18 @@ system_protection_stop:
     DetailPrint "正在关闭系统盘保护..."
     ; The helper shows its own password window. nsExec runs child processes
     ; hidden, which would make that prompt invisible and leave setup waiting.
+    ; 已安装的 Helper 位于 CdpProtect 允许的固定路径，可在口令验证成功后
+    ; 把维护会话签发给安装器。没有已安装 Helper 时才使用临时副本。
+    IfFileExists "$INSTDIR\CdpDriverInstallHelper.exe" 0 system_protection_stop_plugin
+    ExecWait '"$INSTDIR\CdpDriverInstallHelper.exe" --stop-system-protection' $0
+    Goto system_protection_stop_result
+system_protection_stop_plugin:
     ExecWait '"$PLUGINSDIR\CdpDriverInstallHelper.exe" --stop-system-protection' $0
+system_protection_stop_result:
+    ${If} $0 == 14
+        StrCpy $MaintenanceAuthorized 1
+        StrCpy $0 0
+    ${EndIf}
     ${If} $0 == 0
         DetailPrint "系统盘保护已关闭。"
         Goto system_protection_check
@@ -137,6 +150,7 @@ FunctionEnd
 Section "安装源点恢复" SEC_MAIN
     SectionIn RO
     SetShellVarContext all
+    StrCpy $MaintenanceAuthorized 0
 
     ; Extract only the helper needed for the pre-install protection check;
     ; the final payload is not copied to the selected install directory yet.
@@ -180,7 +194,25 @@ Section "安装源点恢复" SEC_MAIN
         DetailPrint "已检测到兼容的 Microsoft Visual C++ x64 运行库，跳过安装。"
     ${EndIf}
 
-    DetailPrint "正在复制图形管理工具..."
+    IfFileExists "$INSTDIR\CdpDriverInstallHelper.exe" 0 copy_payload
+    ${If} $MaintenanceAuthorized == 1
+        DetailPrint "已沿用关闭系统盘保护时完成的维护授权。"
+        Goto copy_payload
+    ${EndIf}
+    DetailPrint "正在请求维护授权..."
+    DetailPrint "请在弹出的“源点恢复维护”窗口中输入保护密码。"
+    System::Call 'user32::AllowSetForegroundWindow(i -1)'
+    ; 升级时首先运行的是已安装的旧 Helper。由新包内的 Helper 在后台修正
+    ; 旧口令窗口的位置并隐藏旧版“尚未设密”按钮。
+    ExecShell "open" "$PLUGINSDIR\CdpDriverInstallHelper.exe" "--adjust-maintenance-window" SW_HIDE
+    ExecWait '"$INSTDIR\CdpDriverInstallHelper.exe" --authorize-maintenance' $0
+    ${If} $0 != 0
+        MessageBox MB_OK|MB_ICONSTOP "维护授权失败，错误码：$0。已取消更新。"
+        Abort
+    ${EndIf}
+
+copy_payload:
+    DetailPrint "正在复制程序文件..."
     SetOutPath "$INSTDIR"
     File /r "work\payload\*.*"
 
@@ -217,6 +249,15 @@ Section "安装源点恢复" SEC_MAIN
         MessageBox MB_OK|MB_ICONSTOP "卷筛选驱动安装失败，错误码：$0。请查看安装进度中的详细信息。"
         Abort
     ${EndIf}
+
+    DetailPrint "正在安装 CdpProtect 自保护驱动..."
+    nsExec::ExecToLog '"$INSTDIR\CdpDriverInstallHelper.exe" --install-protect'
+    Pop $0
+    ${If} $0 != 0
+        MessageBox MB_OK|MB_ICONSTOP "自保护驱动安装失败，错误码：$0。请查看安装进度中的详细信息。"
+        Abort
+    ${EndIf}
+
     DetailPrint "正在创建开始菜单和桌面快捷方式..."
     CreateDirectory "$SMPROGRAMS\源点恢复"
     CreateShortcut "$SMPROGRAMS\源点恢复\源点恢复.lnk" "$INSTDIR\${PRODUCT_EXE}" "" "$INSTDIR\${PRODUCT_EXE}" 0
@@ -240,14 +281,14 @@ Section "Uninstall"
     SetShellVarContext all
     SetRegView 64
 
-    DetailPrint "正在停止并删除 CdpBootService..."
-    ExecWait '"$INSTDIR\CdpBootService.exe" --uninstall'
-
-    DetailPrint "正在注销 CdpDriver 卷筛选驱动..."
-    nsExec::ExecToLog '"$INSTDIR\CdpDriverInstallHelper.exe" --uninstall'
-    Pop $0
-    ${If} $0 != 0
-        DetailPrint "警告：驱动注销未完全完成，错误码：$0。文件卸载将继续。"
+    DetailPrint "正在卸载驱动..."
+    ExecWait '"$INSTDIR\CdpDriverInstallHelper.exe" --uninstall-all' $0
+    ${If} $0 == 10
+        MessageBox MB_OK|MB_ICONSTOP "仍有分区处于保护状态，已取消卸载。"
+        Abort
+    ${ElseIf} $0 != 0
+        MessageBox MB_OK|MB_ICONSTOP "卸载驱动失败，错误码：$0。"
+        Abort
     ${EndIf}
 
     Delete "$DESKTOP\源点恢复.lnk"

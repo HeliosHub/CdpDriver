@@ -1,7 +1,8 @@
 ﻿[CmdletBinding()]
 param(
     [string]$GuiRoot = '',
-    [string]$OutputDirectory = ''
+    [string]$OutputDirectory = '',
+    [switch]$Production
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,6 +28,9 @@ $guiExecutable = $guiExecutableCandidates | Where-Object { Test-Path -LiteralPat
 if (-not $guiExecutable) {
     throw "找不到 GUI 发布文件。已检查: $($guiExecutableCandidates -join ', ')"
 }
+$protectRoot = Join-Path (Split-Path -Parent $driverRoot) 'cdp-protect-drv'
+$protectOutput = Join-Path $protectRoot 'x64\Release\driver'
+$enableCdpProtect = $true
 $workRoot = Join-Path $installerRoot 'work'
 $payloadRoot = Join-Path $workRoot 'payload'
 $archivePath = Join-Path $workRoot 'payload.zip'
@@ -94,8 +98,28 @@ foreach ($file in @(
 
 $msbuild = 'C:\Program Files\Microsoft Visual Studio\2022\Community\MSBuild\Current\Bin\MSBuild.exe'
 Require-File $msbuild
+$stampScript = Join-Path $protectRoot 'tools\Stamp-Altitudes.ps1'
+$verifyScript = Join-Path $protectRoot 'tools\Verify-Release.ps1'
+$protectInf = Join-Path $protectRoot 'CdpProtectDrv\CdpProtect.inf'
+$protectInfTemplate = Join-Path $protectRoot 'CdpProtectDrv\CdpProtect.inf.in'
+$releaseAltitude = Join-Path $protectRoot 'tools\altitudes.release.json'
+$productionSigner = Join-Path $protectRoot 'tools\production-signer.txt'
 $savedProcessPath = $env:PATH
+$infBackup = $null
 try {
+    if ($Production -and $enableCdpProtect) {
+        if (-not (Test-Path -LiteralPath $releaseAltitude -PathType Leaf)) {
+            throw "正式打包需要 tools\altitudes.release.json。仓库里没有正式 altitude，不能用 370010、370011 或 370012 代替。"
+        }
+        if (-not (Test-Path -LiteralPath $productionSigner -PathType Leaf)) {
+            throw "正式打包需要 tools\production-signer.txt。WDKTestCert 不能作为交付签名。"
+        }
+        $infBackup = Join-Path $env:TEMP 'CdpProtect.inf.testbak'
+        Copy-Item -LiteralPath $protectInf -Destination $infBackup -Force
+        $headerTmp = Join-Path $env:TEMP 'CdpProtectAltitude.prod.h'
+        & $stampScript -AltitudeFile $releaseAltitude -HeaderOut $headerTmp -InfTemplate $protectInfTemplate -InfOut $protectInf
+        Remove-Item -LiteralPath $headerTmp -Force -ErrorAction SilentlyContinue
+    }
     # Some launchers provide both `Path` and `PATH` in the native environment
     # block. MSBuild's ToolTask imports variables into a case-insensitive
     # dictionary and then fails before CL.exe starts. Removing the inherited
@@ -106,8 +130,22 @@ try {
     $bootServiceBuildExitCode = $LASTEXITCODE
     & $msbuild (Join-Path $installerRoot 'CdpDriverInstallHelper.vcxproj') /m /t:Build /p:Configuration=Release /p:Platform=x64 /v:minimal /nologo
     $helperBuildExitCode = $LASTEXITCODE
+    if ($enableCdpProtect) {
+        if ($Production) {
+            & $msbuild (Join-Path $protectRoot 'CdpProtectDrv\CdpProtectDrv.vcxproj') /m /t:Rebuild /p:Configuration=Release /p:Platform=x64 /p:CdppAltitudeFile=$releaseAltitude /v:minimal /nologo
+        } else {
+            & $msbuild (Join-Path $protectRoot 'CdpProtectDrv\CdpProtectDrv.vcxproj') /m /t:Build /p:Configuration=Release /p:Platform=x64 /v:minimal /nologo
+        }
+        $protectBuildExitCode = $LASTEXITCODE
+    } else {
+        $protectBuildExitCode = 0
+    }
 } finally {
     $env:Path = $savedProcessPath
+    if ($infBackup -and (Test-Path -LiteralPath $infBackup -PathType Leaf)) {
+        Copy-Item -LiteralPath $infBackup -Destination $protectInf -Force
+        Remove-Item -LiteralPath $infBackup -Force
+    }
 }
 if ($bootServiceBuildExitCode -ne 0) {
     throw "生成启动服务失败 (exit code $bootServiceBuildExitCode)。"
@@ -115,8 +153,30 @@ if ($bootServiceBuildExitCode -ne 0) {
 if ($helperBuildExitCode -ne 0) {
     throw "生成驱动安装助手失败 (exit code $helperBuildExitCode)。"
 }
+if ($enableCdpProtect -and $protectBuildExitCode -ne 0) {
+    throw "生成 CdpProtect 失败 (exit code $protectBuildExitCode)。"
+}
 Require-File (Join-Path $driverOutput 'CdpBootService.exe')
 Require-File (Join-Path $driverOutput 'CdpDriverInstallHelper.exe')
+if ($enableCdpProtect) {
+    foreach ($file in @(
+        (Join-Path $protectOutput 'CdpProtect.sys'),
+        (Join-Path $protectOutput 'CdpProtect.inf'),
+        (Join-Path $protectOutput 'cdpprotect.cat')
+    )) { Require-File $file }
+}
+if (-not $guiExecutable) {
+    throw "找不到 GUI 发布文件，Helper、启动服务和 CdpProtect 已构建，但未生成安装包。已检查: $($guiExecutableCandidates -join ', ')"
+}
+foreach ($file in @(
+    $guiExecutable,
+    (Join-Path $guiOutput 'handle.exe'),
+    (Join-Path $guiOutput 'iscsi_target_dotnet.dll'),
+    (Join-Path $driverOutput 'CdpDriver.cer'),
+    (Join-Path $driverOutput 'driver\CdpDriver.inf'),
+    (Join-Path $driverOutput 'driver\CdpDriver.sys'),
+    (Join-Path $driverOutput 'driver\cdpdriver.cat')
+)) { Require-File $file }
 
 if (-not (Test-Path -LiteralPath (Join-Path $guiOutput 'Web') -PathType Container)) {
     throw "找不到 GUI Web 资源目录: $(Join-Path $guiOutput 'Web')"
@@ -155,6 +215,19 @@ Copy-ReleaseFile (Join-Path $driverOutput 'CdpDriver.cer') (Join-Path $payloadRo
 Copy-ReleaseFile (Join-Path $driverOutput 'driver\CdpDriver.inf') (Join-Path $payloadRoot 'driver\CdpDriver.inf')
 Copy-ReleaseFile (Join-Path $driverOutput 'driver\CdpDriver.sys') (Join-Path $payloadRoot 'driver\CdpDriver.sys')
 Copy-ReleaseFile (Join-Path $driverOutput 'driver\cdpdriver.cat') (Join-Path $payloadRoot 'driver\CdpDriver.cat')
+if ($enableCdpProtect) {
+    Copy-ReleaseFile (Join-Path $protectOutput 'CdpProtect.sys') (Join-Path $payloadRoot 'driver\protect\CdpProtect.sys')
+    Copy-ReleaseFile (Join-Path $protectOutput 'CdpProtect.inf') (Join-Path $payloadRoot 'driver\protect\CdpProtect.inf')
+    Copy-ReleaseFile (Join-Path $protectOutput 'cdpprotect.cat') (Join-Path $payloadRoot 'driver\protect\CdpProtect.cat')
+}
+if ($enableCdpProtect) {
+    if ($Production) {
+        & $verifyScript -PackageRoot $payloadRoot -RequireProduction -SignerFile $productionSigner
+    } else {
+        & $verifyScript -PackageRoot $payloadRoot
+        Write-Host "这是测试 altitude / 测试签名包，不是正式发布包。"
+    }
+}
 
 Assert-NoSymbolOrBuildMetadata $payloadRoot 'Installer payload'
 
@@ -195,13 +268,17 @@ if (Test-Path -LiteralPath $previousOutputPath -PathType Leaf) {
     Remove-Item -LiteralPath $previousOutputPath -Force
 }
 
-$excluded = @('CdpConsole.exe', 'CdpConsole_Param.exe', 'CdpCore.Tests.exe', 'VolHexdump.exe')
+$excluded = @('CdpConsole.exe', 'CdpConsole_Param.exe', 'CdpCore.Tests.exe', 'VolHexdump.exe', 'CdpProtectConsole.exe')
 $zip = [System.IO.Compression.ZipFile]::OpenRead($archivePath)
 $archiveEntries = $zip.Entries.FullName
 $zip.Dispose()
-$presentExcluded = $archiveEntries | Where-Object { $_ -in $excluded }
-if ($presentExcluded) {
-    throw "安装包包含不应发布的文件: $($presentExcluded -join ', ')"
+$presentExcluded = $archiveEntries | Where-Object {
+    ([System.IO.Path]::GetFileName($_.Replace('/', '\'))) -in $excluded
+}
+$payloadExcluded = Get-ChildItem -LiteralPath $payloadRoot -Recurse -File |
+    Where-Object { $_.Name -in $excluded }
+if ($presentExcluded -or $payloadExcluded) {
+    throw "安装包包含不应发布的文件: $(($presentExcluded + $payloadExcluded) -join ', ')"
 }
 
 $forbiddenArchiveEntry = $archiveEntries | Where-Object {

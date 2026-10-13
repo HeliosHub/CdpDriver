@@ -61,13 +61,19 @@ NTSTATUS CdpLicenseExportReceipt(
  * 正式申请：时长模式 duration>0，次数模式 credits>0，混合两者都要；
  * 试用申请：duration/credits 可为 0（由服务端配置覆盖）。
  * QrPrefix：应用层传入的扫码 URI 前缀（须自带 #c= / ?c=），驱动只拼接 Base64。
+ * Email：申请邮箱，写入加密 JSON，供服务端建用户并用于后续找回密码。
  */
+NTSTATUS CdpLicenseSanitizeEmail(
+	_In_reads_(Cdp_EMAIL_MAX) const CHAR* Email,
+	_Out_writes_z_(Cdp_EMAIL_MAX) CHAR* Out);
+
 NTSTATUS CdpLicenseBuildApplyQrPayload(
 	_In_ ULONG DesiredDurationSec,
 	_In_ ULONG DesiredCredits,
 	_In_ ULONG Mode,
 	_In_ ULONG Kind,
 	_In_reads_(Cdp_APPLY_QR_PREFIX_MAX) const CHAR* QrPrefix,
+	_In_reads_(Cdp_EMAIL_MAX) const CHAR* Email,
 	_Out_writes_bytes_to_(OutLength, *Written) PVOID OutBuffer,
 	_In_ ULONG OutLength,
 	_Out_ PULONG Written);

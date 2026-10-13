@@ -22,21 +22,89 @@ static int LastErrorExitCode()
 	return error ? (int)error : 1;
 }
 
+/* 清掉失败重启并停掉服务。新版本忽略 STOP，已授权进程再结束服务进程。 */
+static BOOL ForceStopService(SC_HANDLE service)
+{
+	SERVICE_FAILURE_ACTIONSW actions;
+	SERVICE_STATUS_PROCESS status;
+	DWORD bytesNeeded = 0;
+	DWORD waited = 0;
+	HANDLE process;
+	DWORD processId;
+
+	ZeroMemory(&actions, sizeof(actions));
+	ChangeServiceConfig2W(service, SERVICE_CONFIG_FAILURE_ACTIONS, &actions);
+	ChangeServiceConfigW(
+		service,
+		SERVICE_NO_CHANGE,
+		SERVICE_DISABLED,
+		SERVICE_NO_CHANGE,
+		NULL,
+		NULL,
+		NULL,
+		NULL,
+		NULL,
+		NULL,
+		NULL);
+	if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+		(LPBYTE)&status, sizeof(status), &bytesNeeded))
+		return FALSE;
+	if (status.dwCurrentState == SERVICE_STOPPED)
+		return TRUE;
+	ControlService(service, SERVICE_CONTROL_STOP, (LPSERVICE_STATUS)&status);
+	while (status.dwCurrentState != SERVICE_STOPPED && waited < 3000)
+	{
+		Sleep(200);
+		waited += 200;
+		if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+			(LPBYTE)&status, sizeof(status), &bytesNeeded))
+			break;
+	}
+	processId = status.dwProcessId;
+	if (status.dwCurrentState != SERVICE_STOPPED && processId != 0)
+	{
+		process = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, processId);
+		if (!process)
+			return FALSE;
+		if (!TerminateProcess(process, 1))
+		{
+			DWORD error = GetLastError();
+			CloseHandle(process);
+			SetLastError(error);
+			return FALSE;
+		}
+		WaitForSingleObject(process, 10000);
+		CloseHandle(process);
+		waited = 0;
+		while (status.dwCurrentState != SERVICE_STOPPED && waited < 10000)
+		{
+			Sleep(200);
+			waited += 200;
+			if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
+				(LPBYTE)&status, sizeof(status), &bytesNeeded))
+				break;
+		}
+	}
+	if (status.dwCurrentState != SERVICE_STOPPED)
+	{
+		SetLastError(ERROR_SERVICE_REQUEST_TIMEOUT);
+		return FALSE;
+	}
+	return TRUE;
+}
+
 /* The old one-shot service can still be running while retrying.  Stop it before
  * replacing its executable, otherwise CopyFile fails with sharing violation. */
 static BOOL StopExistingServiceForUpdate()
 {
 	SC_HANDLE scm;
 	SC_HANDLE service;
-	SERVICE_STATUS_PROCESS status = {};
-	DWORD bytesNeeded = 0;
-	DWORD waited = 0;
 
 	scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
 	if (!scm)
 		return FALSE;
 	service = OpenServiceW(scm, kServiceName,
-		SERVICE_QUERY_STATUS | SERVICE_STOP);
+		SERVICE_QUERY_STATUS | SERVICE_STOP | SERVICE_CHANGE_CONFIG);
 	if (!service)
 	{
 		DWORD error = GetLastError();
@@ -46,8 +114,7 @@ static BOOL StopExistingServiceForUpdate()
 		SetLastError(error);
 		return FALSE;
 	}
-	if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
-		(LPBYTE)&status, sizeof(status), &bytesNeeded))
+	if (!ForceStopService(service))
 	{
 		DWORD error = GetLastError();
 		CloseServiceHandle(service);
@@ -55,23 +122,8 @@ static BOOL StopExistingServiceForUpdate()
 		SetLastError(error);
 		return FALSE;
 	}
-	if (status.dwCurrentState != SERVICE_STOPPED)
-		ControlService(service, SERVICE_CONTROL_STOP, (LPSERVICE_STATUS)&status);
-	while (status.dwCurrentState != SERVICE_STOPPED && waited < 30000)
-	{
-		Sleep(500);
-		waited += 500;
-		if (!QueryServiceStatusEx(service, SC_STATUS_PROCESS_INFO,
-			(LPBYTE)&status, sizeof(status), &bytesNeeded))
-			break;
-	}
 	CloseServiceHandle(service);
 	CloseServiceHandle(scm);
-	if (status.dwCurrentState != SERVICE_STOPPED)
-	{
-		SetLastError(ERROR_SERVICE_REQUEST_TIMEOUT);
-		return FALSE;
-	}
 	return TRUE;
 }
 
@@ -82,7 +134,9 @@ static void ReportServiceStatus(DWORD state, DWORD win32ExitCode, DWORD waitHint
 	g_ServiceStatus.dwWin32ExitCode = win32ExitCode;
 	g_ServiceStatus.dwWaitHint = waitHint;
 	g_ServiceStatus.dwControlsAccepted =
-		state == SERVICE_RUNNING ? SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN : 0;
+		state == SERVICE_RUNNING
+		? SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_PRESHUTDOWN
+		: 0;
 	if (state == SERVICE_START_PENDING || state == SERVICE_STOP_PENDING)
 		g_ServiceStatus.dwCheckPoint++;
 	else
@@ -515,7 +569,9 @@ static DWORD WINAPI BootConfirmWorker(void*)
 
 static DWORD WINAPI ServiceControlHandler(DWORD control, DWORD, void*, void*)
 {
-	if (control == SERVICE_CONTROL_STOP || control == SERVICE_CONTROL_SHUTDOWN)
+	/* STOP 不接受。关机和预关机才退出；维护卸载由已授权进程结束本进程。 */
+	if (control == SERVICE_CONTROL_SHUTDOWN ||
+		control == SERVICE_CONTROL_PRESHUTDOWN)
 	{
 		ReportServiceStatus(SERVICE_STOP_PENDING, ERROR_SUCCESS, 5000);
 		if (g_StopEvent)
@@ -588,15 +644,17 @@ static int InstallService()
 	scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
 	if (!scm)
 		return LastErrorExitCode();
+	/* SC_ACTION_RESTART 要求句柄带 SERVICE_START，否则 ChangeServiceConfig2 返回拒绝访问。 */
 	service = CreateServiceW(
 		scm, kServiceName, kServiceDisplayName,
-		SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG | DELETE,
+		SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG | SERVICE_START | DELETE,
 		SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
 		commandLine, NULL, NULL, NULL, NULL, NULL);
 	if (!service && GetLastError() == ERROR_SERVICE_EXISTS)
 	{
 		service = OpenServiceW(scm,
-			kServiceName, SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG | DELETE);
+			kServiceName,
+			SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG | SERVICE_START | DELETE);
 	}
 	if (!service)
 	{
@@ -631,29 +689,75 @@ static int InstallService()
 		CloseServiceHandle(scm);
 		return LastErrorExitCode();
 	}
+	{
+		SC_ACTION restart[3];
+		SERVICE_FAILURE_ACTIONSW failureActions;
+		int index;
+
+		for (index = 0; index < 3; ++index)
+		{
+			restart[index].Type = SC_ACTION_RESTART;
+			restart[index].Delay = 5000;
+		}
+		ZeroMemory(&failureActions, sizeof(failureActions));
+		failureActions.dwResetPeriod = 86400;
+		failureActions.cActions = 3;
+		failureActions.lpsaActions = restart;
+		if (!ChangeServiceConfig2W(
+			service, SERVICE_CONFIG_FAILURE_ACTIONS, &failureActions))
+		{
+			CloseServiceHandle(service);
+			CloseServiceHandle(scm);
+			return LastErrorExitCode();
+		}
+	}
 	CloseServiceHandle(service);
 	CloseServiceHandle(scm);
 	return 0;
+}
+
+/* 服务删掉以后再删 System32 里的程序。删不掉就留到重启。 */
+static void DeleteInstalledImage(void)
+{
+	wchar_t systemDirectory[MAX_PATH];
+	wchar_t installPath[MAX_PATH];
+
+	if (!GetSystemDirectoryW(systemDirectory, _countof(systemDirectory)))
+		return;
+	if (FAILED(StringCchPrintfW(
+		installPath, _countof(installPath), L"%s\\CdpBootService.exe",
+		systemDirectory)))
+		return;
+	if (!DeleteFileW(installPath))
+		MoveFileExW(installPath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
 }
 
 static int UninstallService()
 {
 	SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
 	SC_HANDLE service;
-	SERVICE_STATUS status;
 	if (!scm)
 		return LastErrorExitCode();
-	service = OpenServiceW(scm, kServiceName, SERVICE_STOP | DELETE | SERVICE_QUERY_STATUS);
+	service = OpenServiceW(scm, kServiceName,
+		SERVICE_STOP | DELETE | SERVICE_QUERY_STATUS | SERVICE_CHANGE_CONFIG);
 	if (!service)
 	{
 		CloseServiceHandle(scm);
 		return GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST ? 0 : LastErrorExitCode();
 	}
-	ControlService(service, SERVICE_CONTROL_STOP, &status);
+	if (!ForceStopService(service))
+	{
+		CloseServiceHandle(service);
+		CloseServiceHandle(scm);
+		return LastErrorExitCode();
+	}
 	BOOL ok = DeleteService(service);
 	CloseServiceHandle(service);
 	CloseServiceHandle(scm);
-	return ok ? 0 : LastErrorExitCode();
+	if (!ok)
+		return LastErrorExitCode();
+	DeleteInstalledImage();
+	return 0;
 }
 
 int wmain(int argc, wchar_t** argv)

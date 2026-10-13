@@ -33,6 +33,7 @@ typedef struct _CONSOLE_SET_LICENSE_REQUEST {
 typedef struct _CONSOLE_BUILD_APPLY_QR_REQUEST {
 	ULONG DesiredDurationSec, DesiredCredits, Mode, Kind;
 	CHAR QrPrefix[CONSOLE_APPLY_QR_PREFIX_MAX];
+	CHAR Email[128];
 } CONSOLE_BUILD_APPLY_QR_REQUEST;
 typedef struct _CONSOLE_LICENSE_APPLY_QR_REPLY {
 	ULONG CiphertextLength, Reserved; UCHAR DeviceFingerprint[32];
@@ -1866,6 +1867,23 @@ static BOOL PromptPaidLicenseApplyParams(ULONG* modeOut, ULONG* durationOut, ULO
 	return TRUE;
 }
 
+static BOOL PromptApplyEmail(CHAR* emailOut, size_t emailChars)
+{
+	wchar_t line[128] = { 0 };
+	ConOut(L"Email: ");
+	if (!ReadLine(line, _countof(line)) || line[0] == L'\0')
+	{
+		ConOut(L"Email is required.\n");
+		return FALSE;
+	}
+	if (WideCharToMultiByte(CP_UTF8, 0, line, -1, emailOut, (int)emailChars, NULL, NULL) <= 1)
+	{
+		ConOut(L"Invalid email.\n");
+		return FALSE;
+	}
+	return TRUE;
+}
+
 static BOOL DoLicenseManagement(HANDLE hDevice)
 {
 	wchar_t action[16] = { 0 };
@@ -1911,6 +1929,7 @@ static BOOL DoLicenseManagement(HANDLE hDevice)
 		request.Kind = trial ? 1 : 0;
 		if (trial) request.Mode = 1;
 		else if (!PromptPaidLicenseApplyParams(&request.Mode, &request.DesiredDurationSec, &request.DesiredCredits)) return FALSE;
+		if (!PromptApplyEmail(request.Email, sizeof(request.Email))) return FALSE;
 		if (!DeviceIoControl(hDevice, CONSOLE_IOCTL_BUILD_APPLY_QR, &request, sizeof(request),
 			&reply, sizeof(reply), &returned, NULL))
 		{ ConOutFmt(L"Build application URL failed (err=%lu).\n", GetLastError()); return FALSE; }

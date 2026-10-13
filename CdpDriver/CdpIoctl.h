@@ -67,6 +67,16 @@
 #define IOCTL_Cdp_QUERY_RESTORE_SPACE_ALERT  CTL_CODE(Cdp_IOCTL_TYPE, 0x81B, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_WAIT_RESTORE_SPACE_ALERT   CTL_CODE(Cdp_IOCTL_TYPE, 0x81C, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_Cdp_QUERY_DRAIN_PROGRESS       CTL_CODE(Cdp_IOCTL_TYPE, 0x81D, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* 重验口令，并把已挂载的共享凭据 Journal 收成同一份 v19 密码信封。 */
+#define IOCTL_Cdp_ENSURE_PASSWORD_ENVELOPE   CTL_CODE(Cdp_IOCTL_TYPE, 0x822, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* 忘记口令：生成找回二维码。不要求旧口令，只要求已有 v19 信封。 */
+#define IOCTL_Cdp_BUILD_RECOVERY_QR          CTL_CODE(Cdp_IOCTL_TYPE, 0x823, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* 导入厂商签名的重设凭据，只武装当前控制设备句柄。 */
+#define IOCTL_Cdp_IMPORT_RECOVERY_CREDENTIAL CTL_CODE(Cdp_IOCTL_TYPE, 0x824, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* 在已武装的句柄上把共享凭据换成新口令，AuthEpoch 加一。 */
+#define IOCTL_Cdp_CHANGE_PASSWORD_WITH_RECOVERY CTL_CODE(Cdp_IOCTL_TYPE, 0x825, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* KernelMode only. CdpProtect re-authenticates then arms a 30-second unload window. */
+#define IOCTL_Cdp_ARM_PROTECTED_UNLOAD       CTL_CODE(Cdp_IOCTL_TYPE, 0x826, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #ifdef CDP_LICENSE
 /* License control codes use a separate range to preserve existing v17 ABI. */
@@ -169,6 +179,92 @@ typedef struct _Cdp_DRAIN_PROGRESS_QUERY_REPLY
 	*PCdp_DRAIN_PROGRESS_QUERY_REPLY;
 
 C_ASSERT(sizeof(Cdp_DRAIN_PROGRESS_QUERY_REPLY) == 24);
+
+#define Cdp_ARM_UNLOAD_REQUEST_VERSION 1u
+#define Cdp_ARM_UNLOAD_REQUEST_SIZE 8u
+#define Cdp_PROTECTED_UNLOAD_ARM_SEC 30u
+
+typedef struct _Cdp_ARM_UNLOAD_REQUEST
+{
+	ULONG Size;
+	ULONG Version;
+} Cdp_ARM_UNLOAD_REQUEST, *PCdp_ARM_UNLOAD_REQUEST;
+
+C_ASSERT(sizeof(Cdp_ARM_UNLOAD_REQUEST) == Cdp_ARM_UNLOAD_REQUEST_SIZE);
+
+#define Cdp_ENSURE_PASSWORD_ENVELOPE_REQUEST_VERSION 1u
+
+/* 口令只在这次调用的缓冲里出现，驱动用完必须清零。 */
+typedef struct _Cdp_ENSURE_PASSWORD_ENVELOPE_REQUEST
+{
+	ULONG Size;
+	ULONG Version;
+	ULONG PasswordLength;
+	UCHAR Password[Cdp_PASSWORD_MAX_UTF8_BYTES];
+} Cdp_ENSURE_PASSWORD_ENVELOPE_REQUEST,
+	*PCdp_ENSURE_PASSWORD_ENVELOPE_REQUEST;
+
+C_ASSERT(sizeof(Cdp_ENSURE_PASSWORD_ENVELOPE_REQUEST) == 140);
+
+#define Cdp_BUILD_RECOVERY_QR_REQUEST_VERSION 2u
+#define Cdp_IMPORT_RECOVERY_CREDENTIAL_REQUEST_VERSION 1u
+#define Cdp_RECOVERY_CHANGE_PASSWORD_REQUEST_VERSION 1u
+#define Cdp_RECOVERY_QR_PREFIX_MAX 256u
+#define Cdp_RECOVERY_QR_PAYLOAD_MAX 4096u
+#define Cdp_RECOVERY_CIPHERTEXT_MAX 3072u
+#define Cdp_RECOVERY_FP_BYTES 32u
+#define Cdp_RECOVERY_CREDENTIAL_MAX 4096u
+#ifndef Cdp_EMAIL_MAX
+#define Cdp_EMAIL_MAX 128u
+#endif
+
+/* 调用方自带扫码前缀，驱动只拼接 Base64 密文。 */
+typedef struct _Cdp_BUILD_RECOVERY_QR_REQUEST
+{
+	ULONG Size;
+	ULONG Version;
+	CHAR QrPrefix[Cdp_RECOVERY_QR_PREFIX_MAX];
+	CHAR Email[Cdp_EMAIL_MAX];
+} Cdp_BUILD_RECOVERY_QR_REQUEST, *PCdp_BUILD_RECOVERY_QR_REQUEST;
+
+C_ASSERT(sizeof(Cdp_BUILD_RECOVERY_QR_REQUEST) == 392);
+
+/* 与申请二维码应答相同：原始混合密文加可直接画码的 URI。 */
+typedef struct _Cdp_RECOVERY_QR_REPLY
+{
+	ULONG CiphertextLength;
+	ULONG Reserved;
+	UCHAR DeviceFingerprint[Cdp_RECOVERY_FP_BYTES];
+	UCHAR Ciphertext[Cdp_RECOVERY_CIPHERTEXT_MAX];
+	CHAR QrPayload[Cdp_RECOVERY_QR_PAYLOAD_MAX];
+} Cdp_RECOVERY_QR_REPLY, *PCdp_RECOVERY_QR_REPLY;
+
+C_ASSERT(sizeof(Cdp_RECOVERY_QR_REPLY) == 7208);
+
+/* 凭据文件在 Credential 里，长度由 CredentialLength 给出。 */
+typedef struct _Cdp_IMPORT_RECOVERY_CREDENTIAL_REQUEST
+{
+	ULONG Size;
+	ULONG Version;
+	ULONG CredentialLength;
+	ULONG Reserved;
+	UCHAR Credential[Cdp_RECOVERY_CREDENTIAL_MAX];
+} Cdp_IMPORT_RECOVERY_CREDENTIAL_REQUEST,
+	*PCdp_IMPORT_RECOVERY_CREDENTIAL_REQUEST;
+
+C_ASSERT(sizeof(Cdp_IMPORT_RECOVERY_CREDENTIAL_REQUEST) == 4112);
+
+/* 新口令。驱动接受 1..128 字节，界面上的最短长度由安装器自己限制。 */
+typedef struct _Cdp_RECOVERY_CHANGE_PASSWORD_REQUEST
+{
+	ULONG Size;
+	ULONG Version;
+	ULONG PasswordLength;
+	UCHAR Password[Cdp_PASSWORD_MAX_UTF8_BYTES];
+} Cdp_RECOVERY_CHANGE_PASSWORD_REQUEST,
+	*PCdp_RECOVERY_CHANGE_PASSWORD_REQUEST;
+
+C_ASSERT(sizeof(Cdp_RECOVERY_CHANGE_PASSWORD_REQUEST) == 140);
 
 typedef struct _Cdp_COMMAND_REPLY
 {
@@ -519,292 +615,25 @@ typedef struct _Cdp_RESTORE_SPACE_ALERT_NOTIFICATION
 } Cdp_RESTORE_SPACE_ALERT_NOTIFICATION,
 	*PCdp_RESTORE_SPACE_ALERT_NOTIFICATION;
 
-/* Duplicated, reversed merge fragment; the canonical license ABI is below.
-`r`n#ifdef CDP_LICENSE
-
-#endif
-#define ERROR_CDP_LICENSE_TRIAL_USED  0x0000CD06L
-#ifndef ERROR_CDP_LICENSE_TRIAL_USED
-#endif
-#define ERROR_CDP_LICENSE_TRIAL_USED  0x0000CD06L /* 试用证已用过 * /
-#define ERROR_CDP_LICENSE_INVALID     0x0000CD05L /* 验签或绑机失败 * /
-#define ERROR_CDP_LICENSE_TAMPER      0x0000CD04L /* 本地状态被篡改 * /
-#define ERROR_CDP_LICENSE_EXHAUSTED   0x0000CD03L /* 次数用尽 * /
-#define ERROR_CDP_LICENSE_EXPIRED     0x0000CD02L /* 已过期 * /
-#define ERROR_CDP_LICENSE_REQUIRED    0x0000CD01L /* 未导入/未加载 * /
-#ifndef ERROR_CDP_LICENSE_REQUIRED
- * /
- * 旧驱动若仍返回 0xC0CDxxxx，GetLastError() 会是 317（ERROR_MR_MID_NOT_FOUND）。
- * 用户态 DeviceIoControl 失败后 GetLastError() 即为此值。
- * 授权失败的 Win32 错误码。驱动将对应 NTSTATUS 包成 FACILITY_NTWIN32，
-/*
-
-} Cdp_VERSION_REPLY, *PCdp_VERSION_REPLY;
-	CHAR Build[Cdp_BUILD_STRING_CHARS];
-	CHAR Version[Cdp_VERSION_STRING_CHARS];
-	ULONG Reserved;
-	ULONG JournalVersion;
-{
-typedef struct _Cdp_VERSION_REPLY
-
-C_ASSERT(sizeof(Cdp_JOURNAL_RECORD_INFO) == 40);
-
-} Cdp_JOURNAL_RECORD_INFO, *PCdp_JOURNAL_RECORD_INFO;
-	ULONG Flags; // Cdp_RECORD_FLAG_*; currently BACKFILL=0x80000000
-	ULONG DataLength;
-	UINT64 Sequence;
-	UINT64 FileOffset;
-	UINT64 VolumeOffset;
-	UINT64 WallClock100ns;
-{
-typedef struct _Cdp_JOURNAL_RECORD_INFO
-
-} Cdp_JOURNAL_RECORD_QUERY_REPLY, *PCdp_JOURNAL_RECORD_QUERY_REPLY;
-	ULONG Reserved;
-	ULONG RecordCount;
-	UINT64 Generation;          // changes whenever retained records change
-	UINT64 TotalRecords;
-{
-typedef struct _Cdp_JOURNAL_RECORD_QUERY_REPLY
-
-} Cdp_JOURNAL_RECORD_QUERY_REQUEST, *PCdp_JOURNAL_RECORD_QUERY_REQUEST;
-	ULONG Reserved;
-	ULONG MaxRecords;           // capped by Cdp_JOURNAL_RECORD_QUERY_MAX_PER_CALL
-	UINT64 ExpectedGeneration;  // zero for first page; later pages must echo reply
-	UINT64 StartIndex;          // zero-based, oldest record first
-	GUID SourceVolumeGuid;
-{
-typedef struct _Cdp_JOURNAL_RECORD_QUERY_REQUEST
-// The returned records contain metadata only.  No payload bytes are returned.
-
-} Cdp_JOURNAL_USAGE_QUERY_REPLY, *PCdp_JOURNAL_USAGE_QUERY_REPLY;
-	UINT64 TotalRecords;                // surviving COW record count
-	UINT64 RecordPayloadBytesFree;      // free payload space with current headers
-	UINT64 RecordPayloadBytesUsed;      // sector-aligned payload space in use
-	UINT64 JournalMetadataBytes;        // superblock + active header regions
-	UINT64 JournalPartitionBytes;       // total journal partition size
-{
-typedef struct _Cdp_JOURNAL_USAGE_QUERY_REPLY
-
-} Cdp_JOURNAL_USAGE_QUERY_REQUEST, *PCdp_JOURNAL_USAGE_QUERY_REQUEST;
-	GUID SourceVolumeGuid;
-{
-typedef struct _Cdp_JOURNAL_USAGE_QUERY_REQUEST
-
-} Cdp_TIME_RANGE_QUERY_REPLY, *PCdp_TIME_RANGE_QUERY_REPLY;
-	UINT64 NewestRecord100ns; // latest WallClock100ns
-	UINT64 OldestRecord100ns; // earliest surviving WallClock100ns
-	ULONG Reserved;
-	ULONG HasRecords; // 1 if journal has COW history; 0 if empty
-{
-typedef struct _Cdp_TIME_RANGE_QUERY_REPLY
-
-} Cdp_TIME_RANGE_QUERY_REQUEST, *PCdp_TIME_RANGE_QUERY_REQUEST;
-	GUID SourceVolumeGuid;
-{
-typedef struct _Cdp_TIME_RANGE_QUERY_REQUEST
-
-} Cdp_RECOVERY_COMMIT_REPLY, *PCdp_RECOVERY_COMMIT_REPLY;
-	UINT64 TargetTime100ns;
-	ULONG Phase; // Cdp_PHASE_GENERAL after synchronous writeback completes
-{
-typedef struct _Cdp_RECOVERY_COMMIT_REPLY
-
-} Cdp_RECOVERY_CONTROL_REQUEST, *PCdp_RECOVERY_CONTROL_REQUEST;
-	GUID SourceVolumeGuid;
-{
-typedef struct _Cdp_RECOVERY_CONTROL_REQUEST
-
-} Cdp_RECOVERY_BEGIN_REPLY, *PCdp_RECOVERY_BEGIN_REPLY;
-	UINT64 NewestRecoverable100ns;
-	UINT64 OldestRecoverable100ns;
-	UINT64 TargetTime100ns;
-	ULONG Phase; // Cdp_PHASE_RECOVERY after history view is prepared
-{
-typedef struct _Cdp_RECOVERY_BEGIN_REPLY
-
-} Cdp_RECOVERY_BEGIN_REQUEST, *PCdp_RECOVERY_BEGIN_REQUEST;
-	ULONG Reserved;
-	ULONG Flags;
-	UINT64 TargetTime100ns;
-	GUID SourceVolumeGuid;
-{
-typedef struct _Cdp_RECOVERY_BEGIN_REQUEST
-
-} Cdp_PHASE_QUERY_REPLY, *PCdp_PHASE_QUERY_REPLY;
-	UINT64 RecoveryTargetTime100ns;
-	GUID JournalPartitionGuid; // valid when Status >= 0 and protection is on
-	ULONG Reserved;
-	LONG Status;
-	// Cdp_PHASE_GENERAL / PREVIEW / RECOVERY, or Cdp_STATUS_UNPROTECTED (-1).
-{
-typedef struct _Cdp_PHASE_QUERY_REPLY
-
-} Cdp_PHASE_QUERY_REQUEST, *PCdp_PHASE_QUERY_REQUEST;
-	GUID SourceVolumeGuid;
-{
-typedef struct _Cdp_PHASE_QUERY_REQUEST
-
-} Cdp_PREVIEW_END_REQUEST, *PCdp_PREVIEW_END_REQUEST;
-	UINT64 PreviewHandle;
-{
-typedef struct _Cdp_PREVIEW_END_REQUEST
-
-} Cdp_PREVIEW_READ_REQUEST, *PCdp_PREVIEW_READ_REQUEST;
-	ULONG Reserved;
-	ULONG ByteLength;
-	UINT64 ByteOffset;
-	UINT64 PreviewHandle;
-{
-typedef struct _Cdp_PREVIEW_READ_REQUEST
-
-} Cdp_PREVIEW_BEGIN_REPLY, *PCdp_PREVIEW_BEGIN_REPLY;
-	UINT64 NewestRecoverable100ns;
-	UINT64 OldestRecoverable100ns;
-	UINT64 TargetTime100ns;
-	UINT64 PreviewHandle;
-{
-typedef struct _Cdp_PREVIEW_BEGIN_REPLY
-
-} Cdp_PREVIEW_BEGIN_REQUEST, *PCdp_PREVIEW_BEGIN_REQUEST;
-	UINT64 TargetTime100ns;
-	GUID SourceVolumeGuid;
-{
-typedef struct _Cdp_PREVIEW_BEGIN_REQUEST
-// TargetTime100ns 使用本地时区 wall-clock（与 COW 记录 WallClock100ns 同口径）。
-
-} Cdp_COMMAND_REPLY, *PCdp_COMMAND_REPLY;
-	WCHAR Message[Cdp_COMMAND_REPLY_MSG_CHARS];
-	UINT64 VolumeHandle;   // CMD1 成功时有效，其余为 0
-	ULONG Result;
-	ULONG Command;
-{
-typedef struct _Cdp_COMMAND_REPLY
-
-} Cdp_CMD2_REQUEST, *PCdp_CMD2_REQUEST;
-	GUID SourceVolumeGuid; // stop CDP for this protected source only
-	ULONG Code;
-{
-typedef struct _Cdp_CMD2_REQUEST
-
-} Cdp_CHANGE_PASSWORD_REQUEST, *PCdp_CHANGE_PASSWORD_REQUEST;
-	UCHAR Password[Cdp_PASSWORD_MAX_UTF8_BYTES];
-	ULONG PasswordLength;
-{
-typedef struct _Cdp_CHANGE_PASSWORD_REQUEST
-
-} Cdp_CREDENTIAL_STATUS_REPLY, *PCdp_CREDENTIAL_STATUS_REPLY;
-	UINT64 AuthEpoch;
-	GUID CredentialId;
-	ULONG JournalCount;
-	ULONG Configured;
-{
-typedef struct _Cdp_CREDENTIAL_STATUS_REPLY
-
-} Cdp_AUTH_REQUEST, *PCdp_AUTH_REQUEST;
-	UCHAR Password[Cdp_PASSWORD_MAX_UTF8_BYTES];
-	ULONG PasswordLength;
-{
-typedef struct _Cdp_AUTH_REQUEST
-
-} Cdp_CMD1_REQUEST_V2, *PCdp_CMD1_REQUEST_V2;
-	UCHAR Password[Cdp_PASSWORD_MAX_UTF8_BYTES];
-	ULONG PasswordLength;
-	ULONG FormatJournal;
-	GUID PartitionGuid2;
-	GUID PartitionGuid1;
-	ULONG Code;
-{
-typedef struct _Cdp_CMD1_REQUEST_V2
-
-} Cdp_CMD1_REQUEST, *PCdp_CMD1_REQUEST;
-	ULONG FormatJournal;    // nonzero: initialize journal; zero: mount existing journal
-	GUID PartitionGuid2;    // dedicated journal partition
-	GUID PartitionGuid1;    // protected source volume
-	ULONG Code;
-{
-typedef struct _Cdp_CMD1_REQUEST
-
-#pragma pack(push, 8)
-
-#define Cdp_PASSWORD_MAX_UTF8_BYTES 128u
-#define Cdp_RECORD_FLAG_BACKFILL 0x80000000UL
-#define Cdp_JOURNAL_RECORD_QUERY_MAX_PER_CALL 512u
-#define Cdp_BUILD_STRING_CHARS 32
-#define Cdp_VERSION_STRING_CHARS 32
-#define Cdp_COMMAND_REPLY_MSG_CHARS 64
-#define Cdp_SECTOR_SIZE_DEFAULT 512u
-#define Cdp_CMD3_MAX_READ_BYTES (2u * 1024u * 1024u)
-
-#define Cdp_CMD_2 2
-#define Cdp_CMD_1 1
-
-#define Cdp_STATUS_UNPROTECTED (-1L)
-#define Cdp_PHASE_RECOVERY 2UL
-#define Cdp_PHASE_PREVIEW  1UL
-#define Cdp_PHASE_GENERAL  0UL
-
-#endif
-#define IOCTL_Cdp_BUILD_APPLY_QR        CTL_CODE(Cdp_IOCTL_TYPE, 0x815, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_Cdp_EXPORT_RECEIPT        CTL_CODE(Cdp_IOCTL_TYPE, 0x814, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_Cdp_QUERY_LICENSE         CTL_CODE(Cdp_IOCTL_TYPE, 0x813, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_Cdp_SET_LICENSE           CTL_CODE(Cdp_IOCTL_TYPE, 0x812, METHOD_BUFFERED, FILE_ANY_ACCESS)
-/* 授权 IOCTL（设计 §11）；仅 Debug-Lic / Release 可见 * /
-#ifdef CDP_LICENSE
-#define IOCTL_Cdp_CHANGE_PASSWORD       CTL_CODE(Cdp_IOCTL_TYPE, 0x811, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_Cdp_QUERY_CREDENTIAL      CTL_CODE(Cdp_IOCTL_TYPE, 0x810, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_Cdp_AUTHENTICATE          CTL_CODE(Cdp_IOCTL_TYPE, 0x80F, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_Cdp_QUERY_JOURNAL_RECORDS CTL_CODE(Cdp_IOCTL_TYPE, 0x80E, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_Cdp_QUERY_JOURNAL_USAGE   CTL_CODE(Cdp_IOCTL_TYPE, 0x80D, METHOD_BUFFERED, FILE_ANY_ACCESS)
-// Query the current journal payload-space accounting and record metadata.
-#define IOCTL_Cdp_QUERY_VERSION   CTL_CODE(Cdp_IOCTL_TYPE, 0x80C, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_Cdp_CANCEL_RECOVERY CTL_CODE(Cdp_IOCTL_TYPE, 0x80B, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_Cdp_QUERY_TIME_RANGE CTL_CODE(Cdp_IOCTL_TYPE, 0x80A, METHOD_BUFFERED, FILE_ANY_ACCESS)
-// 查询 journal 内最早/最新 COW 记录的 WallClock100ns
-
-#define IOCTL_Cdp_COMMIT_RECOVERY CTL_CODE(Cdp_IOCTL_TYPE, 0x809, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_Cdp_BEGIN_RECOVERY CTL_CODE(Cdp_IOCTL_TYPE, 0x808, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_Cdp_QUERY_PHASE    CTL_CODE(Cdp_IOCTL_TYPE, 0x807, METHOD_BUFFERED, FILE_ANY_ACCESS)
-// 卷工作阶段：查询 / 准备恢复 / 提交回填 / 取消恢复
-
-#define IOCTL_Cdp_END_PREVIEW   CTL_CODE(Cdp_IOCTL_TYPE, 0x806, METHOD_BUFFERED, FILE_ANY_ACCESS)
-#define IOCTL_Cdp_READ_PREVIEW  CTL_CODE(Cdp_IOCTL_TYPE, 0x805, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
-#define IOCTL_Cdp_BEGIN_PREVIEW CTL_CODE(Cdp_IOCTL_TYPE, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS)
-// 文件预览：创建时间点会话、读取该时间点的卷数据、关闭会话
-
-#define IOCTL_Cdp_SEND_COMMAND CTL_CODE(Cdp_IOCTL_TYPE, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
-// 指令 1 / 2：METHOD_BUFFERED
-
-#define IOCTL_Cdp_QUERY_PROTECT_STATUS CTL_CODE(Cdp_IOCTL_TYPE, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
-
-#define Cdp_IOCTL_TYPE 0x8000
-
-#endif
-#define Cdp_CONTROL_SYSTEM_LINK_NAME L"\\\\.\\CdpEngineControlDevice"
-#include <Windows.h>
-#else
-#define Cdp_CONTROL_SYSTEM_LINK_NAME L"\\DosDevices\\CdpEngineControlDevice"
-#define Cdp_CONTROL_DEVICE_NAME L"\\Device\\CdpEngineControlDevice"
-#include <ntddk.h>
-#ifdef _KERNEL_MODE
-
-#pragma once
-
- * /
- * limitations under the License.
- * See the License for the specific language governing permissions and
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * distributed under the License is distributed on an "AS IS" BASIS,
- * Unless required by applicable law or agreed to in writing, software
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * You may obtain a copy of the License at
- * you may not use this file except in compliance with the License.
- * Licensed under the Apache License, Version 2.0 (the "License");
- *
-*/
 #define Cdp_RECOVERY_BEGIN_FLAG_ON_REBOOT 0x00000001UL
+
+/*
+ * 授权失败的 Win32 错误码。驱动将对应 NTSTATUS 包成 FACILITY_NTWIN32，
+ * 用户态 DeviceIoControl 失败后 GetLastError() 即为此值。
+ * 旧驱动若仍返回 0xC0CDxxxx，GetLastError() 会是 317（ERROR_MR_MID_NOT_FOUND）。
+ */
+#ifndef ERROR_CDP_LICENSE_REQUIRED
+#define ERROR_CDP_LICENSE_REQUIRED    0x0000CD01L /* 未导入/未加载 */
+#define ERROR_CDP_LICENSE_EXPIRED     0x0000CD02L /* 已过期 */
+#define ERROR_CDP_LICENSE_EXHAUSTED   0x0000CD03L /* 次数用尽 */
+#define ERROR_CDP_LICENSE_TAMPER      0x0000CD04L /* 本地状态被篡改 */
+#define ERROR_CDP_LICENSE_INVALID     0x0000CD05L /* 验签或绑机失败 */
+#define ERROR_CDP_LICENSE_TRIAL_USED  0x0000CD06L /* 试用证已用过 */
+#endif
+#ifndef ERROR_CDP_LICENSE_TRIAL_USED
+#define ERROR_CDP_LICENSE_TRIAL_USED  0x0000CD06L
+#endif
+
 #ifdef CDP_LICENSE
 /*
  * 授权相关 IOCTL 缓冲区（与驱动 CdpLicenseGate 一一对应）。
@@ -818,6 +647,9 @@ typedef struct _Cdp_CMD1_REQUEST
 #endif
 #ifndef Cdp_APPLY_QR_PREFIX_MAX
 #define Cdp_APPLY_QR_PREFIX_MAX 256u
+#endif
+#ifndef Cdp_EMAIL_MAX
+#define Cdp_EMAIL_MAX 128u
 #endif
 #ifndef Cdp_APPLY_CIPHERTEXT_MAX
 #define Cdp_APPLY_CIPHERTEXT_MAX 3072u
@@ -888,10 +720,11 @@ typedef struct _Cdp_BUILD_APPLY_QR_REQUEST
 	ULONG Mode; /* 1=time 2=counter 3=hybrid */
 	ULONG Kind; /* 0=paid 1=trial；旧客户端此字段为 Reserved=0 */
 	CHAR QrPrefix[Cdp_APPLY_QR_PREFIX_MAX]; /* 扫码 URI 前缀，由应用层传入，须自带 #c= / ?c= */
+	CHAR Email[Cdp_EMAIL_MAX]; /* 申请邮箱，后续找回密码须与此一致 */
 } Cdp_BUILD_APPLY_QR_REQUEST, *PCdp_BUILD_APPLY_QR_REQUEST;
 
 #ifdef _KERNEL_MODE
-C_ASSERT(sizeof(Cdp_BUILD_APPLY_QR_REQUEST) == 272);
+C_ASSERT(sizeof(Cdp_BUILD_APPLY_QR_REQUEST) == 400);
 #endif
 
 typedef struct _Cdp_LICENSE_APPLY_QR_REPLY
@@ -917,7 +750,5 @@ typedef struct _Cdp_LICENSE_APPLY_QR_REPLY_EX
 } Cdp_LICENSE_APPLY_QR_REPLY_EX, *PCdp_LICENSE_APPLY_QR_REPLY_EX;
 #endif
 #endif
+
 #pragma pack(pop)
-// Persist this recovery request in the journal.  After a system restart the
-// driver discovers the journal and automatically runs begin + commit.
-#define Cdp_RECOVERY_BEGIN_FLAG_ON_REBOOT 0x00000001UL

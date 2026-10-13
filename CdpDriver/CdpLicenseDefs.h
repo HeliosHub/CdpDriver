@@ -38,6 +38,9 @@
 #define Cdp_LICENSE_ID_CHARS             64u
 #define Cdp_APPLY_QR_PAYLOAD_MAX         4096u /* 申请二维码 URI 字符串 */
 #define Cdp_APPLY_QR_PREFIX_MAX          256u  /* 应用层传入的扫码 URI 前缀 */
+#ifndef Cdp_EMAIL_MAX
+#define Cdp_EMAIL_MAX                    128u  /* 申请 / 找回明文中的邮箱 */
+#endif
 #define Cdp_APPLY_CIPHERTEXT_MAX         3072u /* 混合加密申请包 */
 #define Cdp_APPLY_PLAINTEXT_MAX          1536u
 

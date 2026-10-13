@@ -3790,6 +3790,8 @@ static int TestMultipleProtectedPartitionIsolation(void)
 	return g_caseFailed;
 }
 
+int TestPasswordRecoveryPolicy(void);
+
 int main(void)
 {
 	int failed = 0;
@@ -3873,6 +3875,7 @@ int main(void)
 		TestAncestorBranchTailRetention);
 	failed += RunCase("Multiple protected partition isolation",
 		TestMultipleProtectedPartitionIsolation);
+	failed += TestPasswordRecoveryPolicy();
 
 	printf("\n%s (%d failures)\n", failed ? "FAILED" : "ALL PASSED", failed);
 	return failed ? 1 : 0;

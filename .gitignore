@@ -84,5 +84,40 @@ Desktop.ini
 *.p12
 *.key
 
-# Installer build staging (the final setup executable is written to cdpgui\bin).
+*.PML
+*.pptx
+
+# ---------------------------------------------------------------------------
+# Windows Driver Kit / MSVC driver build outputs
+# ---------------------------------------------------------------------------
+*.sys
+*.cat
+*.cer
+*.tmh
+*.tlog
+*.recipe
+*.lastbuildstate
+*.iobj
+*.ipdb
+
+# Intermediate / package staging under projects (beyond x64/Release)
+**/DriverPackage/
+*.inf_loc
+
+# Keep source INF under version control
+!CdpDriver/CdpDriver.inf
+
+# ---------------------------------------------------------------------------
+# Installer build products (NSIS / payload staging)
+# ---------------------------------------------------------------------------
 installer/work/
+installer/*.exe
+
+# ---------------------------------------------------------------------------
+# Crash dumps / local tooling residue
+# ---------------------------------------------------------------------------
+*.dmp
+*.mdmp
+*.etl
+*.wrn
+*.err

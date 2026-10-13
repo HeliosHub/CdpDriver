@@ -1,8 +1,231 @@
 #include "../CdpConsole/cdp_driver_install.h"
 #include "../CdpDriver/CdpIoctl.h"
+#include "CdpMaintenance.h"
+#include "../../cdp-protect-drv/include/CdpProtectIoctl.h"
 
 #include <commctrl.h>
 #include <stdio.h>
+#include <strsafe.h>
+
+enum ProtectionCheckExitCode {
+    ProtectionCheckNone = 0,
+    ProtectionCheckActive = 10,
+    ProtectionCheckUnavailable = 11,
+    ProtectionCheckCancelled = 12,
+    ProtectionCheckActiveWithRestorePoint = 13,
+    ProtectionCheckNoneAndMaintenanceAuthorized = 14,
+};
+
+static int Fail(const wchar_t *Stage);
+static int CheckProtectionStatus(void);
+
+/* CdpProtect 包的安装与卸载，实现在 CdpProtectPackage.cpp。 */
+BOOL CdpInstallProtectPackage(void);
+BOOL CdpUninstallProtectPackage(void);
+
+/* 升级开始时口令框由已安装的旧 Helper 创建。新包中的 Helper 以此隐藏模式
+ * 修正旧窗口，保证第一次升级也能居中且不再显示“尚未设密”。 */
+static int AdjustLegacyMaintenanceWindow(void)
+{
+    const ULONGLONG deadline = GetTickCount64() + 30000;
+
+    do {
+        HWND window = FindWindowW(L"CdpSecurePrompt", L"源点恢复维护");
+        if (window) {
+            RECT rect;
+            MONITORINFO monitorInfo = {};
+            HMONITOR monitor;
+            HWND unconfigured = GetDlgItem(window, 104);
+
+            if (unconfigured) {
+                EnableWindow(unconfigured, FALSE);
+                ShowWindow(unconfigured, SW_HIDE);
+            }
+            if (GetWindowRect(window, &rect)) {
+                monitorInfo.cbSize = sizeof(monitorInfo);
+                monitor = MonitorFromWindow(window, MONITOR_DEFAULTTOPRIMARY);
+                if (monitor && GetMonitorInfoW(monitor, &monitorInfo)) {
+                    const int width = rect.right - rect.left;
+                    const int height = rect.bottom - rect.top;
+                    const int x = monitorInfo.rcWork.left +
+                        ((monitorInfo.rcWork.right - monitorInfo.rcWork.left) - width) / 2;
+                    const int y = monitorInfo.rcWork.top +
+                        ((monitorInfo.rcWork.bottom - monitorInfo.rcWork.top) - height) / 2;
+                    SetWindowPos(window, HWND_TOPMOST, x, y, 0, 0,
+                        SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                }
+            }
+            return 0;
+        }
+        Sleep(50);
+    } while (GetTickCount64() < deadline);
+    return ERROR_TIMEOUT;
+}
+
+/* MiniFilter 必须通过 Filter Manager 卸载，才能触发受 ARM 窗口保护的
+ * FilterUnload 回调。仅删除服务或调用普通 SCM 停止不够可靠。 */
+static BOOL UnloadMiniFilter(const wchar_t *FilterName)
+{
+	typedef HRESULT (WINAPI *FILTER_UNLOAD)(LPCWSTR);
+	HANDLE token = NULL;
+	TOKEN_PRIVILEGES privileges = {};
+	LUID luid;
+	HMODULE fltlib;
+	FILTER_UNLOAD unload;
+	HRESULT result;
+	DWORD error;
+
+	/* FilterUnload 要求调用线程显式启用 SeLoadDriverPrivilege。即使安装器
+	 * 已经通过 UAC 提权，该权限在管理员令牌中默认仍可能处于禁用状态。 */
+	if (!OpenProcessToken(GetCurrentProcess(),
+		TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token))
+		return FALSE;
+	if (!LookupPrivilegeValueW(NULL, SE_LOAD_DRIVER_NAME, &luid))
+	{
+		error = GetLastError();
+		CloseHandle(token);
+		SetLastError(error);
+		return FALSE;
+	}
+	privileges.PrivilegeCount = 1;
+	privileges.Privileges[0].Luid = luid;
+	privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+	SetLastError(ERROR_SUCCESS);
+	if (!AdjustTokenPrivileges(token, FALSE, &privileges, 0, NULL, NULL) ||
+		(error = GetLastError()) != ERROR_SUCCESS)
+	{
+		CloseHandle(token);
+		SetLastError(error ? error : ERROR_PRIVILEGE_NOT_HELD);
+		return FALSE;
+	}
+	CloseHandle(token);
+
+	fltlib = LoadLibraryW(L"fltlib.dll");
+	if (!fltlib)
+		return FALSE;
+	unload = (FILTER_UNLOAD)GetProcAddress(fltlib, "FilterUnload");
+	if (!unload)
+	{
+		error = GetLastError();
+		FreeLibrary(fltlib);
+		SetLastError(error);
+		return FALSE;
+	}
+	result = unload(FilterName);
+	FreeLibrary(fltlib);
+	if (FAILED(result))
+	{
+		error = HRESULT_FACILITY(result) == FACILITY_WIN32
+			? HRESULT_CODE(result)
+			: ERROR_GEN_FAILURE;
+		SetLastError(error);
+		return FALSE;
+	}
+	return TRUE;
+}
+
+/* 启动目录里的 CdpBootService --uninstall。此时 Helper 已持有维护会话。 */
+static int UninstallBootService(void)
+{
+	wchar_t exePath[MAX_PATH];
+	wchar_t command[MAX_PATH + 32];
+	STARTUPINFOW startup;
+	PROCESS_INFORMATION process;
+	DWORD exitCode = 1;
+	DWORD length;
+	wchar_t *slash;
+
+	length = GetModuleFileNameW(NULL, exePath, _countof(exePath));
+	if (!length || length >= _countof(exePath))
+		return ERROR_FILENAME_EXCED_RANGE;
+	slash = wcsrchr(exePath, L'\\');
+	if (!slash)
+		return ERROR_PATH_NOT_FOUND;
+	*(slash + 1) = L'\0';
+	if (FAILED(StringCchCatW(exePath, _countof(exePath), L"CdpBootService.exe")))
+		return ERROR_FILENAME_EXCED_RANGE;
+	if (FAILED(StringCchPrintfW(command, _countof(command), L"\"%s\" --uninstall", exePath)))
+		return ERROR_FILENAME_EXCED_RANGE;
+	ZeroMemory(&startup, sizeof(startup));
+	ZeroMemory(&process, sizeof(process));
+	startup.cb = sizeof(startup);
+	startup.dwFlags = STARTF_USESHOWWINDOW;
+	startup.wShowWindow = SW_HIDE;
+	if (!CreateProcessW(NULL, command, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+		NULL, NULL, &startup, &process))
+		return (int)GetLastError();
+	WaitForSingleObject(process.hProcess, 60000);
+	GetExitCodeProcess(process.hProcess, &exitCode);
+	CloseHandle(process.hThread);
+	CloseHandle(process.hProcess);
+	return exitCode == STILL_ACTIVE ? WAIT_TIMEOUT : (int)exitCode;
+}
+
+/* 卸载：有保护分区则拒绝；日志清空后不再要口令，空口令武装卸载窗口。 */
+static int UninstallAll(void)
+{
+	DWORD error = ERROR_SUCCESS;
+	HANDLE protect;
+	BOOL protectPresent;
+	int protection;
+
+	protect = CreateFileW(
+		L"\\\\.\\CdpProtectControl",
+		GENERIC_READ | GENERIC_WRITE,
+		FILE_SHARE_READ | FILE_SHARE_WRITE,
+		NULL,
+		OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL,
+		NULL);
+	protectPresent = protect != INVALID_HANDLE_VALUE;
+	if (protectPresent)
+		CloseHandle(protect);
+
+	protection = CheckProtectionStatus();
+	if (protection != ProtectionCheckNone)
+		return protection;
+
+	if (protectPresent)
+	{
+		if (!CdpAuthorizeMaintenance(
+			CDPP_AUTH_MAINTENANCE | CDPP_AUTH_ALLOW_UNCONFIGURED,
+			NULL,
+			&error))
+		{
+			fwprintf(stderr, L"Maintenance authorization failed (Win32=%lu).\n", error);
+			return error ? (int)error : 1;
+		}
+	}
+
+	/* 启动服务停掉以后再武装 30 秒窗口，避免终止进程把窗口耗光。 */
+	{
+		int bootStatus = UninstallBootService();
+		if (bootStatus != 0)
+			fwprintf(stderr, L"CdpBootService uninstall returned %d.\n", bootStatus);
+	}
+	if (protectPresent)
+	{
+		if (!CdpAuthorizeMaintenance(
+			CDPP_AUTH_MAINTENANCE | CDPP_AUTH_ARM_UNLOAD | CDPP_AUTH_ALLOW_UNCONFIGURED,
+			NULL,
+			&error))
+		{
+			fwprintf(stderr, L"Unload arm failed (Win32=%lu).\n", error);
+			return error ? (int)error : 1;
+		}
+		/* CdpDriver 是由卷设备栈加载的 PnP UpperFilter，不接受 SCM 的
+		 * SERVICE_CONTROL_STOP（Windows 会返回 1052）。这里只立即卸载
+		 * CdpProtect；随后移除 CdpDriver 的 UpperFilters/服务并在重启时卸载。 */
+		if (!UnloadMiniFilter(L"CdpProtect"))
+			return Fail(L"Unload CdpProtect minifilter");
+	}
+	if (!CdpUninstallDriverPackage())
+		return Fail(CdpGetInstallFailureStage());
+	if (!CdpUninstallProtectPackage())
+		return Fail(L"Uninstall CdpProtect package");
+	wprintf(L"Product drivers were removed; reboot is required.\n");
+	return 0;
+}
 
 #pragma comment(lib, "comctl32.lib")
 
@@ -11,14 +234,6 @@ static int Fail(const wchar_t* stage) {
     fwprintf(stderr, L"%s failed (Win32=%lu).\n", stage, error);
     return error ? static_cast<int>(error) : 1;
 }
-
-enum ProtectionCheckExitCode {
-    ProtectionCheckNone = 0,
-    ProtectionCheckActive = 10,
-    ProtectionCheckUnavailable = 11,
-    ProtectionCheckCancelled = 12,
-    ProtectionCheckActiveWithRestorePoint = 13,
-};
 
 static HANDLE OpenControlDevice() {
     HANDLE device = CreateFileW(
@@ -58,10 +273,14 @@ static BOOL GetSystemVolumeGuid(GUID* volumeGuid) {
 }
 
 static int CheckProtectionStatus() {
-    BOOLEAN active = FALSE;
-    DWORD bytesReturned = 0;
-    HANDLE device = OpenControlDevice();
-
+   HANDLE device = CreateFileW(
+        Cdp_CONTROL_SYSTEM_LINK_NAME,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL,
+        nullptr);
     if (device == INVALID_HANDLE_VALUE) {
         const DWORD error = GetLastError();
         if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND)
@@ -70,6 +289,8 @@ static int CheckProtectionStatus() {
         return ProtectionCheckUnavailable;
     }
 
+    BOOLEAN active = FALSE;
+    DWORD bytesReturned = 0;
     const BOOL ok = DeviceIoControl(
         device,
         IOCTL_Cdp_QUERY_PROTECT_STATUS,
@@ -310,12 +531,17 @@ static BOOL PromptForProtectionPassword(wchar_t* password, size_t capacity) {
     return state.Accepted;
 }
 
-static BOOL AuthenticateWithPrompt(HANDLE device) {
+static BOOL AuthenticateWithPrompt(
+    HANDLE device,
+    CDP_SECURE_PASSWORD* reusablePassword) {
     wchar_t password[Cdp_PASSWORD_MAX_UTF8_BYTES + 1] = {};
     Cdp_AUTH_REQUEST request = {};
     DWORD bytesReturned = 0;
     int passwordBytes;
     BOOL ok = FALSE;
+
+    if (reusablePassword)
+        CdpSecurePasswordClear(reusablePassword);
 
     if (!PromptForProtectionPassword(password, _countof(password)))
         goto cleanup;
@@ -331,6 +557,10 @@ static BOOL AuthenticateWithPrompt(HANDLE device) {
     request.PasswordLength = static_cast<ULONG>(passwordBytes - 1);
     ok = DeviceIoControl(device, IOCTL_Cdp_AUTHENTICATE,
         &request, sizeof(request), nullptr, 0, &bytesReturned, nullptr);
+	if (ok && reusablePassword) {
+		reusablePassword->Bytes = request.PasswordLength;
+		memcpy(reusablePassword->Utf8, request.Password, request.PasswordLength);
+	}
 
 cleanup:
     SecureZeroMemory(&request, sizeof(request));
@@ -658,6 +888,8 @@ static int StopSystemProtection() {
     Cdp_PHASE_QUERY_REPLY phaseReply = {};
     wchar_t windowsDirectory[MAX_PATH] = {};
     wchar_t systemMountPoint[MAX_PATH] = {};
+    CDP_SECURE_PASSWORD maintenancePassword = {};
+    DWORD maintenanceError = ERROR_SUCCESS;
     const int state = CheckSystemProtectionStatus();
 
     if (state != ProtectionCheckActive && state != ProtectionCheckActiveWithRestorePoint)
@@ -674,9 +906,10 @@ static int StopSystemProtection() {
         CloseHandle(device);
         return ProtectionCheckUnavailable;
     }
-    if (!AuthenticateWithPrompt(device)) {
+    if (!AuthenticateWithPrompt(device, &maintenancePassword)) {
         const DWORD error = GetLastError();
         CloseHandle(device);
+        CdpSecurePasswordClear(&maintenancePassword);
         return error == ERROR_CANCELLED ? ProtectionCheckCancelled : ProtectionCheckUnavailable;
     }
 
@@ -684,20 +917,40 @@ static int StopSystemProtection() {
     const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
     CloseHandle(device);
     if (!ok) {
+        CdpSecurePasswordClear(&maintenancePassword);
         SetLastError(error ? error : ERROR_GEN_FAILURE);
         return ProtectionCheckUnavailable;
     }
     if (CheckSystemProtectionStatus() != ProtectionCheckNone ||
         !GetWindowsDirectoryW(windowsDirectory, _countof(windowsDirectory)) ||
         !GetVolumePathNameW(windowsDirectory, systemMountPoint, _countof(systemMountPoint)) ||
-        !ReclaimSystemJournal(phaseReply, systemMountPoint[0]))
+        !ReclaimSystemJournal(phaseReply, systemMountPoint[0])) {
+        CdpSecurePasswordClear(&maintenancePassword);
         return ProtectionCheckUnavailable;
+    }
+
+    /* 口令只在本进程内存中沿用。关闭系统盘保护完成后，为安装器父进程
+     * 签发维护会话并立即清零；成功时由专用退出码通知 NSIS 跳过二次询问。 */
+    const BOOL maintenanceAuthorized = CdpAuthorizeMaintenance(
+        CDPP_AUTH_MAINTENANCE,
+        &maintenancePassword,
+        &maintenanceError);
+    CdpSecurePasswordClear(&maintenancePassword);
+    if (maintenanceAuthorized)
+        return ProtectionCheckNoneAndMaintenanceAuthorized;
     return ProtectionCheckNone;
 }
 
 int wmain(int argc, wchar_t** argv) {
+    CDP_PROMPT_RESULT maintenance;
+    DWORD authError = ERROR_SUCCESS;
+
+    if (argc == 2 && _wcsicmp(argv[1], L"--adjust-maintenance-window") == 0)
+        return AdjustLegacyMaintenanceWindow();
+
     if (argc != 2) {
-        fwprintf(stderr, L"Usage: CdpDriverInstallHelper.exe --install|--uninstall|--check-protection|--check-system-protection|--stop-system-protection\n");
+        fwprintf(stderr,
+            L"Usage: CdpDriverInstallHelper.exe --install|--install-protect|--authorize-maintenance|--uninstall-all|--check-protection|--check-system-protection|--stop-system-protection\n");
         return ERROR_INVALID_PARAMETER;
     }
 
@@ -709,16 +962,43 @@ int wmain(int argc, wchar_t** argv) {
 
     if (_wcsicmp(argv[1], L"--stop-system-protection") == 0)
         return StopSystemProtection();
+    if (_wcsicmp(argv[1], L"--uninstall") == 0 ||
+        _wcsicmp(argv[1], L"--uninstall-all") == 0)
+        return UninstallAll();
 
-    if (_wcsicmp(argv[1], L"--uninstall") == 0) {
-        if (!CdpUninstallDriverPackage())
-            return Fail(CdpGetInstallFailureStage());
-        wprintf(L"CdpDriver removal completed; reboot is required.\n");
+    if (_wcsicmp(argv[1], L"--install-protect") == 0)
+        return CdpInstallProtectPackage() ? 0 : Fail(L"Install CdpProtect");
+
+    if (_wcsicmp(argv[1], L"--authorize-maintenance") == 0) {
+        /* 全部保护分区已关闭时，CdpDriver 的凭据状态已回到未配置。
+         * 先尝试受限的空口令维护通道，成功便不显示口令框；只要仍有
+         * 保护分区或驱动拒绝该通道，就继续执行正常口令验证。 */
+        if (CheckProtectionStatus() == ProtectionCheckNone) {
+            if (CdpAuthorizeMaintenance(
+                CDPP_AUTH_MAINTENANCE | CDPP_AUTH_ALLOW_UNCONFIGURED,
+                NULL,
+                &authError))
+            {
+                wprintf(L"No protected volumes; maintenance authorization completed without a password prompt.\n");
+                return 0;
+            }
+        }
+        ZeroMemory(&maintenance, sizeof(maintenance));
+        if (!CdpPromptAndAuthorize(
+            CDPP_AUTH_MAINTENANCE, FALSE, TRUE, &maintenance, &authError))
+        {
+            CdpSecurePasswordClear(&maintenance.Password);
+            fwprintf(stderr, L"Maintenance authorization failed (Win32=%lu).\n", authError);
+            return authError ? (int)authError : ERROR_CANCELLED;
+        }
+        CdpSecurePasswordClear(&maintenance.Password);
+        wprintf(L"Maintenance authorization completed.\n");
         return 0;
     }
 
     if (_wcsicmp(argv[1], L"--install") != 0) {
-        fwprintf(stderr, L"Usage: CdpDriverInstallHelper.exe --install|--uninstall|--check-protection|--check-system-protection|--stop-system-protection\n");
+        fwprintf(stderr,
+            L"Usage: CdpDriverInstallHelper.exe --install|--install-protect|--authorize-maintenance|--uninstall-all|--check-protection|--check-system-protection|--stop-system-protection\n");
         return ERROR_INVALID_PARAMETER;
     }
 

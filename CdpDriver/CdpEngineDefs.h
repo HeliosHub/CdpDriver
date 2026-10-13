@@ -19,10 +19,10 @@
 #include "CdpJournal.h"
 
 #define Cdp_DRIVER_VERSION_STRING "1.0.16"
-#define Cdp_DRIVER_BUILD_STRING   "20261009.116-release-quiet"
+#define Cdp_DRIVER_BUILD_STRING   "20261009.117-release-log"
 
-/* Keep diagnostic text out of the Release driver. */
-#if DBG
+/* Release diagnostics can be enabled explicitly by the project configuration. */
+#if DBG || defined(CDP_RELEASE_LOGGING)
 #define Cdp_LOG(fmt, ...) \
 	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
 		"CdpDriver: " fmt, ##__VA_ARGS__)
@@ -120,6 +120,13 @@ typedef struct _Cdp_DRIVER_EXTENSION
 	// Pending inverted-call IOCTLs from CdpBootService. The I/O manager cancel
 	// spin lock serializes this list with each IRP's cancel routine.
 	LIST_ENTRY RestoreSpaceAlertWaitList;
+
+	/* Owner-managed unload gate. DriverUnload stays NULL until KernelMode ARM. */
+	PDRIVER_UNLOAD RealDriverUnload;
+	KTIMER ProtectedUnloadTimer;
+	KDPC ProtectedUnloadDpc;
+	volatile LONG ProtectedUnloadArmed;
+	volatile LONG ProtectedUnloadStarted;
 } Cdp_DRIVER_EXTENSION, *PCdp_DRIVER_EXTENSION;
 
 NTSTATUS CdpPinMountedJournals(_In_ PCdp_DRIVER_EXTENSION DriverExt,
@@ -133,6 +140,14 @@ typedef struct _Cdp_CONTROL_FILE_CONTEXT
 	GUID CredentialId;
 	UINT64 AuthEpoch;
 	UINT64 ExpiresAt100ns;
+	/* 找回状态只属于这个句柄。CLEANUP 与 CLOSE 都会清零。 */
+	BOOLEAN RecoveryResetArmed;
+	BOOLEAN RecoveryNonceValid;
+	UCHAR RecoveryRequestNonce[16];
+	UCHAR RecoveryJtiHash[32];
+	UINT64 RecoveryExpiresAt100ns;
+	GUID RecoveryCredentialId;
+	UINT64 RecoveryAuthEpoch;
 } Cdp_CONTROL_FILE_CONTEXT, *PCdp_CONTROL_FILE_CONTEXT;
 
 typedef struct _Cdp_CORE Cdp_CORE, *PCdp_CORE;
@@ -142,6 +157,7 @@ typedef struct _Cdp_PREVIEW_SESSION
 	LIST_ENTRY Entry;
 	UINT64 HandleId;
 	UINT64 TargetTime100ns;
+	UINT64 SourceVolumeHandleId;
 	PCdp_VOLUME_HANDLE_ENTRY JournalEntry;
 	GUID SourceVolumeGuid;
 	volatile LONG ReferenceCount;
@@ -161,14 +177,14 @@ typedef struct _Cdp_DEVICE_EXTENSION
 {
 	Cdp_DEVICE_KIND DeviceKind;
 	volatile LONG CaptureEnabled;
-	// Set only after the complete volume/journal/Core object graph has passed
-	// fail-closed activation validation.
-	volatile LONG ProtectionStateValidated;
 	// The protected Volume FIFO accepts new references only while this is set.
 	// Disable clears it before waiting for outstanding requests to drain.
 	volatile LONG VolumeIoAccepting;
 	volatile LONG VolumeIoOutstanding;
 	KEVENT VolumeIoDrainedEvent;
+	// Set only after the complete source/disk/journal/Core object graph has
+	// passed fail-closed activation validation. Disk hot paths require both.
+	volatile LONG ProtectionStateValidated;
 	/* Normal current-view reads pin immutable Journal payload locations while
 	 * performing slow source/Journal I/O without HistoryMutex. Merge, drain and
 	 * recovery transitions wait for this count to reach zero before changing or

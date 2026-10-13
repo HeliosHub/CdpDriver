@@ -38,11 +38,14 @@
       <SubSystem>Windows</SubSystem>
       <EntryPointSymbol>wmainCRTStartup</EntryPointSymbol>
       <GenerateDebugInformation>false</GenerateDebugInformation>
-      <AdditionalDependencies>advapi32.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>advapi32.lib;ole32.lib;user32.lib;gdi32.lib;comdlg32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="CdpDriverInstallHelper.cpp" />
+    <ClCompile Include="CdpSecurePrompt.cpp" />
+    <ClCompile Include="CdpMaintenance.cpp" />
+    <ClCompile Include="CdpProtectPackage.cpp" />
     <ClCompile Include="..\CdpConsole\cdp_driver_install.cpp" />
   </ItemGroup>
   <ItemGroup>

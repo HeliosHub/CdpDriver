@@ -13,6 +13,8 @@
 #endif
 
 #define Cdp_JOURNAL_MAGIC            0x4C4E4A51UL /* 'QJNL' */
+#define Cdp_JOURNAL_VERSION_V18      18UL
+#define Cdp_JOURNAL_VERSION_V19      Cdp_JOURNAL_VERSION
 #define Cdp_JOURNAL_VERSION          19UL
 #define Cdp_JOURNAL_MAX_RECORD_DATA  (2UL * 1024UL * 1024UL)
 #define Cdp_JOURNAL_HEADER_REGION_SIZE (1UL * 1024UL * 1024UL)
@@ -32,6 +34,8 @@
 // its current Journal view must first be materialized to the source baseline.
 #define Cdp_JOURNAL_FLAG_RESTORE_BOOT_PENDING 0x00000010UL
 #define Cdp_JOURNAL_FLAG_LICENSE_CONFIGURED    0x00000020UL
+/* v19 才允许置位。v18 回写必须保持该位为 0。 */
+#define Cdp_JOURNAL_FLAG_PASSWORD_ENVELOPE     0x00000040UL
 #ifdef CDP_LICENSE
 #define Cdp_JOURNAL_SUPERBLOCK_BYTES Cdp_JOURNAL_SUPERBLOCK_RESERVE
 #else
@@ -111,7 +115,23 @@ typedef struct _Cdp_CREDENTIAL_DESCRIPTOR
 	UINT64 AuthEpoch;
 } Cdp_CREDENTIAL_DESCRIPTOR, *PCdp_CREDENTIAL_DESCRIPTOR;
 
-// On-disk layout: VolumeOffset is relative to the protected source volume;
+#ifdef CDP_LICENSE
+#define Cdp_PASSWORD_ENVELOPE_ALG_RSA_OAEP_SHA256 1UL
+#define Cdp_PASSWORD_ENVELOPE_MAX 256UL
+
+/* 紧挨 LicenseCrc32c 之后追加。CRC 只覆盖已用密文，不覆盖结构尾部。 */
+typedef struct _Cdp_PASSWORD_ENVELOPE
+{
+	ULONG Algorithm;
+	ULONG CiphertextLength;
+	UCHAR Ciphertext[Cdp_PASSWORD_ENVELOPE_MAX];
+	ULONG Crc32c;
+} Cdp_PASSWORD_ENVELOPE, *PCdp_PASSWORD_ENVELOPE;
+
+C_ASSERT(sizeof(Cdp_PASSWORD_ENVELOPE) == 268);
+#endif
+
+// On-disk layout (v15): VolumeOffset uses the absolute physical-disk address;
 // FileOffset remains relative to the journal partition's own storage backend.
 // One superblock is followed by alternating header/payload areas.
 //   [Superblock]
@@ -154,8 +174,13 @@ typedef struct _Cdp_JOURNAL_SUPERBLOCK
 	ULONG E0Length;
 	UCHAR E0[Cdp_E0_SEAL_MAX];
 	ULONG LicenseCrc32c;
+	Cdp_PASSWORD_ENVELOPE PasswordEnvelope;
 #endif
 } Cdp_JOURNAL_SUPERBLOCK, *PCdp_JOURNAL_SUPERBLOCK;
+
+#ifdef CDP_LICENSE
+C_ASSERT(sizeof(Cdp_JOURNAL_SUPERBLOCK) <= Cdp_JOURNAL_SUPERBLOCK_RESERVE);
+#endif
 
 #pragma pack(pop)
 
@@ -400,7 +425,11 @@ typedef struct _Cdp_JOURNAL
 	UINT64 RestorePointTime100ns;
 	BOOLEAN CredentialConfigured;
 	Cdp_CREDENTIAL_DESCRIPTOR Credential;
+	/* 0 表示尚未从盘上确定。v18 元数据回写必须保持 18，不能自动升成无信封 v19。 */
+	ULONG MountedSuperblockVersion;
 #ifdef CDP_LICENSE
+	BOOLEAN PasswordEnvelopeConfigured;
+	Cdp_PASSWORD_ENVELOPE PasswordEnvelope;
 	BOOLEAN LicenseConfigured;
 	ULONG LicenseBlobLength;
 	UCHAR LicenseBlob[Cdp_LICENSE_BLOB_MAX];
@@ -417,8 +446,8 @@ typedef struct _Cdp_JOURNAL
 	UINT64 JournalPartitionSize;
 #ifndef Cdp_USERMODE
 	PDEVICE_OBJECT TargetDevice;
-	// Optional adjacent-volume backend used only for Journal metadata. Payload
-	// remains on TargetDevice; TargetBaseOffset performs backend translation.
+	// Optional volume-stack backend used only for journal metadata. Payload
+	// remains on TargetDevice with an absolute disk offset.
 	PDEVICE_OBJECT MetadataTargetDevice;
 #else
 	PVOID TargetDevice;
@@ -581,6 +610,26 @@ NTSTATUS CdpJournalResetHistoryPreserveRestorePoint(
 NTSTATUS CdpJournalSetCredential(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ const Cdp_CREDENTIAL_DESCRIPTOR* Credential);
+
+#ifdef CDP_LICENSE
+/* 凭据和信封同一次写入。已挂载时失败会恢复调用前的内存状态。 */
+NTSTATUS CdpJournalSetCredentialBundle(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ const Cdp_CREDENTIAL_DESCRIPTOR* Credential,
+	_In_ const Cdp_PASSWORD_ENVELOPE* Envelope);
+
+BOOLEAN CdpJournalGetCredentialBundle(
+	_In_ PCdp_JOURNAL Journal,
+	_Out_ PCdp_CREDENTIAL_DESCRIPTOR Credential,
+	_Out_ PCdp_PASSWORD_ENVELOPE Envelope,
+	_Out_ PBOOLEAN EnvelopeConfigured,
+	_Out_ PULONG SuperblockVersion);
+
+/* 改密回滚：回到没有信封的 v18 序列化。 */
+NTSTATUS CdpJournalRestoreCredentialWithoutEnvelope(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ const Cdp_CREDENTIAL_DESCRIPTOR* Credential);
+#endif
 
 BOOLEAN CdpJournalGetCredential(
 	_In_ PCdp_JOURNAL Journal,

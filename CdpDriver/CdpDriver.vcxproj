@@ -139,7 +139,7 @@
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <ClCompile>
-      <PreprocessorDefinitions>CDP_LICENSE;CDP_LICENSE_OBFUSCATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>CDP_LICENSE;CDP_LICENSE_OBFUSCATE;CDP_RELEASE_LOGGING;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <!-- Release x64 uses the locally built LLVM MSVC Ex compiler. The WDK linker and packaging pipeline remain unchanged. -->
@@ -180,7 +180,7 @@
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
     <ClCompile>
-      <PreprocessorDefinitions>CDP_LICENSE;CDP_LICENSE_OBFUSCATE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>CDP_LICENSE;CDP_LICENSE_OBFUSCATE;CDP_RELEASE_LOGGING;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup>
@@ -261,8 +261,10 @@
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
-    <!-- Embed the version resource so Windows exposes the SYS file metadata. -->
-    <ResourceCompile Include="CdpDriver.rc" />
+    <ClCompile Include="CdpUnloadGate.c" />
+    <ClCompile Include="CdpPasswordEnvelope.c" />
+    <ClCompile Include="CdpPasswordRecovery.c" />
+    <ClCompile Include="CdpPasswordRecoveryPolicy.c" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="CdpEngineDefs.h" />
@@ -271,24 +273,22 @@
     <ClInclude Include="CdpJournal.h" />
     <ClInclude Include="CdpJournalCodec.h" />
 	<ClInclude Include="CdpCredential.h" />
-	<ClInclude Include="CdpCredentialRoute.h" />
 	<ClInclude Include="CdpLicenseDefs.h" />
 	<ClInclude Include="CdpLocalSeal.h" />
 	<ClInclude Include="CdpLicenseTrust.h" />
 	<ClInclude Include="CdpLicenseHw.h" />
 	<ClInclude Include="CdpLicenseGate.h" />
-	<ClInclude Include="CdpLicenseGateCall.h" />
-	<ClInclude Include="CdpLicenseCodec.h" />
 	<ClInclude Include="CdpLicenseProtect.h" />
 	<ClInclude Include="CdpLicenseSeg.h" />
 	<ClInclude Include="CdpLicenseSegEnd.h" />
-	<ClInclude Include="CdpIoctlGuard.h" />
+	<ClInclude Include="CdpPasswordEnvelope.h" />
+	<ClInclude Include="CdpPasswordRecovery.h" />
+	<ClInclude Include="CdpPasswordRecoveryPolicy.h" />
     <ClInclude Include="..\CdpCore\include\cdp_alloc.h" />
     <ClInclude Include="..\CdpCore\include\cdp_core.h" />
     <ClInclude Include="..\CdpCore\include\cdp_dev_store.h" />
     <ClInclude Include="..\CdpCore\include\cdp_portable.h" />
     <ClInclude Include="..\CdpCore\include\cdp_store.h" />
-    <ClInclude Include="..\CdpCore\include\cdp_view_policy.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="CdpLicensePubKey.inc" />

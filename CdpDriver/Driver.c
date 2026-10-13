@@ -215,6 +215,9 @@ VOID CdpDriverUnload(_In_ PDRIVER_OBJECT DriverObject)
 	if (!DriverExtension)
 		return;
 
+	/* 进入真实卸载后禁止到期 DPC 再清掉 DriverUnload 指针。 */
+	CdpMarkProtectedUnloadStarted(DriverExtension);
+
 	// Preview sessions own source-volume handles and can call into Core.  Tear
 	// them down before any filter device/Core is removed.
 	CdpCancelAllRestoreSpaceAlertWaits(DriverExtension);
@@ -257,7 +260,8 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 		Cdp_DRIVER_BUILD_STRING);
 
 	g_DriverObject = DriverObject;
-	DriverObject->DriverUnload = CdpDriverUnload;
+	/* 默认不允许 sc stop。合法卸载必须先走 KernelMode ARM_PROTECTED_UNLOAD。 */
+	DriverObject->DriverUnload = NULL;
 
 	Status = IoAllocateDriverObjectExtension(
 		DriverObject,
@@ -269,6 +273,7 @@ NTSTATUS DriverEntry(_In_ PDRIVER_OBJECT DriverObject, _In_ PUNICODE_STRING Regi
 		goto cleanup;
 
 	RtlZeroMemory(DriverExtension, sizeof(Cdp_DRIVER_EXTENSION));
+	CdpInitializeUnloadGate(DriverObject, DriverExtension);
 	InitializeListHead(&DriverExtension->DeviceObjectListHead);
 	KeInitializeSpinLock(&DriverExtension->DeviceObjectListLock);
 	InitializeListHead(&DriverExtension->VolumeHandleList);

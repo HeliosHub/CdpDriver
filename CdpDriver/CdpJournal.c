@@ -5,6 +5,9 @@
 #else
 #include "CdpEngineDefs.h"
 #include "CdpJournal.h"
+#ifdef CDP_LICENSE
+#include "CdpPasswordEnvelope.h"
+#endif
 #endif
 #include "CdpJournalCodec.h"
 
@@ -997,16 +1000,54 @@ static NTSTATUS CdpJournalWriteSuperblockLocked(_Inout_ PCdp_JOURNAL Journal)
 	PVOID allocationBase = NULL;
 	PUCHAR sector;
 	PCdp_JOURNAL_SUPERBLOCK superblock;
+	ULONG onDiskVersion;
 	NTSTATUS status;
 
 	sector = (PUCHAR)CdpAllocateAligned(Journal, Cdp_JOURNAL_SUPERBLOCK_BYTES, &allocationBase);
 	if (!sector)
 		return STATUS_INSUFFICIENT_RESOURCES;
 
+	/*
+	 * 版本 0 只在首次格式化出现：有信封才写成 v19。
+	 * 已经挂载成 v18 的 Journal 继续按 v18 回写，直到 Bundle 迁移把版本改成 19。
+	 */
+	onDiskVersion = Journal->MountedSuperblockVersion;
+#ifdef CDP_LICENSE
+	if (onDiskVersion == 0)
+	{
+		onDiskVersion = Journal->PasswordEnvelopeConfigured ?
+			Cdp_JOURNAL_VERSION_V19 : Cdp_JOURNAL_VERSION_V18;
+	}
+	if (onDiskVersion == Cdp_JOURNAL_VERSION_V19)
+	{
+		if (Journal->CredentialConfigured != Journal->PasswordEnvelopeConfigured ||
+			(Journal->PasswordEnvelopeConfigured &&
+			 !CdpPasswordEnvelopeValid(&Journal->PasswordEnvelope)))
+		{
+			cdpfree(allocationBase);
+			return STATUS_INVALID_DEVICE_STATE;
+		}
+	}
+	else if (onDiskVersion != Cdp_JOURNAL_VERSION_V18 ||
+		Journal->PasswordEnvelopeConfigured)
+	{
+		cdpfree(allocationBase);
+		return STATUS_INVALID_DEVICE_STATE;
+	}
+#else
+	if (onDiskVersion == 0)
+		onDiskVersion = Cdp_JOURNAL_VERSION_V18;
+	if (onDiskVersion != Cdp_JOURNAL_VERSION_V18)
+	{
+		cdpfree(allocationBase);
+		return STATUS_INVALID_DEVICE_STATE;
+	}
+#endif
+
 	RtlZeroMemory(sector, Cdp_JOURNAL_SUPERBLOCK_BYTES);
 	superblock = (PCdp_JOURNAL_SUPERBLOCK)sector;
 	superblock->Magic = Cdp_JOURNAL_MAGIC;
-	superblock->Version = Cdp_JOURNAL_VERSION;
+	superblock->Version = onDiskVersion;
 	superblock->SectorSize = Journal->SectorSize;
 	superblock->Flags = Journal->RecoveryPending ?
 		Cdp_JOURNAL_FLAG_RECOVERY_PENDING : 0;
@@ -1028,6 +1069,13 @@ static NTSTATUS CdpJournalWriteSuperblockLocked(_Inout_ PCdp_JOURNAL Journal)
 		superblock->E0Length = Journal->E0Length;
 		RtlCopyMemory(superblock->LicenseBlob, Journal->LicenseBlob, Journal->LicenseBlobLength);
 		RtlCopyMemory(superblock->E0, Journal->E0, Journal->E0Length);
+	}
+	/* 信封标志只跟 v19 一起落盘。v18 缓冲尾部保持 0，不解释成信封。 */
+	if (onDiskVersion == Cdp_JOURNAL_VERSION_V19 &&
+		Journal->PasswordEnvelopeConfigured)
+	{
+		superblock->Flags |= Cdp_JOURNAL_FLAG_PASSWORD_ENVELOPE;
+		superblock->PasswordEnvelope = Journal->PasswordEnvelope;
 	}
 #endif
 	superblock->PartitionSize = Journal->PartitionSize;
@@ -1075,7 +1123,10 @@ static NTSTATUS CdpJournalWriteSuperblockLocked(_Inout_ PCdp_JOURNAL Journal)
 		sector);
 	cdpfree(allocationBase);
 	if (NT_SUCCESS(status))
+	{
+		Journal->MountedSuperblockVersion = onDiskVersion;
 		Journal->SuperblockDirty = FALSE;
+	}
 	return status;
 }
 
@@ -1083,8 +1134,105 @@ static BOOLEAN CdpJournalSuperblockValid(
 	_In_ PCdp_JOURNAL Journal,
 	_In_ const Cdp_JOURNAL_SUPERBLOCK* Superblock)
 {
-	return CdpJournalCodecSuperblockValid(Superblock, Journal->SectorSize,
-		Journal->PartitionSize, CdpJournalUsableStart(Journal));
+	ULONG crc;
+	UINT64 usableStart;
+	UINT64 usableEnd;
+
+	if (Superblock->Magic != Cdp_JOURNAL_MAGIC ||
+		Superblock->SectorSize != Journal->SectorSize ||
+		Superblock->PartitionSize != Journal->PartitionSize)
+	{
+		return FALSE;
+	}
+	/* 只接受 v18，以及授权构建上的 v19。更早版本维持拒绝。 */
+	if (Superblock->Version != Cdp_JOURNAL_VERSION_V18
+#ifdef CDP_LICENSE
+		&& Superblock->Version != Cdp_JOURNAL_VERSION_V19
+#endif
+		)
+	{
+		return FALSE;
+	}
+	crc = CdpCrc32c(
+		0,
+		Superblock,
+		FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, Crc32c));
+	if (crc != Superblock->Crc32c)
+		return FALSE;
+	if ((Superblock->Flags & Cdp_JOURNAL_FLAG_RECOVERY_PENDING) != 0 &&
+		(Superblock->RecoveryTargetTime100ns == 0 ||
+		 CdpCrc32c(0, Superblock,
+			FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, RecoveryCrc32c)) !=
+			Superblock->RecoveryCrc32c))
+	{
+		return FALSE;
+	}
+	if (CdpCrc32c(0, Superblock,
+		FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, MetadataCrc32c)) !=
+		Superblock->MetadataCrc32c)
+	{
+		return FALSE;
+	}
+	if (Superblock->Version >= Cdp_JOURNAL_VERSION_V18 &&
+		(Superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_POINT_SET) != 0 &&
+		(Superblock->RestorePointTime100ns == 0 ||
+		 CdpCrc32c(0, Superblock,
+			FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, RestorePointCrc32c)) !=
+			Superblock->RestorePointCrc32c))
+	{
+		return FALSE;
+	}
+	if ((Superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_BOOT_PENDING) != 0 &&
+		(Superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_POINT_SET) == 0)
+	{
+		return FALSE;
+	}
+	if ((Superblock->Flags & Cdp_JOURNAL_FLAG_CREDENTIAL_CONFIGURED) != 0 &&
+		(Superblock->Credential.KdfAlgorithm != Cdp_CREDENTIAL_KDF_PBKDF2_SHA256 ||
+		 Superblock->Credential.KdfIterations == 0 ||
+		 Superblock->Credential.AuthEpoch == 0))
+	{
+		return FALSE;
+	}
+#ifdef CDP_LICENSE
+	if ((Superblock->Flags & Cdp_JOURNAL_FLAG_LICENSE_CONFIGURED) != 0 &&
+		(Superblock->LicenseBlobLength == 0 || Superblock->LicenseBlobLength > Cdp_LICENSE_BLOB_MAX ||
+		 Superblock->E0Length == 0 || Superblock->E0Length > Cdp_E0_SEAL_MAX ||
+		 CdpCrc32c(0, Superblock, FIELD_OFFSET(Cdp_JOURNAL_SUPERBLOCK, LicenseCrc32c)) != Superblock->LicenseCrc32c))
+		return FALSE;
+	if (Superblock->Version == Cdp_JOURNAL_VERSION_V19)
+	{
+		BOOLEAN hasCredential =
+			(Superblock->Flags & Cdp_JOURNAL_FLAG_CREDENTIAL_CONFIGURED) != 0;
+		BOOLEAN hasEnvelope =
+			(Superblock->Flags & Cdp_JOURNAL_FLAG_PASSWORD_ENVELOPE) != 0;
+
+		/* 驱动没有私钥，挂载时不能解密核对 CredentialId，只核对标志和信封 CRC。 */
+		if (hasCredential != hasEnvelope)
+			return FALSE;
+		if (hasEnvelope && !CdpPasswordEnvelopeValid(&Superblock->PasswordEnvelope))
+			return FALSE;
+	}
+	else if ((Superblock->Flags & Cdp_JOURNAL_FLAG_PASSWORD_ENVELOPE) != 0)
+	{
+		return FALSE;
+	}
+#endif
+	if (Superblock->CurrentBranchNumber <= 0 ||
+		Superblock->HighestBranchNumber < Superblock->CurrentBranchNumber)
+	{
+		return FALSE;
+	}
+
+	usableStart = CdpJournalUsableStart(Journal);
+	usableEnd = Journal->PartitionSize;
+	if (Superblock->LastHeaderRegionOff < usableStart ||
+		Superblock->LastHeaderRegionOff + Cdp_JOURNAL_HEADER_REGION_SIZE > usableEnd ||
+		(Superblock->LastHeaderRegionOff % Journal->SectorSize) != 0)
+	{
+		return FALSE;
+	}
+	return TRUE;
 }
 
 static NTSTATUS CdpJournalReadRegionLink(
@@ -3999,7 +4147,7 @@ Cdp_JOURNAL_OBF_WORKFLOW static NTSTATUS CdpJournalMountInternal(
 	}
 #endif
 	Journal->RestorePointSet =
-		(superblock->Version >= Cdp_JOURNAL_VERSION) &&
+		(superblock->Version >= Cdp_JOURNAL_VERSION_V18) &&
 		((superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_POINT_SET) != 0);
 	Journal->RestoreBootPending = Journal->RestorePointSet &&
 		((superblock->Flags & Cdp_JOURNAL_FLAG_RESTORE_BOOT_PENDING) != 0);
@@ -4011,6 +4159,17 @@ Cdp_JOURNAL_OBF_WORKFLOW static NTSTATUS CdpJournalMountInternal(
 		Journal->Credential = superblock->Credential;
 	else
 		RtlZeroMemory(&Journal->Credential, sizeof(Journal->Credential));
+	Journal->MountedSuperblockVersion = superblock->Version;
+#ifdef CDP_LICENSE
+	/* v18 不读取尾部信封字节，避免用 v19 结构解释旧盘。 */
+	Journal->PasswordEnvelopeConfigured =
+		superblock->Version == Cdp_JOURNAL_VERSION_V19 &&
+		(superblock->Flags & Cdp_JOURNAL_FLAG_PASSWORD_ENVELOPE) != 0;
+	if (Journal->PasswordEnvelopeConfigured)
+		Journal->PasswordEnvelope = superblock->PasswordEnvelope;
+	else
+		RtlZeroMemory(&Journal->PasswordEnvelope, sizeof(Journal->PasswordEnvelope));
+#endif
 	Journal->SuperblockDirty = FALSE;
 
 	/* A persistent restore point means the source already contains the boot
@@ -4695,6 +4854,15 @@ NTSTATUS CdpJournalSetCredential(
 		return STATUS_INVALID_PARAMETER;
 	}
 	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+#ifdef CDP_LICENSE
+	/* 已是 v19 时单独写凭据会丢掉信封，必须走 SetCredentialBundle。 */
+	if (Journal->Mounted &&
+		Journal->MountedSuperblockVersion == Cdp_JOURNAL_VERSION_V19)
+	{
+		Cdp_LOCK_RELEASE(&Journal->Lock);
+		return STATUS_INVALID_DEVICE_STATE;
+	}
+#endif
 	Journal->Credential = *Credential;
 	Journal->CredentialConfigured = TRUE;
 	if (Journal->Mounted)
@@ -4705,6 +4873,137 @@ NTSTATUS CdpJournalSetCredential(
 	Cdp_LOCK_RELEASE(&Journal->Lock);
 	return status;
 }
+
+#ifdef CDP_LICENSE
+static BOOLEAN CdppCredentialWellFormed(
+	_In_ const Cdp_CREDENTIAL_DESCRIPTOR* Credential)
+{
+	return Credential &&
+		Credential->KdfAlgorithm == Cdp_CREDENTIAL_KDF_PBKDF2_SHA256 &&
+		Credential->KdfIterations != 0 &&
+		Credential->AuthEpoch != 0;
+}
+
+NTSTATUS CdpJournalSetCredentialBundle(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ const Cdp_CREDENTIAL_DESCRIPTOR* Credential,
+	_In_ const Cdp_PASSWORD_ENVELOPE* Envelope)
+{
+	Cdp_CREDENTIAL_DESCRIPTOR oldCredential;
+	Cdp_PASSWORD_ENVELOPE oldEnvelope;
+	BOOLEAN oldConfigured;
+	BOOLEAN oldEnvelopeOn;
+	ULONG oldVersion;
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!CdppCredentialWellFormed(Credential) ||
+		!Envelope ||
+		!CdpPasswordEnvelopeValid(Envelope))
+	{
+		return STATUS_INVALID_PARAMETER;
+	}
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	oldCredential = Journal->Credential;
+	oldEnvelope = Journal->PasswordEnvelope;
+	oldConfigured = Journal->CredentialConfigured;
+	oldEnvelopeOn = Journal->PasswordEnvelopeConfigured;
+	oldVersion = Journal->MountedSuperblockVersion;
+	Journal->Credential = *Credential;
+	Journal->CredentialConfigured = TRUE;
+	Journal->PasswordEnvelope = *Envelope;
+	Journal->PasswordEnvelopeConfigured = TRUE;
+	Journal->MountedSuperblockVersion = Cdp_JOURNAL_VERSION_V19;
+	if (Journal->Mounted)
+	{
+		Journal->SuperblockDirty = TRUE;
+		status = CdpJournalWriteSuperblockLocked(Journal);
+		if (!NT_SUCCESS(status))
+		{
+			Journal->Credential = oldCredential;
+			Journal->PasswordEnvelope = oldEnvelope;
+			Journal->CredentialConfigured = oldConfigured;
+			Journal->PasswordEnvelopeConfigured = oldEnvelopeOn;
+			Journal->MountedSuperblockVersion = oldVersion;
+			Journal->SuperblockDirty = TRUE;
+		}
+	}
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	RtlSecureZeroMemory(&oldCredential, sizeof(oldCredential));
+	RtlSecureZeroMemory(&oldEnvelope, sizeof(oldEnvelope));
+	return status;
+}
+
+BOOLEAN CdpJournalGetCredentialBundle(
+	_In_ PCdp_JOURNAL Journal,
+	_Out_ PCdp_CREDENTIAL_DESCRIPTOR Credential,
+	_Out_ PCdp_PASSWORD_ENVELOPE Envelope,
+	_Out_ PBOOLEAN EnvelopeConfigured,
+	_Out_ PULONG SuperblockVersion)
+{
+	BOOLEAN configured;
+
+	if (!Journal || !Credential || !Envelope || !EnvelopeConfigured || !SuperblockVersion)
+		return FALSE;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	configured = Journal->CredentialConfigured;
+	if (configured)
+		*Credential = Journal->Credential;
+	else
+		RtlZeroMemory(Credential, sizeof(*Credential));
+	*EnvelopeConfigured = Journal->PasswordEnvelopeConfigured;
+	if (Journal->PasswordEnvelopeConfigured)
+		*Envelope = Journal->PasswordEnvelope;
+	else
+		RtlZeroMemory(Envelope, sizeof(*Envelope));
+	*SuperblockVersion = Journal->MountedSuperblockVersion;
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	return configured;
+}
+
+NTSTATUS CdpJournalRestoreCredentialWithoutEnvelope(
+	_Inout_ PCdp_JOURNAL Journal,
+	_In_ const Cdp_CREDENTIAL_DESCRIPTOR* Credential)
+{
+	Cdp_CREDENTIAL_DESCRIPTOR oldCredential;
+	Cdp_PASSWORD_ENVELOPE oldEnvelope;
+	BOOLEAN oldConfigured;
+	BOOLEAN oldEnvelopeOn;
+	ULONG oldVersion;
+	NTSTATUS status = STATUS_SUCCESS;
+
+	if (!CdppCredentialWellFormed(Credential))
+		return STATUS_INVALID_PARAMETER;
+	Cdp_LOCK_ACQUIRE(&Journal->Lock);
+	oldCredential = Journal->Credential;
+	oldEnvelope = Journal->PasswordEnvelope;
+	oldConfigured = Journal->CredentialConfigured;
+	oldEnvelopeOn = Journal->PasswordEnvelopeConfigured;
+	oldVersion = Journal->MountedSuperblockVersion;
+	Journal->Credential = *Credential;
+	Journal->CredentialConfigured = TRUE;
+	Journal->PasswordEnvelopeConfigured = FALSE;
+	RtlZeroMemory(&Journal->PasswordEnvelope, sizeof(Journal->PasswordEnvelope));
+	Journal->MountedSuperblockVersion = Cdp_JOURNAL_VERSION_V18;
+	if (Journal->Mounted)
+	{
+		Journal->SuperblockDirty = TRUE;
+		status = CdpJournalWriteSuperblockLocked(Journal);
+		if (!NT_SUCCESS(status))
+		{
+			Journal->Credential = oldCredential;
+			Journal->PasswordEnvelope = oldEnvelope;
+			Journal->CredentialConfigured = oldConfigured;
+			Journal->PasswordEnvelopeConfigured = oldEnvelopeOn;
+			Journal->MountedSuperblockVersion = oldVersion;
+			Journal->SuperblockDirty = TRUE;
+		}
+	}
+	Cdp_LOCK_RELEASE(&Journal->Lock);
+	RtlSecureZeroMemory(&oldCredential, sizeof(oldCredential));
+	RtlSecureZeroMemory(&oldEnvelope, sizeof(oldEnvelope));
+	return status;
+}
+#endif
 
 BOOLEAN CdpJournalGetCredential(
 	_In_ PCdp_JOURNAL Journal,

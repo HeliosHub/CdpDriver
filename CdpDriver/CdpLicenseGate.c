@@ -252,6 +252,58 @@ static NTSTATUS CdpLicenseSanitizeApplyQrPrefix(
 		In, Out, Cdp_APPLY_QR_PREFIX_MAX);
 }
 
+NTSTATUS CdpLicenseSanitizeEmail(
+	_In_reads_(Cdp_EMAIL_MAX) const CHAR* Email,
+	_Out_writes_z_(Cdp_EMAIL_MAX) CHAR* Out)
+{
+	ULONG i;
+	ULONG at = 0;
+	ULONG dotsAfterAt = 0;
+	BOOLEAN seenAt = FALSE;
+
+	if (!Email || !Out)
+	{
+		Cdp_LIC_FAIL("STATUS_INVALID_PARAMETER: Email null");
+		return STATUS_INVALID_PARAMETER;
+	}
+	RtlZeroMemory(Out, Cdp_EMAIL_MAX);
+	for (i = 0; i + 1 < Cdp_EMAIL_MAX; ++i)
+	{
+		UCHAR c = (UCHAR)Email[i];
+		if (c == 0)
+			break;
+		if (c >= 'A' && c <= 'Z')
+			c = (UCHAR)(c - 'A' + 'a');
+		if (c == '@')
+		{
+			if (seenAt || i == 0)
+			{
+				Cdp_LIC_FAIL("STATUS_INVALID_PARAMETER: Email @");
+				return STATUS_INVALID_PARAMETER;
+			}
+			seenAt = TRUE;
+			at = i;
+		}
+		else if (!((c >= 'a' && c <= 'z') ||
+			(c >= '0' && c <= '9') ||
+			c == '.' || c == '_' || c == '%' || c == '+' || c == '-'))
+		{
+			Cdp_LIC_FAIL("STATUS_INVALID_PARAMETER: Email char");
+			return STATUS_INVALID_PARAMETER;
+		}
+		else if (seenAt && c == '.')
+			++dotsAfterAt;
+		Out[i] = (CHAR)c;
+	}
+	if (!seenAt || i < 5 || Out[i - 1] == '.' || Out[i - 1] == '@' ||
+		Out[at + 1] == 0 || dotsAfterAt == 0)
+	{
+		Cdp_LIC_FAIL("STATUS_INVALID_PARAMETER: Email shape");
+		return STATUS_INVALID_PARAMETER;
+	}
+	return STATUS_SUCCESS;
+}
+
 static BOOLEAN CdpLicenseCStrEq(
 	_In_z_ const CHAR* A,
 	_In_z_ const CHAR* B)
@@ -1410,12 +1462,27 @@ NTSTATUS CdpLicenseExportReceipt(
 	return STATUS_SUCCESS;
 }
 
+/*
+ * 申请二维码组装用的临时缓冲，放在池里，避免撑满 24KB 内核栈。
+ * MSVC 在函数入口一次性分配整帧；plain/ct/packet/b64 合计约 11KB，
+ * 再叠加 CdpIrpDispatchDeviceControl 与 ZwQuerySystemInformation，
+ * 会在读 SMBIOS 时触发 DOUBLE_FAULT (0x7F / trap 8)。
+ */
+typedef struct _CDP_APPLY_QR_WORK
+{
+	CHAR Plain[Cdp_APPLY_PLAINTEXT_MAX];
+	UCHAR Ct[Cdp_APPLY_PLAINTEXT_MAX + 16];
+	UCHAR Packet[Cdp_APPLY_CIPHERTEXT_MAX];
+	CHAR B64[Cdp_APPLY_QR_PAYLOAD_MAX];
+} CDP_APPLY_QR_WORK, *PCDP_APPLY_QR_WORK;
+
 NTSTATUS CdpLicenseBuildApplyQrPayload(
 	_In_ ULONG DesiredDurationSec,
 	_In_ ULONG DesiredCredits,
 	_In_ ULONG Mode,
 	_In_ ULONG Kind,
 	_In_reads_(Cdp_APPLY_QR_PREFIX_MAX) const CHAR* QrPrefix,
+	_In_reads_(Cdp_EMAIL_MAX) const CHAR* Email,
 	_Out_writes_bytes_to_(OutLength, *Written) PVOID OutBuffer,
 	_In_ ULONG OutLength,
 	_Out_ PULONG Written)
@@ -1425,21 +1492,19 @@ NTSTATUS CdpLicenseBuildApplyQrPayload(
 	 * → QrPayload = 应用层前缀 + Base64。GUI 只需对 QrPayload 生成二维码。
 	 */
 	CHAR prefix[Cdp_APPLY_QR_PREFIX_MAX];
+	CHAR email[Cdp_EMAIL_MAX];
 	CHAR mb[Cdp_LICENSE_MB_UUID_CHARS];
 	CHAR disk[Cdp_LICENSE_DISK_SERIAL_CHARS];
 	UCHAR fp[Cdp_LICENSE_FP_BYTES];
-	CHAR plain[Cdp_APPLY_PLAINTEXT_MAX];
 	UCHAR aesKey[32];
 	UCHAR nonce[12];
 	UCHAR ek[256];
 	ULONG ekLen = 0;
-	UCHAR ct[Cdp_APPLY_PLAINTEXT_MAX + 16];
 	ULONG ctLen = 0;
 	UCHAR aad = 0x01;
-	UCHAR packet[Cdp_APPLY_CIPHERTEXT_MAX];
 	ULONG packetLen = 0;
-	CHAR b64[Cdp_APPLY_QR_PAYLOAD_MAX];
 	ULONG b64Len = 0;
+	PCDP_APPLY_QR_WORK work = NULL;
 	PCdp_LICENSE_APPLY_QR_REPLY reply;
 	TIME_FIELDS tf;
 	LARGE_INTEGER now;
@@ -1458,6 +1523,9 @@ NTSTATUS CdpLicenseBuildApplyQrPayload(
 		return STATUS_BUFFER_TOO_SMALL;
 	}
 	status = CdpLicenseSanitizeApplyQrPrefix(QrPrefix, prefix);
+	if (!NT_SUCCESS(status))
+		return status;
+	status = CdpLicenseSanitizeEmail(Email, email);
 	if (!NT_SUCCESS(status))
 		return status;
 	if (Mode != Cdp_LICENSE_MODE_TIME &&
@@ -1498,11 +1566,20 @@ NTSTATUS CdpLicenseBuildApplyQrPayload(
 	reply = (PCdp_LICENSE_APPLY_QR_REPLY)OutBuffer;
 	RtlZeroMemory(reply, sizeof(*reply));
 
+	work = (PCDP_APPLY_QR_WORK)cdpalloc(sizeof(*work));
+	if (!work)
+	{
+		Cdp_LIC_FAIL("STATUS_INSUFFICIENT_RESOURCES: if (!work)");
+		return STATUS_INSUFFICIENT_RESOURCES;
+	}
+	RtlZeroMemory(work, sizeof(*work));
+	RtlZeroMemory(aesKey, sizeof(aesKey));
+
 	status = CdpLicenseCollectHardwareId(mb, disk, fp);
 	if (!NT_SUCCESS(status))
 	{
-		Cdp_LIC_FAIL("failed status=0x%08X", status);
-		return status;
+		Cdp_LIC_FAIL("goto done, status=0x%08X", status);
+		goto done;
 	}
 	KeQuerySystemTimePrecise(&now);
 	RtlTimeToTimeFields(&now, &tf);
@@ -1513,8 +1590,8 @@ NTSTATUS CdpLicenseBuildApplyQrPayload(
 	status = CdpLicenseRandomBytes(aesKey, sizeof(aesKey));
 	if (!NT_SUCCESS(status))
 	{
-		Cdp_LIC_FAIL("failed status=0x%08X", status);
-		return status;
+		Cdp_LIC_FAIL("goto done, status=0x%08X", status);
+		goto done;
 	}
 	status = CdpLicenseRandomBytes(nonce, sizeof(nonce));
 	if (!NT_SUCCESS(status))
@@ -1526,53 +1603,41 @@ NTSTATUS CdpLicenseBuildApplyQrPayload(
 		RtlStringCbPrintfA(nonceStr + i * 2, 3, "%02x", nonce[i % 12]);
 
 	CdpLicenseLock();
-	status = RtlStringCbPrintfA(
-		plain,
-		sizeof(plain),
-		"{\"mb_uuid\":\"%s\",\"disk_serial\":\"%s\",\"t_client\":\"%s\","
-		"\"desired_duration_sec\":%lu,\"desired_credits\":%lu,\"mode\":%lu,"
-		"\"kind\":\"%s\",\"receipt\":{\"ops_t\":%lu,\"ops_s\":%lu,\"a_mod\":%lu,"
-		"\"prev_license_id\":%s},\"nonce\":\"%s\"}",
-		mb,
-		disk,
-		tClient,
-		durationSec,
-		credits,
-		Mode,
-		kindStr,
-		g_CdpLicenseState.g_OPS_T,
-		g_CdpLicenseState.g_OPS_S,
-		g_CdpLicenseState.g_A_MOD,
-		g_CdpLicenseState.LicenseId[0] ?
-			g_CdpLicenseState.LicenseId : "null",
-		nonceStr);
+	if (g_CdpLicenseState.LicenseId[0])
+	{
+		status = RtlStringCbPrintfA(
+			work->Plain,
+			sizeof(work->Plain),
+			"{\"mb_uuid\":\"%s\",\"disk_serial\":\"%s\",\"t_client\":\"%s\","
+			"\"desired_duration_sec\":%lu,\"desired_credits\":%lu,\"mode\":%lu,"
+			"\"kind\":\"%s\",\"email\":\"%s\",\"receipt\":{\"ops_t\":%lu,\"ops_s\":%lu,\"a_mod\":%lu,"
+			"\"prev_license_id\":\"%s\"},\"nonce\":\"%s\"}",
+			mb, disk, tClient, durationSec, credits, Mode, kindStr, email,
+			g_CdpLicenseState.g_OPS_T, g_CdpLicenseState.g_OPS_S,
+			g_CdpLicenseState.g_A_MOD, g_CdpLicenseState.LicenseId, nonceStr);
+	}
+	else
+	{
+		status = RtlStringCbPrintfA(
+			work->Plain,
+			sizeof(work->Plain),
+			"{\"mb_uuid\":\"%s\",\"disk_serial\":\"%s\",\"t_client\":\"%s\","
+			"\"desired_duration_sec\":%lu,\"desired_credits\":%lu,\"mode\":%lu,"
+			"\"kind\":\"%s\",\"email\":\"%s\",\"receipt\":{\"ops_t\":%lu,\"ops_s\":%lu,\"a_mod\":%lu,"
+			"\"prev_license_id\":%s},\"nonce\":\"%s\"}",
+			mb, disk, tClient, durationSec, credits, Mode, kindStr, email,
+			g_CdpLicenseState.g_OPS_T, g_CdpLicenseState.g_OPS_S,
+			g_CdpLicenseState.g_A_MOD, "null", nonceStr);
+	}
 	CdpLicenseUnlock();
 	if (!NT_SUCCESS(status))
 	{
 		Cdp_LIC_FAIL("goto done, status=0x%08X", status);
 		goto done;
 	}
-	/* Fix prev_license_id quoting when non-null. */
-	if (g_CdpLicenseState.LicenseId[0])
-	{
-		CHAR fixed[Cdp_APPLY_PLAINTEXT_MAX];
-		CdpLicenseLock();
-		RtlStringCbPrintfA(
-			fixed,
-			sizeof(fixed),
-			"{\"mb_uuid\":\"%s\",\"disk_serial\":\"%s\",\"t_client\":\"%s\","
-			"\"desired_duration_sec\":%lu,\"desired_credits\":%lu,\"mode\":%lu,"
-			"\"kind\":\"%s\",\"receipt\":{\"ops_t\":%lu,\"ops_s\":%lu,\"a_mod\":%lu,"
-			"\"prev_license_id\":\"%s\"},\"nonce\":\"%s\"}",
-			mb, disk, tClient, durationSec, credits, Mode, kindStr,
-			g_CdpLicenseState.g_OPS_T, g_CdpLicenseState.g_OPS_S,
-			g_CdpLicenseState.g_A_MOD, g_CdpLicenseState.LicenseId, nonceStr);
-		CdpLicenseUnlock();
-		RtlStringCbCopyA(plain, sizeof(plain), fixed);
-	}
 
 	#ifdef LIC_DEBUG
-	DbgPrint("CdpLicenseBuildApplyQrPayload: plain = %s\n", plain);
+	DbgPrint("CdpLicenseBuildApplyQrPayload: plain = %s\n", work->Plain);
 	#endif
 
 	status = CdpLicenseRsaOaepEncrypt(
@@ -1584,31 +1649,31 @@ NTSTATUS CdpLicenseBuildApplyQrPayload(
 	}
 	status = CdpLicenseAesGcmEncrypt(
 		aesKey, nonce, &aad, 1,
-		(const UCHAR*)plain,
-		(ULONG)CdpLicenseStrLen(plain, sizeof(plain)),
-		ct, sizeof(ct), &ctLen); // 
+		(const UCHAR*)work->Plain,
+		(ULONG)CdpLicenseStrLen(work->Plain, sizeof(work->Plain)),
+		work->Ct, sizeof(work->Ct), &ctLen);
 	if (!NT_SUCCESS(status))
 	{
 		Cdp_LIC_FAIL("goto done, status=0x%08X", status);
 		goto done;
 	}
-	if (1 + 2 + ekLen + 12 + ctLen > sizeof(packet))
+	if (1 + 2 + ekLen + 12 + ctLen > sizeof(work->Packet))
 	{
 		Cdp_LIC_FAIL("STATUS_BUFFER_TOO_SMALL then goto done;");
 		status = STATUS_BUFFER_TOO_SMALL;
 		Cdp_LIC_FAIL("goto done, status=0x%08X", status);
 		goto done;
 	}
-	packet[0] = 0x01;
-	packet[1] = (UCHAR)((ekLen >> 8) & 0xFF);
-	packet[2] = (UCHAR)(ekLen & 0xFF);
-	RtlCopyMemory(packet + 3, ek, ekLen);
-	RtlCopyMemory(packet + 3 + ekLen, nonce, 12);
-	RtlCopyMemory(packet + 3 + ekLen + 12, ct, ctLen);
+	work->Packet[0] = 0x01;
+	work->Packet[1] = (UCHAR)((ekLen >> 8) & 0xFF);
+	work->Packet[2] = (UCHAR)(ekLen & 0xFF);
+	RtlCopyMemory(work->Packet + 3, ek, ekLen);
+	RtlCopyMemory(work->Packet + 3 + ekLen, nonce, 12);
+	RtlCopyMemory(work->Packet + 3 + ekLen + 12, work->Ct, ctLen);
 	packetLen = 3 + ekLen + 12 + ctLen;
 
 	status = CdpLicenseBase64Encode(
-		packet, packetLen, b64, sizeof(b64), &b64Len);
+		work->Packet, packetLen, work->B64, sizeof(work->B64), &b64Len);
 	if (!NT_SUCCESS(status))
 	{
 		Cdp_LIC_FAIL("goto done, status=0x%08X", status);
@@ -1621,7 +1686,7 @@ NTSTATUS CdpLicenseBuildApplyQrPayload(
 		Cdp_LIC_FAIL("goto done, status=0x%08X", status);
 		goto done;
 	}
-	status = RtlStringCbCatA(reply->QrPayload, sizeof(reply->QrPayload), b64);
+	status = RtlStringCbCatA(reply->QrPayload, sizeof(reply->QrPayload), work->B64);
 	if (!NT_SUCCESS(status))
 	{
 		Cdp_LIC_FAIL("goto done, status=0x%08X", status);
@@ -1629,7 +1694,7 @@ NTSTATUS CdpLicenseBuildApplyQrPayload(
 	}
 	reply->CiphertextLength = packetLen;
 	if (packetLen <= sizeof(reply->Ciphertext))
-		RtlCopyMemory(reply->Ciphertext, packet, packetLen);
+		RtlCopyMemory(reply->Ciphertext, work->Packet, packetLen);
 	RtlCopyMemory(reply->DeviceFingerprint, fp, Cdp_LICENSE_FP_BYTES);
 	*Written = sizeof(*reply);
 #ifdef LIC_DEBUG
@@ -1641,14 +1706,18 @@ NTSTATUS CdpLicenseBuildApplyQrPayload(
 	{
 		PCdp_LICENSE_APPLY_QR_REPLY_EX ex =
 			(PCdp_LICENSE_APPLY_QR_REPLY_EX)OutBuffer;
-		RtlStringCbCopyA(ex->Plaintext, sizeof(ex->Plaintext), plain);
+		RtlStringCbCopyA(ex->Plaintext, sizeof(ex->Plaintext), work->Plain);
 		*Written = sizeof(*ex);
 	}
 #endif
 
 done:
 	CdpLocalSealSecureZero(aesKey, sizeof(aesKey));
-	CdpLocalSealSecureZero(plain, sizeof(plain));
+	if (work)
+	{
+		CdpLocalSealSecureZero(work, sizeof(*work));
+		cdpfree(work);
+	}
 	return status;
 }
 

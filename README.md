@@ -153,7 +153,11 @@ Recovery Begin 根据目标时间确定父分支和继承点，追加一个新�
 - 默认 PBKDF2 迭代次数为 200,000。
 - 认证状态绑定到打开控制设备的文件句柄，不能被其他句柄复用。
 - 成功认证后的空闲有效期为 1 小时；通过敏感操作授权检查会续期。
-- 更换密码会更新所有使用当前共享凭据的已挂载 Journal，并递增认证代次；中途失败时驱动会尝试回滚已经更新的 Journal。
+- 更换密码会更新所有使用当前共享凭据的已挂载 Journal，并递增认证代次。授权构建同时重写密码信封；中途失败时驱动会按旧 Bundle 回滚，回滚写失败只记日志并返回最初的错误。
+- 授权构建提供离线找回：`IOCTL_Cdp_BUILD_RECOVERY_QR` 不要求旧口令，但要求已有同一份 v19 信封。`IOCTL_Cdp_IMPORT_RECOVERY_CREDENTIAL` 验厂商签名后只武装当前句柄 15 分钟。`IOCTL_Cdp_CHANGE_PASSWORD_WITH_RECOVERY` 成功后 AuthEpoch 加一，旧口令失效。非授权构建这三个 IOCTL 返回 `STATUS_NOT_SUPPORTED`。
+- 虚拟机验证尚未运行：忘记口令二维码、错设备/过期/旧代次/重放拒绝、导入后新口令生效且旧口令失败。
+- 安装包由 `installer\Build-Installer.ps1` 生成。目录固定为 `%ProgramFiles%\源点恢复`。Helper 命令 `--authorize-maintenance`、`--install-protect`、`--uninstall-all` 不接受口令参数；口令只在 Helper 窗口输入。`CdpBootConfirm` 不接受 `SERVICE_CONTROL_STOP`，卸载时由已授权进程结束服务进程。不加 `-Production` 时这是测试 altitude / 测试签名包。虚拟机验证尚未运行：固定目录、安装包不含控制台、更新口令不出现在命令行、卸载后两个驱动都卸下、忘记口令闭环、`sc stop` 无效但关机退出、首次开启保护写入 `AuthInitialized`、Driver Verifier、休眠和反复更新。
+- 更换密码或补写密码信封时，只处理当前已挂载的 Journal；不维护离线分区清单。
 - 连续 5 次认证失败会锁定认证入口 1 小时。
 - 遇到 `ERROR_ACCESS_DENIED (err=5)` 时应重新认证，并确认目标源卷绑定的 Journal 使用同一凭据。
 

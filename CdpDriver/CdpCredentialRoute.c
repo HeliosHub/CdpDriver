@@ -34,6 +34,7 @@ BOOLEAN CdpCredentialRouteTryDispatchIoctl(
 		*Status = CdpCredentialGetShared(DriverExt, &credential, &count);
 		if (*Status == STATUS_NOT_FOUND)
 		{
+			Cdp_LOG("[CREDENTIAL] query configured=0 journals=0\n");
 			*Status = STATUS_SUCCESS;
 			*Information = sizeof(*reply);
 			return TRUE;
@@ -44,6 +45,8 @@ BOOLEAN CdpCredentialRouteTryDispatchIoctl(
 		reply->JournalCount = count;
 		reply->CredentialId = credential.CredentialId;
 		reply->AuthEpoch = credential.AuthEpoch;
+		Cdp_LOG("[CREDENTIAL] query configured=1 journals=%lu epoch=%llu\n",
+			count, credential.AuthEpoch);
 		*Status = STATUS_SUCCESS;
 		*Information = sizeof(*reply);
 		return TRUE;

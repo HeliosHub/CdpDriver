@@ -62,6 +62,8 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="tests\test_core_main.c" />
+    <ClCompile Include="tests\test_recovery_policy.c" />
+    <ClCompile Include="..\CdpDriver\CdpPasswordRecoveryPolicy.c" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="CdpCore.vcxproj">
