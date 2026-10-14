@@ -222,6 +222,18 @@ Section "安装源点恢复" SEC_MAIN
     ; 耗时的运行库、测试模式和证书步骤完成后，再请求维护授权。
     Call EnsureSystemProtectionDisabled
 
+    ; 旧安装目录存在不代表旧版本带 CdpProtect。先用新包内的 Helper
+    ; 探测控制设备；没有加载自保护时无需也不能调用旧 Helper 授权。
+    nsExec::ExecToLog '"$PLUGINSDIR\CdpDriverInstallHelper.exe" --check-protect-loaded'
+    Pop $0
+    ${If} $0 == 10
+        DetailPrint "旧版本未加载自保护驱动，跳过覆盖前维护授权。"
+        Goto copy_payload
+    ${ElseIf} $0 != 0
+        MessageBox MB_OK|MB_ICONSTOP "无法检测旧版自保护驱动状态，错误码：$0。已取消更新。"
+        Abort
+    ${EndIf}
+
     IfFileExists "$INSTDIR\CdpDriverInstallHelper.exe" 0 copy_payload
     ${If} $MaintenanceAuthorized != 1
         DetailPrint "正在请求维护授权..."

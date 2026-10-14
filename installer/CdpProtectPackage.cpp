@@ -23,6 +23,14 @@ typedef BOOL (WINAPI *CDP_DI_UNINSTALL_DRIVER_W)(
 	DWORD Flags,
 	PBOOL NeedReboot);
 
+typedef BOOL (WINAPI *CDP_SETUP_GET_INF_DRIVER_STORE_LOCATION_W)(
+	PCWSTR FileName,
+	PVOID AlternatePlatformInfo,
+	PCWSTR LocaleName,
+	PWSTR ReturnBuffer,
+	DWORD ReturnBufferSize,
+	PDWORD RequiredSize);
+
 /* 取 Helper 所在目录。 */
 static BOOL CdpPackageExeDir(wchar_t *Dir, size_t CchDir)
 {
@@ -103,11 +111,40 @@ static BOOL CdpInstallInfPackage(const wchar_t *InfPath)
 /* 与安装对应地移除 Primitive 驱动包，并把真实 Win32 错误返回给安装器。 */
 static BOOL CdpUninstallInfPackage(const wchar_t *InfPath)
 {
+	HMODULE setupapi;
 	HMODULE newdev;
+	CDP_SETUP_GET_INF_DRIVER_STORE_LOCATION_W getStoreLocation;
 	CDP_DI_UNINSTALL_DRIVER_W uninstall;
+	wchar_t storeInf[MAX_PATH];
 	BOOL needReboot = FALSE;
 	BOOL ok;
 	DWORD error;
+
+	/* DiUninstallDriver 只接受 Driver Store 中的 INF。当前版本采用手工服务
+	 * 安装，仓库中可能根本没有包；旧版本若曾暂存过，则先解析到其真实路径。 */
+	setupapi = LoadLibraryW(L"setupapi.dll");
+	if (!setupapi)
+		return FALSE;
+	getStoreLocation = (CDP_SETUP_GET_INF_DRIVER_STORE_LOCATION_W)GetProcAddress(
+		setupapi, "SetupGetInfDriverStoreLocationW");
+	if (!getStoreLocation)
+	{
+		error = GetLastError();
+		FreeLibrary(setupapi);
+		SetLastError(error);
+		return FALSE;
+	}
+	if (!getStoreLocation(InfPath, NULL, NULL, storeInf, _countof(storeInf), NULL))
+	{
+		error = GetLastError();
+		FreeLibrary(setupapi);
+		if (error == ERROR_NOT_FOUND || error == ERROR_FILE_NOT_FOUND ||
+			error == ERROR_PATH_NOT_FOUND)
+			return TRUE;
+		SetLastError(error);
+		return FALSE;
+	}
+	FreeLibrary(setupapi);
 
 	newdev = LoadLibraryW(L"newdev.dll");
 	if (!newdev)
@@ -121,12 +158,76 @@ static BOOL CdpUninstallInfPackage(const wchar_t *InfPath)
 		SetLastError(error);
 		return FALSE;
 	}
-	ok = uninstall(NULL, InfPath, 0, &needReboot);
+	ok = uninstall(NULL, storeInf, 0, &needReboot);
 	error = ok ? ERROR_SUCCESS : GetLastError();
 	FreeLibrary(newdev);
+	if (!ok && (error == ERROR_NOT_FOUND || error == ERROR_FILE_NOT_FOUND ||
+		error == ERROR_PATH_NOT_FOUND))
+		return TRUE;
 	if (!ok)
 		SetLastError(error ? error : ERROR_GEN_FAILURE);
 	return ok;
+}
+
+/* 当前安装路径直接创建 MiniFilter 服务，因此卸载必须对称地删除服务和
+ * System32\\drivers 中的映像。文件仍被系统短暂占用时安排到重启删除。 */
+static BOOL CdpRemoveProtectServiceAndBinary(void)
+{
+	SC_HANDLE manager;
+	SC_HANDLE service;
+	wchar_t systemDirectory[MAX_PATH];
+	wchar_t driverPath[MAX_PATH];
+	DWORD error;
+
+	manager = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+	if (!manager)
+		return FALSE;
+	service = OpenServiceW(manager, L"CdpProtect", DELETE);
+	if (service)
+	{
+		if (!DeleteService(service))
+		{
+			error = GetLastError();
+			CloseServiceHandle(service);
+			CloseServiceHandle(manager);
+			if (error != ERROR_SERVICE_MARKED_FOR_DELETE)
+			{
+				SetLastError(error);
+				return FALSE;
+			}
+		}
+		else
+		{
+			CloseServiceHandle(service);
+			CloseServiceHandle(manager);
+		}
+	}
+	else
+	{
+		error = GetLastError();
+		CloseServiceHandle(manager);
+		if (error != ERROR_SERVICE_DOES_NOT_EXIST)
+		{
+			SetLastError(error);
+			return FALSE;
+		}
+	}
+
+	if (!GetSystemDirectoryW(systemDirectory, _countof(systemDirectory)) ||
+		FAILED(StringCchPrintfW(driverPath, _countof(driverPath),
+			L"%s\\drivers\\CdpProtect.sys", systemDirectory)))
+	{
+		SetLastError(ERROR_FILENAME_EXCED_RANGE);
+		return FALSE;
+	}
+	if (!DeleteFileW(driverPath))
+	{
+		error = GetLastError();
+		if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND &&
+			!MoveFileExW(driverPath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT))
+			return FALSE;
+	}
+	return TRUE;
 }
 
 /* 解析 protect 包里的 INF。 */
@@ -490,8 +591,21 @@ BOOL CdpInstallProtectPackage(void)
 BOOL CdpUninstallProtectPackage(void)
 {
 	wchar_t infPath[MAX_PATH];
+	BOOL packageRemoved = TRUE;
+	DWORD packageError = ERROR_SUCCESS;
 
-	if (!CdpResolveProtectInf(infPath, _countof(infPath)))
-		return TRUE;
-	return CdpUninstallInfPackage(infPath);
+	if (CdpResolveProtectInf(infPath, _countof(infPath)))
+	{
+		packageRemoved = CdpUninstallInfPackage(infPath);
+		if (!packageRemoved)
+			packageError = GetLastError();
+	}
+	if (!CdpRemoveProtectServiceAndBinary())
+		return FALSE;
+	if (!packageRemoved)
+	{
+		SetLastError(packageError);
+		return FALSE;
+	}
+	return TRUE;
 }

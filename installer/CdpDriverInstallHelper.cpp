@@ -19,6 +19,32 @@ enum ProtectionCheckExitCode {
 static int Fail(const wchar_t *Stage);
 static int CheckProtectionStatus(void);
 
+/* 仅探测自保护控制设备是否已加载。升级自不含 CdpProtect 的旧版本时，
+ * 安装目录虽然存在旧 Helper，但它不支持维护授权参数，不能据此判断。 */
+static int CheckProtectLoaded(void)
+{
+	HANDLE device = CreateFileW(
+		L"\\\\.\\CdpProtectControl",
+		GENERIC_READ | GENERIC_WRITE,
+		FILE_SHARE_READ | FILE_SHARE_WRITE,
+		NULL,
+		OPEN_EXISTING,
+		FILE_ATTRIBUTE_NORMAL,
+		NULL);
+	DWORD error;
+
+	if (device != INVALID_HANDLE_VALUE)
+	{
+		CloseHandle(device);
+		return 0;
+	}
+	error = GetLastError();
+	if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ||
+		error == ERROR_INVALID_NAME)
+		return 10;
+	return error ? (int)error : 1;
+}
+
 /* CdpProtect 包的安装与卸载，实现在 CdpProtectPackage.cpp。 */
 BOOL CdpInstallProtectPackage(void);
 BOOL CdpUninstallProtectPackage(void);
@@ -963,9 +989,12 @@ int wmain(int argc, wchar_t** argv) {
 
     if (argc != 2) {
         fwprintf(stderr,
-            L"Usage: CdpDriverInstallHelper.exe --install|--install-protect|--authorize-maintenance|--uninstall-all|--check-protection|--check-system-protection|--stop-system-protection\n");
+            L"Usage: CdpDriverInstallHelper.exe --install|--install-protect|--authorize-maintenance|--uninstall-all|--check-protect-loaded|--check-protection|--check-system-protection|--stop-system-protection\n");
         return ERROR_INVALID_PARAMETER;
     }
+
+	if (_wcsicmp(argv[1], L"--check-protect-loaded") == 0)
+		return CheckProtectLoaded();
 
     if (_wcsicmp(argv[1], L"--check-protection") == 0)
         return CheckProtectionStatus();
@@ -1011,7 +1040,7 @@ int wmain(int argc, wchar_t** argv) {
 
     if (_wcsicmp(argv[1], L"--install") != 0) {
         fwprintf(stderr,
-            L"Usage: CdpDriverInstallHelper.exe --install|--install-protect|--authorize-maintenance|--uninstall-all|--check-protection|--check-system-protection|--stop-system-protection\n");
+            L"Usage: CdpDriverInstallHelper.exe --install|--install-protect|--authorize-maintenance|--uninstall-all|--check-protect-loaded|--check-protection|--check-system-protection|--stop-system-protection\n");
         return ERROR_INVALID_PARAMETER;
     }
 
