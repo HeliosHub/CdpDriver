@@ -631,7 +631,7 @@ static VOID CdpCloseVolumeHandleEntry(_In_ PCdp_VOLUME_HANDLE_ENTRY Item)
 
 	CdpReleaseVolumeHandleEntry(Item); // Drop the list ownership reference.
 	diagnosticTimeout.QuadPart = -10LL * 1000LL * 1000LL * 10LL;
-	Cdp_LOG("[DRAIN-DIAG] stage=journal-references-wait-begin handle=%llu refs=%ld\n",
+	Cdp_DBG("[DRAIN-DIAG] stage=journal-references-wait-begin handle=%llu refs=%ld\n",
 		Item->HandleId, InterlockedCompareExchange(&Item->ReferenceCount, 0, 0));
 	do
 	{
@@ -639,12 +639,12 @@ static VOID CdpCloseVolumeHandleEntry(_In_ PCdp_VOLUME_HANDLE_ENTRY Item)
 			Executive, KernelMode, FALSE, &diagnosticTimeout);
 		if (waitStatus == STATUS_TIMEOUT)
 		{
-			Cdp_LOG("[DRAIN-DIAG] stage=journal-references-wait-still-blocked handle=%llu refs=%ld\n",
+			Cdp_DBG("[DRAIN-DIAG] stage=journal-references-wait-still-blocked handle=%llu refs=%ld\n",
 				Item->HandleId,
 				InterlockedCompareExchange(&Item->ReferenceCount, 0, 0));
 		}
 	} while (waitStatus == STATUS_TIMEOUT);
-	Cdp_LOG("[DRAIN-DIAG] stage=journal-references-wait-end handle=%llu status=0x%08X\n",
+	Cdp_DBG("[DRAIN-DIAG] stage=journal-references-wait-end handle=%llu status=0x%08X\n",
 		Item->HandleId, waitStatus);
 	if (Item->Journal.Mounted)
 		CdpJournalClose(&Item->Journal);
@@ -890,15 +890,15 @@ static NTSTATUS CdpCloseVolumeHandle(
 	if (!item)
 		return STATUS_NOT_FOUND;
 
-	Cdp_LOG("[DRAIN-DIAG] stage=close-handle-begin handle=%llu\n", HandleId);
+	Cdp_DBG("[DRAIN-DIAG] stage=close-handle-begin handle=%llu\n", HandleId);
 	pairedSource = CdpFindSourceByJournalHandle(DriverExt, HandleId);
 	if (pairedSource)
 	{
-		Cdp_LOG("[DRAIN-DIAG] stage=drain-call-begin handle=%llu source=%p disk=%lu part=%lu\n",
+		Cdp_DBG("[DRAIN-DIAG] stage=drain-call-begin handle=%llu source=%p disk=%lu part=%lu\n",
 			HandleId, pairedSource, pairedSource->DiskNumber,
 			pairedSource->PartitionNumber);
 		NTSTATUS drainStatus = CdpDrainAndDisableCapture(pairedSource);
-		Cdp_LOG("[DRAIN-DIAG] stage=drain-call-end handle=%llu status=0x%08X\n",
+		Cdp_DBG("[DRAIN-DIAG] stage=drain-call-end handle=%llu status=0x%08X\n",
 			HandleId, drainStatus);
 		if (!NT_SUCCESS(drainStatus))
 		{
@@ -911,9 +911,9 @@ static NTSTATUS CdpCloseVolumeHandle(
 			return drainStatus;
 		}
 		pairedSource->JournalHandleId = 0;
-		Cdp_LOG("[DRAIN-DIAG] stage=destroy-capture-begin handle=%llu\n", HandleId);
+		Cdp_DBG("[DRAIN-DIAG] stage=destroy-capture-begin handle=%llu\n", HandleId);
 		CdpDisableAndDestroyCapture(pairedSource);
-		Cdp_LOG("[DRAIN-DIAG] stage=destroy-capture-end handle=%llu\n", HandleId);
+		Cdp_DBG("[DRAIN-DIAG] stage=destroy-capture-end handle=%llu\n", HandleId);
 		if (item->Journal.Mounted)
 		{
 			NTSTATUS invStatus = CdpJournalInvalidate(&item->Journal);
@@ -2685,7 +2685,7 @@ static VOID CdpDestroyPreviewSession(
 
 	UNREFERENCED_PARAMETER(DriverExt);
 
-	Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=session-drain-begin handle=%llu refs=%ld thread=%p\n",
+	Cdp_DBG("[PREVIEW-CLOSE-DIAG] stage=session-drain-begin handle=%llu refs=%ld thread=%p\n",
 		Session->HandleId,
 		InterlockedCompareExchange(&Session->ReferenceCount, 0, 0),
 		PsGetCurrentThread());
@@ -2702,14 +2702,14 @@ static VOID CdpDestroyPreviewSession(
 			&diagnosticTimeout);
 		if (waitStatus == STATUS_TIMEOUT)
 		{
-			Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=session-drain-still-blocked handle=%llu refs=%ld elapsedMs=%llu thread=%p\n",
+			Cdp_DBG("[PREVIEW-CLOSE-DIAG] stage=session-drain-still-blocked handle=%llu refs=%ld elapsedMs=%llu thread=%p\n",
 				Session->HandleId,
 				InterlockedCompareExchange(&Session->ReferenceCount, 0, 0),
 				(KeQueryInterruptTime() - stageStart100ns) / 10000ULL,
 				PsGetCurrentThread());
 		}
 	} while (waitStatus == STATUS_TIMEOUT);
-	Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=session-drain-end handle=%llu status=0x%08X elapsedMs=%llu\n",
+	Cdp_DBG("[PREVIEW-CLOSE-DIAG] stage=session-drain-end handle=%llu status=0x%08X elapsedMs=%llu\n",
 		Session->HandleId,
 		waitStatus,
 		(KeQueryInterruptTime() - stageStart100ns) / 10000ULL);
@@ -2717,17 +2717,17 @@ static VOID CdpDestroyPreviewSession(
 	if (Session->JournalEntry)
 	{
 		stageStart100ns = KeQueryInterruptTime();
-		Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=journal-reference-release-begin handle=%llu journal=%p refs=%ld\n",
+		Cdp_DBG("[PREVIEW-CLOSE-DIAG] stage=journal-reference-release-begin handle=%llu journal=%p refs=%ld\n",
 			Session->HandleId,
 			Session->JournalEntry,
 			InterlockedCompareExchange(
 				&Session->JournalEntry->ReferenceCount, 0, 0));
 		CdpReleaseVolumeHandleEntry(Session->JournalEntry);
-		Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=journal-reference-release-end handle=%llu elapsedMs=%llu\n",
+		Cdp_DBG("[PREVIEW-CLOSE-DIAG] stage=journal-reference-release-end handle=%llu elapsedMs=%llu\n",
 			Session->HandleId,
 			(KeQueryInterruptTime() - stageStart100ns) / 10000ULL);
 	}
-	Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=session-free handle=%llu session=%p\n",
+	Cdp_DBG("[PREVIEW-CLOSE-DIAG] stage=session-free handle=%llu session=%p\n",
 		Session->HandleId,
 		Session);
 	cdpfree(Session);
@@ -2770,7 +2770,7 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpBeginPreviewSessionCore(
 	RtlZeroMemory(Reply, sizeof(*Reply));
 	Reply->Status = Cdp_STATUS_UNPROTECTED;
 	previewSequence = InterlockedIncrement64(&g_CdpPreviewBeginSequence);
-	Cdp_LOG("[PREVIEW-DIAG] stage=request-received seq=%lld requested=%llu thread=%p\n",
+	Cdp_DBG("[PREVIEW-DIAG] stage=request-received seq=%lld requested=%llu thread=%p\n",
 		previewSequence,
 		Request->TargetTime100ns,
 		PsGetCurrentThread());
@@ -2906,7 +2906,7 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpBeginPreviewSessionCore(
 	KeEnterCriticalRegion();
 	ExAcquirePushLockExclusive(&sourceExt->PreviewAccessLock);
 	buildStart100ns = KeQueryInterruptTime();
-	Cdp_LOG("[PREVIEW-DIAG] stage=tree-build-begin seq=%lld source=%p target=%llu journalTarget=%p journalBase=%llu thread=%p\n",
+	Cdp_DBG("[PREVIEW-DIAG] stage=tree-build-begin seq=%lld source=%p target=%llu journalTarget=%p journalBase=%llu thread=%p\n",
 		previewSequence,
 		sourceExt,
 		targetTime,
@@ -2915,7 +2915,7 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpBeginPreviewSessionCore(
 		PsGetCurrentThread());
 	status = CdpCorePreviewBegin(sourceExt->Core, targetTime);
 	buildEnd100ns = KeQueryInterruptTime();
-	Cdp_LOG("[PREVIEW-DIAG] stage=tree-build-end seq=%lld status=0x%08X elapsedMs=%llu settled=%llu thread=%p\n",
+	Cdp_DBG("[PREVIEW-DIAG] stage=tree-build-end seq=%lld status=0x%08X elapsedMs=%llu settled=%llu thread=%p\n",
 		previewSequence,
 		status,
 		(buildEnd100ns - buildStart100ns) / 10000ULL,
@@ -3023,7 +3023,7 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpEndPreviewSessionCore(
 	NTSTATUS coreStatus = STATUS_SUCCESS;
 
 	closeStart100ns = KeQueryInterruptTime();
-	Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=request-begin handle=%llu thread=%p\n",
+	Cdp_DBG("[PREVIEW-CLOSE-DIAG] stage=request-begin handle=%llu thread=%p\n",
 		HandleId,
 		PsGetCurrentThread());
 
@@ -3038,13 +3038,13 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpEndPreviewSessionCore(
 		haveGuid = TRUE;
 	}
 	ExReleaseFastMutex(&DriverExt->PreviewSessionMutex);
-	Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=session-unpublish-end handle=%llu found=%u elapsedMs=%llu\n",
+	Cdp_DBG("[PREVIEW-CLOSE-DIAG] stage=session-unpublish-end handle=%llu found=%u elapsedMs=%llu\n",
 		HandleId,
 		session ? 1u : 0u,
 		(KeQueryInterruptTime() - stageStart100ns) / 10000ULL);
 	if (!session)
 	{
-		Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=request-end handle=%llu status=0x%08X elapsedMs=%llu\n",
+		Cdp_DBG("[PREVIEW-CLOSE-DIAG] stage=request-end handle=%llu status=0x%08X elapsedMs=%llu\n",
 			HandleId,
 			STATUS_NOT_FOUND,
 			(KeQueryInterruptTime() - closeStart100ns) / 10000ULL);
@@ -3061,22 +3061,22 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpEndPreviewSessionCore(
 		{
 			KeEnterCriticalRegion();
 			stageStart100ns = KeQueryInterruptTime();
-			Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=preview-access-wait-begin handle=%llu source=%p thread=%p\n",
+			Cdp_DBG("[PREVIEW-CLOSE-DIAG] stage=preview-access-wait-begin handle=%llu source=%p thread=%p\n",
 				HandleId,
 				sourceExt,
 				PsGetCurrentThread());
 			ExAcquirePushLockExclusive(&sourceExt->PreviewAccessLock);
-			Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=preview-access-wait-end handle=%llu source=%p elapsedMs=%llu\n",
+			Cdp_DBG("[PREVIEW-CLOSE-DIAG] stage=preview-access-wait-end handle=%llu source=%p elapsedMs=%llu\n",
 				HandleId,
 				sourceExt,
 				(KeQueryInterruptTime() - stageStart100ns) / 10000ULL);
 			stageStart100ns = KeQueryInterruptTime();
-			Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=preview-tree-free-begin handle=%llu core=%p\n",
+			Cdp_DBG("[PREVIEW-CLOSE-DIAG] stage=preview-tree-free-begin handle=%llu core=%p\n",
 				HandleId,
 				sourceExt->Core);
 			if (sourceExt->Core)
 				coreStatus = CdpCorePreviewEnd(sourceExt->Core);
-			Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=preview-tree-free-end handle=%llu core=%p status=0x%08X elapsedMs=%llu\n",
+			Cdp_DBG("[PREVIEW-CLOSE-DIAG] stage=preview-tree-free-end handle=%llu core=%p status=0x%08X elapsedMs=%llu\n",
 				HandleId,
 				sourceExt->Core,
 				coreStatus,
@@ -3084,18 +3084,18 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpEndPreviewSessionCore(
 			InterlockedExchange(&sourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
 			ExReleasePushLockExclusive(&sourceExt->PreviewAccessLock);
 			KeLeaveCriticalRegion();
-			Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=phase-general handle=%llu source=%p\n",
+			Cdp_DBG("[PREVIEW-CLOSE-DIAG] stage=phase-general handle=%llu source=%p\n",
 				HandleId,
 				sourceExt);
 		}
 		else
 		{
-			Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=source-not-found handle=%llu\n",
+			Cdp_DBG("[PREVIEW-CLOSE-DIAG] stage=source-not-found handle=%llu\n",
 				HandleId);
 		}
 	}
 
-	Cdp_LOG("[PREVIEW-CLOSE-DIAG] stage=request-end handle=%llu status=0x%08X coreStatus=0x%08X elapsedMs=%llu\n",
+	Cdp_DBG("[PREVIEW-CLOSE-DIAG] stage=request-end handle=%llu status=0x%08X coreStatus=0x%08X elapsedMs=%llu\n",
 		HandleId,
 		STATUS_SUCCESS,
 		coreStatus,
@@ -4848,6 +4848,12 @@ static VOID CdpSetRestorePointSpaceAlert(
 	if (changed)
 	{
 		InterlockedIncrement64(&DevExt->RestorePointSpaceAlertGeneration);
+		if (Active && Reason == Cdp_RESTORE_SPACE_ALERT_RESERVE_FAILED &&
+			MergeStatus == STATUS_DISK_FULL)
+		{
+			Cdp_LOG("[RESTORE-SPACE-EXHAUSTED] restore-point backup space is full source=%p disk=%lu part=%lu; protected writes remain blocked until space is reclaimed\n",
+				DevExt, DevExt->DiskNumber, DevExt->PartitionNumber);
+		}
 		Cdp_LOG("[RESTORE-SPACE-ALERT] active=%lu reason=%lu mergeStatus=0x%08X source=%p\n",
 			Active ? 1UL : 0UL, Reason, MergeStatus, DevExt);
 		CdpNotifyRestoreSpaceAlertWaiters(DevExt);
@@ -5143,18 +5149,18 @@ static VOID CdpStopMergeThread(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 			&DevExt->MergeThreadRunning, 0, 0) != 0)
 	{
 		diagnosticTimeout.QuadPart = -10LL * 1000LL * 1000LL * 10LL;
-		Cdp_LOG("[DRAIN-DIAG] stage=merge-thread-wait-begin source=%p\n", DevExt);
+		Cdp_DBG("[DRAIN-DIAG] stage=merge-thread-wait-begin source=%p\n", DevExt);
 		do
 		{
 			waitStatus = KeWaitForSingleObject(
 				&DevExt->MergeThreadDoneEvent, Executive, KernelMode,
 				FALSE, &diagnosticTimeout);
 			if (waitStatus == STATUS_TIMEOUT)
-				Cdp_LOG("[DRAIN-DIAG] stage=merge-thread-wait-still-blocked source=%p running=%ld\n",
+				Cdp_DBG("[DRAIN-DIAG] stage=merge-thread-wait-still-blocked source=%p running=%ld\n",
 					DevExt, InterlockedCompareExchange(
 						&DevExt->MergeThreadRunning, 0, 0));
 		} while (waitStatus == STATUS_TIMEOUT);
-		Cdp_LOG("[DRAIN-DIAG] stage=merge-thread-wait-end source=%p status=0x%08X\n",
+		Cdp_DBG("[DRAIN-DIAG] stage=merge-thread-wait-end source=%p status=0x%08X\n",
 			DevExt, waitStatus);
 	}
 	CdpCloseFinishedMergeHandle(DevExt);
@@ -5440,7 +5446,7 @@ Cdp_OBF_WORKFLOW_LIGHT static NTSTATUS CdpScatterReadMdlChain(
 			if (InterlockedCompareExchange(
 					&g_CdpMdllessSystemBufferReported, 1, 0) == 0)
 			{
-				Cdp_LOG("[CORE-READ-BUFFER] mdlless SystemBuffer supported irp=%p len=%lu flags=0x%08lX\n",
+				Cdp_DBG("[CORE-READ-BUFFER] mdlless SystemBuffer supported irp=%p len=%lu flags=0x%08lX\n",
 					Irp, Length, Irp->Flags);
 			}
 			return STATUS_SUCCESS;
@@ -5459,7 +5465,7 @@ Cdp_OBF_WORKFLOW_LIGHT static NTSTATUS CdpScatterReadMdlChain(
 			if (InterlockedCompareExchange(
 					&g_CdpMdllessUserBufferReported, 1, 0) == 0)
 			{
-				Cdp_LOG("[CORE-READ-BUFFER] mdlless kernel UserBuffer supported irp=%p len=%lu flags=0x%08lX buffer=%p\n",
+				Cdp_DBG("[CORE-READ-BUFFER] mdlless kernel UserBuffer supported irp=%p len=%lu flags=0x%08lX buffer=%p\n",
 					Irp, Length, Irp->Flags, Irp->UserBuffer);
 			}
 			return STATUS_SUCCESS;
@@ -5870,7 +5876,7 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpRedirectJournalWrite(
 				 * same mutex to reclaim space, so never wait for the merge while
 				 * holding it. Keep the IRP, its MDLs and snapshot alive, then
 				 * reacquire the mutex before retrying this exact chunk. */
-				Cdp_LOG("[REDIRECT-WRITE-WAIT] stage=merge-space-wait-begin offset=%llu len=%lu chunkOffset=%lu chunkLen=%lu\n",
+				Cdp_DBG("[REDIRECT-WRITE-WAIT] stage=merge-space-wait-begin offset=%llu len=%lu chunkOffset=%lu chunkLen=%lu\n",
 					writeOffset, writeLength, chunkOffset, chunkLength);
 				KeClearEvent(&SourceExt->MergeSpaceRetryDoneEvent);
 				InterlockedExchange(&SourceExt->MergeSpaceRetryOwner, 1);
@@ -5889,7 +5895,7 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpRedirectJournalWrite(
 					FALSE,
 					NULL);
 				mergeWaitRetried = TRUE;
-				Cdp_LOG("[REDIRECT-WRITE-WAIT] stage=merge-space-wait-end offset=%llu len=%lu waitStatus=0x%08X enabled=%ld stopping=%ld phase=%ld\n",
+				Cdp_DBG("[REDIRECT-WRITE-WAIT] stage=merge-space-wait-end offset=%llu len=%lu waitStatus=0x%08X enabled=%ld stopping=%ld phase=%ld\n",
 					writeOffset,
 					writeLength,
 					waitStatus,
@@ -5906,7 +5912,7 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpRedirectJournalWrite(
 					InterlockedCompareExchange(&SourceExt->Phase, 0, 0) !=
 						(LONG)Cdp_PHASE_DRAINING)
 				{
-					Cdp_LOG("[REDIRECT-WRITE-WAIT] stage=merge-space-retry offset=%llu len=%lu chunkOffset=%lu chunkLen=%lu\n",
+					Cdp_DBG("[REDIRECT-WRITE-WAIT] stage=merge-space-retry offset=%llu len=%lu chunkOffset=%lu chunkLen=%lu\n",
 						writeOffset, writeLength, chunkOffset, chunkLength);
 					continue;
 				}
@@ -5995,7 +6001,7 @@ Cdp_OBF_WORKFLOW_LIGHT static NTSTATUS CdpDispatchProtectedVolumeIo(
 			irpSp->Parameters.Read.Length) == 0)
 	{
 		if (!write && CdpShouldTraceRead(sequence))
-			Cdp_LOG("[READ-TRACE] layer=volume stage=fallback reason=invalid-range seq=%lld relativeOffset=%lld len=%lu\n",
+			Cdp_DBG("[READ-TRACE] layer=volume stage=fallback reason=invalid-range seq=%lld relativeOffset=%lld len=%lu\n",
 				sequence,
 				irpSp->Parameters.Read.ByteOffset.QuadPart,
 				irpSp->Parameters.Read.Length);
@@ -6011,7 +6017,7 @@ Cdp_OBF_WORKFLOW_LIGHT static NTSTATUS CdpDispatchProtectedVolumeIo(
 	if (!sourceExt)
 	{
 		if (!write && CdpShouldTraceRead(sequence))
-			Cdp_LOG("[READ-TRACE] layer=volume stage=fallback reason=no-protection seq=%lld disk=%lu relativeOffset=%llu len=%lu\n",
+			Cdp_DBG("[READ-TRACE] layer=volume stage=fallback reason=no-protection seq=%lld disk=%lu relativeOffset=%llu len=%lu\n",
 				sequence, VolumeExt->DiskNumber, relativeOffset, length);
 		return CdpSendToNextDevice(VolumeExt->LowerDeviceObject, Irp);
 	}
@@ -6019,7 +6025,7 @@ Cdp_OBF_WORKFLOW_LIGHT static NTSTATUS CdpDispatchProtectedVolumeIo(
 		length > sourceExt->PartitionSize - relativeOffset)
 	{
 		if (!write && CdpShouldTraceRead(sequence))
-			Cdp_LOG("[READ-TRACE] layer=volume stage=fallback reason=outside-source seq=%lld disk=%lu relativeOffset=%llu len=%lu sourceSize=%llu\n",
+			Cdp_DBG("[READ-TRACE] layer=volume stage=fallback reason=outside-source seq=%lld disk=%lu relativeOffset=%llu len=%lu sourceSize=%llu\n",
 				sequence, VolumeExt->DiskNumber, relativeOffset, length,
 				sourceExt->PartitionSize);
 		ObDereferenceObject(sourceReference);
@@ -6028,7 +6034,7 @@ Cdp_OBF_WORKFLOW_LIGHT static NTSTATUS CdpDispatchProtectedVolumeIo(
 	if (!CdpAcquireVolumeIoOutstanding(sourceExt))
 	{
 		if (!write && CdpShouldTraceRead(sequence))
-			Cdp_LOG("[READ-TRACE] layer=volume stage=fallback reason=admission-closed seq=%lld relativeOffset=%llu len=%lu\n",
+			Cdp_DBG("[READ-TRACE] layer=volume stage=fallback reason=admission-closed seq=%lld relativeOffset=%llu len=%lu\n",
 				sequence, relativeOffset, length);
 		ObDereferenceObject(sourceReference);
 		/* While protection is still published, admission closes only for a
@@ -6045,7 +6051,7 @@ Cdp_OBF_WORKFLOW_LIGHT static NTSTATUS CdpDispatchProtectedVolumeIo(
 	if (!journalEntry || !sourceExt->CaptureThreadHandle)
 	{
 		if (!write && CdpShouldTraceRead(sequence))
-			Cdp_LOG("[READ-TRACE] layer=volume stage=fallback reason=worker-unavailable seq=%lld relativeOffset=%llu len=%lu\n",
+			Cdp_DBG("[READ-TRACE] layer=volume stage=fallback reason=worker-unavailable seq=%lld relativeOffset=%llu len=%lu\n",
 				sequence, relativeOffset, length);
 		CdpReleaseVolumeIoOutstanding(sourceExt);
 		ObDereferenceObject(sourceReference);
@@ -6103,7 +6109,7 @@ Cdp_OBF_WORKFLOW_LIGHT static NTSTATUS CdpDispatchProtectedVolumeIo(
 		KeSetEvent(&sourceExt->CaptureEvent, IO_NO_INCREMENT, FALSE);
 		KeReleaseSpinLock(&sourceExt->CaptureQueueLock, oldIrql);
 		if (!write && CdpShouldTraceRead(sequence))
-			Cdp_LOG("[READ-TRACE] layer=volume stage=queued seq=%lld disk=%lu relativeOffset=%llu len=%lu source=%p\n",
+			Cdp_DBG("[READ-TRACE] layer=volume stage=queued seq=%lld disk=%lu relativeOffset=%llu len=%lu source=%p\n",
 				sequence, VolumeExt->DiskNumber, relativeOffset, length, sourceExt);
 		return STATUS_PENDING;
 	}
@@ -6113,7 +6119,7 @@ Cdp_OBF_WORKFLOW_LIGHT static NTSTATUS CdpDispatchProtectedVolumeIo(
 	ObDereferenceObject(item->OriginLowerReference);
 	cdpfree(item);
 	if (!write && CdpShouldTraceRead(sequence))
-		Cdp_LOG("[READ-TRACE] layer=volume stage=fallback reason=queue-state-change seq=%lld relativeOffset=%llu len=%lu\n",
+		Cdp_DBG("[READ-TRACE] layer=volume stage=fallback reason=queue-state-change seq=%lld relativeOffset=%llu len=%lu\n",
 			sequence, relativeOffset, length);
 	if (InterlockedCompareExchange(
 			&sourceExt->CaptureEnabled, 0, 0) != 0)
@@ -6539,19 +6545,19 @@ VOID CdpStopCaptureWorker(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 		*PsThreadType, KernelMode, &threadObject, NULL)))
 	{
 		diagnosticTimeout.QuadPart = -10LL * 1000LL * 1000LL * 10LL;
-		Cdp_LOG("[DRAIN-DIAG] stage=capture-worker-wait-begin source=%p thread=%p\n",
+		Cdp_DBG("[DRAIN-DIAG] stage=capture-worker-wait-begin source=%p thread=%p\n",
 			DevExt, threadObject);
 		do
 		{
 			waitStatus = KeWaitForSingleObject(threadObject,
 				Executive, KernelMode, FALSE, &diagnosticTimeout);
 			if (waitStatus == STATUS_TIMEOUT)
-				Cdp_LOG("[DRAIN-DIAG] stage=capture-worker-wait-still-blocked source=%p queued=%ld diskOutstanding=%ld\n",
+				Cdp_DBG("[DRAIN-DIAG] stage=capture-worker-wait-still-blocked source=%p queued=%ld diskOutstanding=%ld\n",
 					DevExt,
 					InterlockedCompareExchange(&DevExt->CaptureQueueDepth, 0, 0),
 					InterlockedCompareExchange(&DevExt->VolumeIoOutstanding, 0, 0));
 		} while (waitStatus == STATUS_TIMEOUT);
-		Cdp_LOG("[DRAIN-DIAG] stage=capture-worker-wait-end source=%p status=0x%08X\n",
+		Cdp_DBG("[DRAIN-DIAG] stage=capture-worker-wait-end source=%p status=0x%08X\n",
 			DevExt, waitStatus);
 		ObDereferenceObject(threadObject);
 	}
@@ -6631,9 +6637,9 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpDrainAndDisableCapture(
 	InterlockedExchange(&DevExt->DrainProgressStatus, (LONG)STATUS_PENDING);
 	InterlockedExchange(&DevExt->DrainProgressState,
 		(LONG)Cdp_DRAIN_PROGRESS_RUNNING);
-	Cdp_LOG("[DRAIN-DIAG] stage=stop-merge-begin source=%p\n", DevExt);
+	Cdp_DBG("[DRAIN-DIAG] stage=stop-merge-begin source=%p\n", DevExt);
 	CdpStopMergeThread(DevExt);
-	Cdp_LOG("[DRAIN-DIAG] stage=stop-merge-end source=%p\n", DevExt);
+	Cdp_DBG("[DRAIN-DIAG] stage=stop-merge-end source=%p\n", DevExt);
 	/* DRAINING was published before this wait, so no new fast read can pin the
 	 * append-only view. Finish old readers before source writeback/punching. */
 	CdpWaitForCurrentViewReads(DevExt);
@@ -6648,7 +6654,7 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpDrainAndDisableCapture(
 			FALSE,
 			&diagnosticTimeout);
 		if (waitStatus == STATUS_TIMEOUT)
-			Cdp_LOG("[DRAIN-DIAG] stage=redirect-writes-wait-still-blocked source=%p inFlight=%ld\n",
+			Cdp_DBG("[DRAIN-DIAG] stage=redirect-writes-wait-still-blocked source=%p inFlight=%ld\n",
 				DevExt, InterlockedCompareExchange(
 					&DevExt->RedirectWritesInFlight, 0, 0));
 	}
@@ -6658,7 +6664,7 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpDrainAndDisableCapture(
 		waitStatus = KeWaitForSingleObject(&DevExt->HistoryMutex,
 			Executive, KernelMode, FALSE, &diagnosticTimeout);
 		if (waitStatus == STATUS_TIMEOUT)
-			Cdp_LOG("[DRAIN-DIAG] stage=progress-total-wait-still-blocked source=%p\n",
+			Cdp_DBG("[DRAIN-DIAG] stage=progress-total-wait-still-blocked source=%p\n",
 				DevExt);
 	} while (waitStatus == STATUS_TIMEOUT);
 	status = DevExt->Core ? CdpCoreQueryMetaCoverageBytes(
@@ -6696,11 +6702,11 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpDrainAndDisableCapture(
 			waitStatus = KeWaitForSingleObject(&DevExt->HistoryMutex,
 				Executive, KernelMode, FALSE, &diagnosticTimeout);
 			if (waitStatus == STATUS_TIMEOUT)
-				Cdp_LOG("[DRAIN-DIAG] stage=history-mutex-wait-still-blocked source=%p ranges=%lu bytes=%llu\n",
+				Cdp_DBG("[DRAIN-DIAG] stage=history-mutex-wait-still-blocked source=%p ranges=%lu bytes=%llu\n",
 					DevExt, drainedRanges, drainedBytes);
 		} while (waitStatus == STATUS_TIMEOUT);
 		if (drainedRanges == 0 || (drainedRanges % 1024UL) == 0)
-			Cdp_LOG("[DRAIN-DIAG] stage=core-drain-call-begin source=%p ranges=%lu bytes=%llu\n",
+			Cdp_DBG("[DRAIN-DIAG] stage=core-drain-call-begin source=%p ranges=%lu bytes=%llu\n",
 				DevExt, drainedRanges, drainedBytes);
 		asynchronousFailure = InterlockedCompareExchange(
 			&DevExt->DrainFailureStatus, 0, 0);
@@ -6741,7 +6747,7 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpDrainAndDisableCapture(
 		}
 		KeReleaseMutex(&DevExt->HistoryMutex, FALSE);
 		if (drainedRanges == 1 || (drainedRanges % 1024UL) == 0 || complete || !NT_SUCCESS(status))
-			Cdp_LOG("[DRAIN-DIAG] stage=core-drain-call-end source=%p status=0x%08X complete=%lu ranges=%lu bytes=%llu\n",
+			Cdp_DBG("[DRAIN-DIAG] stage=core-drain-call-end source=%p status=0x%08X complete=%lu ranges=%lu bytes=%llu\n",
 				DevExt, status, complete ? 1UL : 0UL,
 				drainedRanges, drainedBytes);
 
@@ -6892,7 +6898,7 @@ static NTSTATUS CdpShutdownLowerCompletion(
 		entered = InterlockedCompareExchange64(
 			&trace->DeviceExt->ShutdownIrpEntryCount, 0, 0);
 	}
-	Cdp_LOG("[SHUTDOWN-TRACE] stage=lower-complete hop=%llu kind=%lu disk=%lu filter=%p lower=%p irp=%p status=0x%08X information=%Iu pendingReturned=%u entered=%lld completed=%lld outstanding=%lld\n",
+	Cdp_DBG("[SHUTDOWN-TRACE] stage=lower-complete hop=%llu kind=%lu disk=%lu filter=%p lower=%p irp=%p status=0x%08X information=%Iu pendingReturned=%u entered=%lld completed=%lld outstanding=%lld\n",
 		trace ? trace->HopId : 0,
 		trace ? trace->DeviceKind : 0,
 		trace ? trace->DiskNumber : MAXULONG,
@@ -6989,7 +6995,7 @@ static NTSTATUS CdpForwardShutdownWithTrace(
 	trace = (PCdp_SHUTDOWN_TRACE_CONTEXT)cdpalloc(sizeof(*trace));
 	if (!trace)
 	{
-		Cdp_LOG("[SHUTDOWN-TRACE] stage=trace-allocation-failed hop=%llu kind=%lu disk=%lu filter=%p lower=%p irp=%p; forwarding-untraced\n",
+		Cdp_DBG("[SHUTDOWN-TRACE] stage=trace-allocation-failed hop=%llu kind=%lu disk=%lu filter=%p lower=%p irp=%p; forwarding-untraced\n",
 			HopId,
 			(ULONG)DeviceExt->DeviceKind,
 			DeviceExt->DiskNumber,
@@ -7005,7 +7011,7 @@ static NTSTATUS CdpForwardShutdownWithTrace(
 	trace->LowerDevice = DeviceExt->LowerDeviceObject;
 	trace->DeviceKind = (ULONG)DeviceExt->DeviceKind;
 	trace->DiskNumber = DeviceExt->DiskNumber;
-	Cdp_LOG("[SHUTDOWN-TRACE] stage=forward-lower hop=%llu kind=%lu disk=%lu filter=%p lower=%p irp=%p\n",
+	Cdp_DBG("[SHUTDOWN-TRACE] stage=forward-lower hop=%llu kind=%lu disk=%lu filter=%p lower=%p irp=%p\n",
 		HopId,
 		trace->DeviceKind,
 		trace->DiskNumber,
@@ -7038,7 +7044,7 @@ NTSTATUS CdpIrpDispatchShutdown(
 
 	if (!deviceExt || !deviceExt->LowerDeviceObject)
 	{
-		Cdp_LOG("[SHUTDOWN-TRACE] stage=local-complete reason=no-lower filter=%p irp=%p status=0x%08X\n",
+		Cdp_DBG("[SHUTDOWN-TRACE] stage=local-complete reason=no-lower filter=%p irp=%p status=0x%08X\n",
 			DeviceObject, Irp, STATUS_SUCCESS);
 		return CdpCompleteIrp(Irp, STATUS_SUCCESS, 0);
 	}
@@ -7047,7 +7053,7 @@ NTSTATUS CdpIrpDispatchShutdown(
 	entered = InterlockedIncrement64(&deviceExt->ShutdownIrpEntryCount);
 	completed = InterlockedCompareExchange64(
 		&deviceExt->ShutdownIrpCompletionCount, 0, 0);
-	Cdp_LOG("[SHUTDOWN-TRACE] stage=entry hop=%llu kind=%lu disk=%lu filter=%p lower=%p irp=%p irql=%lu entered=%lld completed=%lld outstanding=%lld\n",
+	Cdp_DBG("[SHUTDOWN-TRACE] stage=entry hop=%llu kind=%lu disk=%lu filter=%p lower=%p irp=%p irql=%lu entered=%lld completed=%lld outstanding=%lld\n",
 		hopId,
 		(ULONG)deviceExt->DeviceKind, deviceExt->DiskNumber,
 		DeviceObject, deviceExt->LowerDeviceObject, Irp,
@@ -7069,7 +7075,7 @@ NTSTATUS CdpIrpDispatchShutdown(
 				hopId, sourceExt, sourceExt->DiskNumber,
 				(ULONG)KeGetCurrentIrql());
 		}
-		Cdp_LOG("[SHUTDOWN-TRACE] stage=volume-forward hop=%llu disk=%lu source=%p terminalStatus=0x%08X lower=%p\n",
+		Cdp_DBG("[SHUTDOWN-TRACE] stage=volume-forward hop=%llu disk=%lu source=%p terminalStatus=0x%08X lower=%p\n",
 			hopId, deviceExt->DiskNumber, sourceExt, terminalStatus,
 			deviceExt->LowerDeviceObject);
 		if (sourceReference)
@@ -7077,7 +7083,7 @@ NTSTATUS CdpIrpDispatchShutdown(
 	}
 	else
 	{
-		Cdp_LOG("[SHUTDOWN-TRACE] stage=passthrough hop=%llu kind=%lu disk=%lu lower=%p\n",
+		Cdp_DBG("[SHUTDOWN-TRACE] stage=passthrough hop=%llu kind=%lu disk=%lu lower=%p\n",
 			hopId, (ULONG)deviceExt->DeviceKind,
 			deviceExt->DiskNumber, deviceExt->LowerDeviceObject);
 	}
@@ -7312,7 +7318,7 @@ static NTSTATUS CdpPowerLowerCompletion(
 		entered = InterlockedCompareExchange64(
 			&trace->DeviceExt->PowerIrpEntryCount, 0, 0);
 	}
-	Cdp_LOG("[POWER-TRACE] stage=lower-complete hop=%llu kind=%lu disk=%lu filter=%p lower=%p irp=%p minor=0x%02X type=%lu state=%lu action=%lu status=0x%08X pendingReturned=%u entered=%lld completed=%lld outstanding=%lld\n",
+	Cdp_DBG("[POWER-TRACE] stage=lower-complete hop=%llu kind=%lu disk=%lu filter=%p lower=%p irp=%p minor=0x%02X type=%lu state=%lu action=%lu status=0x%08X pendingReturned=%u entered=%lld completed=%lld outstanding=%lld\n",
 		trace ? trace->HopId : 0,
 		trace ? trace->DeviceKind : 0,
 		trace ? trace->DiskNumber : MAXULONG,
@@ -7357,7 +7363,7 @@ NTSTATUS CdpIrpDispatchPower(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 	entered = InterlockedIncrement64(&DevExt->PowerIrpEntryCount);
 	completed = InterlockedCompareExchange64(
 		&DevExt->PowerIrpCompletionCount, 0, 0);
-	Cdp_LOG("[POWER-TRACE] stage=entry hop=%llu kind=%lu disk=%lu filter=%p lower=%p irp=%p minor=0x%02X type=%lu state=%lu action=%lu irql=%lu entered=%lld completed=%lld outstanding=%lld\n",
+	Cdp_DBG("[POWER-TRACE] stage=entry hop=%llu kind=%lu disk=%lu filter=%p lower=%p irp=%p minor=0x%02X type=%lu state=%lu action=%lu irql=%lu entered=%lld completed=%lld outstanding=%lld\n",
 		hopId,
 		(ULONG)DevExt->DeviceKind,
 		DevExt->DiskNumber,
@@ -7376,7 +7382,7 @@ NTSTATUS CdpIrpDispatchPower(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 	trace = (PCdp_POWER_TRACE_CONTEXT)cdpalloc(sizeof(*trace));
 	if (!trace)
 	{
-		Cdp_LOG("[POWER-TRACE] stage=trace-allocation-failed hop=%llu filter=%p lower=%p irp=%p; forwarding-untraced\n",
+		Cdp_DBG("[POWER-TRACE] stage=trace-allocation-failed hop=%llu filter=%p lower=%p irp=%p; forwarding-untraced\n",
 			hopId, DeviceObject, DevExt->LowerDeviceObject, Irp);
 
 #if (NTDDI_VERSION < NTDDI_VISTA)
@@ -7398,7 +7404,7 @@ NTSTATUS CdpIrpDispatchPower(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ PIRP Irp)
 	trace->PowerType = irpSp->Parameters.Power.Type;
 	trace->PowerState = powerState;
 	trace->PowerAction = irpSp->Parameters.Power.ShutdownType;
-	Cdp_LOG("[POWER-TRACE] stage=forward-lower hop=%llu kind=%lu disk=%lu filter=%p lower=%p irp=%p\n",
+	Cdp_DBG("[POWER-TRACE] stage=forward-lower hop=%llu kind=%lu disk=%lu filter=%p lower=%p irp=%p\n",
 		hopId,
 		trace->DeviceKind,
 		trace->DiskNumber,
@@ -8938,7 +8944,7 @@ NTSTATUS CdpIrpDispatchDeviceControl(_In_ PDEVICE_OBJECT DeviceObject, _Inout_ P
 	}
 	if (CdpIsTrimRequest(Irp, IrpSp) && CdpShouldSuppressTrim(DevExt))
 	{
-		Cdp_LOG("[COW-TRIM] suppressed kind=%lu disk=%lu part=%lu capture=%ld phase=%ld\n",
+		Cdp_DBG("[COW-TRIM] suppressed kind=%lu disk=%lu part=%lu capture=%ld phase=%ld\n",
 			(ULONG)DevExt->DeviceKind,
 			DevExt->DiskNumber,
 			DevExt->PartitionNumber,

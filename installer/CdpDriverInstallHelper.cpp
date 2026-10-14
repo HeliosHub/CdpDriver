@@ -124,6 +124,19 @@ static BOOL UnloadMiniFilter(const wchar_t *FilterName)
 	return TRUE;
 }
 
+/* 升级时先卸载正在保护自身文件的旧 MiniFilter，再安装并校验新包。
+ * 首次安装没有控制设备，直接进入安装路径。 */
+static int InstallProtectWithUpgrade(void)
+{
+	/* CdpProtect 是 BOOT_START MiniFilter。升级时不必、也不应强求立即卸载
+	 * 当前内核实例；标准驱动升级语义是更新磁盘副本并在重启后加载新版。
+	 * CdpInstallProtectPackage 会对 System32\drivers 中的最终字节做校验。 */
+	if (!CdpInstallProtectPackage())
+		return Fail(L"Install CdpProtect");
+	wprintf(L"CdpProtect system driver was updated and verified; reboot is required.\n");
+	return 0;
+}
+
 /* 启动目录里的 CdpBootService --uninstall。此时 Helper 已持有维护会话。 */
 static int UninstallBootService(void)
 {
@@ -932,9 +945,9 @@ static int StopSystemProtection() {
     /* 口令只在本进程内存中沿用。关闭系统盘保护完成后，为安装器父进程
      * 签发维护会话并立即清零；成功时由专用退出码通知 NSIS 跳过二次询问。 */
     const BOOL maintenanceAuthorized = CdpAuthorizeMaintenance(
-        CDPP_AUTH_MAINTENANCE,
-        &maintenancePassword,
-        &maintenanceError);
+		CDPP_AUTH_MAINTENANCE,
+		&maintenancePassword,
+		&maintenanceError);
     CdpSecurePasswordClear(&maintenancePassword);
     if (maintenanceAuthorized)
         return ProtectionCheckNoneAndMaintenanceAuthorized;
@@ -967,7 +980,7 @@ int wmain(int argc, wchar_t** argv) {
         return UninstallAll();
 
     if (_wcsicmp(argv[1], L"--install-protect") == 0)
-        return CdpInstallProtectPackage() ? 0 : Fail(L"Install CdpProtect");
+		return InstallProtectWithUpgrade();
 
     if (_wcsicmp(argv[1], L"--authorize-maintenance") == 0) {
         /* 全部保护分区已关闭时，CdpDriver 的凭据状态已回到未配置。
@@ -975,7 +988,7 @@ int wmain(int argc, wchar_t** argv) {
          * 保护分区或驱动拒绝该通道，就继续执行正常口令验证。 */
         if (CheckProtectionStatus() == ProtectionCheckNone) {
             if (CdpAuthorizeMaintenance(
-                CDPP_AUTH_MAINTENANCE | CDPP_AUTH_ALLOW_UNCONFIGURED,
+				CDPP_AUTH_MAINTENANCE | CDPP_AUTH_ALLOW_UNCONFIGURED,
                 NULL,
                 &authError))
             {
@@ -985,7 +998,7 @@ int wmain(int argc, wchar_t** argv) {
         }
         ZeroMemory(&maintenance, sizeof(maintenance));
         if (!CdpPromptAndAuthorize(
-            CDPP_AUTH_MAINTENANCE, FALSE, TRUE, &maintenance, &authError))
+			CDPP_AUTH_MAINTENANCE, FALSE, TRUE, &maintenance, &authError))
         {
             CdpSecurePasswordClear(&maintenance.Password);
             fwprintf(stderr, L"Maintenance authorization failed (Win32=%lu).\n", authError);

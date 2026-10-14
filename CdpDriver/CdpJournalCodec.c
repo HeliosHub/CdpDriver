@@ -173,7 +173,7 @@ BOOLEAN CdpJournalCodecHeaderRegionOffsetValid(UINT64 UsableStart,
 }
 
 BOOLEAN CdpJournalCodecRegionLinkValid(UINT64 UsableStart, UINT64 UsableEnd,
-    ULONG SectorSize, ULONG HeaderRegionSize, ULONG Reserved,
+    ULONG SectorSize, ULONG HeaderRegionSize, UINT64 Reserved,
     UINT64 StartSequence, UINT64 PrevRegionOff, UINT64 NextRegionOff)
 {
     return Reserved == 0 && StartSequence != 0 &&

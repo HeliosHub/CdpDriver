@@ -22,7 +22,7 @@ NTSTATUS CdpJournalCodecRingDistance(UINT64 UsableStart, UINT64 UsableEnd,
 BOOLEAN CdpJournalCodecHeaderRegionOffsetValid(UINT64 UsableStart,
     UINT64 UsableEnd, ULONG SectorSize, UINT64 RegionOff, ULONG HeaderRegionSize);
 BOOLEAN CdpJournalCodecRegionLinkValid(UINT64 UsableStart, UINT64 UsableEnd,
-    ULONG SectorSize, ULONG HeaderRegionSize, ULONG Reserved,
+    ULONG SectorSize, ULONG HeaderRegionSize, UINT64 Reserved,
     UINT64 StartSequence, UINT64 PrevRegionOff, UINT64 NextRegionOff);
 
 NTSTATUS CdpJournalCodecDecodeRecord(const Cdp_HEADER_REGION_LINK* Link,

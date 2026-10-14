@@ -26,10 +26,17 @@
 #define Cdp_LOG(fmt, ...) \
 	DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, \
 		"CdpDriver: " fmt, ##__VA_ARGS__)
-#define Cdp_DBG(fmt, ...) Cdp_LOG(fmt, ##__VA_ARGS__)
 #else
 #define Cdp_LOG(fmt, ...) ((void)0)
-#define Cdp_DBG(fmt, ...) ((void)0)
+#endif
+
+/* Never promote high-volume tracing into release diagnostics. */
+#if DBG
+#define Cdp_DBG(fmt, ...) Cdp_LOG(fmt, ##__VA_ARGS__)
+#else
+/* Keep arguments type-checked and referenced without evaluating a trace. */
+#define Cdp_DBG(fmt, ...) \
+	do { if (0) { Cdp_LOG(fmt, ##__VA_ARGS__); } } while (0)
 #endif
 
 #if (NTDDI_VERSION >= NTDDI_WIN10_VB)

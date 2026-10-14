@@ -667,7 +667,7 @@ Cdp_JOURNAL_OBF_LIGHT static NTSTATUS CdpJournalRawIoImpl(
 #ifndef Cdp_USERMODE
 		if (!NT_SUCCESS(status))
 		{
-			Cdp_LOG("[JOURNAL-RAW-FAIL] backend=store origin=%s major=0x%02X status=0x%08X offset=%llu len=%lu\n",
+			Cdp_LOG("[JOURNAL-IO-FAIL] backend=store origin=%s major=0x%02X status=0x%08X offset=%llu len=%lu\n",
 				Origin, MajorFunction, status, Offset, Length);
 		}
 #endif
@@ -677,7 +677,7 @@ Cdp_JOURNAL_OBF_LIGHT static NTSTATUS CdpJournalRawIoImpl(
 #ifndef Cdp_USERMODE
 	if (InterlockedCompareExchange(&Journal->RawIoQuiesced, 0, 0) != 0)
 	{
-		Cdp_LOG("[JOURNAL-RAW-BLOCKED] origin=%s major=0x%02X offset=%llu len=%lu reason=device-power-quiesced\n",
+		Cdp_LOG("[JOURNAL-IO-BLOCKED] origin=%s major=0x%02X offset=%llu len=%lu reason=device-power-quiesced\n",
 			Origin, MajorFunction, Offset, Length);
 		return STATUS_DEVICE_NOT_READY;
 	}
@@ -727,7 +727,7 @@ Cdp_JOURNAL_OBF_LIGHT static NTSTATUS CdpJournalRawIoImpl(
 			return STATUS_UNEXPECTED_IO_ERROR;
 		if (!NT_SUCCESS(status))
 		{
-			Cdp_LOG("[JOURNAL-RAW-FAIL] backend=physical origin=%s major=0x%02X status=0x%08X partitionOffset=%llu diskOffset=%llu len=%lu\n",
+			Cdp_LOG("[JOURNAL-IO-FAIL] backend=physical origin=%s major=0x%02X status=0x%08X partitionOffset=%llu diskOffset=%llu len=%lu\n",
 				Origin, MajorFunction,
 				status,
 				Offset,
@@ -799,7 +799,7 @@ Cdp_JOURNAL_OBF_LIGHT static NTSTATUS CdpJournalRawIoImpl(
 				Executive, KernelMode, FALSE, &diagnosticTimeout);
 			if (waitStatus == STATUS_TIMEOUT)
 			{
-				Cdp_LOG("[DRAIN-DIAG] stage=journal-io-wait-still-blocked origin=%s target=%p major=0x%02X partitionOffset=%llu diskOffset=%llu len=%lu irp=%p iosb=0x%08X thread=%p\n",
+				Cdp_DBG("[DRAIN-DIAG] stage=journal-io-wait-still-blocked origin=%s target=%p major=0x%02X partitionOffset=%llu diskOffset=%llu len=%lu irp=%p iosb=0x%08X thread=%p\n",
 					Origin, Journal->TargetDevice, MajorFunction, Offset,
 					(UINT64)byteOffset.QuadPart, Length, irp, iosb.Status,
 					PsGetCurrentThread());
@@ -822,7 +822,7 @@ Cdp_JOURNAL_OBF_LIGHT static NTSTATUS CdpJournalRawIoImpl(
 		return STATUS_UNEXPECTED_IO_ERROR;
 	if (!NT_SUCCESS(status))
 	{
-		Cdp_LOG("[JOURNAL-RAW-FAIL] backend=device origin=%s major=0x%02X status=0x%08X partitionOffset=%llu diskOffset=%llu len=%lu target=%p\n",
+		Cdp_LOG("[JOURNAL-IO-FAIL] backend=device origin=%s major=0x%02X status=0x%08X partitionOffset=%llu diskOffset=%llu len=%lu target=%p\n",
 			Origin, MajorFunction,
 			status,
 			Offset,

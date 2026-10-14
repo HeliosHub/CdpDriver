@@ -157,8 +157,8 @@ Section "安装源点恢复" SEC_MAIN
     InitPluginsDir
     SetOutPath "$PLUGINSDIR"
     File /oname=CdpDriverInstallHelper.exe "work\payload\CdpDriverInstallHelper.exe"
+    File /oname=CdpDriver.cer "work\payload\driver\CdpDriver.cer"
     Call CloseRunningGui
-    Call EnsureSystemProtectionDisabled
 
     DetailPrint "正在检查 Microsoft Visual C++ x64 运行库..."
     StrCpy $2 1
@@ -194,31 +194,8 @@ Section "安装源点恢复" SEC_MAIN
         DetailPrint "已检测到兼容的 Microsoft Visual C++ x64 运行库，跳过安装。"
     ${EndIf}
 
-    IfFileExists "$INSTDIR\CdpDriverInstallHelper.exe" 0 copy_payload
-    ${If} $MaintenanceAuthorized == 1
-        DetailPrint "已沿用关闭系统盘保护时完成的维护授权。"
-        Goto copy_payload
-    ${EndIf}
-    DetailPrint "正在请求维护授权..."
-    DetailPrint "请在弹出的“源点恢复维护”窗口中输入保护密码。"
-    System::Call 'user32::AllowSetForegroundWindow(i -1)'
-    ; 升级时首先运行的是已安装的旧 Helper。由新包内的 Helper 在后台修正
-    ; 旧口令窗口的位置并隐藏旧版“尚未设密”按钮。
-    ExecShell "open" "$PLUGINSDIR\CdpDriverInstallHelper.exe" "--adjust-maintenance-window" SW_HIDE
-    ExecWait '"$INSTDIR\CdpDriverInstallHelper.exe" --authorize-maintenance' $0
-    ${If} $0 != 0
-        MessageBox MB_OK|MB_ICONSTOP "维护授权失败，错误码：$0。已取消更新。"
-        Abort
-    ${EndIf}
-
-copy_payload:
-    DetailPrint "正在复制程序文件..."
-    SetOutPath "$INSTDIR"
-    File /r "work\payload\*.*"
-
+    ; 这些步骤不依赖维护会话，放在密码授权前完成，避免消耗 30 秒卸载窗口。
     DetailPrint "正在启用 Windows 测试模式..."
-    ; NSIS is a 32-bit process. Sysnative bypasses WOW64 redirection so this
-    ; launches the 64-bit bcdedit.exe; SysWOW64 does not include bcdedit.exe.
     nsExec::ExecToLog '"$WINDIR\Sysnative\bcdedit.exe" /set testsigning on'
     Pop $0
     ${If} $0 != 0
@@ -228,17 +205,85 @@ copy_payload:
     DetailPrint "Windows 测试模式将在重启后生效。"
     SetRebootFlag true
 
-    DetailPrint "正在安装 CdpDriver 测试签名证书..."
-    nsExec::ExecToLog '"$SYSDIR\certutil.exe" -addstore -f Root "$INSTDIR\driver\CdpDriver.cer"'
+    DetailPrint "正在安装驱动测试签名证书..."
+    nsExec::ExecToLog '"$SYSDIR\certutil.exe" -addstore -f Root "$PLUGINSDIR\CdpDriver.cer"'
     Pop $0
     ${If} $0 != 0
         MessageBox MB_OK|MB_ICONSTOP "驱动证书安装失败，错误码：$0。"
         Abort
     ${EndIf}
-    nsExec::ExecToLog '"$SYSDIR\certutil.exe" -addstore -f TrustedPublisher "$INSTDIR\driver\CdpDriver.cer"'
+    nsExec::ExecToLog '"$SYSDIR\certutil.exe" -addstore -f TrustedPublisher "$PLUGINSDIR\CdpDriver.cer"'
     Pop $0
     ${If} $0 != 0
         MessageBox MB_OK|MB_ICONSTOP "驱动发布者证书安装失败，错误码：$0。"
+        Abort
+    ${EndIf}
+
+    ; 耗时的运行库、测试模式和证书步骤完成后，再请求维护授权。
+    Call EnsureSystemProtectionDisabled
+
+    IfFileExists "$INSTDIR\CdpDriverInstallHelper.exe" 0 copy_payload
+    ${If} $MaintenanceAuthorized != 1
+        DetailPrint "正在请求维护授权..."
+        DetailPrint "请在弹出的“源点恢复维护”窗口中输入保护密码。"
+        System::Call 'user32::AllowSetForegroundWindow(i -1)'
+        ; 旧 CdpProtect 只信任固定安装目录内的 Helper。用旧 Helper 给
+        ; 安装器签发维护会话；临时目录内的新版 Helper 会被拒绝为 1314。
+        ExecWait '"$INSTDIR\CdpDriverInstallHelper.exe" --authorize-maintenance' $0
+        ${If} $0 != 0
+            MessageBox MB_OK|MB_ICONSTOP "覆盖前维护授权失败，错误码：$0。已取消更新。"
+            Abort
+        ${EndIf}
+        StrCpy $MaintenanceAuthorized 1
+    ${EndIf}
+
+copy_payload:
+    DetailPrint "正在复制程序文件..."
+    SetOutPath "$INSTDIR"
+    File /r "work\payload\*.*"
+
+    ; 维护会话明确签发给安装器进程，因此由安装器自身覆盖精确受保护文件。
+    ; 不生成 .new：旧 BOOT_START Protect 会在重启早期重新拦截延迟替换。
+    DetailPrint "正在强制覆盖 CdpProtect 系统驱动..."
+    ${DisableX64FSRedirection}
+    IfFileExists "$WINDIR\System32\drivers\CdpProtect.sys" 0 protect_acl_ready
+        ; 旧版通过 PnpLockdown INF 安装，文件所有者是 TrustedInstaller。
+        ; 先改成管理员所有并授予写权限，行为与 CdpDriver 手工部署一致。
+        nsExec::ExecToLog '"$WINDIR\System32\takeown.exe" /F "$WINDIR\System32\drivers\CdpProtect.sys" /A'
+        Pop $0
+        ${If} $0 != 0
+            ${EnableX64FSRedirection}
+            MessageBox MB_OK|MB_ICONSTOP "无法取得 CdpProtect 系统驱动所有权，错误码：$0。"
+            Abort
+        ${EndIf}
+        nsExec::ExecToLog '"$WINDIR\System32\icacls.exe" "$WINDIR\System32\drivers\CdpProtect.sys" /grant *S-1-5-32-544:F'
+        Pop $0
+        ${If} $0 != 0
+            ${EnableX64FSRedirection}
+            MessageBox MB_OK|MB_ICONSTOP "无法修改 CdpProtect 系统驱动权限，错误码：$0。"
+            Abort
+        ${EndIf}
+protect_acl_ready:
+    ClearErrors
+    CopyFiles /SILENT "$INSTDIR\driver\protect\CdpProtect.sys" "$WINDIR\System32\drivers\CdpProtect.sys"
+    IfErrors protect_binary_copy_failed protect_binary_copied
+protect_binary_copy_failed:
+        ${EnableX64FSRedirection}
+        MessageBox MB_OK|MB_ICONSTOP "无法覆盖 CdpProtect 系统驱动。维护授权未生效或目标文件仍被占用。"
+        Abort
+protect_binary_copied:
+    ; 清掉旧安装包遗留的延迟替换源。PendingFileRenameOperations 即使仍有
+    ; 对应项，源文件不存在时也不会覆盖本次已经写入的新驱动。
+    Delete "$WINDIR\System32\drivers\CdpProtect.sys.new"
+    Delete "$INSTDIR\driver\protect\CdpProtect.sys.pending"
+    ${EnableX64FSRedirection}
+
+    ; BOOT_START 驱动只更新磁盘副本；当前内核实例留到重启时自然替换。
+    DetailPrint "正在更新 CdpProtect 自保护驱动..."
+    nsExec::ExecToLog '"$INSTDIR\CdpDriverInstallHelper.exe" --install-protect'
+    Pop $0
+    ${If} $0 != 0
+        MessageBox MB_OK|MB_ICONSTOP "自保护驱动安装失败，错误码：$0。请查看安装进度中的详细信息。"
         Abort
     ${EndIf}
 
@@ -247,14 +292,6 @@ copy_payload:
     Pop $0
     ${If} $0 != 0
         MessageBox MB_OK|MB_ICONSTOP "卷筛选驱动安装失败，错误码：$0。请查看安装进度中的详细信息。"
-        Abort
-    ${EndIf}
-
-    DetailPrint "正在安装 CdpProtect 自保护驱动..."
-    nsExec::ExecToLog '"$INSTDIR\CdpDriverInstallHelper.exe" --install-protect'
-    Pop $0
-    ${If} $0 != 0
-        MessageBox MB_OK|MB_ICONSTOP "自保护驱动安装失败，错误码：$0。请查看安装进度中的详细信息。"
         Abort
     ${EndIf}
 

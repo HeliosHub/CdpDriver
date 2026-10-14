@@ -84,7 +84,7 @@ Cdp_DEVSTORE_OBF_LIGHT static NTSTATUS CdpDevStoreRawIo(
 				Executive, KernelMode, FALSE, &diagnosticTimeout);
 			if (waitStatus == STATUS_TIMEOUT)
 			{
-				Cdp_LOG("[DRAIN-DIAG] stage=devstore-io-wait-still-blocked device=%p major=0x%02X offset=%llu len=%lu irp=%p iosb=0x%08X\n",
+				Cdp_DBG("[DRAIN-DIAG] stage=devstore-io-wait-still-blocked device=%p major=0x%02X offset=%llu len=%lu irp=%p iosb=0x%08X\n",
 					Device, MajorFunction, Offset, Length, irp, iosb.Status);
 			}
 		} while (waitStatus == STATUS_TIMEOUT);
