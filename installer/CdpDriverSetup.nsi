@@ -15,6 +15,8 @@ RequestExecutionLevel admin
 !define PRODUCT_EXE "源点恢复.exe"
 
 Var MaintenanceAuthorized
+Var ProtectLoaded
+Var ProtectReplaceScheduled
 
 Name "${PRODUCT_NAME}"
 OutFile "work\out\RecoverySetup-x64.exe"
@@ -151,6 +153,8 @@ Section "安装源点恢复" SEC_MAIN
     SectionIn RO
     SetShellVarContext all
     StrCpy $MaintenanceAuthorized 0
+    StrCpy $ProtectLoaded 0
+    StrCpy $ProtectReplaceScheduled 0
 
     ; Extract only the helper needed for the pre-install protection check;
     ; the final payload is not copied to the selected install directory yet.
@@ -233,6 +237,7 @@ Section "安装源点恢复" SEC_MAIN
         MessageBox MB_OK|MB_ICONSTOP "无法检测旧版自保护驱动状态，错误码：$0。已取消更新。"
         Abort
     ${EndIf}
+    StrCpy $ProtectLoaded 1
 
     IfFileExists "$INSTDIR\CdpDriverInstallHelper.exe" 0 copy_payload
     ${If} $MaintenanceAuthorized != 1
@@ -276,17 +281,65 @@ copy_payload:
             Abort
         ${EndIf}
 protect_acl_ready:
-    ClearErrors
-    CopyFiles /SILENT "$INSTDIR\driver\protect\CdpProtect.sys" "$WINDIR\System32\drivers\CdpProtect.sys"
-    IfErrors protect_binary_copy_failed protect_binary_copied
+    ; 不使用 Shell CopyFiles：它在目标已存在时可能只返回笼统失败。
+    ; CopyFileW 可可靠覆盖，并保留准确的 Win32 错误码。
+    System::Call 'kernel32::SetLastError(i 0)'
+    System::Call 'kernel32::CopyFileW(w "$INSTDIR\driver\protect\CdpProtect.sys", w "$WINDIR\System32\drivers\CdpProtect.sys", i 0) i.r0'
+    ${If} $0 != 0
+        Goto protect_binary_copied
+    ${EndIf}
+    System::Call 'kernel32::GetLastError() i.r1'
+    ${If} $ProtectLoaded == 1
+        ; 系统盘关闭保护后，Protect 驱动可能仍处于已加载状态，但磁盘文件
+        ; 应允许正常更新。先把新版落到同目录的唯一临时文件，再用
+        ; MOVEFILE_REPLACE_EXISTING 原子覆盖，避免 CopyFileW 对已有目标返回 80。
+        System::Call 'kernel32::GetCurrentProcessId() i.r2'
+        System::Call 'kernel32::SetLastError(i 0)'
+        System::Call 'kernel32::CopyFileW(w "$INSTDIR\driver\protect\CdpProtect.sys", w "$WINDIR\System32\drivers\CdpProtect.sys.upgrade.$2", i 0) i.r0'
+        ${If} $0 == 0
+            System::Call 'kernel32::GetLastError() i.r1'
+            Goto protect_binary_copy_failed
+        ${EndIf}
+        System::Call 'kernel32::SetLastError(i 0)'
+        System::Call 'kernel32::MoveFileExW(w "$WINDIR\System32\drivers\CdpProtect.sys.upgrade.$2", w "$WINDIR\System32\drivers\CdpProtect.sys", i 1) i.r0'
+        ${If} $0 == 0
+            System::Call 'kernel32::GetLastError() i.r1'
+            Delete "$WINDIR\System32\drivers\CdpProtect.sys.upgrade.$2"
+            Goto protect_binary_copy_failed
+        ${EndIf}
+        DetailPrint "已覆盖 CdpProtect 系统驱动，重启后生效。"
+        Goto protect_binary_copied
+    ${EndIf}
+    ${If} $ProtectLoaded == 0
+        ; 未加载 Protect 时没有自保护拦截。若旧映像仍被系统短暂占用，
+        ; 把新版保存到旁路文件并安排重启替换。
+        System::Call 'kernel32::SetLastError(i 0)'
+        System::Call 'kernel32::CopyFileW(w "$INSTDIR\driver\protect\CdpProtect.sys", w "$WINDIR\System32\drivers\CdpProtect.sys.new", i 0) i.r0'
+        ${If} $0 == 0
+            System::Call 'kernel32::GetLastError() i.r1'
+            Goto protect_binary_copy_failed
+        ${EndIf}
+        ClearErrors
+        Rename /REBOOTOK "$WINDIR\System32\drivers\CdpProtect.sys.new" "$WINDIR\System32\drivers\CdpProtect.sys"
+        IfErrors protect_binary_schedule_failed
+        StrCpy $ProtectReplaceScheduled 1
+        DetailPrint "CdpProtect 系统驱动将在重启时完成替换。"
+        Goto protect_binary_copied
+    ${EndIf}
 protect_binary_copy_failed:
         ${EnableX64FSRedirection}
-        MessageBox MB_OK|MB_ICONSTOP "无法覆盖 CdpProtect 系统驱动。维护授权未生效或目标文件仍被占用。"
+        MessageBox MB_OK|MB_ICONSTOP "无法覆盖 CdpProtect 系统驱动，错误码：$1。维护授权未生效或目标文件仍被占用。"
+        Abort
+protect_binary_schedule_failed:
+        ${EnableX64FSRedirection}
+        MessageBox MB_OK|MB_ICONSTOP "无法安排 CdpProtect 系统驱动在重启时替换。"
         Abort
 protect_binary_copied:
     ; 清掉旧安装包遗留的延迟替换源。PendingFileRenameOperations 即使仍有
     ; 对应项，源文件不存在时也不会覆盖本次已经写入的新驱动。
-    Delete "$WINDIR\System32\drivers\CdpProtect.sys.new"
+    ${If} $ProtectReplaceScheduled == 0
+        Delete "$WINDIR\System32\drivers\CdpProtect.sys.new"
+    ${EndIf}
     Delete "$INSTDIR\driver\protect\CdpProtect.sys.pending"
     ${EnableX64FSRedirection}
 

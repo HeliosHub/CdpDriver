@@ -4,6 +4,7 @@
 #include <Shlwapi.h>
 #include <strsafe.h>
 #include <stdio.h>
+#include <string.h>
 
 #pragma comment(lib, "SetupAPI.lib")
 #pragma comment(lib, "Shlwapi.lib")
@@ -18,6 +19,152 @@ const wchar_t* CdpGetInstallFailureStage(void)
 static BOOL CdpFileExists(_In_ const wchar_t* path)
 {
 	return path && path[0] && GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES;
+}
+
+static BOOL CdpPathEndsWithInsensitive(
+	_In_ const wchar_t* path,
+	_In_ const wchar_t* suffix)
+{
+	size_t pathChars;
+	size_t suffixChars;
+
+	if (!path || !suffix)
+		return FALSE;
+	while (*path == L'!')
+		++path;
+	pathChars = wcslen(path);
+	suffixChars = wcslen(suffix);
+	return pathChars >= suffixChars &&
+		_wcsicmp(path + pathChars - suffixChars, suffix) == 0;
+}
+
+/* 旧安装包曾用 MoveFileEx(..., DELAY_UNTIL_REBOOT) 更新启动驱动。
+ * 该操作由“删除旧文件 + .new 改名”两步组成，自保护若挡住第二步会让
+ * 正式驱动路径消失。升级前必须撤销所有这类遗留任务。 */
+static BOOL CdpRemoveLegacyDriverPendingRename(void)
+{
+	static const wchar_t keyPath[] =
+		L"SYSTEM\\CurrentControlSet\\Control\\Session Manager";
+	static const wchar_t valueName[] = L"PendingFileRenameOperations";
+	static const wchar_t driverSuffix[] = L"\\System32\\drivers\\CdpDriver.sys";
+	static const wchar_t pendingSuffix[] = L"\\System32\\drivers\\CdpDriver.sys.new";
+	HKEY key = NULL;
+	DWORD type = 0;
+	DWORD bytes = 0;
+	LONG result;
+	wchar_t* values = NULL;
+	wchar_t* read;
+	wchar_t* write;
+	size_t remaining;
+	BOOL removed = FALSE;
+
+	result = RegOpenKeyExW(
+		HKEY_LOCAL_MACHINE, keyPath, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, &key);
+	if (result != ERROR_SUCCESS)
+	{
+		SetLastError((DWORD)result);
+		return FALSE;
+	}
+	result = RegQueryValueExW(key, valueName, NULL, &type, NULL, &bytes);
+	if (result == ERROR_FILE_NOT_FOUND)
+	{
+		RegCloseKey(key);
+		return TRUE;
+	}
+	if (result != ERROR_SUCCESS || type != REG_MULTI_SZ || bytes < sizeof(wchar_t))
+	{
+		RegCloseKey(key);
+		SetLastError(result == ERROR_SUCCESS ? ERROR_INVALID_DATA : (DWORD)result);
+		return FALSE;
+	}
+	values = (wchar_t*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+		bytes + 2 * sizeof(wchar_t));
+	if (!values)
+	{
+		RegCloseKey(key);
+		SetLastError(ERROR_OUTOFMEMORY);
+		return FALSE;
+	}
+	result = RegQueryValueExW(key, valueName, NULL, &type, (BYTE*)values, &bytes);
+	if (result != ERROR_SUCCESS)
+	{
+		HeapFree(GetProcessHeap(), 0, values);
+		RegCloseKey(key);
+		SetLastError((DWORD)result);
+		return FALSE;
+	}
+
+	read = values;
+	write = values;
+	remaining = bytes / sizeof(wchar_t);
+	while (remaining > 1 && *read != L'\0')
+	{
+		size_t sourceChars = wcsnlen_s(read, remaining);
+		wchar_t* source = read;
+		wchar_t* destination;
+		size_t destinationChars;
+		BOOL discard;
+
+		if (sourceChars >= remaining)
+		{
+			SetLastError(ERROR_INVALID_DATA);
+			goto cleanup_failed;
+		}
+		read += sourceChars + 1;
+		remaining -= sourceChars + 1;
+		if (remaining == 0)
+		{
+			SetLastError(ERROR_INVALID_DATA);
+			goto cleanup_failed;
+		}
+		destination = read;
+		destinationChars = wcsnlen_s(read, remaining);
+		if (destinationChars >= remaining)
+		{
+			SetLastError(ERROR_INVALID_DATA);
+			goto cleanup_failed;
+		}
+		read += destinationChars + 1;
+		remaining -= destinationChars + 1;
+
+		discard =
+			CdpPathEndsWithInsensitive(source, driverSuffix) ||
+			CdpPathEndsWithInsensitive(source, pendingSuffix) ||
+			CdpPathEndsWithInsensitive(destination, driverSuffix) ||
+			CdpPathEndsWithInsensitive(destination, pendingSuffix);
+		if (discard)
+		{
+			removed = TRUE;
+			continue;
+		}
+		memmove(write, source, (sourceChars + 1) * sizeof(wchar_t));
+		write += sourceChars + 1;
+		memmove(write, destination, (destinationChars + 1) * sizeof(wchar_t));
+		write += destinationChars + 1;
+	}
+	*write++ = L'\0';
+	if (removed)
+	{
+		if (write == values + 1)
+			result = RegDeleteValueW(key, valueName);
+		else
+			result = RegSetValueExW(
+				key, valueName, 0, REG_MULTI_SZ, (const BYTE*)values,
+				(DWORD)((write - values) * sizeof(wchar_t)));
+		if (result != ERROR_SUCCESS && result != ERROR_FILE_NOT_FOUND)
+		{
+			SetLastError((DWORD)result);
+			goto cleanup_failed;
+		}
+	}
+	HeapFree(GetProcessHeap(), 0, values);
+	RegCloseKey(key);
+	return TRUE;
+
+cleanup_failed:
+	HeapFree(GetProcessHeap(), 0, values);
+	RegCloseKey(key);
+	return FALSE;
 }
 
 static void CdpGetExeDirectory(_Out_writes_(cchDir) wchar_t* dir, _In_ size_t cchDir)
@@ -133,6 +280,8 @@ static BOOL CdpUpdateDriverBinary(_In_ const wchar_t* infPath)
 	wchar_t dir[MAX_PATH];
 	wchar_t src[MAX_PATH];
 	wchar_t dst[MAX_PATH];
+	wchar_t staged[MAX_PATH];
+	wchar_t legacyPending[MAX_PATH];
 	wchar_t winDir[MAX_PATH];
 	wchar_t* slash;
 
@@ -158,30 +307,41 @@ static BOOL CdpUpdateDriverBinary(_In_ const wchar_t* infPath)
 		_TRUNCATE,
 		L"%s\\System32\\drivers\\CdpDriver.sys",
 		winDir);
+	_snwprintf_s(
+		staged,
+		_countof(staged),
+		_TRUNCATE,
+		L"%s\\System32\\drivers\\CdpDriver.sys.upgrade.%lu",
+		winDir,
+		GetCurrentProcessId());
+	_snwprintf_s(
+		legacyPending,
+		_countof(legacyPending),
+		_TRUNCATE,
+		L"%s\\System32\\drivers\\CdpDriver.sys.new",
+		winDir);
+
+	/* 先撤销旧包留下的两阶段重启替换，避免下次启动只删除正式驱动。 */
+	if (!CdpRemoveLegacyDriverPendingRename())
+		return FALSE;
+	DeleteFileW(legacyPending);
+	DeleteFileW(staged);
 
 	if (CopyFileW(src, dst, FALSE))
 		return TRUE;
 
-	/* Loaded image may lock the file; stage replace for next reboot. */
-	if (GetLastError() == ERROR_SHARING_VIOLATION ||
-		GetLastError() == ERROR_ACCESS_DENIED ||
-		GetLastError() == ERROR_USER_MAPPED_FILE)
+	/* 已加载的驱动可能拒绝 CopyFile 原地写入。新版先完整落到同目录，再做
+	 * 单次原子替换；失败时旧正式文件完全不动。禁止 DELAY_UNTIL_REBOOT。 */
+	if (!CopyFileW(src, staged, FALSE))
+		return FALSE;
+	if (!MoveFileExW(staged, dst, MOVEFILE_REPLACE_EXISTING))
 	{
-		wchar_t pending[MAX_PATH];
-		_snwprintf_s(
-			pending,
-			_countof(pending),
-			_TRUNCATE,
-			L"%s\\System32\\drivers\\CdpDriver.sys.new",
-			winDir);
-		if (!CopyFileW(src, pending, FALSE))
-			return CdpFileExists(dst);
-		if (!MoveFileExW(pending, dst, MOVEFILE_REPLACE_EXISTING | MOVEFILE_DELAY_UNTIL_REBOOT))
-			return CdpFileExists(dst);
-		return TRUE;
+		DWORD error = GetLastError();
+		DeleteFileW(staged);
+		SetLastError(error);
+		return FALSE;
 	}
-
-	return CdpFileExists(dst);
+	return TRUE;
 }
 
 static BOOL CdpEnsureDriverService(void)
@@ -533,48 +693,154 @@ BOOL CdpUninstallDriverPackage(void)
 BOOL CdpInstallBootConfirmService(void)
 {
 	wchar_t exeDir[MAX_PATH];
+	wchar_t sourcePath[MAX_PATH];
+	wchar_t systemDirectory[MAX_PATH];
 	wchar_t servicePath[MAX_PATH];
-	wchar_t commandLine[MAX_PATH + 32];
-	STARTUPINFOW startupInfo;
-	PROCESS_INFORMATION processInfo;
-	DWORD exitCode = 1;
+	wchar_t stagedPath[MAX_PATH];
+	wchar_t oldPath[MAX_PATH];
+	wchar_t commandLine[MAX_PATH + 4];
+	SC_HANDLE scm = NULL;
+	SC_HANDLE service = NULL;
+	DWORD error = ERROR_SUCCESS;
+	const wchar_t* operation = L"initializing";
+	SERVICE_DELAYED_AUTO_START_INFO delayed = {};
+	SC_ACTION restart[3];
+	SERVICE_FAILURE_ACTIONSW failureActions = {};
+	int index;
 
 	CdpGetExeDirectory(exeDir, _countof(exeDir));
 	if (!exeDir[0] ||
 		FAILED(StringCchPrintfW(
-			servicePath, _countof(servicePath), L"%s\\CdpBootService.exe", exeDir)) ||
-		!CdpFileExists(servicePath))
+			sourcePath, _countof(sourcePath), L"%s\\CdpBootService.exe", exeDir)) ||
+		!CdpFileExists(sourcePath))
 	{
 		SetLastError(ERROR_FILE_NOT_FOUND);
 		return FALSE;
 	}
-	if (FAILED(StringCchPrintfW(
-		commandLine, _countof(commandLine), L"\"%s\" --install", servicePath)))
+	if (!GetSystemDirectoryW(systemDirectory, _countof(systemDirectory)) ||
+		FAILED(StringCchPrintfW(
+			servicePath, _countof(servicePath), L"%s\\CdpBootService.exe",
+			systemDirectory)) ||
+		FAILED(StringCchPrintfW(
+			stagedPath, _countof(stagedPath), L"%s\\CdpBootService.exe.upgrade.%lu",
+			systemDirectory, GetCurrentProcessId())) ||
+		FAILED(StringCchPrintfW(
+			oldPath, _countof(oldPath), L"%s\\CdpBootService.exe.old.%lu",
+			systemDirectory, GetCurrentProcessId())) ||
+		FAILED(StringCchPrintfW(
+			commandLine, _countof(commandLine), L"\"%s\"", servicePath)))
 	{
 		SetLastError(ERROR_FILENAME_EXCED_RANGE);
 		return FALSE;
 	}
-	ZeroMemory(&startupInfo, sizeof(startupInfo));
-	ZeroMemory(&processInfo, sizeof(processInfo));
-	startupInfo.cb = sizeof(startupInfo);
-	startupInfo.dwFlags = STARTF_USESHOWWINDOW;
-	startupInfo.wShowWindow = SW_HIDE;
-	if (!CreateProcessW(
-		NULL, commandLine, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, exeDir,
-		&startupInfo, &processInfo))
+
+	/* 旧 CdpBootConfirm 在 Windows 11 上可能仍处于等待驱动就绪的运行状态，
+	 * 而它有意不接受 SERVICE_CONTROL_STOP。升级不能依赖强杀进程：把旧映像
+	 * 改名后在原路径写入新版，当前进程继续运行旧映像，重启后自然加载新版。 */
+	operation = L"staging CdpBootService.exe";
+	DeleteFileW(stagedPath);
+	DeleteFileW(oldPath);
+	if (!CopyFileW(sourcePath, stagedPath, FALSE))
 	{
-		return FALSE;
+		error = GetLastError();
+		goto failed;
 	}
-	WaitForSingleObject(processInfo.hProcess, INFINITE);
-	GetExitCodeProcess(processInfo.hProcess, &exitCode);
-	CloseHandle(processInfo.hThread);
-	CloseHandle(processInfo.hProcess);
-	if (exitCode != 0)
+	if (CdpFileExists(servicePath))
 	{
-		SetLastError(exitCode);
-		return FALSE;
+		operation = L"renaming the running CdpBootService.exe";
+		if (!MoveFileExW(servicePath, oldPath, MOVEFILE_REPLACE_EXISTING))
+		{
+			error = GetLastError();
+			DeleteFileW(stagedPath);
+			goto failed;
+		}
 	}
+	operation = L"publishing the new CdpBootService.exe";
+	if (!MoveFileExW(stagedPath, servicePath, MOVEFILE_REPLACE_EXISTING))
+	{
+		error = GetLastError();
+		if (CdpFileExists(oldPath))
+			(void)MoveFileExW(oldPath, servicePath, MOVEFILE_REPLACE_EXISTING);
+		DeleteFileW(stagedPath);
+		goto failed;
+	}
+	if (CdpFileExists(oldPath) && !DeleteFileW(oldPath))
+		(void)MoveFileExW(oldPath, NULL, MOVEFILE_DELAY_UNTIL_REBOOT);
+
+	/* 由已持有维护票的 Helper 直接更新 SCM，避免再派生二级安装进程。 */
+	operation = L"opening the Service Control Manager";
+	scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT | SC_MANAGER_CREATE_SERVICE);
+	if (!scm)
+	{
+		error = GetLastError();
+		goto failed;
+	}
+	operation = L"opening CdpBootConfirm";
+	service = OpenServiceW(
+		scm, L"CdpBootConfirm",
+		SERVICE_CHANGE_CONFIG | SERVICE_START);
+	if (!service && GetLastError() != ERROR_SERVICE_DOES_NOT_EXIST)
+	{
+		error = GetLastError();
+		goto failed;
+	}
+
+	if (!service)
+	{
+		operation = L"creating CdpBootConfirm";
+		service = CreateServiceW(
+			scm, L"CdpBootConfirm", L"CDP Boot Confirmation",
+			SERVICE_CHANGE_CONFIG | SERVICE_START,
+			SERVICE_WIN32_OWN_PROCESS, SERVICE_AUTO_START, SERVICE_ERROR_NORMAL,
+			commandLine, NULL, NULL, NULL, NULL, NULL);
+		if (!service)
+		{
+			error = GetLastError();
+			goto failed;
+		}
+	}
+	operation = L"updating CdpBootConfirm configuration";
+	if (!ChangeServiceConfigW(
+		service, SERVICE_NO_CHANGE, SERVICE_AUTO_START, SERVICE_NO_CHANGE,
+		commandLine, NULL, NULL, NULL, NULL, NULL, L"CDP Boot Confirmation"))
+	{
+		error = GetLastError();
+		goto failed;
+	}
+	delayed.fDelayedAutostart = FALSE;
+	operation = L"disabling delayed auto-start";
+	if (!ChangeServiceConfig2W(
+		service, SERVICE_CONFIG_DELAYED_AUTO_START_INFO, &delayed))
+	{
+		error = GetLastError();
+		goto failed;
+	}
+	for (index = 0; index < 3; ++index)
+	{
+		restart[index].Type = SC_ACTION_RESTART;
+		restart[index].Delay = 5000;
+	}
+	failureActions.dwResetPeriod = 86400;
+	failureActions.cActions = _countof(restart);
+	failureActions.lpsaActions = restart;
+	operation = L"updating CdpBootConfirm failure actions";
+	if (!ChangeServiceConfig2W(
+		service, SERVICE_CONFIG_FAILURE_ACTIONS, &failureActions))
+	{
+		error = GetLastError();
+		goto failed;
+	}
+	CloseServiceHandle(service);
+	CloseServiceHandle(scm);
 	return TRUE;
+
+failed:
+	fwprintf(stderr, L"CdpBootConfirm: %s failed (Win32=%lu).\n", operation,
+		error ? error : ERROR_GEN_FAILURE);
+	if (service) CloseServiceHandle(service);
+	if (scm) CloseServiceHandle(scm);
+	SetLastError(error ? error : ERROR_GEN_FAILURE);
+	return FALSE;
 }
 
 BOOL CdpInstallDriverPackage(void)

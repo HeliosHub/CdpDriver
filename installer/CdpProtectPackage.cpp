@@ -523,6 +523,7 @@ static BOOL CdpUpdateProtectBinary(_In_z_ const wchar_t *InfPath)
 {
 	wchar_t sourcePath[MAX_PATH];
 	wchar_t systemPath[MAX_PATH];
+	wchar_t pendingPath[MAX_PATH];
 	wchar_t *slash;
 	BYTE sourceDigest[32];
 	BYTE systemDigest[32];
@@ -550,6 +551,15 @@ static BOOL CdpUpdateProtectBinary(_In_z_ const wchar_t *InfPath)
 	/* 安装器已经覆盖成功时不要再次以 Helper 身份打开受保护目标。 */
 	if (CdpHashFileSha256(sourcePath, sourceDigest) &&
 		CdpHashFileSha256(systemPath, systemDigest) &&
+		memcmp(sourceDigest, systemDigest, sizeof(sourceDigest)) == 0)
+		return TRUE;
+
+	/* 未加载旧 Protect 但映像仍被占用时，NSIS 会把新版保存为 .new 并
+	 * 通过 MoveFileEx 安排重启替换。认可已经核对过字节的待替换文件。 */
+	if (SUCCEEDED(StringCchPrintfW(pendingPath, _countof(pendingPath),
+		L"%s.new", systemPath)) &&
+		CdpHashFileSha256(sourcePath, sourceDigest) &&
+		CdpHashFileSha256(pendingPath, systemDigest) &&
 		memcmp(sourceDigest, systemDigest, sizeof(sourceDigest)) == 0)
 		return TRUE;
 
