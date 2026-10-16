@@ -617,8 +617,10 @@ static int TestJournalPhysicalLayoutPersistence(void)
 	Expect(NT_SUCCESS(CdpJournalFormat(&formatted)),
 		"format journal with stable physical identity");
 	superblock = (PCdp_JOURNAL_SUPERBLOCK)CdpMemStoreData(store);
-	Expect(superblock->Version == Cdp_JOURNAL_VERSION &&
-		superblock->DiskPartitionStyle == gptStyle &&
+	Expect(superblock->Version == Cdp_JOURNAL_VERSION_V18 &&
+		formatted.MountedSuperblockVersion == Cdp_JOURNAL_VERSION_V18,
+		"journal without a password envelope remains on-disk v18");
+	Expect(superblock->DiskPartitionStyle == gptStyle &&
 		memcmp(&superblock->DiskGuid, &diskGuid, sizeof(GUID)) == 0 &&
 		superblock->SourcePartitionStart == sourceStart &&
 		superblock->SourcePartitionSize == sourceSize &&

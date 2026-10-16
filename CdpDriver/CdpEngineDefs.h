@@ -271,16 +271,15 @@ typedef struct _Cdp_DEVICE_EXTENSION
 	// That Core pass still reclaims any branch-invalidated tombstone RRs.
 	volatile LONG MergeIgnoreUsageThreshold;
 	KEVENT MergeThreadDoneEvent;
-	// Serializes the one write that releases HistoryMutex while waiting for a
-	// running merge. Later writes wait here so they cannot overtake its retry.
-	volatile LONG MergeSpaceRetryOwner;
-	KEVENT MergeSpaceRetryDoneEvent;
-	// Raised only for restore-point mode after the 80-percent automatic merge
-	// proves that no RR can currently be reclaimed.
+	// Raised only for restore-point mode when an append exhausts Journal space,
+	// or when automatic merge proves that no RR can currently be reclaimed.
 	volatile LONG RestorePointSpaceAlertActive;
 	volatile LONG RestorePointSpaceAlertReason;
 	volatile LONG RestorePointSpaceAlertStatus;
 	volatile LONG64 RestorePointSpaceAlertGeneration;
+	// Last reported five-percent Journal payload-usage bucket.  This is reset
+	// when usage falls so a later upward crossing is visible in release logs.
+	volatile LONG RestorePointUsageLogBucket;
 	KMUTEX HistoryMutex;
 	// Preview reads share this gate. Preview teardown/automatic compaction takes
 	// it exclusively, while ordinary protected writes intentionally do not.

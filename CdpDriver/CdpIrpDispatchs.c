@@ -42,7 +42,9 @@ static NTSTATUS CdpStartMergeThread(
 	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
 	_In_ BOOLEAN IgnoreUsageThreshold);
 static VOID CdpStopMergeThread(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
-static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt);
+static VOID CdpStartMergeIfNeeded(
+	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
+	_In_ BOOLEAN ForceForSpaceExhaustion);
 static VOID CdpWaitForCurrentViewReads(
 	_Inout_ PCdp_DEVICE_EXTENSION SourceExt);
 static VOID CdpSetRestorePointSpaceAlert(
@@ -3793,6 +3795,7 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpSetRestorePoint(
 	Reply->NewestRecoverable100ns = newest;
 	Reply->WrittenRanges = ranges;
 	Reply->WrittenBytes = bytes;
+	InterlockedExchange(&sourceExt->RestorePointUsageLogBucket, 0);
 	CdpSetRestorePointSpaceAlert(
 		sourceExt, FALSE, Cdp_RESTORE_SPACE_ALERT_NONE, STATUS_SUCCESS);
 	Cdp_LOG("[RESTORE-POINT] set target=%llu sequence=%llu sourceRanges=%lu sourceBytes=%llu deletedRR=%lu tombstonedRecords=%lu persistent=1\n",
@@ -3820,7 +3823,7 @@ phase_cleanup:
 	}
 	InterlockedExchange(&sourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
 	if (!NT_SUCCESS(status))
-		CdpStartMergeIfNeeded(sourceExt);
+		CdpStartMergeIfNeeded(sourceExt, FALSE);
 	return status;
 }
 
@@ -3869,9 +3872,10 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpDeleteRestorePoint(
 cleanup:
 	KeReleaseMutex(&sourceExt->HistoryMutex, FALSE);
 	InterlockedExchange(&sourceExt->Phase, (LONG)Cdp_PHASE_GENERAL);
-	CdpStartMergeIfNeeded(sourceExt);
+	CdpStartMergeIfNeeded(sourceExt, FALSE);
 	if (NT_SUCCESS(status))
 	{
+		InterlockedExchange(&sourceExt->RestorePointUsageLogBucket, 0);
 		CdpSetRestorePointSpaceAlert(
 			sourceExt, FALSE,
 			Cdp_RESTORE_SPACE_ALERT_NONE, STATUS_SUCCESS);
@@ -4851,7 +4855,7 @@ static VOID CdpSetRestorePointSpaceAlert(
 		if (Active && Reason == Cdp_RESTORE_SPACE_ALERT_RESERVE_FAILED &&
 			MergeStatus == STATUS_DISK_FULL)
 		{
-			Cdp_LOG("[RESTORE-SPACE-EXHAUSTED] restore-point backup space is full source=%p disk=%lu part=%lu; protected writes remain blocked until space is reclaimed\n",
+			Cdp_LOG("[RESTORE-SPACE-EXHAUSTED] restore-point backup space is full source=%p disk=%lu part=%lu; protected writes fail until space is reclaimed\n",
 				DevExt, DevExt->DiskNumber, DevExt->PartitionNumber);
 		}
 		Cdp_LOG("[RESTORE-SPACE-ALERT] active=%lu reason=%lu mergeStatus=0x%08X source=%p\n",
@@ -4920,7 +4924,70 @@ static VOID CdpNotifyRestoreSpaceAlertWaiters(
  * system always retains a fixed write reserve, regardless of Journal size.
  * Restore-point mode uses its separate percentage-based checkpoint policy. */
 #define Cdp_AUTO_MERGE_FREE_SPACE_RESERVE_BYTES \
-	(500ULL * 1024ULL * 1024ULL)
+	(1ULL * 1024ULL * 1024ULL * 1024ULL)
+
+static BOOLEAN CdpJournalUsageAtLeastPercent(
+	_In_ UINT64 PayloadBytesUsed,
+	_In_ UINT64 PayloadBytesFree,
+	_In_ ULONG Percent)
+{
+	UINT64 capacity;
+	UINT64 threshold;
+
+	if (Percent == 0)
+		return TRUE;
+	if (Percent > 100 || PayloadBytesUsed > MAXUINT64 - PayloadBytesFree)
+		return FALSE;
+	capacity = PayloadBytesUsed + PayloadBytesFree;
+	if (capacity == 0)
+		return FALSE;
+	threshold = (capacity / 100) * Percent +
+		((capacity % 100) * Percent + 99) / 100;
+	return PayloadBytesUsed >= threshold;
+}
+
+static VOID CdpLogRestorePointJournalUsage(
+	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
+	_In_ UINT64 PayloadBytesUsed,
+	_In_ UINT64 PayloadBytesFree)
+{
+	ULONG bucket = 0;
+	ULONG candidate;
+	LONG previousBucket;
+	UINT64 capacity;
+
+	if (PayloadBytesUsed > MAXUINT64 - PayloadBytesFree)
+		return;
+	capacity = PayloadBytesUsed + PayloadBytesFree;
+	if (capacity == 0)
+	{
+		InterlockedExchange(&DevExt->RestorePointUsageLogBucket, 0);
+		return;
+	}
+	for (candidate = 1; candidate <= 20; ++candidate)
+	{
+		if (!CdpJournalUsageAtLeastPercent(
+				PayloadBytesUsed, PayloadBytesFree, candidate * 5))
+		{
+			break;
+		}
+		bucket = candidate;
+	}
+	previousBucket = InterlockedExchange(
+		&DevExt->RestorePointUsageLogBucket, (LONG)bucket);
+	if ((LONG)bucket <= previousBucket)
+		return;
+	for (candidate = (ULONG)previousBucket + 1;
+		candidate <= bucket;
+		++candidate)
+	{
+		Cdp_LOG("[RESTORE-USAGE] threshold=%lu%% used=%llu free=%llu capacity=%llu\n",
+			candidate * 5,
+			PayloadBytesUsed,
+			PayloadBytesFree,
+			capacity);
+	}
+}
 
 static NTSTATUS CdpAutomaticMergeNeeded(
 	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
@@ -4936,8 +5003,6 @@ static NTSTATUS CdpAutomaticMergeNeeded(
 
 	if (!DevExt || !DevExt->Core || !Needed)
 		return STATUS_INVALID_PARAMETER;
-	if (RestorePointMode)
-		return CdpCoreJournalUsageAtLeast(DevExt->Core, 80UL, Needed);
 	*Needed = FALSE;
 	status = CdpCoreQueryJournalUsage(
 		DevExt->Core,
@@ -4948,10 +5013,23 @@ static NTSTATUS CdpAutomaticMergeNeeded(
 		&totalRecords);
 	UNREFERENCED_PARAMETER(partitionBytes);
 	UNREFERENCED_PARAMETER(metadataBytes);
-	UNREFERENCED_PARAMETER(payloadBytesUsed);
 	UNREFERENCED_PARAMETER(totalRecords);
 	if (NT_SUCCESS(status))
-		*Needed = payloadBytesFree <= Cdp_AUTO_MERGE_FREE_SPACE_RESERVE_BYTES;
+	{
+		if (RestorePointMode)
+		{
+			CdpLogRestorePointJournalUsage(
+				DevExt, payloadBytesUsed, payloadBytesFree);
+			*Needed = CdpJournalUsageAtLeastPercent(
+				payloadBytesUsed, payloadBytesFree, 80UL);
+		}
+		else
+		{
+			InterlockedExchange(&DevExt->RestorePointUsageLogBucket, 0);
+			*Needed = payloadBytesFree <=
+				Cdp_AUTO_MERGE_FREE_SPACE_RESERVE_BYTES;
+		}
+	}
 	return status;
 }
 
@@ -5167,7 +5245,9 @@ static VOID CdpStopMergeThread(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	InterlockedExchange(&DevExt->MergeThreadStopping, 0);
 }
 
-static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
+static VOID CdpStartMergeIfNeeded(
+	_Inout_ PCdp_DEVICE_EXTENSION DevExt,
+	_In_ BOOLEAN ForceForSpaceExhaustion)
 {
 	BOOLEAN atLeast = FALSE;
 	BOOLEAN restorePointMode;
@@ -5182,8 +5262,8 @@ static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	/* An automatic restore-point merge has already proved that the current
 	 * Journal state cannot reclaim another RR.  Do not let every subsequent
 	 * protected write create another worker and repeat the same failed scan.
-	 * Manual merge requests bypass this helper and remain available. */
-	if (InterlockedCompareExchange(
+	 * Manual requests and a hard space-exhaustion signal may still retry. */
+	if (!ForceForSpaceExhaustion && InterlockedCompareExchange(
 			&DevExt->RestorePointSpaceAlertActive, 0, 0) != 0)
 	{
 		return;
@@ -5194,14 +5274,22 @@ static VOID CdpStartMergeIfNeeded(_Inout_ PCdp_DEVICE_EXTENSION DevExt)
 	if (phase != (LONG)Cdp_PHASE_GENERAL &&
 		phase != (LONG)Cdp_PHASE_PREVIEW)
 		return;
-	status = CdpAutomaticMergeNeeded(DevExt, restorePointMode, &atLeast);
-	if (!NT_SUCCESS(status))
+	if (!ForceForSpaceExhaustion)
 	{
-		Cdp_LOG("[MERGE] usage query failed status=0x%08X\n", status);
-		return;
+		status = CdpAutomaticMergeNeeded(DevExt, restorePointMode, &atLeast);
+		if (!NT_SUCCESS(status))
+		{
+			Cdp_LOG("[MERGE] usage query failed status=0x%08X\n", status);
+			return;
+		}
+		if (!atLeast)
+			return;
 	}
-	if (!atLeast)
-		return;
+	else
+	{
+		Cdp_LOG("[MERGE] forced after journal space exhaustion source=%p\n",
+			DevExt);
+	}
 	status = CdpStartMergeThread(DevExt, FALSE);
 	if (!NT_SUCCESS(status) && status != STATUS_DEVICE_BUSY)
 	{
@@ -5501,38 +5589,6 @@ Cdp_OBF_WORKFLOW_LIGHT static NTSTATUS CdpScatterReadMdlChain(
 	return copied == Length ? STATUS_SUCCESS : STATUS_BUFFER_TOO_SMALL;
 }
 
-// Called with HistoryMutex owned. A preceding write may have temporarily
-// released that mutex so the merge can run; keep later writes behind its retry.
-static VOID CdpWaitForMergeSpaceRetryGateLocked(
-	_Inout_ PCdp_DEVICE_EXTENSION SourceExt)
-{
-	while (InterlockedCompareExchange(
-		&SourceExt->MergeSpaceRetryOwner, 0, 0) != 0)
-	{
-		KeReleaseMutex(&SourceExt->HistoryMutex, FALSE);
-		(void)KeWaitForSingleObject(
-			&SourceExt->MergeSpaceRetryDoneEvent,
-			Executive,
-			KernelMode,
-			FALSE,
-			NULL);
-		(void)KeWaitForSingleObject(
-			&SourceExt->HistoryMutex,
-			Executive,
-			KernelMode,
-			FALSE,
-			NULL);
-	}
-}
-
-static VOID CdpReleaseMergeSpaceRetryGateLocked(
-	_Inout_ PCdp_DEVICE_EXTENSION SourceExt)
-{
-	InterlockedExchange(&SourceExt->MergeSpaceRetryOwner, 0);
-	KeSetEvent(
-		&SourceExt->MergeSpaceRetryDoneEvent, IO_NO_INCREMENT, FALSE);
-}
-
 typedef struct _Cdp_ORIGINAL_IRP_PAYLOAD_CONTEXT
 {
 	PIRP Irp;
@@ -5753,8 +5809,7 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpRedirectJournalWrite(
 	ULONG mdlCount = 0;
 	UINT64 mdlBytes = 0;
 	UINT64 writeOffset;
-	BOOLEAN mergeWaitRetried = FALSE;
-	BOOLEAN ownsMergeSpaceRetryGate = FALSE;
+	BOOLEAN startEmergencyMerge;
 	BOOLEAN useOriginalIrp = FALSE;
 	BOOLEAN useClonedIrp = FALSE;
 	Cdp_ORIGINAL_IRP_PAYLOAD_CONTEXT originalIrpContext;
@@ -5780,7 +5835,6 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpRedirectJournalWrite(
 
 	if (!SourceExt->RedirectJournalEntry)
 		return CdpFinishRedirectWrite(SourceExt, STATUS_DEVICE_NOT_READY);
-	CdpWaitForMergeSpaceRetryGateLocked(SourceExt);
 	RtlZeroMemory(&originalIrpContext, sizeof(originalIrpContext));
 	RtlZeroMemory(&clonedIrpContext, sizeof(clonedIrpContext));
 	useOriginalIrp = CdpCanRedirectOriginalWriteIrp(
@@ -5864,60 +5918,25 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpRedirectJournalWrite(
 		}
 		if (!NT_SUCCESS(status))
 		{
-			if (status == STATUS_DISK_FULL && !mergeWaitRetried &&
-				!originalIrpContext.Forwarded &&
-				!clonedIrpContext.Submitted &&
-				InterlockedCompareExchange(
-					&SourceExt->MergeThreadRunning, 0, 0) != 0)
+			if (status == STATUS_DISK_FULL)
 			{
-				NTSTATUS waitStatus;
-
-				/* The caller owns HistoryMutex. A normal merge may need the
-				 * same mutex to reclaim space, so never wait for the merge while
-				 * holding it. Keep the IRP, its MDLs and snapshot alive, then
-				 * reacquire the mutex before retrying this exact chunk. */
-				Cdp_DBG("[REDIRECT-WRITE-WAIT] stage=merge-space-wait-begin offset=%llu len=%lu chunkOffset=%lu chunkLen=%lu\n",
-					writeOffset, writeLength, chunkOffset, chunkLength);
-				KeClearEvent(&SourceExt->MergeSpaceRetryDoneEvent);
-				InterlockedExchange(&SourceExt->MergeSpaceRetryOwner, 1);
-				ownsMergeSpaceRetryGate = TRUE;
-				KeReleaseMutex(&SourceExt->HistoryMutex, FALSE);
-				waitStatus = KeWaitForSingleObject(
-					&SourceExt->MergeThreadDoneEvent,
-					Executive,
-					KernelMode,
-					FALSE,
-					NULL);
-				KeWaitForSingleObject(
-					&SourceExt->HistoryMutex,
-					Executive,
-					KernelMode,
-					FALSE,
-					NULL);
-				mergeWaitRetried = TRUE;
-				Cdp_DBG("[REDIRECT-WRITE-WAIT] stage=merge-space-wait-end offset=%llu len=%lu waitStatus=0x%08X enabled=%ld stopping=%ld phase=%ld\n",
-					writeOffset,
-					writeLength,
-					waitStatus,
-					InterlockedCompareExchange(
-						&SourceExt->CaptureEnabled, 0, 0),
-					InterlockedCompareExchange(
-						&SourceExt->CaptureStopping, 0, 0),
-					InterlockedCompareExchange(&SourceExt->Phase, 0, 0));
-				if (NT_SUCCESS(waitStatus) && SourceExt->Core &&
-					InterlockedCompareExchange(
-						&SourceExt->CaptureEnabled, 0, 0) != 0 &&
-					InterlockedCompareExchange(
-						&SourceExt->CaptureStopping, 0, 0) == 0 &&
-					InterlockedCompareExchange(&SourceExt->Phase, 0, 0) !=
-						(LONG)Cdp_PHASE_DRAINING)
+				startEmergencyMerge = TRUE;
+				if (SourceExt->RedirectJournalEntry &&
+					SourceExt->RedirectJournalEntry->Journal.RestorePointSet)
 				{
-					Cdp_DBG("[REDIRECT-WRITE-WAIT] stage=merge-space-retry offset=%llu len=%lu chunkOffset=%lu chunkLen=%lu\n",
-						writeOffset, writeLength, chunkOffset, chunkLength);
-					continue;
+					startEmergencyMerge = InterlockedCompareExchange(
+						&SourceExt->RestorePointSpaceAlertActive, 0, 0) == 0;
+					CdpSetRestorePointSpaceAlert(
+						SourceExt,
+						TRUE,
+						Cdp_RESTORE_SPACE_ALERT_RESERVE_FAILED,
+						status);
 				}
-				status = NT_SUCCESS(waitStatus) ?
-					STATUS_DEVICE_NOT_READY : waitStatus;
+				if (startEmergencyMerge && InterlockedCompareExchange(
+						&SourceExt->ShutdownInProgress, 0, 0) == 0)
+				{
+					CdpStartMergeIfNeeded(SourceExt, TRUE);
+				}
 			}
 			Cdp_LOG("[REDIRECT-WRITE-FAIL] stage=append-publish status=0x%08X offset=%lld len=%lu chunkOffset=%lu chunkLen=%lu chunksCommitted=%lu\n",
 				status,
@@ -5928,21 +5947,16 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpRedirectJournalWrite(
 				chunkOffset / Cdp_JOURNAL_MAX_RECORD_DATA);
 			if (snapshot)
 				cdpfree(snapshot);
-			if (ownsMergeSpaceRetryGate)
-				CdpReleaseMergeSpaceRetryGateLocked(SourceExt);
 			return CdpFinishRedirectWrite(SourceExt, status);
 		}
 		chunkOffset += chunkLength;
 	}
 	if (snapshot)
 		cdpfree(snapshot);
-	if (ownsMergeSpaceRetryGate)
-		CdpReleaseMergeSpaceRetryGateLocked(SourceExt);
-
 	if (InterlockedCompareExchange(
 			&SourceExt->ShutdownInProgress, 0, 0) == 0)
 	{
-		CdpStartMergeIfNeeded(SourceExt);
+		CdpStartMergeIfNeeded(SourceExt, FALSE);
 	}
 	CdpReleaseRedirectWrite(SourceExt);
 	return STATUS_SUCCESS;
@@ -6685,7 +6699,7 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpDrainAndDisableCapture(
 		InterlockedExchange(&DevExt->DrainProgressStatus, (LONG)status);
 		InterlockedExchange(&DevExt->DrainProgressState,
 			(LONG)Cdp_DRAIN_PROGRESS_FAILED);
-		CdpStartMergeIfNeeded(DevExt);
+		CdpStartMergeIfNeeded(DevExt, FALSE);
 		Cdp_LOG("[DRAIN] progress total query failed status=0x%08X; protection remains active\n",
 			status);
 		return status;
@@ -6762,7 +6776,7 @@ Cdp_OBF_WORKFLOW static NTSTATUS CdpDrainAndDisableCapture(
 			(LONG)Cdp_DRAIN_PROGRESS_FAILED);
 		InterlockedExchange(&DevExt->Phase, (LONG)Cdp_PHASE_GENERAL);
 		InterlockedExchange(&DevExt->DrainFailureStatus, 0);
-		CdpStartMergeIfNeeded(DevExt);
+		CdpStartMergeIfNeeded(DevExt, FALSE);
 		Cdp_LOG("[DRAIN] graceful shutdown failed status=0x%08X ranges=%lu bytes=%llu; protection remains active\n",
 			status, drainedRanges, drainedBytes);
 		return status;

@@ -2466,7 +2466,7 @@ static VOID CdpJournalFreeRuntimeCheckpointsLocked(
 		Journal->CheckpointGeneration++;
 }
 
-Cdp_JOURNAL_OBF_LIGHT static NTSTATUS CdpJournalWritePayloadRangeLocked(
+Cdp_JOURNAL_OBF_LIGHT static NTSTATUS CdpJournalWritePayloadRange(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 FileOffset,
 	_In_ ULONG DataLength,
@@ -3137,6 +3137,38 @@ static VOID CdpJournalCommitCheckpointAllocationLocked(
 	}
 }
 
+static BOOLEAN CdpJournalCheckpointReservationMatchesLocked(
+	_In_ PCdp_JOURNAL Journal,
+	_In_ UINT64 SourceRegionOffset,
+	_In_ UINT64 PayloadOffset,
+	_In_ UINT64 AlignedLength)
+{
+	return Journal->Mounted && Journal->RestorePointSet &&
+		Journal->CheckpointMergeReservationActive &&
+		Journal->CheckpointMergeRegionOffset == SourceRegionOffset &&
+		Journal->CheckpointMergeReservedCursor == PayloadOffset &&
+		AlignedLength <= Journal->CheckpointMergeReservedRemaining;
+}
+
+static BOOLEAN CdpJournalCheckpointMatchesLocked(
+	_In_ PCdp_JOURNAL Journal,
+	_In_ PCdp_RUNTIME_CHECKPOINT ExpectedCheckpoint,
+	_In_ UINT64 ExpectedFileOffset)
+{
+	PCdp_RUNTIME_CHECKPOINT checkpoint;
+
+	if (!Journal->Mounted || !Journal->RestorePointSet)
+		return FALSE;
+	for (checkpoint = Journal->CheckpointFirst;
+		checkpoint;
+		checkpoint = checkpoint->Next)
+	{
+		if (checkpoint == ExpectedCheckpoint)
+			return checkpoint->FileOffset == ExpectedFileOffset;
+	}
+	return FALSE;
+}
+
 NTSTATUS CdpJournalMergeIntoRuntimeCheckpoints(
 	_Inout_ PCdp_JOURNAL Journal,
 	_In_ UINT64 SourceRegionOffset,
@@ -3216,6 +3248,8 @@ NTSTATUS CdpJournalMergeIntoRuntimeCheckpoints(
 		{
 			ULONG runStart;
 			ULONG runLength;
+			UINT64 checkpointFileOffset;
+			UINT64 checkpointVolumeOffset;
 			while (cursor < overlapLimit && covered[cursor] != 0)
 				cursor++;
 			if (cursor == overlapLimit)
@@ -3224,12 +3258,26 @@ NTSTATUS CdpJournalMergeIntoRuntimeCheckpoints(
 			while (cursor < overlapLimit && covered[cursor] == 0)
 				cursor++;
 			runLength = cursor - runStart;
-			status = CdpJournalWritePayloadRangeLocked(
+			checkpointFileOffset = checkpoint->FileOffset;
+			checkpointVolumeOffset = checkpoint->VolumeOffset;
+			/* Existing checkpoint storage is already allocated and cannot
+			 * collide with an ordinary append.  Keep its slow read/modify/write
+			 * outside Journal->Lock, then verify the checkpoint identity before
+			 * publishing the remap. */
+			Cdp_LOCK_RELEASE(&Journal->Lock);
+			status = CdpJournalWritePayloadRange(
 				Journal,
-				checkpoint->FileOffset +
-					(VolumeOffset + runStart - checkpoint->VolumeOffset),
+				checkpointFileOffset +
+					(VolumeOffset + runStart - checkpointVolumeOffset),
 				runLength,
 				(PUCHAR)Data + runStart);
+			Cdp_LOCK_ACQUIRE(&Journal->Lock);
+			if (NT_SUCCESS(status) &&
+				!CdpJournalCheckpointMatchesLocked(
+					Journal, checkpoint, checkpointFileOffset))
+			{
+				status = STATUS_DISK_CORRUPT_ERROR;
+			}
 			if (!NT_SUCCESS(status))
 				goto cleanup_locked;
 			RtlFillMemory(covered + runStart, runLength, 1);
@@ -3237,8 +3285,8 @@ NTSTATUS CdpJournalMergeIntoRuntimeCheckpoints(
 			status = CdpJournalAppendCheckpointRemap(
 				&remaps, &remapCount, &remapCapacity,
 				VolumeOffset + runStart,
-				checkpoint->FileOffset +
-					(VolumeOffset + runStart - checkpoint->VolumeOffset),
+				checkpointFileOffset +
+					(VolumeOffset + runStart - checkpointVolumeOffset),
 				runLength);
 			if (!NT_SUCCESS(status))
 				goto cleanup_locked;
@@ -3305,9 +3353,31 @@ NTSTATUS CdpJournalMergeIntoRuntimeCheckpoints(
 			}
 			RtlZeroMemory(writeBuffer, (SIZE_T)alignedLength);
 			RtlCopyMemory(writeBuffer, (PUCHAR)Data + runStart, runLength);
-			status = CdpJournalRawIo(
-				Journal, IRP_MJ_WRITE, payloadOffset,
-				(ULONG)alignedLength, writeBuffer);
+			if (usesReservation)
+			{
+				/* The exact reservation has already advanced the ordinary append
+				 * cursor past this range.  Drop the metadata lock for the slow
+				 * payload write so protected appends can continue in parallel;
+				 * publish the checkpoint only after the write succeeds. */
+				Cdp_LOCK_RELEASE(&Journal->Lock);
+				status = CdpJournalRawIo(
+					Journal, IRP_MJ_WRITE, payloadOffset,
+					(ULONG)alignedLength, writeBuffer);
+				Cdp_LOCK_ACQUIRE(&Journal->Lock);
+				if (NT_SUCCESS(status) &&
+					!CdpJournalCheckpointReservationMatchesLocked(
+						Journal, SourceRegionOffset, payloadOffset,
+						alignedLength))
+				{
+					status = STATUS_DISK_CORRUPT_ERROR;
+				}
+			}
+			else
+			{
+				status = CdpJournalRawIo(
+					Journal, IRP_MJ_WRITE, payloadOffset,
+					(ULONG)alignedLength, writeBuffer);
+			}
 			cdpfree(allocationBase);
 			if (!NT_SUCCESS(status))
 			{
@@ -3411,6 +3481,7 @@ NTSTATUS CdpJournalRelocateCheckpointsFromRegion(
 	{
 		UINT64 alignedLength;
 		UINT64 newOffset;
+		UINT64 previousOffset;
 		BOOLEAN usesReservation;
 		PVOID allocationBase = NULL;
 		PUCHAR buffer;
@@ -3438,14 +3509,42 @@ NTSTATUS CdpJournalRelocateCheckpointsFromRegion(
 			status = STATUS_INSUFFICIENT_RESOURCES;
 			goto cleanup_locked;
 		}
-		status = CdpJournalRawIo(
-			Journal, IRP_MJ_READ, checkpoint->FileOffset,
-			(ULONG)alignedLength, buffer);
-		if (NT_SUCCESS(status))
+		previousOffset = checkpoint->FileOffset;
+		if (usesReservation)
+		{
+			/* The old payload remains authoritative while its replacement is
+			 * copied into the private reservation.  Keep both raw I/Os outside
+			 * Journal->Lock and switch FileOffset only after reacquiring it. */
+			Cdp_LOCK_RELEASE(&Journal->Lock);
+			status = CdpJournalRawIo(
+				Journal, IRP_MJ_READ, previousOffset,
+				(ULONG)alignedLength, buffer);
+			if (NT_SUCCESS(status))
+			{
+				status = CdpJournalRawIo(
+					Journal, IRP_MJ_WRITE, newOffset,
+					(ULONG)alignedLength, buffer);
+			}
+			Cdp_LOCK_ACQUIRE(&Journal->Lock);
+			if (NT_SUCCESS(status) &&
+				(checkpoint->FileOffset != previousOffset ||
+				 !CdpJournalCheckpointReservationMatchesLocked(
+					 Journal, RegionOffset, newOffset, alignedLength)))
+			{
+				status = STATUS_DISK_CORRUPT_ERROR;
+			}
+		}
+		else
 		{
 			status = CdpJournalRawIo(
-				Journal, IRP_MJ_WRITE, newOffset,
+				Journal, IRP_MJ_READ, previousOffset,
 				(ULONG)alignedLength, buffer);
+			if (NT_SUCCESS(status))
+			{
+				status = CdpJournalRawIo(
+					Journal, IRP_MJ_WRITE, newOffset,
+					(ULONG)alignedLength, buffer);
+			}
 		}
 		cdpfree(allocationBase);
 		if (!NT_SUCCESS(status))
@@ -3456,7 +3555,7 @@ NTSTATUS CdpJournalRelocateCheckpointsFromRegion(
 			checkpoint->DataLength);
 		if (!NT_SUCCESS(status))
 			goto cleanup_locked;
-		remaps[remapCount - 1].PreviousFileOffset = checkpoint->FileOffset;
+		remaps[remapCount - 1].PreviousFileOffset = previousOffset;
 		checkpoint->FileOffset = newOffset;
 		CdpJournalCommitCheckpointAllocationLocked(
 			Journal, alignedLength, usesReservation);

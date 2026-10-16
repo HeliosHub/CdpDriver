@@ -156,14 +156,12 @@ NTSTATUS CdpAddDevice(_In_ PDRIVER_OBJECT DriverObject, _In_ PDEVICE_OBJECT Phys
 	InterlockedExchange64(&DeviceExtension->PowerIrpCompletionCount, 0);
 	KeInitializeEvent(&DeviceExtension->MergeThreadDoneEvent,
 		NotificationEvent, TRUE);
-	KeInitializeEvent(&DeviceExtension->MergeSpaceRetryDoneEvent,
-		NotificationEvent, TRUE);
-	InterlockedExchange(&DeviceExtension->MergeSpaceRetryOwner, 0);
 	InterlockedExchange(&DeviceExtension->RestorePointSpaceAlertActive, 0);
 	InterlockedExchange(&DeviceExtension->RestorePointSpaceAlertReason, 0);
 	InterlockedExchange(&DeviceExtension->RestorePointSpaceAlertStatus, 0);
 	InterlockedExchange64(
 		&DeviceExtension->RestorePointSpaceAlertGeneration, 1);
+	InterlockedExchange(&DeviceExtension->RestorePointUsageLogBucket, 0);
 	KeInitializeMutex(&DeviceExtension->HistoryMutex, 0);
 	ExInitializePushLock(&DeviceExtension->PreviewAccessLock);
 	DeviceExtension->SectorSize = Cdp_SECTOR_SIZE_DEFAULT;
